@@ -2,7 +2,7 @@
 import { homedir } from "node:os";
 import { join, basename } from "node:path";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 export interface Config {
   server: string;
@@ -32,7 +32,9 @@ export function readConfig(): Config | null {
 
 export function writeConfig(cfg: Config): void {
   mkdirSync(agentpartyHome(), { recursive: true });
-  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n");
+  // 配置里有 token 明文，收紧到仅属主可读写；对已存在的文件补 chmod
+  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(configPath(), 0o600);
 }
 
 export function slugifyBasename(name: string): string {
