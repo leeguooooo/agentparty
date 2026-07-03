@@ -1,6 +1,7 @@
 // party history — rest 拉历史消息
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
-import { readConfig, resolveChannel } from "../config";
+import { resolveChannel } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import { fetchMessages, handleRestError } from "../rest";
 import { formatMsg } from "../format";
 import { isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
@@ -9,9 +10,9 @@ const HISTORY_FLAGS = ["channel", "since", "limit"];
 
 export async function run(argv: string[]): Promise<number> {
   const { positionals, flags } = parseArgs(argv);
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const unknown = unknownFlagError(flags, HISTORY_FLAGS);

@@ -1,6 +1,7 @@
 // party ask — send + watch 语法糖，agent 主循环用
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
-import { loadCursor, readConfig, saveCursor } from "../config";
+import { loadCursor, saveCursor } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import { MAX_TIMEOUT_SEC, parsePositiveIntFlag } from "../validation";
 import { doSend, resolveSendInput, sendSpec } from "./send";
 import { runWatch } from "./watch";
@@ -12,9 +13,9 @@ export async function run(argv: string[]): Promise<number> {
     ...sendSpec,
     booleans: ["mentions-only"],
   });
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const unknown = unknownFlagError(parsed.flags, ASK_FLAGS);

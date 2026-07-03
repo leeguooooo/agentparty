@@ -1,7 +1,8 @@
 // party status — 发 status 消息（rest）
 import type { StatusState } from "@agentparty/shared";
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
-import { readConfig, resolveChannel, saveCursor } from "../config";
+import { resolveChannel, saveCursor } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
 import { isSlug } from "../validation";
 
@@ -10,9 +11,9 @@ const STATUS_FLAGS = ["channel", "note"];
 
 export async function run(argv: string[]): Promise<number> {
   const { positionals, flags } = parseArgs(argv, { aliases: { m: "note" } });
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const unknown = unknownFlagError(flags, STATUS_FLAGS);

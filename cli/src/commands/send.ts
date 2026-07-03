@@ -1,6 +1,7 @@
 // party send — rest 一次性发消息，成功后推进游标
 import { parseArgs, str, strArray, unknownFlagError, valueFlagError, type Parsed } from "../args";
-import { readConfig, resolveChannel, saveCursor, type Config } from "../config";
+import { resolveChannel, saveCursor, type Config } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
 import { isName, isSlug, parsePositiveIntFlag } from "../validation";
 
@@ -96,9 +97,9 @@ export async function doSend(cfg: Config, input: SendInput): Promise<number | { 
 }
 
 export async function run(argv: string[]): Promise<number> {
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const input = await resolveSendInput(parseArgs(argv, sendSpec));

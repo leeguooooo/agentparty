@@ -2,7 +2,8 @@
 import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_LOOP_GUARD, EXIT_TIMEOUT } from "@agentparty/shared";
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
-import { loadCursor, readConfig, resolveChannel, saveCursor } from "../config";
+import { loadCursor, resolveChannel, saveCursor } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import { formatMsg } from "../format";
 import { MAX_TIMEOUT_SEC, isSlug, parsePositiveIntFlag } from "../validation";
 
@@ -82,9 +83,9 @@ export async function runWatch(o: WatchOptions): Promise<number> {
 
 export async function run(argv: string[]): Promise<number> {
   const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "mentions-only"] });
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const unknown = unknownFlagError(flags, WATCH_FLAGS);

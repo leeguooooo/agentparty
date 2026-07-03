@@ -1,6 +1,6 @@
 // party webhook add|remove|list — 频道级 webhook 管理
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
-import { readConfig } from "../config";
+import { resolveAuth } from "../oidc-cli";
 import {
   addWebhook,
   handleRestError,
@@ -101,9 +101,9 @@ export async function run(argv: string[]): Promise<number> {
     console.error(flagError);
     return 1;
   }
-  const cfg = readConfig();
+  const cfg = await resolveAuth();
   if (!cfg) {
-    console.error("no config, run: party init --server URL --token T");
+    console.error("no config, run: party login or party init --server URL --token T");
     return 1;
   }
   const sub = positionals[0];

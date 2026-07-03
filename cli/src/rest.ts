@@ -73,6 +73,53 @@ function bearerJson(token: string): Record<string, string> {
   return { authorization: `Bearer ${token}`, "content-type": "application/json" };
 }
 
+// 公开配置：oidc issuer + web client_id + cli client_id（供 party login 知道去哪授权、用哪个 client）
+export interface PublicConfig {
+  issuer: string;
+  clientId: string;
+}
+
+export async function fetchPublicConfig(server: string): Promise<PublicConfig> {
+  const body = (await req(server, "/api/config")) as {
+    oidc?: { issuer?: string; client_id?: string } | null;
+    cli_client_id?: string;
+  } | null;
+  const issuer = body?.oidc?.issuer;
+  if (!issuer) throw new Error("server has no OIDC configured (cannot party login)");
+  // cli_client_id 缺省回落到 web 的 client_id（老 worker 尚未返 cli_client_id 时仍可用）
+  const clientId = body.cli_client_id ?? body.oidc?.client_id;
+  if (!clientId) throw new Error("server did not advertise a cli client_id");
+  return { issuer, clientId };
+}
+
+export interface Identity {
+  name: string;
+  email: string | null;
+  kind: string;
+  role: string;
+  owner: string | null;
+}
+
+export async function fetchMe(server: string, token: string): Promise<Identity> {
+  return (await req(server, "/api/me", { headers: bearerJson(token) })) as Identity;
+}
+
+// 账号自助铸 agent token（spec P3）：须账号会话作 bearer，owner 由 worker 从会话推导
+export async function createAgent(
+  server: string,
+  token: string,
+  name: string,
+  channelScope?: string,
+): Promise<{ token: string; name: string; owner?: string; channel_scope?: string }> {
+  const body: Record<string, unknown> = { name };
+  if (channelScope !== undefined) body.channel_scope = channelScope;
+  return (await req(server, "/api/agents", {
+    method: "POST",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as { token: string; name: string; owner?: string; channel_scope?: string };
+}
+
 export async function createToken(
   server: string,
   adminSecret: string,

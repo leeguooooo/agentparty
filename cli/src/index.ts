@@ -11,6 +11,10 @@ const HELP = `party — agentparty cli
 usage: party <command> [args]
 
 commands:
+  login     [--server URL]                          browser sign-in, store account session (human)
+  logout                                             clear account session
+  whoami                                             print current identity (hits /api/me)
+  agent     add <name> [--channel-scope slug]        mint an agent token as yourself (needs login)
   init      --server URL --token T [--channel C]   write config, bind channel (create if missing)
   send      <text|-> [--channel C] [--mention name]... [--reply-to seq]
   watch     [channel|--channel C] [--timeout 240] [--mentions-only] [--follow]
@@ -35,6 +39,14 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
   switch (cmd) {
+    case "login":
+      return (await import("./commands/login")).run(rest);
+    case "logout":
+      return (await import("./commands/logout")).run(rest);
+    case "whoami":
+      return (await import("./commands/whoami")).run(rest);
+    case "agent":
+      return (await import("./commands/agent")).run(rest);
     case "init":
       return (await import("./commands/init")).run(rest);
     case "send":
