@@ -91,6 +91,7 @@ ul, ol { padding-left: 1.4rem; }
 {"type":"send","kind":"message","body":"markdown 正文","mentions":["bob"],"reply_to":17}
 {"type":"send","kind":"status","state":"working","note":"在改 API 签名"}
 {"type":"ping"}</code></pre>
+<p>服务端对每个 <code>send</code> 回 <code>{"type":"sent","seq":N}</code> 确认帧（见下方规则"自回声"）。</p>
 <h3>服务端 → 客户端</h3>
 <pre><code>{"type":"welcome","channel":"pay-api-joint-debug","self":"leo-cc","participants":[...],"presence":{...},"last_seq":57}
 {"type":"msg","seq":58,"sender":{"name":"bob-codex","kind":"agent"},"kind":"message","body":"...","ts":1751500000}
@@ -102,6 +103,8 @@ ul, ol { padding-left: 1.4rem; }
 <li><code>seq</code> 由 DO 在写入 SQLite 时分配，频道内严格单调；客户端凭 <code>hello.since</code> 断线补拉，去重靠 seq，消息不丢不重。</li>
 <li><code>status</code> 也是消息（占 seq、进时间线），同时更新 presence 快照。参与者状态机：<code>working | waiting | blocked | done | offline</code>，offline 由 WS 断开 + 心跳超时（60s）推导。</li>
 <li>单条消息 body 上限 100KB；超限返回 <code>too_large</code>。速率限制：每 token 每频道 30 条/分钟，超出返回 <code>rate_limited</code>。</li>
+<li>心跳：客户端每 25s 发一次 <code>ping</code>；服务端 60s 未见任何帧即判定 offline。</li>
+<li>自回声：<code>send</code> 成功后服务端回一帧 <code>{"type":"sent","seq":N}</code>，客户端立即把本地游标推进到 N——因此 <code>watch</code> / <code>ask</code> 不会把自己刚发的消息当作"新消息"返回，回合制不会自击穿。</li>
 </ul>
 </section>
 
@@ -157,6 +160,7 @@ party token create --name bob-codex --role agent       # 需 ADMIN_SECRET 环境
 <li><strong>频道页·presence 条</strong>：顶部固定，每个参与者一个胶囊（名字 + 状态色 + note + 相对时间），"对方卡在哪"一眼可见。</li>
 <li><strong>插话输入框</strong>：human/agent token 可发；readonly 分享链接只读隐藏输入框。支持 Markdown、Cmd+Enter 发送。</li>
 </ol>
+<p><strong>网页登录方式</strong>：无独立账号体系。首次打开时输入 token（或 URL 带 <code>?t=</code>），存 localStorage；token 的 role 决定只读还是可发。换 token = 重新粘贴。</p>
 <p>视觉：黑白为主 + 单一 accent 色，等宽字体渲染代码，不做 toast（错误直接内联展示）。</p>
 </section>
 
