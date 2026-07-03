@@ -182,6 +182,8 @@
         align-items: start;
         max-width: 2100px; margin: 0 auto;
       }
+      /* 桌面端抽屉遮罩必须脱离 grid 流，否则它占掉内容列把 main 挤到第三列造成横向溢出 */
+      .du-drawer-scrim { display: none; }
 
       /* ======================================================== SIDEBAR === */
       .du-sidebar {
