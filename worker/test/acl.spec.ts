@@ -301,3 +301,107 @@ describe("kick (spec §5)", () => {
     expect(missing.status).toBe(404);
   });
 });
+
+// ── webhook 管理仅限房主/ap_（spec §7/§15）── 补 bypass #1：粉丝不得注册/查看/删除 webhook ──
+describe("webhook management is moderator-only (spec §7/§15)", () => {
+  const hook = { name: "hermes", url: "https://hooks.test/wake", secret: "s", filter: "mentions" };
+
+  it("fan (OIDC non-owner) is forbidden on POST/GET/DELETE for a private channel", async () => {
+    const { token: apToken } = await seedToken("agent");
+    const slug = await makeChannel(apToken, "private"); // created_by = ap agent，粉丝无权
+    const fan = await jwtFor("wh-fan", "wh-fan@leeguoo.com");
+
+    const post = await api(`/api/channels/${slug}/webhooks`, fan, {
+      method: "POST",
+      body: JSON.stringify(hook),
+    });
+    expect(post.status).toBe(403);
+    expect((await post.json()) as { error: { code: string } }).toMatchObject({ error: { code: "forbidden" } });
+
+    const list = await api(`/api/channels/${slug}/webhooks`, fan);
+    expect(list.status).toBe(403);
+
+    const del = await api(`/api/channels/${slug}/webhooks/hermes`, fan, { method: "DELETE" });
+    expect(del.status).toBe(403);
+
+    // 确认粉丝确实什么都没写进去：房主查列表为空
+    const ownerList = (await (await api(`/api/channels/${slug}/webhooks`, apToken)).json()) as {
+      webhooks: unknown[];
+    };
+    expect(ownerList.webhooks).toHaveLength(0);
+  });
+
+  it("fan is forbidden on webhooks even for a PUBLIC channel (可读写≠可管理)", async () => {
+    const { token: apToken } = await seedToken("agent");
+    const slug = await makeChannel(apToken, "public");
+    const fan = await jwtFor("wh-fan-pub", "wh-fan-pub@leeguoo.com");
+    const post = await api(`/api/channels/${slug}/webhooks`, fan, {
+      method: "POST",
+      body: JSON.stringify(hook),
+    });
+    expect(post.status).toBe(403);
+    expect((await post.json()) as { error: { code: string } }).toMatchObject({ error: { code: "forbidden" } });
+  });
+
+  it("ap_ token (creator) may register, list and delete", async () => {
+    const { token: apToken } = await seedToken("agent");
+    const slug = await makeChannel(apToken, "private");
+    expect(
+      (await api(`/api/channels/${slug}/webhooks`, apToken, { method: "POST", body: JSON.stringify(hook) }))
+        .status,
+    ).toBe(201);
+    expect((await api(`/api/channels/${slug}/webhooks`, apToken)).status).toBe(200);
+    expect(
+      (await api(`/api/channels/${slug}/webhooks/hermes`, apToken, { method: "DELETE" })).status,
+    ).toBe(200);
+  });
+
+  it("OIDC channel owner may manage webhooks in their own channel", async () => {
+    const owner = await jwtFor("wh-owner", "wh-owner@leeguoo.com");
+    const slug = await makeChannel(owner, "private"); // created_by = owner sub
+    expect(
+      (await api(`/api/channels/${slug}/webhooks`, owner, { method: "POST", body: JSON.stringify(hook) }))
+        .status,
+    ).toBe(201);
+    expect((await api(`/api/channels/${slug}/webhooks`, owner)).status).toBe(200);
+    expect(
+      (await api(`/api/channels/${slug}/webhooks/hermes`, owner, { method: "DELETE" })).status,
+    ).toBe(200);
+  });
+});
+
+// ── 频道列表按 ACL 过滤（spec §3.2）── 补 bypass #2：无权私有频道连名字都不出现 ──
+describe("GET /api/channels hides inaccessible private channels (spec §3.2)", () => {
+  it("fan sees public but not someone else's private; ap_ and OIDC owner see their own private", async () => {
+    const { token: apToken } = await seedToken("agent");
+    const priv = await makeChannel(apToken, "private"); // created_by = ap agent，粉丝无权
+    const pub = await makeChannel(apToken, "public");
+    const fan = await jwtFor("list-fan", "list-fan@leeguoo.com");
+
+    const fanRes = await api("/api/channels", fan);
+    expect(fanRes.status).toBe(200);
+    const fanChannels = ((await fanRes.json()) as {
+      channels: { slug: string; created_by?: unknown }[];
+    }).channels;
+    const fanSlugs = fanChannels.map((ch) => ch.slug);
+    expect(fanSlugs).not.toContain(priv); // 私有频道连名字都不给
+    expect(fanSlugs).toContain(pub);
+    // created_by 不得回给客户端（仅用于服务端 ACL 判定）
+    for (const ch of fanChannels) expect(ch.created_by).toBeUndefined();
+
+    // ap_ token 能看到该私有频道
+    const apSlugs = ((await (await api("/api/channels", apToken)).json()) as {
+      channels: { slug: string }[];
+    }).channels.map((ch) => ch.slug);
+    expect(apSlugs).toContain(priv);
+
+    // OIDC 房主看得到自己的私有频道，但仍看不到别人的私有频道
+    const owner = await jwtFor("list-owner", "list-owner@leeguoo.com");
+    const ownerPriv = await makeChannel(owner, "private");
+    const ownerSlugs = ((await (await api("/api/channels", owner)).json()) as {
+      channels: { slug: string }[];
+    }).channels.map((ch) => ch.slug);
+    expect(ownerSlugs).toContain(ownerPriv);
+    expect(ownerSlugs).not.toContain(priv);
+  });
+});

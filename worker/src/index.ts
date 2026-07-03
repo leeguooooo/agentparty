@@ -273,11 +273,16 @@ interface ChannelSummary {
 }
 
 app.get("/api/channels", async (c) => {
+  const identity = c.get("identity");
+  // created_by 仅用于 ACL 判定，不回给客户端（保持列表响应契约不变）
   const { results } = await c.env.DB.prepare(
-    "SELECT slug, title, topic, kind, mode, visibility, created_at, archived_at FROM channels ORDER BY created_at, id",
-  ).all<{ slug: string }>();
+    "SELECT slug, title, topic, kind, mode, visibility, created_by, created_at, archived_at FROM channels ORDER BY created_at, id",
+  ).all<{ slug: string; visibility: string; created_by: string | null }>();
+  // 防私有频道泄漏给粉丝（spec §3.2）：无权访问的私有频道连名字都不出现，summary 也不拉。
+  // ap_ token / OIDC 房主照常看到自己的私有频道。
+  const visible = results.filter((row) => canAccessChannel(identity, row));
   const channels = await Promise.all(
-    results.map(async (row) => {
+    visible.map(async ({ created_by, ...row }) => {
       let summary: ChannelSummary = { last: null, presence: [] };
       try {
         const stub = await getServerByName(c.env.CHANNELS, row.slug);
@@ -402,11 +407,13 @@ app.post("/api/channels/:slug/webhooks", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  // webhook 能窃取频道全部消息，属管理操作：仅 ap_ token（非只读）或房主可管理（spec §7/§15）。
+  // 前置于 archived 判定，避免向粉丝泄漏私有频道是否存在/是否已归档。
+  if (!isChannelModerator(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can manage webhooks"), 403);
+  }
   if (channel.archived_at !== null) {
     return c.json(errorBody("archived", "channel is archived"), 410);
-  }
-  if (c.get("identity").role === "readonly") {
-    return c.json(errorBody("unauthorized", "readonly token cannot manage webhooks"), 403);
   }
   const body = (await c.req.json().catch(() => null)) as
     | { name?: unknown; url?: unknown; secret?: unknown; filter?: unknown }
@@ -454,11 +461,13 @@ app.get("/api/channels/:slug/webhooks", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  // webhook 能窃取频道全部消息，属管理操作：仅 ap_ token（非只读）或房主可管理（spec §7/§15）。
+  // 前置于 archived 判定，避免向粉丝泄漏私有频道是否存在/是否已归档。
+  if (!isChannelModerator(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can manage webhooks"), 403);
+  }
   if (channel.archived_at !== null) {
     return c.json(errorBody("archived", "channel is archived"), 410);
-  }
-  if (c.get("identity").role === "readonly") {
-    return c.json(errorBody("unauthorized", "readonly token cannot manage webhooks"), 403);
   }
   const stub = await getServerByName(c.env.CHANNELS, slug);
   return stub.fetch(
@@ -470,11 +479,13 @@ app.delete("/api/channels/:slug/webhooks/:name", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  // webhook 能窃取频道全部消息，属管理操作：仅 ap_ token（非只读）或房主可管理（spec §7/§15）。
+  // 前置于 archived 判定，避免向粉丝泄漏私有频道是否存在/是否已归档。
+  if (!isChannelModerator(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can manage webhooks"), 403);
+  }
   if (channel.archived_at !== null) {
     return c.json(errorBody("archived", "channel is archived"), 410);
-  }
-  if (c.get("identity").role === "readonly") {
-    return c.json(errorBody("unauthorized", "readonly token cannot manage webhooks"), 403);
   }
   const stub = await getServerByName(c.env.CHANNELS, slug);
   return stub.fetch(
