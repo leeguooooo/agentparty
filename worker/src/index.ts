@@ -87,7 +87,9 @@ const requireBearer = createMiddleware<AppContext>(async (c, next) => {
 
 async function loadChannel(db: D1Database, slug: string) {
   return db
-    .prepare("SELECT slug, kind, mode, archived_at, created_by, visibility FROM channels WHERE slug = ?")
+    .prepare(
+      "SELECT slug, kind, mode, archived_at, created_by, visibility, owner_account FROM channels WHERE slug = ?",
+    )
     .bind(slug)
     .first<{
       slug: string;
@@ -96,6 +98,7 @@ async function loadChannel(db: D1Database, slug: string) {
       archived_at: number | null;
       created_by: string | null;
       visibility: string;
+      owner_account: string | null;
     }>();
 }
 
@@ -191,17 +194,28 @@ app.get("/api/me", requireBearer, (c) => {
 
 app.post("/api/tokens", requireAdmin, async (c) => {
   const body = (await c.req.json().catch(() => null)) as
-    | { name?: unknown; role?: unknown; owner?: unknown }
+    | { name?: unknown; role?: unknown; owner?: unknown; channel_scope?: unknown }
     | null;
   const name = typeof body?.name === "string" ? body.name : "";
   const role = typeof body?.role === "string" ? body.role : "";
   if (!NAME_RE.test(name) || !ROLES.includes(role)) {
     return c.json(errorBody("bad_request", "valid name and role (agent|human|readonly) required"), 400);
   }
-  // owner 可选：给则须 header-safe 且不超长（后续经 x-ap-owner 转发给 do）
-  const owner = body?.owner === undefined || body?.owner === null ? null : body.owner;
-  if (owner !== null && (typeof owner !== "string" || owner.length > OWNER_MAX || !OWNER_RE.test(owner))) {
+  // owner 必填（spec §6 修复3）：P1 起新铸 token 一律带归属账号（连 ADMIN_SECRET 铸也要求），
+  // 这样 owner=null 只存在于 P1 之前的存量 token，不再新增，legacy 过渡缺口随轮换单调收敛。
+  if (body?.owner === undefined || body?.owner === null) {
+    return c.json(errorBody("bad_request", "owner required"), 400);
+  }
+  const owner = body.owner;
+  // owner 须 header-safe 且不超长（后续经 x-ap-owner 转发给 do）
+  if (typeof owner !== "string" || owner.length > OWNER_MAX || !OWNER_RE.test(owner)) {
     return c.json(errorBody("bad_request", `owner must be printable ascii, <= ${OWNER_MAX} chars`), 400);
+  }
+  // channel_scope 可选（spec §5.3）：把 agent/readonly token 限死单频道 slug——invite 递给外部
+  // 协作方 / 分享链接用，canAccessChannel 据此硬上限。须是合法频道 slug。
+  const channelScope = body?.channel_scope === undefined || body?.channel_scope === null ? null : body.channel_scope;
+  if (channelScope !== null && (typeof channelScope !== "string" || !SLUG_RE.test(channelScope))) {
+    return c.json(errorBody("bad_request", "channel_scope must be a valid channel slug"), 400);
   }
   if (RESERVED_NAMES.includes(name)) {
     return c.json(errorBody("bad_request", "name is reserved"), 400);
@@ -216,20 +230,20 @@ app.post("/api/tokens", requireAdmin, async (c) => {
   const hash = await sha256Hex(token);
   const now = Date.now();
   if (existing) {
-    // 已吊销的同名 token 允许重铸，复用行（owner 一并覆盖，未给则清空）
+    // 已吊销的同名 token 允许重铸，复用行（owner/channel_scope 一并覆盖，scope 未给则清空）
     await c.env.DB.prepare(
-      "UPDATE tokens SET hash = ?, role = ?, owner = ?, created_at = ?, revoked_at = NULL WHERE id = ?",
+      "UPDATE tokens SET hash = ?, role = ?, owner = ?, channel_scope = ?, created_at = ?, revoked_at = NULL WHERE id = ?",
     )
-      .bind(hash, role, owner, now, existing.id)
+      .bind(hash, role, owner, channelScope, now, existing.id)
       .run();
   } else {
     await c.env.DB.prepare(
-      "INSERT INTO tokens (hash, name, role, owner, created_at) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO tokens (hash, name, role, owner, channel_scope, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
-      .bind(hash, name, role, owner, now)
+      .bind(hash, name, role, owner, channelScope, now)
       .run();
   }
-  return c.json(owner !== null ? { token, name, role, owner } : { token, name, role }, 201);
+  return c.json(channelScope !== null ? { token, name, role, owner, channel_scope: channelScope } : { token, name, role, owner }, 201);
 });
 
 app.delete("/api/tokens/:name", requireAdmin, async (c) => {
@@ -274,15 +288,15 @@ interface ChannelSummary {
 
 app.get("/api/channels", async (c) => {
   const identity = c.get("identity");
-  // created_by 仅用于 ACL 判定，不回给客户端（保持列表响应契约不变）
+  // created_by / owner_account 仅用于 ACL 判定，不回给客户端（保持列表响应契约不变）
   const { results } = await c.env.DB.prepare(
-    "SELECT slug, title, topic, kind, mode, visibility, created_by, created_at, archived_at FROM channels ORDER BY created_at, id",
-  ).all<{ slug: string; visibility: string; created_by: string | null }>();
-  // 防私有频道泄漏给粉丝（spec §3.2）：无权访问的私有频道连名字都不出现，summary 也不拉。
-  // ap_ token / OIDC 房主照常看到自己的私有频道。
+    "SELECT slug, title, topic, kind, mode, visibility, created_by, owner_account, created_at, archived_at FROM channels ORDER BY created_at, id",
+  ).all<{ slug: string; visibility: string; created_by: string | null; owner_account: string | null }>();
+  // 防私有频道泄漏给粉丝（spec §5.5）：无权访问的私有频道连名字都不出现，summary 也不拉。
+  // 账号房主 / 自己的 agent / scope 命中的 token / legacy token 照常看到对应私有频道。
   const visible = results.filter((row) => canAccessChannel(identity, row));
   const channels = await Promise.all(
-    visible.map(async ({ created_by, ...row }) => {
+    visible.map(async ({ created_by, owner_account, ...row }) => {
       let summary: ChannelSummary = { last: null, presence: [] };
       try {
         const stub = await getServerByName(c.env.CHANNELS, row.slug);
@@ -322,11 +336,14 @@ app.post("/api/channels", async (c) => {
     return c.json(errorBody("unauthorized", "readonly token cannot create channels"), 403);
   }
   const now = Date.now();
+  const creator = c.get("identity");
   try {
     await c.env.DB.prepare(
-      "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, owner_account, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
-      .bind(slug, title, kind, mode, visibility, c.get("identity").name, now)
+      // created_by 记具体铸造者（审计）；owner_account = 创建者账号（ACL 依据）。
+      // legacy token 无 account → owner_account = null（老频道，仅 legacy 过渡放行）。
+      .bind(slug, title, kind, mode, visibility, creator.name, creator.account ?? null, now)
       .run();
   } catch {
     return c.json(errorBody("conflict", "slug already exists"), 409);

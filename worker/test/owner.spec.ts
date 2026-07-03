@@ -2,7 +2,7 @@
 // 历史补拉）都带 owner；/api/me 回显登录身份的 owner。无 owner 的 token 保持旧形状（不带 owner 字段）。
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ADMIN_HEADERS, WsClient, createChannel, uniq } from "./helpers";
+import { ADMIN_HEADERS, WsClient, createChannel, seedToken, uniq } from "./helpers";
 
 async function mintWithOwner(name: string, role: string, owner?: string) {
   const res = await SELF.fetch("http://ap.test/api/tokens", {
@@ -62,11 +62,11 @@ describe("token owner propagation", () => {
     reader.close();
   });
 
-  it("omits owner for a token minted without one", async () => {
-    const name = uniq("agent-plain");
-    const { body } = await mintWithOwner(name, "agent");
-    const slug = await createChannel(body.token);
-    const ws = await WsClient.open(slug, body.token);
+  // P1 起 owner 必填，无 owner 只可能是 P1 之前的 legacy 存量 token（直插 D1 模拟）
+  it("omits owner for a legacy token stored without one", async () => {
+    const { token, name } = await seedToken("agent");
+    const slug = await createChannel(token);
+    const ws = await WsClient.open(slug, token);
     const welcome = await ws.nextOfType("welcome");
     expect(welcome.participants).toContainEqual({ name, kind: "agent" });
     expect(welcome.participants.find((p) => p.name === name)).not.toHaveProperty("owner");
@@ -86,9 +86,10 @@ describe("token owner propagation", () => {
       owner: "leo@leeguoo.com",
     });
 
-    const plain = await mintWithOwner(uniq("me-plain"), "agent");
+    // legacy 存量 token（无 owner）：/api/me 的 owner 回 null
+    const plain = await seedToken("agent");
     const mePlain = await SELF.fetch("http://ap.test/api/me", {
-      headers: { authorization: `Bearer ${plain.body.token}` },
+      headers: { authorization: `Bearer ${plain.token}` },
     });
     expect(await mePlain.json()).toMatchObject({ kind: "agent", role: "agent", owner: null });
   });

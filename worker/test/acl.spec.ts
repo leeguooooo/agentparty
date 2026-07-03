@@ -4,73 +4,113 @@
 import { SELF, fetchMock } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canAccessChannel, isChannelModerator, type AclIdentity, type ChannelAcl } from "../src/acl";
-import { api, seedToken, uniq, WsClient } from "./helpers";
+import { ADMIN_HEADERS, api, seedToken, uniq, WsClient } from "./helpers";
 
-// ── 单元：矩阵 ──────────────────────────────────────────────────────────────
+// ── 单元：canAccessChannel v2 全矩阵（账号模型 spec §5.4/§5.5）──────────────────
 
-const apAgent: AclIdentity = { hash: "a".repeat(64), name: "leo-agent", role: "agent" };
-const apHuman: AclIdentity = { hash: "b".repeat(64), name: "leo-human", role: "human" };
-const apReadonly: AclIdentity = { hash: "c".repeat(64), name: "share-link", role: "readonly" };
-const oidcOwner: AclIdentity = {
-  hash: "oidc:owner-sub",
-  name: "owner-sub",
-  role: "human",
-  email: "owner@leeguoo.com",
+const LEO = "leo@leeguoo.com";
+
+// 带 owner 的普通 ap_ token（account = owner，无 scope）：leo 自己的 agent / human
+const apAgent: AclIdentity = { hash: "a".repeat(64), name: "leo-agent", role: "agent", account: LEO };
+const apHuman: AclIdentity = { hash: "b".repeat(64), name: "leo-human", role: "human", account: LEO };
+// legacy 存量 token（owner=null → account undefined）：过渡期当部署管理员放行
+const legacyAgent: AclIdentity = { hash: "d".repeat(64), name: "legacy", role: "agent" };
+const legacyReadonly: AclIdentity = { hash: "e".repeat(64), name: "legacy-ro", role: "readonly" };
+// channel-scoped token（account=owner，scope=collab）：给 B 公司 / 分享链接
+const scopedAgent: AclIdentity = {
+  hash: "f".repeat(64), name: "b-corp", role: "agent", account: LEO, channel_scope: "collab",
 };
-const oidcFan: AclIdentity = { hash: "oidc:fan-sub", name: "fan-sub", role: "human", email: "fan@leeguoo.com" };
+const scopedReadonly: AclIdentity = {
+  hash: "1".repeat(64), name: "share", role: "readonly", account: LEO, channel_scope: "collab",
+};
+// 带 owner 但无 scope 的 readonly（不该再签发）：私有一律拒
+const roNoScope: AclIdentity = { hash: "2".repeat(64), name: "ro-plain", role: "readonly", account: LEO };
+// OIDC 房主（account=email）与粉丝
+const oidcOwner: AclIdentity = { hash: "oidc:owner-sub", name: "owner-sub", role: "human", email: LEO, account: LEO };
+const oidcFan: AclIdentity = {
+  hash: "oidc:fan-sub", name: "fan-sub", role: "human", email: "fan@leeguoo.com", account: "fan@leeguoo.com",
+};
 
-const publicCh: ChannelAcl = { visibility: "public", created_by: "owner-sub" };
-const privateBySub: ChannelAcl = { visibility: "private", created_by: "owner-sub" };
-const privateByEmail: ChannelAcl = { visibility: "private", created_by: "owner@leeguoo.com" };
-const privateNoOwner: ChannelAcl = { visibility: "private", created_by: null };
+const publicCh: ChannelAcl = { slug: "pub", visibility: "public", owner_account: LEO };
+const privateOwned: ChannelAcl = { slug: "mine", visibility: "private", owner_account: LEO }; // leo 名下私有
+const collabCh: ChannelAcl = { slug: "collab", visibility: "private", owner_account: LEO }; // scope 目标频道
+const otherOwned: ChannelAcl = { slug: "other", visibility: "private", owner_account: "other@leeguoo.com" };
+const legacyCh: ChannelAcl = { slug: "old", visibility: "private", owner_account: null }; // 老频道无 owner_account
 
-describe("canAccessChannel matrix (spec §3.2)", () => {
-  it("public channel: every authenticated identity may enter", () => {
-    for (const id of [apAgent, apHuman, apReadonly, oidcOwner, oidcFan]) {
+describe("canAccessChannel v2 matrix (spec §5.4/§5.5)", () => {
+  it("public channel: every identity may enter (public 先于 scope)", () => {
+    for (const id of [apAgent, apHuman, legacyAgent, legacyReadonly, scopedAgent, scopedReadonly, roNoScope, oidcOwner, oidcFan]) {
       expect(canAccessChannel(id, publicCh)).toBe(true);
     }
   });
 
-  it("private channel: every ap_ token (agent/human/readonly) may enter", () => {
-    for (const id of [apAgent, apHuman, apReadonly]) {
-      expect(canAccessChannel(id, privateBySub)).toBe(true);
-      expect(canAccessChannel(id, privateNoOwner)).toBe(true);
+  it("account owner (self / own agent / OIDC owner) enters own private channels", () => {
+    for (const id of [apAgent, apHuman, oidcOwner]) {
+      expect(canAccessChannel(id, privateOwned)).toBe(true);
+      expect(canAccessChannel(id, collabCh)).toBe(true); // 同账号名下另一私有频道也进
     }
   });
 
-  it("private channel: OIDC owner may enter (name===created_by or email===created_by)", () => {
-    expect(canAccessChannel(oidcOwner, privateBySub)).toBe(true); // name(sub) 命中
-    expect(canAccessChannel(oidcOwner, privateByEmail)).toBe(true); // email 命中
+  it("account owner cannot enter another account's private, nor an owner_account=null legacy channel", () => {
+    for (const id of [apAgent, apHuman, oidcOwner]) {
+      expect(canAccessChannel(id, otherOwned)).toBe(false);
+      expect(canAccessChannel(id, legacyCh)).toBe(false); // owner_account=null → 带 owner 的 token / OIDC 进不去（§6）
+    }
   });
 
-  it("private channel: OIDC non-owner (fan) is denied", () => {
-    expect(canAccessChannel(oidcFan, privateBySub)).toBe(false);
-    expect(canAccessChannel(oidcFan, privateByEmail)).toBe(false);
-    expect(canAccessChannel(oidcFan, privateNoOwner)).toBe(false);
-    // created_by 为 null 时房主也不会误命中（undefined/null 不等）
-    expect(canAccessChannel(oidcOwner, privateNoOwner)).toBe(false);
+  it("channel-scoped token: only its scope channel, others (even same owner) forbidden", () => {
+    expect(canAccessChannel(scopedAgent, collabCh)).toBe(true); // scope 命中
+    expect(canAccessChannel(scopedAgent, privateOwned)).toBe(false); // 同 owner 也拒（scope 硬上限）
+    expect(canAccessChannel(scopedAgent, otherOwned)).toBe(false);
+    expect(canAccessChannel(scopedAgent, publicCh)).toBe(true); // 公开频道可发
   });
 
-  it("public channel: OIDC fan may enter", () => {
-    expect(canAccessChannel(oidcFan, publicCh)).toBe(true);
+  it("channel-scoped readonly: read-only single channel; scope mismatch forbidden (连读都拒)", () => {
+    expect(canAccessChannel(scopedReadonly, collabCh)).toBe(true); // 只读单频道
+    expect(canAccessChannel(scopedReadonly, privateOwned)).toBe(false); // scope 不匹配连读都拒
+    expect(canAccessChannel(scopedReadonly, otherOwned)).toBe(false);
+    expect(canAccessChannel(scopedReadonly, publicCh)).toBe(true);
+  });
+
+  it("readonly without scope: private denied (不该再签发)", () => {
+    expect(canAccessChannel(roNoScope, privateOwned)).toBe(false); // 即便 account===owner_account
+    expect(canAccessChannel(roNoScope, collabCh)).toBe(false);
+  });
+
+  it("legacy ap_ token (owner=null) transitional passthrough on private (agent & readonly)", () => {
+    for (const id of [legacyAgent, legacyReadonly]) {
+      expect(canAccessChannel(id, privateOwned)).toBe(true);
+      expect(canAccessChannel(id, otherOwned)).toBe(true);
+      expect(canAccessChannel(id, legacyCh)).toBe(true);
+    }
+  });
+
+  it("OIDC fan denied on any private channel", () => {
+    expect(canAccessChannel(oidcFan, privateOwned)).toBe(false);
+    expect(canAccessChannel(oidcFan, collabCh)).toBe(false);
+    expect(canAccessChannel(oidcFan, legacyCh)).toBe(false);
   });
 });
 
-describe("isChannelModerator (spec §5 kick)", () => {
-  it("ap_ agent/human may moderate any channel", () => {
-    expect(isChannelModerator(apAgent, privateBySub)).toBe(true);
+describe("isChannelModerator v2 (spec §5)", () => {
+  it("account owner (ap_ with owner / OIDC owner) moderates own channels only", () => {
+    expect(isChannelModerator(apAgent, privateOwned)).toBe(true);
     expect(isChannelModerator(apHuman, publicCh)).toBe(true);
+    expect(isChannelModerator(oidcOwner, privateOwned)).toBe(true);
+    expect(isChannelModerator(apAgent, otherOwned)).toBe(false); // 别账号的频道不能管
+    expect(isChannelModerator(apAgent, legacyCh)).toBe(false); // owner_account=null 不命中
   });
 
-  it("readonly ap_ token may not moderate", () => {
-    expect(isChannelModerator(apReadonly, privateBySub)).toBe(false);
-    expect(isChannelModerator(apReadonly, publicCh)).toBe(false);
-  });
-
-  it("OIDC owner may moderate own channel, fan may not", () => {
-    expect(isChannelModerator(oidcOwner, privateBySub)).toBe(true);
+  it("legacy ap_ token moderates (transitional); OIDC fan does not", () => {
+    expect(isChannelModerator(legacyAgent, privateOwned)).toBe(true);
     expect(isChannelModerator(oidcFan, publicCh)).toBe(false);
-    expect(isChannelModerator(oidcFan, privateBySub)).toBe(false);
+    expect(isChannelModerator(oidcFan, privateOwned)).toBe(false);
+  });
+
+  it("readonly never moderates; scoped token is not a moderator (even in its scope channel)", () => {
+    expect(isChannelModerator(legacyReadonly, privateOwned)).toBe(false);
+    expect(isChannelModerator(scopedReadonly, collabCh)).toBe(false);
+    expect(isChannelModerator(scopedAgent, collabCh)).toBe(false); // scoped agent 不是 moderator
   });
 });
 
@@ -403,5 +443,147 @@ describe("GET /api/channels hides inaccessible private channels (spec §3.2)", (
     }).channels.map((ch) => ch.slug);
     expect(ownerSlugs).toContain(ownerPriv);
     expect(ownerSlugs).not.toContain(priv);
+  });
+});
+
+// ── channel-scoped token 硬上限（spec §5.3/§5.4/§5.5）── 跨公司隔离的真正手段 ──
+describe("channel_scope enforcement (spec §5.4/§5.5)", () => {
+  it("scoped agent token: only its scope channel; same-owner other private is forbidden; public ok", async () => {
+    const acct = `${uniq("acct")}@leeguoo.com`;
+    const { token: ownerTok } = await seedToken("agent", uniq("owner"), { owner: acct });
+    const collab = await makeChannel(ownerTok, "private"); // owner_account = acct
+    const mine = await makeChannel(ownerTok, "private"); // 同账号名下另一私有频道
+    const pub = await makeChannel(ownerTok, "public");
+    const { token: scoped } = await seedToken("agent", uniq("bcorp"), { owner: acct, channelScope: collab });
+
+    // scope 频道：WS/GET/POST 三关全过
+    expect(await wsUpgradeStatus(collab, scoped)).toBe(101);
+    expect((await api(`/api/channels/${collab}/messages`, scoped)).status).toBe(200);
+    expect((await postMsg(collab, scoped, "hi from b-corp")).status).toBe(200);
+
+    // 同 owner 的另一私有频道：scope 硬上限，连读都拒（WS accept-then-close 1008 / GET 403 / POST 403）
+    const denied = await wsForbiddenClose(mine, scoped);
+    expect(denied.code).toBe(1008);
+    expect(denied.reason).toBe("forbidden");
+    expect((await api(`/api/channels/${mine}/messages`, scoped)).status).toBe(403);
+    expect((await postMsg(mine, scoped, "let me in")).status).toBe(403);
+
+    // 公开频道仍可进可发
+    expect(await wsUpgradeStatus(pub, scoped)).toBe(101);
+    expect((await postMsg(pub, scoped, "public hello")).status).toBe(200);
+
+    // scoped token 不在别账号私有频道的列表里，只看得到 scope 频道 + public
+    const listSlugs = ((await (await api("/api/channels", scoped)).json()) as {
+      channels: { slug: string }[];
+    }).channels.map((ch) => ch.slug);
+    expect(listSlugs).toContain(collab);
+    expect(listSlugs).toContain(pub);
+    expect(listSlugs).not.toContain(mine);
+  });
+
+  it("scoped readonly share token: read-only single channel; can't send; scope mismatch forbidden", async () => {
+    const acct = `${uniq("acct")}@leeguoo.com`;
+    const { token: ownerTok } = await seedToken("agent", uniq("owner"), { owner: acct });
+    const collab = await makeChannel(ownerTok, "private");
+    const mine = await makeChannel(ownerTok, "private");
+    const { token: share } = await seedToken("readonly", uniq("share"), { owner: acct, channelScope: collab });
+
+    // scope 频道可读（WS/GET），但 readonly 不能发（do 侧 403 unauthorized）
+    expect(await wsUpgradeStatus(collab, share)).toBe(101);
+    expect((await api(`/api/channels/${collab}/messages`, share)).status).toBe(200);
+    const post = await postMsg(collab, share, "nope");
+    expect(post.status).toBe(403);
+    expect((await post.json()) as { error: { code: string } }).toMatchObject({ error: { code: "unauthorized" } });
+
+    // scope 不匹配的私有频道连读都拒
+    expect((await api(`/api/channels/${mine}/messages`, share)).status).toBe(403);
+    const denied = await wsForbiddenClose(mine, share);
+    expect(denied.code).toBe(1008);
+  });
+
+  it("readonly token WITHOUT scope: private channels denied (不该再签发无 scope readonly)", async () => {
+    const acct = `${uniq("acct")}@leeguoo.com`;
+    const { token: ownerTok } = await seedToken("agent", uniq("owner"), { owner: acct });
+    const priv = await makeChannel(ownerTok, "private");
+    // 带 owner 但无 channel_scope 的 readonly：即便 account===owner_account 也拒私有
+    const { token: roPlain } = await seedToken("readonly", uniq("ro-plain"), { owner: acct });
+    expect((await api(`/api/channels/${priv}/messages`, roPlain)).status).toBe(403);
+    const denied = await wsForbiddenClose(priv, roPlain);
+    expect(denied.code).toBe(1008);
+  });
+
+  it("account owner cannot enter an owner_account=null legacy channel (spec §6)", async () => {
+    // legacy token（无 owner）建的频道 owner_account = null
+    const { token: legacyTok } = await seedToken("agent", uniq("legacy"));
+    const legacyCh = await makeChannel(legacyTok, "private"); // owner_account = null
+    // 带 owner 的 token / OIDC 都进不去 owner_account=null 的老频道
+    const { token: ownedTok } = await seedToken("agent", uniq("owned"), { owner: `${uniq("a")}@leeguoo.com` });
+    expect((await api(`/api/channels/${legacyCh}/messages`, ownedTok)).status).toBe(403);
+    const oidc = await jwtFor(uniq("sub"), `${uniq("u")}@leeguoo.com`);
+    expect((await api(`/api/channels/${legacyCh}/messages`, oidc)).status).toBe(403);
+    // 但 legacy token 自己（过渡放行）仍进得去
+    expect((await api(`/api/channels/${legacyCh}/messages`, legacyTok)).status).toBe(200);
+  });
+});
+
+// ── P1 起强制新铸 token 带 owner（spec §6 修复3）+ 接受 channel_scope ──
+describe("token mint requires owner and accepts channel_scope (spec §6/§5.3)", () => {
+  function mintToken(body: Record<string, unknown>, headers: Record<string, string> = ADMIN_HEADERS) {
+    return SELF.fetch("http://ap.test/api/tokens", {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("rejects minting without owner (400 owner required), even with ADMIN_SECRET", async () => {
+    const res = await mintToken({ name: uniq("no-owner"), role: "agent" });
+    expect(res.status).toBe(400);
+    expect((await res.json()) as { error: { message: string } }).toMatchObject({
+      error: { message: "owner required" },
+    });
+  });
+
+  it("mints a scoped agent token and echoes channel_scope; the token is limited to that channel", async () => {
+    const acct = `${uniq("acct")}@leeguoo.com`;
+    const { token: ownerTok } = await seedToken("agent", uniq("owner"), { owner: acct });
+    const collab = await makeChannel(ownerTok, "private");
+    const mine = await makeChannel(ownerTok, "private");
+
+    // 模拟 party invite 的 worker mint：带 owner + channel_scope
+    const res = await mintToken({ name: uniq("invitee"), role: "agent", owner: acct, channel_scope: collab });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { token: string; owner: string; channel_scope: string };
+    expect(body.owner).toBe(acct);
+    expect(body.channel_scope).toBe(collab);
+
+    // scope 生效：只进 collab，进不了同 owner 的 mine
+    expect((await postMsg(collab, body.token, "scoped hi")).status).toBe(200);
+    expect((await api(`/api/channels/${mine}/messages`, body.token)).status).toBe(403);
+  });
+
+  it("mints a scoped readonly share token (invite 分享链接)", async () => {
+    const acct = `${uniq("acct")}@leeguoo.com`;
+    const { token: ownerTok } = await seedToken("agent", uniq("owner"), { owner: acct });
+    const collab = await makeChannel(ownerTok, "private");
+    const res = await mintToken({ name: uniq("shared"), role: "readonly", owner: acct, channel_scope: collab });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { token: string; channel_scope: string };
+    expect(body.channel_scope).toBe(collab);
+    // 可读单频道
+    expect((await api(`/api/channels/${collab}/messages`, body.token)).status).toBe(200);
+  });
+
+  it("rejects an invalid channel_scope (not a valid slug)", async () => {
+    const res = await mintToken({ name: uniq("badscope"), role: "agent", owner: "leo@leeguoo.com", channel_scope: "Bad Slug!" });
+    expect(res.status).toBe(400);
+  });
+
+  it("plain (unscoped) token minted with owner has no channel_scope in response", async () => {
+    const res = await mintToken({ name: uniq("plain"), role: "agent", owner: "leo@leeguoo.com" });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ owner: "leo@leeguoo.com" });
+    expect(body).not.toHaveProperty("channel_scope");
   });
 });

@@ -12,11 +12,18 @@ async function sha256Hex(input: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// 测试造 token 直接插 d1
-export async function seedToken(role: TokenRole, name = uniq(`tok-${role}`)) {
+// 测试造 token 直接插 d1。opts 省略 = legacy 存量 token（owner/channel_scope 皆 null）；
+// 传 owner → 带归属账号（account 走账号规则）；传 channelScope → channel-scoped token（硬上限单频道）。
+export async function seedToken(
+  role: TokenRole,
+  name = uniq(`tok-${role}`),
+  opts: { owner?: string; channelScope?: string } = {},
+) {
   const token = `ap_${crypto.randomUUID().replaceAll("-", "")}`;
-  await env.DB.prepare("INSERT INTO tokens (hash, name, role, created_at) VALUES (?, ?, ?, ?)")
-    .bind(await sha256Hex(token), name, role, Date.now())
+  await env.DB.prepare(
+    "INSERT INTO tokens (hash, name, role, owner, channel_scope, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+    .bind(await sha256Hex(token), name, role, opts.owner ?? null, opts.channelScope ?? null, Date.now())
     .run();
   return { token, name };
 }

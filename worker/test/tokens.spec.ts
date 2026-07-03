@@ -2,11 +2,12 @@ import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { ADMIN_HEADERS, api, seedToken, uniq } from "./helpers";
 
+// P1 起 owner 必填（spec §6）：铸 token 一律带归属账号
 function mint(name: string, role: string, headers: Record<string, string> = ADMIN_HEADERS) {
   return SELF.fetch("http://ap.test/api/tokens", {
     method: "POST",
     headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify({ name, role }),
+    body: JSON.stringify({ name, role, owner: "leo@leeguoo.com" }),
   });
 }
 

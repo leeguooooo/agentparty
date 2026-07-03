@@ -89,6 +89,8 @@ describe("lookupToken OIDC verification", () => {
       hash: "oidc:user-abc",
       // 所属人：有 email 用 email
       owner: "u@leeguoo.com",
+      // 账号锚点（spec §5.1）：OIDC 人类 account = email ?? sub
+      account: "u@leeguoo.com",
     });
   });
 

@@ -10,6 +10,13 @@ export interface TokenIdentity {
   email?: string;
   // 所属人：机器 ap_ token 取 tokens.owner 列；人类 OIDC token 取 email（退回 sub）。无则省略
   owner?: string;
+  // principal.account（账号模型 spec §5.1）：ACL 的唯一身份锚点。
+  //   OIDC 人类 = email ?? sub；带 owner 的 ap_ token = owner；legacy ap_ token（owner=null）= undefined。
+  // 与 owner 目前取值一致，但语义分开：owner 是显示标签，account 是 canAccessChannel 判定依据。
+  account?: string;
+  // channel-scoped token（spec §5.3）：把该 token 限死单频道 slug。非空即触发 canAccessChannel 硬上限。
+  //   OIDC 人类恒无 scope；普通 ap_ token 为 null/undefined；scoped token 取 tokens.channel_scope 列。
+  channel_scope?: string;
 }
 
 export type BearerSource = "authorization" | "protocol" | "query";
@@ -80,9 +87,9 @@ export async function lookupToken(
   }
   const hash = await sha256Hex(token);
   const row = await db
-    .prepare("SELECT name, role, owner FROM tokens WHERE hash = ? AND revoked_at IS NULL")
+    .prepare("SELECT name, role, owner, channel_scope FROM tokens WHERE hash = ? AND revoked_at IS NULL")
     .bind(hash)
-    .first<{ name: string; role: string; owner: string | null }>();
+    .first<{ name: string; role: string; owner: string | null; channel_scope: string | null }>();
   if (!row) return null;
   const role = row.role as TokenRole;
   return {
@@ -91,6 +98,10 @@ export async function lookupToken(
     kind: role === "agent" ? "agent" : "human",
     hash,
     owner: row.owner ?? undefined,
+    // account = owner：带 owner 的 token → 走账号规则；legacy owner=null → account undefined → 过渡放行
+    account: row.owner ?? undefined,
+    // scoped token（含 readonly 分享 token）带 channel_scope；普通 token 为 undefined
+    channel_scope: row.channel_scope ?? undefined,
   };
 }
 
@@ -217,5 +228,7 @@ async function verifyOidcToken(token: string, oidc: OidcConfig): Promise<TokenId
     hash: `oidc:${claims.sub}`,
     // 所属人显示：有 email 用 email，否则退回 sub
     owner: email ?? claims.sub,
+    // 账号锚点：OIDC 人类 = email ?? sub（spec §5.1）。OIDC 恒无 channel_scope（scoped 仅发给 ap_ token）
+    account: email ?? claims.sub,
   };
 }
