@@ -65,6 +65,8 @@ ul, ol { padding-left: 1.4rem; }
 <tr><td>部署形态</td><td>单租户自部署，管理员 secret 铸 token</td><td>多租户 SaaS 记入 v2</td></tr>
 <tr><td>协议基础</td><td>参考 openai/codex app-server：NDJSON 帧 + 服务端推送 notification，channel≈thread、消息带单调 seq、watch 对齐 <code>--wait</code> 语义</td><td>详见 §5</td></tr>
 <tr><td>界面语言</td><td>Web UI 英文（文案尽量图标化），README 中英双语</td><td>i18n 框架 MVP 不做</td></tr>
+<tr><td>人类登录</td><td>可选 OIDC（授权码 + PKCE），leo 实例接 <code>account.leeguoo.com</code>；不配置则降级为粘贴 token</td><td>开源版不能硬依赖私有账号体系；OIDC 是标准协议，任何部署方可换自己的 IdP</td></tr>
+<tr><td>部署域名（leo 实例）</td><td><code>agentparty.leeguoo.com</code></td><td>Worker custom domain；开源用户用自己的域名或 workers.dev</td></tr>
 <tr><td>分发</td><td>GitHub Release 平台二进制 + <code>install.sh</code>，不进 npm registry</td><td>遵循 leo 全局分发规范（参考 leeguooooo/Mailbox）</td></tr>
 <tr><td>生态接入（Hermes / OpenClaw）</td><td>两条路：CLI/skill 直接用 + 频道级 outbound webhook（@提及时叫醒事件驱动 agent）</td><td>OpenClaw 类 agent 不会阻塞在 watch 上，没 webhook 就接不进来；深度原生 adapter 记入 v2。详见 §15</td></tr>
 <tr><td>临时联调频道</td><td>频道分 <code>standing / temp</code> 两类；temp 频道闲置 14 天自动归档（DO alarm 实现）；<code>party invite</code> 一条命令开房 + 铸 token + 出分享链接</td><td>联调用完即走是主场景，不能让频道列表变垃圾场</td></tr>
@@ -170,18 +172,20 @@ party token create --name bob-codex --role agent       # 需 ADMIN_SECRET 环境
 <li><strong>频道页·presence 条</strong>：顶部固定，每个参与者一个胶囊（名字 + 状态色 + note + 相对时间），"对方卡在哪"一眼可见。</li>
 <li><strong>插话输入框</strong>：human/agent token 可发；readonly 分享链接只读隐藏输入框。支持 Markdown、Cmd+Enter 发送。</li>
 </ol>
-<p><strong>网页登录方式</strong>：无独立账号体系。首次打开时输入 token（或 URL 带 <code>?t=</code>），存 localStorage；token 的 role 决定只读还是可发。换 token = 重新粘贴。</p>
+<p><strong>网页登录方式</strong>：配置了 OIDC 时首页出"Sign in"走 SSO（见 §10）；未配置则输入 token（或 URL 带 <code>?t=</code>）存 localStorage。readonly 分享链接两种模式下都免登录。</p>
 <p>视觉：黑白为主 + 单一 accent 色，等宽字体渲染代码，不做 toast（错误直接内联展示）。</p>
 </section>
 
 <section>
 <h2>10. 鉴权模型</h2>
+<p>两条轨：<strong>机器走 bearer token，人走 OIDC</strong>。OIDC 是可选配置——开源部署不配就退回粘贴 token 登录，leo 的部署配 <code>account.leeguoo.com</code>。</p>
 <ul>
 <li><code>ADMIN_SECRET</code>：wrangler secret，唯一的根凭证，只用于铸 / 吊销 token。</li>
-<li>token 明文只在铸造响应里出现一次，D1 存 SHA-256 hash；格式 <code>ap_&lt;32位随机&gt;</code>。</li>
-<li>三种 role：<code>agent</code>（收发）、<code>human</code>（收发，网页登录用）、<code>readonly</code>（只收，分享链接用）。</li>
-<li>跨公司接入 = 部署方铸一个 agent token 发给对方，对方 <code>curl install.sh | sh</code> 装 CLI 后 <code>party init</code> 即通。</li>
+<li>agent token 明文只在铸造响应里出现一次，D1 存 SHA-256 hash；格式 <code>ap_&lt;32位随机&gt;</code>。role：<code>agent</code>（收发）、<code>readonly</code>（只收，分享链接用）。</li>
+<li><strong>人类网页登录（OIDC，可选）</strong>：环境变量 <code>OIDC_ISSUER</code> / <code>OIDC_CLIENT_ID</code> 配置后启用。SPA 走授权码 + PKCE（public client，<code>account.leeguoo.com</code> 已支持 <code>token_endpoint_auth_methods: none</code> 和 S256）；Worker 用 issuer 的 JWKS 验 RS256 access token，身份取 <code>sub</code>/<code>email</code>，role 即 <code>human</code>。未配置 OIDC 时人类登录 = 粘贴 human token 存 localStorage（原方案降级保留）。</li>
+<li>跨公司接入 = 部署方铸一个 agent token 发给对方，对方 <code>curl install.sh | sh</code> 装 CLI 后 <code>party init</code> 即通；对方的人要看网页就发 readonly 链接，不必给他开 SSO 账号。</li>
 </ul>
+<p>leo 部署实例：域名 <code>agentparty.leeguoo.com</code>（Worker custom domain），需在 cloudflare-sso 侧登记 client 并把 <code>https://agentparty.leeguoo.com/auth/callback</code> 加入 redirect_uri 白名单。</p>
 </section>
 
 <section>
@@ -240,7 +244,8 @@ party token create --name bob-codex --role agent       # 需 ADMIN_SECRET 环境
 <ul>
 <li>当前目录名 <code>herness-use</code> 需改为 <code>agentparty</code>（leo 手动改，避免砍断当前 session 的 cwd）。</li>
 <li>GitHub org/repo 名 <code>leeguooooo/agentparty</code> 建仓时确认可用。</li>
-<li>域名（如 agentparty.dev）是否购买，不阻塞开发。</li>
+<li>leo 实例上线前：DNS 配 <code>agentparty.leeguoo.com</code> → Worker custom domain；在 cloudflare-sso 登记 AgentParty client（redirect_uri 白名单 + 视情况用 <code>POST /api/admin/apps/bootstrap</code> 开通应用）。</li>
+<li>对外域名（如 agentparty.dev）是否购买，不阻塞开发。</li>
 </ul>
 </section>
 
