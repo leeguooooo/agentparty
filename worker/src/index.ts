@@ -89,14 +89,35 @@ app.post("/api/tokens", requireAdmin, async (c) => {
 });
 
 app.delete("/api/tokens/:name", requireAdmin, async (c) => {
+  const name = c.req.param("name");
   const result = await c.env.DB.prepare(
     "UPDATE tokens SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL",
   )
-    .bind(Date.now(), c.req.param("name"))
+    .bind(Date.now(), name)
     .run();
   if (result.meta.changes === 0) {
     return c.json(errorBody("not_found", "no active token with that name"), 404);
   }
+  // 吊销即时生效：踢掉所有未归档频道里该 name 的存活 ws（spec §12）
+  const { results } = await c.env.DB.prepare(
+    "SELECT slug FROM channels WHERE archived_at IS NULL",
+  ).all<{ slug: string }>();
+  await Promise.all(
+    results.map(async ({ slug }) => {
+      try {
+        const stub = await getServerByName(c.env.CHANNELS, slug);
+        await stub.fetch(
+          new Request("https://do/internal/kick", {
+            method: "POST",
+            body: JSON.stringify({ name }),
+            headers: { "content-type": "application/json", "x-partykit-room": slug },
+          }),
+        );
+      } catch {
+        // do 实例被重置时连接已随之消失，踢线是尽力而为
+      }
+    }),
+  );
   return c.json({ ok: true });
 });
 
@@ -105,7 +126,7 @@ app.use("/api/channels/*", requireBearer);
 
 app.get("/api/channels", async (c) => {
   const { results } = await c.env.DB.prepare(
-    "SELECT slug, title, kind, created_at, archived_at FROM channels ORDER BY created_at, id",
+    "SELECT slug, title, topic, kind, created_at, archived_at FROM channels ORDER BY created_at, id",
   ).all();
   return c.json({ channels: results });
 });
@@ -180,15 +201,15 @@ app.post("/api/channels/:slug/archive", async (c) => {
     await c.env.DB.prepare("UPDATE channels SET archived_at = ? WHERE slug = ? AND archived_at IS NULL")
       .bind(Date.now(), slug)
       .run();
-    // 通知 do 踢掉存活连接（连接态的 archived 是连接时快照）
-    const stub = await getServerByName(c.env.CHANNELS, slug);
-    await stub.fetch(
-      new Request("https://do/internal/archive", {
-        method: "POST",
-        headers: { "x-partykit-room": slug },
-      }),
-    );
   }
+  // 重试/重入也通知 do：写 do 归档态 + 踢存活连接，通知丢失可靠这里补偿
+  const stub = await getServerByName(c.env.CHANNELS, slug);
+  await stub.fetch(
+    new Request("https://do/internal/archive", {
+      method: "POST",
+      headers: { "x-partykit-room": slug },
+    }),
+  );
   return c.json({ ok: true });
 });
 

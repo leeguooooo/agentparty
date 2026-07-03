@@ -1,15 +1,30 @@
-import { SELF } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { WsClient, createChannel, seedToken } from "./helpers";
+import type { ChannelDO } from "../src/do";
+import { ADMIN_HEADERS, WsClient, createChannel, seedToken } from "./helpers";
 
 describe("websocket", () => {
-  it("welcomes with channel, self and last_seq", async () => {
+  it("welcomes with channel, self, participants and last_seq", async () => {
     const { token, name } = await seedToken("agent");
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     const welcome = await ws.nextOfType("welcome");
-    expect(welcome).toMatchObject({ type: "welcome", channel: slug, self: name, last_seq: 0, presence: [] });
+    expect(welcome).toMatchObject({
+      type: "welcome",
+      channel: slug,
+      self: name,
+      participants: [{ name, kind: "agent" }],
+      last_seq: 0,
+      presence: [],
+    });
+
+    const other = await seedToken("human");
+    const second = await WsClient.open(slug, other.token);
+    const welcome2 = await second.nextOfType("welcome");
+    expect(welcome2.participants).toContainEqual({ name, kind: "agent" });
+    expect(welcome2.participants).toContainEqual({ name: other.name, kind: "human" });
     ws.close();
+    second.close();
   });
 
   it("acks sends with strictly monotonic seq", async () => {
@@ -100,6 +115,61 @@ describe("websocket", () => {
     const pong = await ws.next();
     expect(pong.type).toBe("pong");
     ws.close();
+  });
+
+  it("revoking a token kicks its live ws with error unauthorized", async () => {
+    const { token, name } = await seedToken("agent");
+    const other = await seedToken("human");
+    const slug = await createChannel(token);
+    const victim = await WsClient.open(slug, token);
+    await victim.nextOfType("welcome");
+    const bystander = await WsClient.open(slug, other.token);
+    await bystander.nextOfType("welcome");
+
+    const del = await SELF.fetch(`http://ap.test/api/tokens/${name}`, {
+      method: "DELETE",
+      headers: ADMIN_HEADERS,
+    });
+    expect(del.status).toBe(200);
+
+    const err = await victim.nextOfType("error");
+    expect(err.code).toBe("unauthorized");
+
+    // 旁观者不受影响，还能收广播
+    const msg = await (async () => {
+      const res = await SELF.fetch(`http://ap.test/api/channels/${slug}/messages`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${other.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ kind: "message", body: "still here", mentions: [], reply_to: null }),
+      });
+      expect(res.status).toBe(200);
+      return bystander.nextOfType("msg");
+    })();
+    expect(msg.body).toBe("still here");
+    bystander.close();
+  });
+
+  it("presence scan marks a silent connection offline", async () => {
+    const agent = await seedToken("agent");
+    const human = await seedToken("human");
+    const slug = await createChannel(agent.token);
+    const silent = await WsClient.open(slug, agent.token);
+    await silent.nextOfType("welcome");
+    const watcher = await WsClient.open(slug, human.token);
+    await watcher.nextOfType("welcome");
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO) => {
+      for (const c of instance.getConnections<{ name: string; lastSeen: number }>()) {
+        const st = c.state;
+        if (st?.name === agent.name) c.setState({ ...st, lastSeen: Date.now() - 120_000 });
+      }
+      await instance.onAlarm();
+    });
+
+    const presence = await watcher.nextOfType("presence");
+    expect(presence).toMatchObject({ name: agent.name, state: "offline" });
+    watcher.close();
   });
 
   it("rejects upgrade with a bad token or unknown channel", async () => {

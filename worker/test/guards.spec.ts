@@ -1,3 +1,4 @@
+import { env, runInDurableObject } from "cloudflare:test";
 import { BODY_LIMIT, LOOP_GUARD_N, RATE_LIMIT_PER_MIN } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
 import { createChannel, postMessage, seedToken } from "./helpers";
@@ -49,6 +50,29 @@ describe("guards", () => {
     expect(limited.status).toBe(429);
     expect(await errorCode(limited)).toBe("rate_limited");
   }, 90_000);
+
+  it("rate limit slides across the minute boundary (previous bucket counts)", async () => {
+    await avoidMinuteBoundary();
+    const { token, name } = await seedToken("human");
+    const slug = await createChannel(token);
+    expect((await postMessage(slug, token, "warm")).status).toBe(200);
+
+    // 把上一分钟灌满，折算后无论当前处于本分钟哪个位置都应超限
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance, state) => {
+      const bucket = Math.floor(Date.now() / 60_000);
+      state.storage.sql.exec(
+        "INSERT INTO rate (name, bucket, count) VALUES (?, ?, ?)",
+        name,
+        bucket - 1,
+        RATE_LIMIT_PER_MIN * 100,
+      );
+    });
+
+    const limited = await postMessage(slug, token, "spill over");
+    expect(limited.status).toBe(429);
+    expect(await errorCode(limited)).toBe("rate_limited");
+  });
 
   it("rejects a body over the byte limit", async () => {
     const { token } = await seedToken("agent");

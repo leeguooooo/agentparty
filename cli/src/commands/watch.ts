@@ -54,13 +54,15 @@ export async function runWatch(o: WatchOptions): Promise<number> {
         break;
       }
       if (frame.type !== "msg") continue;
-      if (frame.sender.name === self) continue;
-      const qualifies = !o.mentionsOnly || frame.mentions.includes(self);
+      const fromSelf = frame.sender.name === self;
+      const qualifies = !fromSelf && (!o.mentionsOnly || frame.mentions.includes(self));
       if (qualifies) {
         out(formatMsg(frame));
         printed++;
       }
-      // 补拉排空（seq 追平 welcome.last_seq）且已有输出即视为收到新消息
+      // 打印（或有意跳过）之后才推进游标，退出时入队未消费的消息留给下次补拉
+      conn.ack(frame.seq);
+      // 补拉排空（seq 追平 welcome.last_seq）且已有输出即视为收到新消息；自己的消息也参与排空判定
       if (!o.follow && printed > 0 && frame.seq >= lastSeq) break;
     }
   } finally {

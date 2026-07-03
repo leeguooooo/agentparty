@@ -3,6 +3,7 @@ CREATE TABLE channels (
   id INTEGER PRIMARY KEY,
   slug TEXT UNIQUE NOT NULL,
   title TEXT,
+  topic TEXT,
   kind TEXT NOT NULL DEFAULT 'standing',
   created_by TEXT,
   created_at INTEGER,

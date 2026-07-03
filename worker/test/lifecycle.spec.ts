@@ -1,5 +1,7 @@
+import { env, runInDurableObject } from "cloudflare:test";
 import { LOOP_GUARD_N } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
+import type { ChannelDO } from "../src/do";
 import { api, createChannel, postMessage, seedToken, WsClient } from "./helpers";
 
 async function errorCode(res: Response): Promise<string> {
@@ -34,6 +36,31 @@ describe("channel lifecycle endpoints", () => {
     // 幂等
     const again = await api(`/api/channels/${slug}/archive`, token, { method: "POST" });
     expect(again.status).toBe(200);
+  });
+
+  it("do refuses sends on its own authority after archive", async () => {
+    const { token } = await seedToken("human");
+    const slug = await createChannel(token);
+    expect((await postMessage(slug, token, "before")).status).toBe(200);
+    expect((await api(`/api/channels/${slug}/archive`, token, { method: "POST" })).status).toBe(200);
+
+    // 绕过 worker 的 d1 检查直捅 do，模拟归档窗口内在途的旧快照请求
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO) => {
+      const rejected = await instance.onRequest(
+        new Request("https://do/internal/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-ap-name": "stale",
+            "x-ap-kind": "agent",
+            "x-ap-role": "agent",
+          },
+          body: JSON.stringify({ kind: "message", body: "late", mentions: [], reply_to: null }),
+        }),
+      );
+      expect(rejected.status).toBe(410);
+    });
   });
 
   it("archive rejects readonly and unknown slug", async () => {

@@ -2,6 +2,7 @@
 import {
   BODY_LIMIT,
   LOOP_GUARD_N,
+  PRESENCE_TIMEOUT_MS,
   RATE_LIMIT_PER_MIN,
   RETAIN_N,
   type ErrorCode,
@@ -9,6 +10,7 @@ import {
   type PresenceEntry,
   type PresenceFrame,
   type SendFrame,
+  type Sender,
   type SenderKind,
   type ServerFrame,
   type StatusState,
@@ -21,6 +23,7 @@ interface ConnState {
   kind: SenderKind;
   role: TokenRole;
   archived: boolean;
+  lastSeen: number;
 }
 
 interface Identity {
@@ -39,7 +42,11 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   too_large: 413,
   loop_guard: 409,
   archived: 410,
+  not_found: 404,
 };
+
+// presence 扫描周期（spec §5：60s 无帧判 offline）
+export const PRESENCE_SCAN_MS = PRESENCE_TIMEOUT_MS;
 
 const STATUS_STATES: readonly string[] = ["working", "waiting", "blocked", "done"];
 
@@ -110,16 +117,19 @@ export class ChannelDO extends Server<Env> {
     );
   }
 
-  onConnect(connection: Connection<ConnState>, ctx: ConnectionContext) {
+  async onConnect(connection: Connection<ConnState>, ctx: ConnectionContext) {
     const h = ctx.request.headers;
     const state: ConnState = {
       name: h.get("x-ap-name") ?? "",
       kind: h.get("x-ap-kind") === "agent" ? "agent" : "human",
       role: (h.get("x-ap-role") ?? "readonly") as TokenRole,
       archived: h.get("x-ap-archived") === "1",
+      lastSeen: Date.now(),
     };
     connection.setState(state);
-    if (state.archived) {
+    // 归档以 do 自己的记录为权威，升级窗口内的快照竞态也拦得住
+    if (state.archived) this.setMeta("archived", "1");
+    if (state.archived || this.isArchived()) {
       this.sendFrame(connection, { type: "error", code: "archived", message: "channel is archived" });
       connection.close(1008, "archived");
       return;
@@ -128,9 +138,13 @@ export class ChannelDO extends Server<Env> {
       type: "welcome",
       channel: this.name,
       self: state.name,
+      participants: this.participants(),
       last_seq: this.lastSeq(),
       presence: this.presenceList(),
     });
+    if ((await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(Date.now() + PRESENCE_SCAN_MS);
+    }
   }
 
   onMessage(connection: Connection<ConnState>, message: WSMessage) {
@@ -143,7 +157,9 @@ export class ChannelDO extends Server<Env> {
     }
     if (typeof raw !== "object" || raw === null) return;
     const frame = raw as Record<string, unknown>;
-    const st = connection.state;
+    let st = connection.state;
+    if (!st) return;
+    st = connection.setState({ ...st, lastSeen: Date.now() });
     if (!st) return;
 
     if (frame.type === "ping") {
@@ -160,7 +176,7 @@ export class ChannelDO extends Server<Env> {
       return;
     }
     if (frame.type === "send") {
-      if (st.archived) {
+      if (st.archived || this.isArchived()) {
         this.sendFrame(connection, { type: "error", code: "archived", message: "channel is archived" });
         return;
       }
@@ -183,14 +199,46 @@ export class ChannelDO extends Server<Env> {
     for (const other of this.getConnections<ConnState>()) {
       if (other.id !== connection.id && other.state?.name === st.name) return;
     }
-    const ts = Date.now();
+    this.markOffline(st.name, Date.now());
+  }
+
+  // spec §5：60s 无帧（ping 由 auto-response 记时间戳）判 offline，alarm 周期扫描
+  async onAlarm() {
+    const now = Date.now();
+    const stale: Connection<ConnState>[] = [];
+    let live = 0;
+    for (const connection of this.getConnections<ConnState>()) {
+      const st = connection.state;
+      const pinged = this.ctx.getWebSocketAutoResponseTimestamp(connection)?.getTime() ?? 0;
+      const last = Math.max(pinged, st?.lastSeen ?? 0);
+      if (now - last >= PRESENCE_TIMEOUT_MS) stale.push(connection);
+      else live++;
+    }
+    for (const connection of stale) {
+      const name = connection.state?.name;
+      connection.close(1001, "heartbeat timeout");
+      if (!name) continue;
+      // getConnections 只回 open 的连接，刚 close 的不算
+      let gone = true;
+      for (const other of this.getConnections<ConnState>()) {
+        if (other.state?.name === name) {
+          gone = false;
+          break;
+        }
+      }
+      if (gone) this.markOffline(name, now);
+    }
+    if (live > 0) await this.ctx.storage.setAlarm(now + PRESENCE_SCAN_MS);
+  }
+
+  private markOffline(name: string, ts: number) {
     this.ctx.storage.sql.exec(
       `INSERT INTO presence (name, state, note, updated_at) VALUES (?, 'offline', NULL, ?)
        ON CONFLICT(name) DO UPDATE SET state = 'offline', updated_at = excluded.updated_at`,
-      st.name,
+      name,
       ts,
     );
-    const frame: PresenceFrame = { type: "presence", name: st.name, state: "offline", note: null, ts };
+    const frame: PresenceFrame = { type: "presence", name, state: "offline", note: null, ts };
     this.broadcast(JSON.stringify(frame));
   }
 
@@ -236,7 +284,8 @@ export class ChannelDO extends Server<Env> {
       return Response.json({ ok: true });
     }
     if (url.pathname === "/internal/archive" && request.method === "POST") {
-      // 存活连接的 archived 是连接时快照，归档后统一告知并关闭
+      // do 自己记下归档态（handleSend/onConnect 的权威依据），再踢存活连接
+      this.setMeta("archived", "1");
       for (const connection of this.getConnections<ConnState>()) {
         const st = connection.state;
         if (st) connection.setState({ ...st, archived: true });
@@ -245,11 +294,28 @@ export class ChannelDO extends Server<Env> {
       }
       return Response.json({ ok: true });
     }
+    if (url.pathname === "/internal/kick" && request.method === "POST") {
+      // token 吊销即时生效：按 name 踢掉存活连接
+      const body = (await request.json().catch(() => null)) as { name?: unknown } | null;
+      const name = typeof body?.name === "string" ? body.name : "";
+      if (!name) {
+        return Response.json({ error: { code: "bad_request", message: "name required" } }, { status: 400 });
+      }
+      for (const connection of this.getConnections<ConnState>()) {
+        if (connection.state?.name !== name) continue;
+        this.sendFrame(connection, { type: "error", code: "unauthorized", message: "token revoked" });
+        connection.close(1008, "revoked");
+      }
+      return Response.json({ ok: true });
+    }
     return new Response("not found", { status: 404 });
   }
 
   // 校验 → 分配 seq → 落库 → 修剪/presence，返回待广播帧
   private handleSend(identity: Identity, frame: SendFrame): SendOutcome {
+    if (this.isArchived()) {
+      return { ok: false, code: "archived", message: "channel is archived" };
+    }
     if (identity.role === "readonly") {
       return { ok: false, code: "unauthorized", message: "readonly token cannot send" };
     }
@@ -268,10 +334,17 @@ export class ChannelDO extends Server<Env> {
     const now = Date.now();
     const bucket = Math.floor(now / 60_000);
     sql.exec("DELETE FROM rate WHERE bucket < ?", bucket - 1);
-    const used = sql
-      .exec("SELECT count FROM rate WHERE name = ? AND bucket = ?", identity.name, bucket)
-      .toArray();
-    if (used.length > 0 && Number(used[0]!.count) >= RATE_LIMIT_PER_MIN) {
+    // 滑动窗口：当前 bucket + 上一 bucket 按剩余占比折算，跨分钟边界不翻倍
+    let current = 0;
+    let previous = 0;
+    for (const row of sql
+      .exec("SELECT bucket, count FROM rate WHERE name = ? AND bucket >= ?", identity.name, bucket - 1)
+      .toArray()) {
+      if (Number(row.bucket) === bucket) current = Number(row.count);
+      else previous = Number(row.count);
+    }
+    const windowUsed = current + previous * (1 - (now % 60_000) / 60_000);
+    if (windowUsed >= RATE_LIMIT_PER_MIN) {
       return {
         ok: false,
         code: "rate_limited",
@@ -358,6 +431,19 @@ export class ChannelDO extends Server<Env> {
 
   private agentStreak(): number {
     return Number(this.getMeta("agent_streak") ?? "0");
+  }
+
+  private isArchived(): boolean {
+    return this.getMeta("archived") === "1";
+  }
+
+  private participants(): Sender[] {
+    const seen = new Map<string, Sender>();
+    for (const connection of this.getConnections<ConnState>()) {
+      const st = connection.state;
+      if (st?.name && !seen.has(st.name)) seen.set(st.name, { name: st.name, kind: st.kind });
+    }
+    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
   private getMeta(key: string): string | null {

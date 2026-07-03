@@ -6,6 +6,7 @@ export const BODY_LIMIT = 100_000;
 export const RATE_LIMIT_PER_MIN = 30;
 export const LOOP_GUARD_N = 30;
 export const RETAIN_N = 10_000;
+export const PRESENCE_TIMEOUT_MS = 60_000;
 
 // cli 退出码
 export const EXIT_TIMEOUT = 2;
@@ -28,7 +29,8 @@ export type ErrorCode =
   | "rate_limited"
   | "too_large"
   | "loop_guard"
-  | "archived";
+  | "archived"
+  | "not_found";
 
 export interface Sender {
   name: string;
@@ -78,6 +80,7 @@ export interface WelcomeFrame {
   type: "welcome";
   channel: string;
   self: string;
+  participants: Sender[];
   last_seq: number;
   presence: PresenceEntry[];
 }

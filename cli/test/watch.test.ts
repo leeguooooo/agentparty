@@ -114,6 +114,60 @@ describe("runWatch", () => {
     }
   });
 
+  test("self message at the tail still completes the drain promptly", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send(welcomeFrame(4, "me"));
+        sock.send(msgFrame(3, "reply"));
+        sock.send(msgFrame(4, "own note", { sender: { name: "me", kind: "human" } }));
+      }
+    });
+    const o = opts({ server: server.url, timeoutSec: 5 });
+    const started = Date.now();
+    expect(await runWatch(o)).toBe(0);
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(o.lines).toEqual(["[3] bob(agent): reply"]);
+  });
+
+  test("messages queued but not printed before exit are not marked read", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send(welcomeFrame(1));
+        sock.send(msgFrame(1, "prints and exits"));
+        sock.send(msgFrame(2, "same batch, never printed"));
+      }
+    });
+    const cursors: number[] = [];
+    const o = opts({ server: server.url, onCursor: (c) => cursors.push(c) });
+    expect(await runWatch(o)).toBe(0);
+    expect(o.lines).toEqual(["[1] bob(agent): prints and exits"]);
+    // seq 2 未打印，游标不能越过它，留给下次 watch 补拉
+    expect(cursors).toEqual([1]);
+  });
+
+  test("rejected ws upgrade maps 401 to exit 3 and 404 to exit 1", async () => {
+    for (const [status, code, exit] of [
+      [401, "unauthorized", EXIT_AUTH],
+      [404, "not_found", 1],
+    ] as const) {
+      const s = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () =>
+          new Response(JSON.stringify({ error: { code, message: "nope" } }), {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+      });
+      const o = opts({ server: `http://127.0.0.1:${s.port}`, timeoutSec: 5 });
+      const started = Date.now();
+      expect(await runWatch(o)).toBe(exit);
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(o.lines).toEqual([]);
+      s.stop(true);
+    }
+  });
+
   test("cursor callback fires for received messages", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {
