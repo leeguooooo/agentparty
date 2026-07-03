@@ -500,8 +500,9 @@ app.post("/api/channels/:slug/archive", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
-  if (c.get("identity").role === "readonly") {
-    return c.json(errorBody("unauthorized", "readonly token cannot archive"), 403);
+  // 归档是破坏性操作：仅房主或 ap_ token（非只读）可为，否则粉丝能归档别人的私有频道捣乱
+  if (!isChannelModerator(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can archive"), 403);
   }
   const stub = await getServerByName(c.env.CHANNELS, slug);
   const archivedAt = Date.now();
@@ -549,11 +550,10 @@ app.post("/api/channels/:slug/reset-guard", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
-  if (c.get("identity").role === "readonly") {
-    return c.json(errorBody("unauthorized", "readonly token cannot reset guard"), 403);
-  }
-  if (c.get("identity").kind !== "human") {
-    return c.json(errorBody("unauthorized", "only human tokens can reset loop guard"), 403);
+  // 重置 loop guard 要同时满足两条：① 是房主/ap_ token（挡粉丝越权重置别人频道）
+  // ② 是 human（loop guard 防的就是 agent 失控刷屏，不能让 agent 重置自己的熔断）
+  if (!isChannelModerator(c.get("identity"), channel) || c.get("identity").kind !== "human") {
+    return c.json(errorBody("forbidden", "only a human owner or human ap_ token can reset guard"), 403);
   }
   const stub = await getServerByName(c.env.CHANNELS, slug);
   return stub.fetch(
