@@ -3,6 +3,8 @@ import {
   EXIT_ARCHIVED,
   EXIT_AUTH,
   EXIT_LOOP_GUARD,
+  type CaptureKind,
+  type CaptureRecord,
   type ChannelKind,
   type ChannelMode,
   type MsgFrame,
@@ -17,6 +19,7 @@ import {
 import pkg from "../package.json" with { type: "json" };
 
 export type { ChannelMode, WebhookFilter };
+export type { CaptureKind, CaptureRecord };
 
 // 频道可见性：public = 任何鉴权身份可进；private（默认）= 仅 leo 的 ap_ token + 房主（spec §3.2）
 export type ChannelVisibility = "public" | "private";
@@ -267,6 +270,37 @@ export async function fetchWakeDeliveries(
   });
   const deliveries = (body as Record<string, unknown> | null)?.deliveries;
   return Array.isArray(deliveries) ? (deliveries as WakeDelivery[]) : [];
+}
+
+export async function createCapture(
+  server: string,
+  token: string,
+  slug: string,
+  body: { seq: number; kind: CaptureKind; note?: string },
+): Promise<CaptureRecord> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/captures`, {
+    method: "POST",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as CaptureRecord;
+}
+
+export async function listCaptures(
+  server: string,
+  token: string,
+  slug: string,
+  opts: { kind?: CaptureKind; since?: number; limit?: number } = {},
+): Promise<CaptureRecord[]> {
+  const params = new URLSearchParams();
+  if (opts.kind !== undefined) params.set("kind", opts.kind);
+  if (opts.since !== undefined) params.set("since", String(opts.since));
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const body = await req(server, `/api/channels/${encodeURIComponent(slug)}/captures${suffix}`, {
+    headers: bearerJson(token),
+  });
+  const captures = (body as Record<string, unknown> | null)?.captures;
+  return Array.isArray(captures) ? (captures as CaptureRecord[]) : [];
 }
 
 export async function searchMessages(

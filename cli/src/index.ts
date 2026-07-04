@@ -24,6 +24,7 @@ commands:
   history   [channel|--channel C] [--since seq] [--limit n] [--json]
   search    <query> [--channel C] [--from name] [--since seq] [--limit n] [--json]
   digest    [channel|--channel C] [--since seq|last-seen] [--json]
+  capture   <seq>|list [channel|--channel C] --as decision|requirement|bug|action-item [-m note] [--json] [--issue-body]
   wake      test @agent [channel|--channel C] [--timeout N] [--json]
   channel   create <slug> [--title t] [--temp] [--party] [--public] | list | archive [slug] | reset-guard [slug] | kick <name> [slug]
   invite    "<title>" [--slug s] [--temp] [--party] [--public] [--guest-name bob] [--owner label]   (ADMIN_SECRET env)
@@ -71,6 +72,8 @@ export async function main(argv: string[]): Promise<number> {
       return (await import("./commands/search")).run(rest);
     case "digest":
       return (await import("./commands/digest")).run(rest);
+    case "capture":
+      return (await import("./commands/capture")).run(rest);
     case "wake":
       return (await import("./commands/wake")).run(rest);
     case "channel":

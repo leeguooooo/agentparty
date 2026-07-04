@@ -193,6 +193,53 @@ export const openapiDocument = {
         },
       },
     },
+    "/api/channels/{slug}/captures": {
+      get: {
+        summary: "list durable captures for decisions, requirements, bugs, and action items",
+        security: [{ bearer: [] }],
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "kind", in: "query", schema: { type: "string", enum: ["decision", "requirement", "bug", "action-item"] } },
+          { name: "since", in: "query", schema: { type: "integer", default: 0 } },
+          { name: "limit", in: "query", schema: { type: "integer", default: 100 } },
+        ],
+        responses: {
+          "200": { description: "{captures:[{type,channel,seq,capture_kind,note,created_by,created_by_kind,created_at,message}]}" },
+          "400": { description: "invalid kind/since/limit" },
+          "403": { description: "not allowed in this channel" },
+          "404": { description: "channel not found" },
+        },
+      },
+      post: {
+        summary: "capture an existing retained message into the durable issue ledger",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["seq"],
+                properties: {
+                  seq: { type: "integer", minimum: 1 },
+                  kind: { type: "string", enum: ["decision", "requirement", "bug", "action-item"], default: "action-item" },
+                  as: { type: "string", enum: ["decision", "requirement", "bug", "action-item"], description: "alias for kind" },
+                  note: { type: "string", maxLength: 4000 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "capture record" },
+          "400": { description: "invalid seq/kind/note" },
+          "403": { description: "readonly token or not allowed in this channel" },
+          "404": { description: "channel or message not found" },
+          "410": { description: "channel archived" },
+        },
+      },
+    },
     "/api/channels/{slug}/search": {
       get: {
         summary: "server-side retained history search",

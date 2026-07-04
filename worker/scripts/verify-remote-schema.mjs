@@ -5,6 +5,21 @@ const database = process.env.AGENTPARTY_D1_DATABASE ?? "agentparty";
 const required = {
   channels: ["id", "slug", "title", "topic", "kind", "mode", "created_by", "created_at", "archived_at"],
   tokens: ["id", "hash", "name", "role", "owner", "created_at", "revoked_at"],
+  captures: [
+    "id",
+    "channel_slug",
+    "seq",
+    "kind",
+    "note",
+    "created_by",
+    "created_by_kind",
+    "created_at",
+    "message_sender",
+    "message_sender_kind",
+    "message_kind",
+    "message_body",
+    "message_ts",
+  ],
 };
 
 function run(args) {

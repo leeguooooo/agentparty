@@ -38,6 +38,7 @@ export type ChannelKind = "standing" | "temp";
 export type ChannelMode = "normal" | "party";
 export type MessageKind = "message" | "status";
 export type WebhookFilter = "mentions" | "status" | "needs-human" | "all";
+export type CaptureKind = "decision" | "requirement" | "bug" | "action-item";
 
 export type StatusState = "working" | "waiting" | "blocked" | "done";
 export type PresenceState = StatusState | "offline";
@@ -62,6 +63,24 @@ export interface WakeDelivery {
   attempted_at: number;
   ack_seq: number | null;
   resume_seq: number | null;
+}
+
+export interface CaptureRecord {
+  type: "capture";
+  channel: string;
+  seq: number;
+  capture_kind: CaptureKind;
+  note: string | null;
+  created_by: string;
+  created_by_kind: SenderKind;
+  created_at: number;
+  message: {
+    seq: number;
+    sender: Sender;
+    kind: MessageKind;
+    body: string;
+    ts: number;
+  };
 }
 
 export interface SearchHit {

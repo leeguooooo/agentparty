@@ -1,6 +1,15 @@
 // worker 入口 — rest 路由 + ws 升级转发
 import { RESERVED_NAMES } from "@agentparty/shared";
-import type { ChannelKind, ChannelMode, RestErrorCode, TokenRole, WebhookFilter } from "@agentparty/shared";
+import type {
+  CaptureKind,
+  CaptureRecord,
+  ChannelKind,
+  ChannelMode,
+  MsgFrame,
+  RestErrorCode,
+  TokenRole,
+  WebhookFilter,
+} from "@agentparty/shared";
 import { Hono } from "hono";
 import { createMiddleware } from "hono/factory";
 import { getServerByName } from "partyserver";
@@ -33,6 +42,7 @@ const KINDS: readonly string[] = ["standing", "temp"] satisfies ChannelKind[];
 const MODES: readonly string[] = ["normal", "party"] satisfies ChannelMode[];
 const VISIBILITIES: readonly string[] = ["public", "private"];
 const WEBHOOK_FILTERS: readonly string[] = ["mentions", "status", "needs-human", "all"] satisfies WebhookFilter[];
+const CAPTURE_KINDS: readonly string[] = ["decision", "requirement", "bug", "action-item"] satisfies CaptureKind[];
 const WEBHOOK_URL_MAX = 2048;
 const WEBHOOK_SECRET_MAX = 4096;
 const HEADER_VALUE_RE = /^[\x21-\x7e]+$/;
@@ -54,9 +64,50 @@ const OWNER_MAX = 128;
 const OWNER_RE = /^[\x20-\x7e]{1,128}$/;
 // CLI 用来跑回环 PKCE 的 public client（account.leeguoo.com 已登记）。CLI 拉 /api/config 得知用哪个
 const CLI_CLIENT_ID = "agentparty-cli";
+const CAPTURE_NOTE_MAX = 4000;
 
 function errorBody(code: RestErrorCode, message: string) {
   return { error: { code, message } };
+}
+
+function positiveInt(input: unknown): number | null {
+  return typeof input === "number" && Number.isInteger(input) && input > 0 ? input : null;
+}
+
+function captureRowToRecord(row: {
+  channel_slug: string;
+  seq: number;
+  kind: string;
+  note: string | null;
+  created_by: string;
+  created_by_kind: string;
+  created_at: number;
+  message_sender: string;
+  message_sender_kind: string;
+  message_kind: string;
+  message_body: string;
+  message_ts: number;
+}): CaptureRecord {
+  return {
+    type: "capture",
+    channel: row.channel_slug,
+    seq: row.seq,
+    capture_kind: row.kind as CaptureKind,
+    note: row.note,
+    created_by: row.created_by,
+    created_by_kind: row.created_by_kind === "human" ? "human" : "agent",
+    created_at: row.created_at,
+    message: {
+      seq: row.seq,
+      sender: {
+        name: row.message_sender,
+        kind: row.message_sender_kind === "human" ? "human" : "agent",
+      },
+      kind: row.message_kind === "status" ? "status" : "message",
+      body: row.message_body,
+      ts: row.message_ts,
+    },
+  };
 }
 
 // 铸/重铸 token 的落库逻辑（/api/tokens 与 /api/agents 共用）：
@@ -517,6 +568,110 @@ app.get("/api/channels/:slug/wake-deliveries", async (c) => {
       headers: { "x-partykit-room": slug },
     }),
   );
+});
+
+app.get("/api/channels/:slug/captures", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!canAccessChannel(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const url = new URL(c.req.url);
+  const kind = url.searchParams.get("kind");
+  if (kind !== null && !CAPTURE_KINDS.includes(kind)) {
+    return c.json(errorBody("bad_request", "kind must be decision|requirement|bug|action-item"), 400);
+  }
+  const since = Number.parseInt(url.searchParams.get("since") ?? "0", 10);
+  if (!Number.isInteger(since) || since < 0) {
+    return c.json(errorBody("bad_request", "since must be a non-negative integer"), 400);
+  }
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    return c.json(errorBody("bad_request", "limit must be 1..1000"), 400);
+  }
+  const base =
+    "SELECT * FROM captures WHERE channel_slug = ? AND seq > ?" +
+    (kind === null ? "" : " AND kind = ?") +
+    " ORDER BY seq DESC, created_at DESC LIMIT ?";
+  const stmt = c.env.DB.prepare(base);
+  const query = kind === null ? stmt.bind(slug, since, limit) : stmt.bind(slug, since, kind, limit);
+  const { results } = await query.all<Parameters<typeof captureRowToRecord>[0]>();
+  return c.json({ captures: results.map(captureRowToRecord) });
+});
+
+app.post("/api/channels/:slug/captures", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!canAccessChannel(identity, channel)) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  if (identity.role === "readonly") {
+    return c.json(errorBody("forbidden", "readonly token cannot create captures"), 403);
+  }
+  const body = (await c.req.json().catch(() => null)) as
+    | { seq?: unknown; kind?: unknown; as?: unknown; note?: unknown }
+    | null;
+  const seq = positiveInt(body?.seq);
+  const kind = typeof body?.kind === "string" ? body.kind : typeof body?.as === "string" ? body.as : "";
+  const note = body?.note === undefined || body?.note === null ? null : body.note;
+  if (seq === null) return c.json(errorBody("bad_request", "seq must be a positive integer"), 400);
+  if (!CAPTURE_KINDS.includes(kind)) {
+    return c.json(errorBody("bad_request", "kind must be decision|requirement|bug|action-item"), 400);
+  }
+  if (note !== null && (typeof note !== "string" || note.length > CAPTURE_NOTE_MAX)) {
+    return c.json(errorBody("bad_request", `note must be a string <= ${CAPTURE_NOTE_MAX} chars`), 400);
+  }
+
+  const stub = await getServerByName(c.env.CHANNELS, slug);
+  const msgRes = await stub.fetch(
+    new Request(`https://do/internal/messages?since=${seq - 1}&limit=1`, {
+      headers: { "x-partykit-room": slug },
+    }),
+  );
+  if (!msgRes.ok) return c.json(errorBody("unavailable", "channel history unavailable"), 503);
+  const msgBody = (await msgRes.json()) as { messages?: MsgFrame[] };
+  const msg = msgBody.messages?.find((m) => m.seq === seq);
+  if (!msg) return c.json(errorBody("not_found", `message seq ${seq} not found in retained history`), 404);
+
+  const now = Date.now();
+  await c.env.DB.prepare(
+    `INSERT INTO captures (
+      channel_slug, seq, kind, note, created_by, created_by_kind, created_at,
+      message_sender, message_sender_kind, message_kind, message_body, message_ts
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_slug, seq, kind) DO UPDATE SET
+      note = excluded.note,
+      created_by = excluded.created_by,
+      created_by_kind = excluded.created_by_kind,
+      created_at = excluded.created_at,
+      message_sender = excluded.message_sender,
+      message_sender_kind = excluded.message_sender_kind,
+      message_kind = excluded.message_kind,
+      message_body = excluded.message_body,
+      message_ts = excluded.message_ts`,
+  )
+    .bind(
+      slug,
+      seq,
+      kind,
+      note,
+      identity.name,
+      identity.kind,
+      now,
+      msg.sender.name,
+      msg.sender.kind,
+      msg.kind,
+      msg.kind === "status" ? (msg.note ?? msg.body) : msg.body,
+      msg.ts,
+    )
+    .run();
+  const row = await c.env.DB.prepare("SELECT * FROM captures WHERE channel_slug = ? AND seq = ? AND kind = ?")
+    .bind(slug, seq, kind)
+    .first<Parameters<typeof captureRowToRecord>[0]>();
+  return c.json(captureRowToRecord(row!), 201);
 });
 
 app.post("/api/channels/:slug/messages", async (c) => {
