@@ -1,13 +1,23 @@
 // party agent add <name> — 账号会话自助铸一枚 agent token（owner=自己，由 worker 推导）
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readAccount } from "../account";
 import { ensureFreshAccess } from "../oidc-cli";
 import { createAgent, handleRestError } from "../rest";
 import { isName, isSlug } from "../validation";
 
 const AGENT_FLAGS = ["channel-scope"];
+const HELP = `usage: party agent add <name> [--channel-scope slug]
+
+Mint an agent token as the logged-in account.
+
+Options:
+  --channel-scope slug   restrict the new token to one channel`;
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv);
   const unknown = unknownFlagError(flags, AGENT_FLAGS);
   if (unknown !== null) {

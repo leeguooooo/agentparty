@@ -1,0 +1,7 @@
+{
+  "schema": "agentparty.v1",
+  "type": "timeout",
+  "channel": "dev",
+  "timeout_sec": 1,
+  "ts": 1700000000000
+}

@@ -1,12 +1,24 @@
 // party init — 写全局配置 + 绑定当前目录默认频道（不存在则创建）
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readConfig, readState, writeConfig, writeState } from "../config";
 import { RestError, createChannel, handleRestError, listChannels } from "../rest";
 import { isSlug, normalizeServerUrl } from "../validation";
 
 const INIT_FLAGS = ["server", "token", "channel"];
+const HELP = `usage: party init --server URL --token T [--channel C]
+
+Write local config and optionally bind this working directory to a default channel.
+
+Options:
+  --server URL    AgentParty server URL
+  --token T       agent/human/readonly token
+  --channel C     bind the current working directory to channel C`;
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv);
   const unknown = unknownFlagError(flags, INIT_FLAGS);
   if (unknown !== null) {

@@ -1,5 +1,5 @@
 // party send — rest 一次性发消息，成功后推进游标
-import { parseArgs, str, strArray, unknownFlagError, valueFlagError, type Parsed } from "../args";
+import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError, type Parsed } from "../args";
 import { resolveChannel, saveCursor, type Config } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
@@ -7,6 +7,14 @@ import { isName, isSlug, parsePositiveIntFlag } from "../validation";
 
 export const sendSpec = { repeatable: ["mention"] };
 const SEND_FLAGS = ["channel", "reply-to", "mention"];
+const HELP = `usage: party send <text|-> [--channel C] [--mention name]... [--reply-to seq]
+
+Send one message to a channel. Use "-" as the body to read stdin.
+
+Options:
+  --channel C      send to channel C instead of the bound channel
+  --mention name   mention a user or agent; repeatable
+  --reply-to seq   attach this message as a reply to seq`;
 
 export interface SendInput {
   channel: string;
@@ -97,6 +105,10 @@ export async function doSend(cfg: Config, input: SendInput): Promise<number | { 
 }
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv)) {
+    console.log(HELP);
+    return 0;
+  }
   const cfg = await resolveAuth();
   if (!cfg) {
     console.error("no config, run: party login or party init --server URL --token T");

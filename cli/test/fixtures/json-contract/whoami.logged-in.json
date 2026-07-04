@@ -1,0 +1,17 @@
+{
+  "schema": "agentparty.v1",
+  "type": "whoami",
+  "logged_in": true,
+  "server": "https://agentparty.example",
+  "name": "fan@example.com",
+  "kind": "human",
+  "role": "human",
+  "owner": null,
+  "channel_scope": null,
+  "caps": {
+    "send": true,
+    "create_channel": true,
+    "mint_agents": true,
+    "scoped_to": null
+  }
+}

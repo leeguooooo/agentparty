@@ -1,5 +1,5 @@
 // party channel create|list|archive|reset-guard
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import {
@@ -13,8 +13,25 @@ import {
 import { isName, isSlug } from "../validation";
 
 const CHANNEL_FLAGS = ["title", "temp", "party", "public"];
+const HELP = `usage: party channel create <slug> [--title t] [--temp] [--party] [--public]
+       party channel list
+       party channel archive [slug]
+       party channel reset-guard [slug]
+       party channel kick <name> [slug]
+
+Manage channels.
+
+Options:
+  --title t   channel title when creating
+  --temp      create a temporary channel
+  --party     create a party-mode channel
+  --public    create a public channel`;
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv, { booleans: ["temp", "party", "public"] });
   const unknown = unknownFlagError(flags, CHANNEL_FLAGS);
   if (unknown !== null) {

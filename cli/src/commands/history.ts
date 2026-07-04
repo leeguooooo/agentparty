@@ -5,6 +5,7 @@ import { resolveAuth } from "../oidc-cli";
 import { fetchMessages, handleRestError } from "../rest";
 import { formatMsg } from "../format";
 import { isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
+import { jsonFrame } from "../json";
 
 const HISTORY_FLAGS = ["channel", "since", "limit", "json"];
 
@@ -52,8 +53,10 @@ export async function run(argv: string[]): Promise<number> {
       since ?? 0,
       limit ?? 100,
     );
-    // --json：每条一行 NDJSON（原始 msg 帧），供 supervisor/工具消费，免 scrape 人类格式
-    for (const m of messages) console.log(flags.json === true ? JSON.stringify(m) : formatMsg(m));
+    // --json：每条一行 NDJSON（原始 msg 帧 + schema），供 supervisor/工具消费，免 scrape 人类格式
+    for (const m of messages) {
+      console.log(flags.json === true ? JSON.stringify(jsonFrame(m as unknown as Record<string, unknown>)) : formatMsg(m));
+    }
     return 0;
   } catch (e) {
     return handleRestError(e);

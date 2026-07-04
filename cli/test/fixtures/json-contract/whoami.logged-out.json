@@ -1,0 +1,5 @@
+{
+  "schema": "agentparty.v1",
+  "type": "whoami",
+  "logged_in": false
+}

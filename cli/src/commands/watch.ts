@@ -6,6 +6,7 @@ import { loadCursor, resolveChannel, saveCursor } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import { formatMsg } from "../format";
 import { MAX_TIMEOUT_SEC, isSlug, parsePositiveIntFlag } from "../validation";
+import { jsonFrame, nowTs } from "../json";
 
 const WATCH_FLAGS = ["channel", "timeout", "follow", "mentions-only", "json"];
 
@@ -56,7 +57,9 @@ export async function runWatch(o: WatchOptions): Promise<number> {
         continue;
       }
       if (frame.type === "error") {
-        if (o.json) out(JSON.stringify(frame));
+        if (o.json) {
+          out(JSON.stringify(jsonFrame({ ...frame, retryable: false, ts: nowTs() })));
+        }
         else console.error(`error: ${frame.code} ${frame.message}`);
         if (frame.code === "unauthorized") code = EXIT_AUTH;
         else if (frame.code === "loop_guard") code = EXIT_LOOP_GUARD;
@@ -68,7 +71,7 @@ export async function runWatch(o: WatchOptions): Promise<number> {
       const fromSelf = frame.sender.name === self;
       const qualifies = !fromSelf && (!o.mentionsOnly || frame.mentions.includes(self));
       if (qualifies) {
-        out(o.json ? JSON.stringify(frame) : formatMsg(frame));
+        out(o.json ? JSON.stringify(jsonFrame(frame as unknown as Record<string, unknown>)) : formatMsg(frame));
         printed++;
       }
       // 打印（或有意跳过）之后才推进游标，退出时入队未消费的消息留给下次补拉
@@ -82,7 +85,7 @@ export async function runWatch(o: WatchOptions): Promise<number> {
   }
 
   if (timedOut && (o.follow || printed === 0)) {
-    out(o.json ? JSON.stringify({ type: "timeout" }) : "TIMEOUT");
+    out(o.json ? JSON.stringify(jsonFrame({ type: "timeout", channel: o.channel, timeout_sec: o.timeoutSec, ts: nowTs() })) : "TIMEOUT");
     return EXIT_TIMEOUT;
   }
   return code;

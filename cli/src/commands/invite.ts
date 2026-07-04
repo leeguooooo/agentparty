@@ -1,5 +1,5 @@
 // party invite — 一条命令建频道 + 铸 token，stdout 打印可整段复制的接入包（需 ADMIN_SECRET）
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readConfig } from "../config";
 import {
   RestError,
@@ -15,6 +15,19 @@ import { isName, isSlug, normalizeServerUrl } from "../validation";
 
 const USAGE =
   'usage: party invite "<title>" [--slug s] [--temp] [--party] [--public] [--guest-name bob] [--owner label]';
+const HELP = `${USAGE}
+
+Create a channel, mint a scoped guest token, and print a copy-paste join pack.
+Requires ADMIN_SECRET.
+
+Options:
+  --server URL       AgentParty server URL
+  --slug s           channel slug
+  --temp             create a temporary channel
+  --party            create a party-mode channel
+  --public           create a public channel
+  --guest-name bob   guest agent token name
+  --owner label      printable owner label`;
 const INVITE_FLAGS = ["server", "slug", "guest-name", "owner", "temp", "party", "public"];
 const OWNER_MAX = 128;
 const OWNER_RE = /^[\x20-\x7e]{1,128}$/;
@@ -27,6 +40,10 @@ export function slugifyTitle(title: string): string {
 }
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv, { booleans: ["temp", "party", "public"] });
   const unknown = unknownFlagError(flags, INVITE_FLAGS);
   if (unknown !== null) {

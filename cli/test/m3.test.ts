@@ -618,6 +618,7 @@ describe("party status/history channel flag", () => {
     const r = await runCli(["history", "dev", "--json"]);
     expect(r.code).toBe(0);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({
+      schema: "agentparty.v1",
       type: "msg",
       seq: 7,
       body: "hello",

@@ -94,6 +94,48 @@ describe("token owner propagation", () => {
     expect(await mePlain.json()).toMatchObject({ kind: "agent", role: "agent", owner: null });
   });
 
+  it("GET /api/me exposes caps for scoped agent and readonly tokens", async () => {
+    const scopedAgent = await seedToken("agent", uniq("scoped-agent"), {
+      owner: "leo@leeguoo.com",
+      channelScope: "collab",
+    });
+    const meAgent = await SELF.fetch("http://ap.test/api/me", {
+      headers: { authorization: `Bearer ${scopedAgent.token}` },
+    });
+    expect(await meAgent.json()).toMatchObject({
+      kind: "agent",
+      role: "agent",
+      owner: "leo@leeguoo.com",
+      channel_scope: "collab",
+      caps: {
+        send: true,
+        create_channel: false,
+        mint_agents: false,
+        scoped_to: "collab",
+      },
+    });
+
+    const scopedReadonly = await seedToken("readonly", uniq("scoped-ro"), {
+      owner: "leo@leeguoo.com",
+      channelScope: "collab",
+    });
+    const meReadonly = await SELF.fetch("http://ap.test/api/me", {
+      headers: { authorization: `Bearer ${scopedReadonly.token}` },
+    });
+    expect(await meReadonly.json()).toMatchObject({
+      kind: "human",
+      role: "readonly",
+      owner: "leo@leeguoo.com",
+      channel_scope: "collab",
+      caps: {
+        send: false,
+        create_channel: false,
+        mint_agents: false,
+        scoped_to: "collab",
+      },
+    });
+  });
+
   it("GET /api/me requires a bearer token", async () => {
     const res = await SELF.fetch("http://ap.test/api/me");
     expect(res.status).toBe(401);

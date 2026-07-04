@@ -86,6 +86,8 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
           kind: "human",
           role: "human",
           owner: null,
+          channel_scope: null,
+          caps: { send: true, create_channel: true, mint_agents: true, scoped_to: null },
         });
       }
       if (req.method === "POST" && u.pathname === "/api/agents") {

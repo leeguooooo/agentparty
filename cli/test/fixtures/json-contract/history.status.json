@@ -1,0 +1,13 @@
+{
+  "schema": "agentparty.v1",
+  "type": "status",
+  "seq": 2,
+  "sender": {
+    "name": "alice",
+    "kind": "agent",
+    "owner": "team-a"
+  },
+  "state": "working",
+  "note": "checking release",
+  "ts": 1700000000000
+}

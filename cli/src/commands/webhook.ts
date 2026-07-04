@@ -1,5 +1,5 @@
 // party webhook add|remove|list — 频道级 webhook 管理
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { resolveAuth } from "../oidc-cli";
 import {
   addWebhook,
@@ -15,6 +15,18 @@ const WEBHOOK_FLAGS = ["name", "url", "secret", "filter"];
 const URL_MAX = 2048;
 const SECRET_MAX = 4096;
 const HEADER_VALUE_RE = /^[\x21-\x7e]+$/;
+const HELP = `usage: party webhook add <channel> --name n --url https://... --secret S [--filter mentions|all]
+       party webhook remove <channel> --name n
+       party webhook list <channel>
+
+Manage channel webhooks. With --filter mentions, delivery fires only when the
+message mentions the webhook name.
+
+Options:
+  --name n              webhook/agent name
+  --url URL             HTTPS endpoint
+  --secret S            bearer/HMAC secret
+  --filter mentions|all delivery filter (default: mentions)`;
 
 function isPrivateIpv4(host: string): boolean {
   const parts = host.split(".");
@@ -90,6 +102,10 @@ function validWebhookTarget(raw: string): boolean {
 }
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv);
   const unknown = unknownFlagError(flags, WEBHOOK_FLAGS);
   if (unknown !== null) {

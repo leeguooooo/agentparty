@@ -42,6 +42,28 @@ describe("cli subprocess", () => {
     expect(r.stdout).toContain("party <command>");
   });
 
+  test("non-json subcommands support --help without auth or config", async () => {
+    const commands = [
+      "init",
+      "send",
+      "status",
+      "channel",
+      "invite",
+      "webhook",
+      "token",
+      "login",
+      "logout",
+      "agent",
+      "serve",
+    ];
+    for (const cmd of commands) {
+      const r = await runCli([cmd, "--help"]);
+      expect(r.code, cmd).toBe(0);
+      expect(r.stdout, cmd).toContain(`usage: party ${cmd}`);
+      expect(r.stderr, cmd).toBe("");
+    }
+  });
+
   test("--version 输出非空版本号并 exit 0", async () => {
     const r = await runCli(["--version"]);
     expect(r.code).toBe(0);

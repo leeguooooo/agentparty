@@ -125,3 +125,8 @@ export function strArray(v: string | boolean | Array<string | boolean> | undefin
     ? v
     : undefined;
 }
+
+export function isHelpArg(argv: string[], opts: { allowHelpPositional?: boolean } = {}): boolean {
+  if (argv.includes("--help") || argv.includes("-h")) return true;
+  return opts.allowHelpPositional === true && argv.length === 1 && argv[0] === "help";
+}

@@ -1,0 +1,15 @@
+{
+  "schema": "agentparty.v1",
+  "type": "msg",
+  "seq": 1,
+  "sender": {
+    "name": "alice",
+    "kind": "agent",
+    "owner": "team-a"
+  },
+  "kind": "message",
+  "body": "hello",
+  "mentions": ["bob"],
+  "reply_to": null,
+  "ts": 1700000000000
+}

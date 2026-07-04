@@ -5,7 +5,7 @@ import { EXIT_ARCHIVED, EXIT_AUTH, type MsgFrame } from "@agentparty/shared";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
 import { loadCursor, resolveChannel, saveCursor } from "../config";
 import { formatMsg } from "../format";
@@ -44,6 +44,15 @@ function writeContextFile(frame: MsgFrame, channel: string, self: string): strin
 }
 
 const SERVE_FLAGS = ["channel", "on-mention", "all"];
+const HELP = `usage: party serve [channel|--channel C] --on-mention "<cmd>" [--all]
+
+Stay attached to a channel and run one local command for each matching message.
+The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
+
+Options:
+  --channel C          serve channel C instead of the bound channel
+  --on-mention "<cmd>" command to run for each wake
+  --all                run for every non-self message, not only @mentions`;
 
 export interface ServeOptions {
   server: string;
@@ -145,6 +154,10 @@ export async function runServe(o: ServeOptions): Promise<number> {
 }
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv, { booleans: ["all"] });
   const cfg = await resolveAuth();
   if (!cfg) {

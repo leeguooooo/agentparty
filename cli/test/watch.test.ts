@@ -73,7 +73,14 @@ describe("runWatch", () => {
     });
     const o = opts({ server: server.url, timeoutSec: 0.2, json: true });
     expect(await runWatch(o)).toBe(EXIT_TIMEOUT);
-    expect(o.lines.map((line) => JSON.parse(line))).toEqual([{ type: "timeout" }]);
+    const frame = JSON.parse(o.lines[0]!);
+    expect(frame).toMatchObject({
+      schema: "agentparty.v1",
+      type: "timeout",
+      channel: "dev",
+      timeout_sec: 0.2,
+    });
+    expect(typeof frame.ts).toBe("number");
   });
 
   test("mentions-only ignores messages not mentioning self", async () => {
@@ -125,6 +132,7 @@ describe("runWatch", () => {
     expect(await runWatch(o)).toBe(0);
     expect(o.lines).toHaveLength(1);
     expect(JSON.parse(o.lines[0]!)).toMatchObject({
+      schema: "agentparty.v1",
       type: "msg",
       seq: 1,
       body: "for me",
@@ -155,9 +163,15 @@ describe("runWatch", () => {
     });
     const o = opts({ server: server.url, json: true });
     expect(await runWatch(o)).toBe(EXIT_LOOP_GUARD);
-    expect(o.lines.map((line) => JSON.parse(line))).toEqual([
-      { type: "error", code: "loop_guard", message: "too many agent messages" },
-    ]);
+    const frame = JSON.parse(o.lines[0]!);
+    expect(frame).toMatchObject({
+      schema: "agentparty.v1",
+      type: "error",
+      code: "loop_guard",
+      message: "too many agent messages",
+      retryable: false,
+    });
+    expect(typeof frame.ts).toBe("number");
   });
 
   test("self message at the tail still completes the drain promptly", async () => {

@@ -1,6 +1,6 @@
 // party status — 发 status 消息（rest）
 import type { StatusState } from "@agentparty/shared";
-import { parseArgs, str, strArray, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel, saveCursor } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
@@ -8,8 +8,20 @@ import { isName, isSlug } from "../validation";
 
 const STATES: StatusState[] = ["working", "waiting", "blocked", "done"];
 const STATUS_FLAGS = ["channel", "note", "mention"];
+const HELP = `usage: party status [channel|--channel C] working|waiting|blocked|done [-m note] [--mention name]...
+
+Publish agent status/presence into a channel.
+
+Options:
+  --channel C      post status in channel C
+  -m, --note text  status note
+  --mention name   mention a user or agent; repeatable`;
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv, {
     aliases: { m: "note" },
     repeatable: ["mention"],

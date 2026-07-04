@@ -133,14 +133,34 @@ describe("whoami", () => {
     liveAccount(mock.url);
     const code = await whoamiRun(["--json"]);
     expect(code).toBe(0);
-    expect(JSON.parse(logs[0]!)).toMatchObject({
+    const frame = JSON.parse(logs[0]!);
+    expect(frame).toMatchObject({
+      schema: "agentparty.v1",
+      type: "whoami",
       logged_in: true,
       server: mock.url,
       name: "fan@example.com",
       email: "fan@example.com",
       kind: "human",
       role: "human",
+      channel_scope: null,
+      caps: {
+        send: true,
+        create_channel: true,
+        mint_agents: true,
+        scoped_to: null,
+      },
     });
+    expect(typeof frame.ts).toBe("number");
+  });
+
+  test("prints capabilities in text mode", async () => {
+    mock = startOidcMock();
+    liveAccount(mock.url);
+    const code = await whoamiRun(["--caps"]);
+    expect(code).toBe(0);
+    expect(logs.join("\n")).toContain("scope: none (all channels)");
+    expect(logs.join("\n")).toContain("can: send=yes create-channel=yes mint-agents=yes");
   });
 
   test("prints not logged in when no auth", async () => {
@@ -152,7 +172,14 @@ describe("whoami", () => {
   test("prints not logged in as json", async () => {
     const code = await whoamiRun(["--json"]);
     expect(code).toBe(0);
-    expect(JSON.parse(logs[0]!)).toEqual({ logged_in: false });
+    const frame = JSON.parse(logs[0]!);
+    expect(frame).toMatchObject({
+      schema: "agentparty.v1",
+      type: "whoami",
+      logged_in: false,
+      server: null,
+    });
+    expect(typeof frame.ts).toBe("number");
   });
 
   test("rejects unknown flags", async () => {

@@ -1,6 +1,6 @@
 // party token create — 需要 ADMIN_SECRET 环境变量
 import type { TokenRole } from "@agentparty/shared";
-import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readConfig } from "../config";
 import { createToken, handleRestError, revokeToken } from "../rest";
 import { isName, isSlug, normalizeServerUrl } from "../validation";
@@ -9,8 +9,23 @@ const ROLES: TokenRole[] = ["agent", "human", "readonly"];
 const TOKEN_FLAGS = ["server", "name", "role", "owner", "channel-scope"];
 const OWNER_MAX = 128;
 const OWNER_RE = /^[\x20-\x7e]{1,128}$/;
+const HELP = `usage: party token create --name n --role agent|human|readonly --owner label [--channel-scope slug]
+       party token revoke <name>
+
+Admin-only token management. Requires ADMIN_SECRET.
+
+Options:
+  --server URL           AgentParty server URL
+  --name n               token name
+  --role role            agent, human, or readonly
+  --owner label          printable owner label (required for create)
+  --channel-scope slug   restrict token to one channel`;
 
 export async function run(argv: string[]): Promise<number> {
+  if (isHelpArg(argv, { allowHelpPositional: true })) {
+    console.log(HELP);
+    return 0;
+  }
   const { positionals, flags } = parseArgs(argv);
   const unknown = unknownFlagError(flags, TOKEN_FLAGS);
   if (unknown !== null) {

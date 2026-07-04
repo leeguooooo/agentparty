@@ -1,0 +1,8 @@
+{
+  "schema": "agentparty.v1",
+  "type": "error",
+  "code": "unauthorized",
+  "message": "invalid or revoked token",
+  "retryable": false,
+  "ts": 1700000000000
+}
