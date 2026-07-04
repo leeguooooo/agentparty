@@ -85,6 +85,7 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
         presence,
         // welcome 首帧即知角色，readonly 分享链接不闪现输入框（spec §9）
         readonly: frame.role === "readonly" ? true : state.readonly,
+        loopGuard: frame.loop_guard ?? state.loopGuard,
       };
     }
     case "participants":

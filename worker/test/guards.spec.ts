@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { BODY_LIMIT, LOOP_GUARD_N, RATE_LIMIT_PER_MIN } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
-import { api, createChannel, postMessage, seedToken } from "./helpers";
+import { api, createChannel, postMessage, seedToken, WsClient } from "./helpers";
 
 async function errorCode(res: Response): Promise<string> {
   const body = (await res.json()) as { error: { code: string } };
@@ -17,6 +17,28 @@ async function avoidMinuteBoundary() {
 }
 
 describe("guards", () => {
+  it("welcome exposes active loop guard state", async () => {
+    const agent = await seedToken("agent");
+    const human = await seedToken("human");
+    const slug = await createChannel(agent.token);
+    const init = await WsClient.open(slug, agent.token);
+    await init.nextOfType("welcome");
+    init.close();
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO meta (key, value) VALUES ('agent_streak', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        String(LOOP_GUARD_N),
+      );
+    });
+
+    const ws = await WsClient.open(slug, human.token);
+    const welcome = await ws.nextOfType("welcome");
+    expect(welcome.loop_guard).toContain(String(LOOP_GUARD_N));
+    expect(welcome.loop_guard).toContain("waiting for a human");
+    ws.close();
+  });
+
   it("loop guard blocks the 31st consecutive agent message, human resets", async () => {
     const agentA = await seedToken("agent");
     const agentB = await seedToken("agent");

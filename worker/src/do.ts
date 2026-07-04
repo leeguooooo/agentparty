@@ -397,12 +397,14 @@ export class ChannelDO extends Server<Env> {
       connection.close(1008, "archived");
       return;
     }
+    const loopGuard = this.loopGuardMessage();
     this.sendFrame(connection, {
       type: "welcome",
       channel: this.name,
       self: state.name,
       mode: this.getMeta("mode") === "party" ? "party" : "normal",
       role: state.role,
+      loop_guard: loopGuard,
       participants: this.participants(),
       last_seq: this.lastSeq(),
       presence: this.presenceList(),
@@ -1112,13 +1114,12 @@ export class ChannelDO extends Server<Env> {
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
     }
-    // loop guard 分档（spec §3）：party 频道放宽到 200，阈值按 meta 缓存的 mode 选
-    const guardLimit = this.getMeta("mode") === "party" ? LOOP_GUARD_PARTY_N : LOOP_GUARD_N;
-    if (identity.kind === "agent" && this.agentStreak() >= guardLimit) {
+    const loopGuard = identity.kind === "agent" ? this.loopGuardMessage() : null;
+    if (loopGuard !== null) {
       return {
         ok: false,
         code: "loop_guard",
-        message: `${guardLimit} consecutive agent messages, waiting for a human`,
+        message: loopGuard,
       };
     }
     const now = Date.now();
@@ -1319,6 +1320,14 @@ export class ChannelDO extends Server<Env> {
 
   private agentStreak(): number {
     return Number(this.getMeta("agent_streak") ?? "0");
+  }
+
+  private loopGuardMessage(): string | null {
+    // loop guard 分档（spec §3）：party 频道放宽到 200，阈值按 meta 缓存的 mode 选
+    const guardLimit = this.getMeta("mode") === "party" ? LOOP_GUARD_PARTY_N : LOOP_GUARD_N;
+    return this.agentStreak() >= guardLimit
+      ? `${guardLimit} consecutive agent messages, waiting for a human`
+      : null;
   }
 
   private isArchived(): boolean {

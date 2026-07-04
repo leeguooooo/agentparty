@@ -150,6 +150,8 @@ export interface WelcomeFrame {
   mode?: ChannelMode;
   /** 连接方 token 的角色；web 据此在首帧就隐藏 readonly 的输入框（spec §9），旧客户端忽略即可 */
   role?: TokenRole;
+  /** 频道当前已被 loop guard 熔断时首帧提示；旧客户端忽略即可。 */
+  loop_guard?: string | null;
   participants: Sender[];
   last_seq: number;
   presence: PresenceEntry[];
