@@ -82,7 +82,7 @@ export function MessageCard({ msg, self }: Props) {
       msg.status?.summary_seq !== null && msg.status?.summary_seq !== undefined ? `summary #${msg.status.summary_seq}` : null,
     ].filter((part): part is string => typeof part === "string" && part !== "");
     return (
-      <div className="msg-status" data-state={msg.state ?? undefined} style={hueStyle}>
+      <div id={`msg-${msg.seq}`} className="msg-status" data-state={msg.state ?? undefined} style={hueStyle}>
         <span>
           <span className="msg-sender" title={senderTitle}>{msg.sender.name}</span>
           {owner !== null && (
@@ -126,7 +126,7 @@ export function MessageCard({ msg, self }: Props) {
           artifact.related_prs.length > 0 ? `PRs ${artifact.related_prs.map((n) => `#${n}`).join(", ")}` : null,
         ].filter((part): part is string => part !== null);
   return (
-    <article className={"d-card msg-card" + (mine ? " msg-card--own" : "")} style={hueStyle}>
+    <article id={`msg-${msg.seq}`} className={"d-card msg-card" + (mine ? " msg-card--own" : "")} style={hueStyle}>
       <header className="d-meta msg-head">
         <span className="msg-avatar" aria-hidden="true" />
         <span className="msg-sender" title={senderTitle}>{msg.sender.name}</span>

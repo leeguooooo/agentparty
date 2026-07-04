@@ -9,6 +9,7 @@ import { MessageCard } from "../components/MessageCard";
 import { PresenceBar } from "../components/PresenceBar";
 import { AuthError, ForbiddenError, fetchMessages, resetGuard, searchMessages } from "../lib/api";
 import { agentHue } from "../lib/agentColor";
+import { completionMessages } from "../lib/completions";
 import { catchupKey, summarizeCatchup, type CatchupDigest } from "../lib/digest";
 import {
   agentFilterSearch,
@@ -222,6 +223,55 @@ function SearchHitCard({ hit }: { hit: SearchHit }) {
   );
 }
 
+function CompletionPanel({
+  completions,
+  visible,
+  enabled,
+  onToggle,
+  onJump,
+}: {
+  completions: MsgFrame[];
+  visible: number;
+  enabled: boolean;
+  onToggle: () => void;
+  onJump: (seq: number) => void;
+}) {
+  if (completions.length === 0) return null;
+
+  return (
+    <section className="completion-panel" aria-label="completion artifacts">
+      <div className="completion-panel-head">
+        <h2 className="completion-title">Completions</h2>
+        <span className="t-mono completion-count">
+          {visible}/{completions.length}
+        </span>
+        <button className={"d-btn completion-toggle" + (enabled ? " is-active" : "")} type="button" onClick={onToggle}>
+          <span>{enabled ? "All" : "Only"}</span>
+        </button>
+      </div>
+      <ol className="completion-list">
+        {completions.slice(-6).reverse().map((message) => {
+          const artifact = message.completion_artifact!;
+          const meta = [
+            `kickoff #${artifact.kickoff_seq}`,
+            `${artifact.replies_count} replies`,
+            artifact.timeout ? "timeout" : "closed",
+          ];
+          return (
+            <li key={message.seq} className="completion-item">
+              <button className="t-mono completion-jump" type="button" onClick={() => onJump(message.seq)}>
+                #{message.seq}
+              </button>
+              <span className="completion-item-body">{message.body === "" ? "(empty)" : message.body}</span>
+              <span className="t-mono completion-meta">{meta.join(" · ")}</span>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 function DecisionPanel({ messages }: { messages: MsgFrame[] }) {
   const decisions = messages
     .filter((m) => m.kind === "status" && m.status?.decision !== undefined)
@@ -431,6 +481,7 @@ export function ChannelPage({
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [seenSeq, setSeenSeq] = useState<number | null>(null);
   const [teamNow, setTeamNow] = useState(() => Date.now());
+  const [completionOnly, setCompletionOnly] = useState(false);
   const [agentFilter, setAgentFilter] = useState<AgentFilter>(() => parseAgentFilter(window.location.search));
   const sockRef = useRef<ChannelSocket | null>(null);
   const streamRef = useRef<HTMLDivElement | null>(null);
@@ -596,8 +647,14 @@ export function ChannelPage({
     ]),
   ].sort((a, b) => a.localeCompare(b));
   const senderListId = `senders-${slug}`;
-  const visibleMessages = useMemo(() => filterByAgent(state.messages, agentFilter), [agentFilter, state.messages]);
-  const visibleTimeline = useMemo(() => groupTeamMessages(visibleMessages), [visibleMessages]);
+  const completions = useMemo(() => completionMessages(state.messages), [state.messages]);
+  const timelineMessages = completionOnly ? completions : state.messages;
+  const visibleMessages = useMemo(() => filterByAgent(timelineMessages, agentFilter), [agentFilter, timelineMessages]);
+  const visibleCompletions = useMemo(() => filterByAgent(completions, agentFilter), [agentFilter, completions]);
+  const visibleTimeline = useMemo(
+    () => completionOnly ? visibleMessages.map((message) => ({ type: "message" as const, message })) : groupTeamMessages(visibleMessages),
+    [completionOnly, visibleMessages],
+  );
   const visibleSearchHits = useMemo(() => filterByAgent(searchHits, agentFilter), [agentFilter, searchHits]);
   const teamSummaries = useMemo(
     () =>
@@ -614,7 +671,7 @@ export function ChannelPage({
     [slug, state.messages, state.presence, teamNow],
   );
   const agentFilterActive = agentFilter.agents.length > 0;
-  const totalInView = q === "" ? state.messages.length : searchHits.length;
+  const totalInView = q === "" ? timelineMessages.length : searchHits.length;
   const visibleInView = q === "" ? visibleMessages.length : visibleSearchHits.length;
 
   const setAgentMode = useCallback((mode: AgentFilterMode) => {
@@ -627,6 +684,14 @@ export function ChannelPage({
 
   const clearAgentFilter = useCallback(() => {
     setAgentFilter((current) => ({ ...current, agents: [] }));
+  }, []);
+
+  const jumpToCompletion = useCallback((seq: number) => {
+    setSearch("");
+    setCompletionOnly(true);
+    window.setTimeout(() => {
+      document.getElementById(`msg-${seq}`)?.scrollIntoView({ block: "center" });
+    }, 0);
   }, []);
 
   useEffect(() => {
@@ -720,6 +785,15 @@ export function ChannelPage({
       {q === "" && <HostBoardPanel board={hostBoard} />}
       {q === "" && <TeamPanel teams={teamSummaries} />}
       {q === "" && <DecisionPanel messages={state.messages} />}
+      {q === "" && (
+        <CompletionPanel
+          completions={completions}
+          visible={visibleCompletions.length}
+          enabled={completionOnly}
+          onToggle={() => setCompletionOnly((current) => !current)}
+          onJump={jumpToCompletion}
+        />
+      )}
       {(state.messages.length > 0 || q !== "") && (
         <div className="chan-search-panel">
           <div className="chan-search-row">
@@ -800,7 +874,7 @@ export function ChannelPage({
         )}
         {state.messages.length > 0 && q === "" && visibleMessages.length === 0 && (
           <p className="d-empty" role="status" aria-live="polite">
-            no messages match selected agents
+            {completionOnly ? "no completion artifacts match selected agents" : "no messages match selected agents"}
           </p>
         )}
         {q !== "" && !searchLoading && searchHits.length === 0 && searchInputError === null && searchError === null && (
