@@ -15,10 +15,17 @@ export function MessageCard({ msg, self }: Props) {
   // 每个 agent 一个确定性色相：CSS 用 --ah 套 hsl() 给头像点/名字/卡片左条上色
   const hueStyle = { "--ah": agentHue(msg.sender.name) } as CSSProperties;
   const owner = msg.sender.owner && msg.sender.owner !== msg.sender.name ? msg.sender.owner : null;
+  const lineage = msg.sender.lineage ?? null;
+  const lineageLabel = lineage === null ? null : `child of ${lineage.parent_agent}`;
   const senderTitle = [
     `sender: ${msg.sender.name}`,
     `kind: ${msg.sender.kind}`,
     owner ? `owner: ${owner}` : null,
+    lineage ? `parent: ${lineage.parent_agent}` : null,
+    lineage ? `root: ${lineage.root_agent}` : null,
+    lineage ? `team: ${lineage.team_id}` : null,
+    lineage ? `depth: ${lineage.depth}` : null,
+    lineage?.expires_at ? `expires: ${fmtTime(lineage.expires_at)}` : null,
   ]
     .filter((part): part is string => part !== null)
     .join("\n");
@@ -45,6 +52,11 @@ export function MessageCard({ msg, self }: Props) {
             <span className="t-mono msg-owner" title={`owner: ${owner}`}>
               {" "}
               · {owner}
+            </span>
+          )}{" "}
+          {lineageLabel !== null && (
+            <span className="t-mono msg-lineage" title={senderTitle}>
+              {lineageLabel}
             </span>
           )}{" "}
           → {msg.state}
@@ -74,6 +86,11 @@ export function MessageCard({ msg, self }: Props) {
         {owner !== null && (
           <span className="t-mono msg-owner" title={`owner: ${owner}`}>
             · {owner}
+          </span>
+        )}
+        {lineageLabel !== null && (
+          <span className="t-mono msg-lineage" title={senderTitle}>
+            {lineageLabel}
           </span>
         )}
         <span className={"msg-kind" + (msg.sender.kind === "human" ? " msg-kind--human" : "")}>

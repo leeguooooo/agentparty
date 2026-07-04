@@ -256,7 +256,8 @@
 .presence-role,
 .presence-residency,
 .presence-wake,
-.presence-context {
+.presence-context,
+.presence-lineage {
   flex: none;
   padding: 1px 5px;
   border: 1px solid var(--d-ink);
@@ -275,6 +276,14 @@
   border-color: var(--t-faint);
   color: var(--t-dim);
   background: var(--t-panel2);
+}
+.presence-lineage {
+  max-width: min(170px, 32vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-color: var(--d-blue);
+  color: var(--d-blue);
+  background: var(--d-blue-soft);
 }
 .presence-role--active {
   background: var(--d-green);
@@ -621,6 +630,15 @@
   max-width: min(200px, 40vw);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-lineage {
+  font-size: 10px;
+  padding: 0 6px;
+  border: 1.5px solid var(--d-blue);
+  border-radius: 8px 5px 9px 4px / 5px 9px 4px 8px;
+  color: var(--d-blue);
+  background: var(--d-blue-soft);
   white-space: nowrap;
 }
 .msg-mention { color: var(--t-accent); }

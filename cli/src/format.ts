@@ -3,7 +3,8 @@ import type { MsgFrame } from "@agentparty/shared";
 
 function formatSender(m: MsgFrame): string {
   const owner = m.sender.owner && m.sender.owner !== m.sender.name ? ` owner=${m.sender.owner}` : "";
-  return `${m.sender.name}(${m.sender.kind}${owner})`;
+  const lineage = m.sender.lineage ? ` parent=${m.sender.lineage.parent_agent} team=${m.sender.lineage.team_id}` : "";
+  return `${m.sender.name}(${m.sender.kind}${owner}${lineage})`;
 }
 
 export function formatMsg(m: MsgFrame): string {

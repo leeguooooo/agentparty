@@ -26,6 +26,7 @@ interface Item {
   wakeKind: NonNullable<PresenceEntry["wake"]>["kind"] | null;
   wakeVerifiedAt: number | null;
   context: PresenceEntry["context"] | null;
+  lineage: NonNullable<PresenceEntry["lineage"]> | null;
   owner: string | null; // 所属人：agent 的操作者 / 人类的 email，仅连接中的参与者可知
 }
 
@@ -77,7 +78,8 @@ export function PresenceBar({ presence, participants, status, party = false, isP
   const names = [...new Set([...participants.map((p) => p.name), ...Object.keys(presence)])].sort();
   const items: Item[] = names.map((name) => {
     const entry = presence[name];
-    const owner = byName.get(name)?.owner ?? null;
+    const sender = byName.get(name);
+    const owner = sender?.owner ?? null;
     const connected = byName.has(name);
     const meta = {
       lastSeen: entry?.last_seen ?? null,
@@ -87,6 +89,7 @@ export function PresenceBar({ presence, participants, status, party = false, isP
       wakeKind: entry?.wake?.kind ?? null,
       wakeVerifiedAt: entry?.wake?.verified_at ?? null,
       context: entry?.context ?? null,
+      lineage: entry?.lineage ?? sender?.lineage ?? null,
     };
     if (!connected) {
       return { name, state: "offline", note: null, ts: entry?.ts ?? null, owner: null, ...meta };
@@ -118,6 +121,11 @@ export function PresenceBar({ presence, participants, status, party = false, isP
           it.context?.workspace_id !== undefined ? `workspace id: ${it.context.workspace_id}` : null,
           it.context?.workspace_label !== undefined ? `workspace: ${it.context.workspace_label}` : null,
           it.context?.worktree_label !== undefined ? `worktree: ${it.context.worktree_label}` : null,
+          it.lineage !== null ? `parent: ${it.lineage.parent_agent}` : null,
+          it.lineage !== null ? `root: ${it.lineage.root_agent}` : null,
+          it.lineage !== null ? `team: ${it.lineage.team_id}` : null,
+          it.lineage !== null ? `depth: ${it.lineage.depth}` : null,
+          it.lineage?.expires_at ? `expires: ${fmtRel(it.lineage.expires_at)}` : null,
           it.lastSeen !== null ? `last seen: ${fmtRel(it.lastSeen)}` : null,
         ].filter((part): part is string => part !== null);
         return (
@@ -139,6 +147,9 @@ export function PresenceBar({ presence, participants, status, party = false, isP
               <span className={`t-mono presence-role${activeHost ? " presence-role--active" : ""}`}>
                 {badge}
               </span>
+            )}
+            {it.lineage !== null && (
+              <span className="t-mono presence-lineage">child:{it.lineage.parent_agent}</span>
             )}
             {residency !== null && <span className="t-mono presence-residency">{residency}</span>}
             {wakeability !== null && (

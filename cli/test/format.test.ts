@@ -47,4 +47,25 @@ describe("formatMsg", () => {
       ),
     ).toBe("[7] agent-a(agent owner=team-a) {completion}: hello\n    [completion: kickoff=#3 · replies=0 · timeout=true · issues=#5]");
   });
+
+  test("prints lineage context when available", () => {
+    expect(
+      formatMsg(
+        msgFrame({
+          sender: {
+            name: "child-a",
+            kind: "agent",
+            owner: "team-a",
+            lineage: {
+              parent_agent: "parent-a",
+              root_agent: "parent-a",
+              team_id: "team-run",
+              depth: 1,
+              expires_at: 1_725_000_060_000,
+            },
+          },
+        }),
+      ),
+    ).toBe("[7] child-a(agent owner=team-a parent=parent-a team=team-run): hello");
+  });
 });
