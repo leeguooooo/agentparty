@@ -1,10 +1,10 @@
-// party digest — structured catch-up over recent history, without claiming wake/resume.
-import type { MsgFrame, StatusState } from "@agentparty/shared";
+// party digest — structured catch-up over recent history, separating mention/wake/resume.
+import type { MsgFrame, StatusState, WakeDelivery } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { loadCursor, resolveChannel } from "../config";
 import { jsonFrame, nowTs } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { fetchMe, fetchMessages, handleRestError } from "../rest";
+import { RestError, fetchMe, fetchMessages, fetchWakeDeliveries, handleRestError } from "../rest";
 import { isName, isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
 const DIGEST_FLAGS = ["channel", "since", "limit", "for", "json"];
@@ -25,12 +25,21 @@ interface InboxMentionDigest {
   from: string;
   body: string;
   ts: number;
+  wake_invoked: boolean;
 }
 
 interface RespondedMentionDigest extends InboxMentionDigest {
   response_seq: number;
   evidence: "reply_to" | "status.summary_seq";
-  wake_invoked: false;
+}
+
+interface WokenMentionDigest extends InboxMentionDigest {
+  adapter: string;
+  attempt: number;
+  result: "ok" | "failed";
+  http_status: number | null;
+  error: string | null;
+  attempted_at: number;
 }
 
 interface StatusDigest {
@@ -80,17 +89,32 @@ function responseEvidence(mention: MsgFrame, candidate: MsgFrame): RespondedMent
 function summarizeMentions(
   messages: MsgFrame[],
   viewer: string | null,
-): { inbox: InboxMentionDigest[]; responded: RespondedMentionDigest[] } {
-  if (viewer === null) return { inbox: [], responded: [] };
+  deliveries: Map<number, WakeDelivery>,
+): { inbox: InboxMentionDigest[]; responded: RespondedMentionDigest[]; woken: WokenMentionDigest[] } {
+  if (viewer === null) return { inbox: [], responded: [], woken: [] };
   const inbox: InboxMentionDigest[] = [];
   const responded: RespondedMentionDigest[] = [];
+  const woken: WokenMentionDigest[] = [];
   for (const mention of messages.filter((m) => m.mentions.includes(viewer))) {
+    const delivery = deliveries.get(mention.seq) ?? null;
     const base = {
       seq: mention.seq,
       from: mention.sender.name,
       body: firstLine(mention.body),
       ts: mention.ts,
+      wake_invoked: delivery !== null,
     };
+    if (delivery !== null) {
+      woken.push({
+        ...base,
+        adapter: delivery.adapter_kind,
+        attempt: delivery.attempt,
+        result: delivery.result,
+        http_status: delivery.http_status,
+        error: delivery.error,
+        attempted_at: delivery.attempted_at,
+      });
+    }
     const response = messages
       .filter((candidate) => candidate.seq > mention.seq && candidate.sender.name === viewer)
       .map((candidate) => ({ candidate, evidence: responseEvidence(mention, candidate) }))
@@ -100,13 +124,48 @@ function summarizeMentions(
         ...base,
         response_seq: response.candidate.seq,
         evidence: response.evidence,
-        wake_invoked: false,
       });
     } else {
       inbox.push(base);
     }
   }
-  return { inbox, responded };
+  return { inbox, responded, woken };
+}
+
+function latestWakeDeliveries(deliveries: WakeDelivery[]): Map<number, WakeDelivery> {
+  const byMention = new Map<number, WakeDelivery>();
+  for (const d of deliveries) {
+    const prev = byMention.get(d.mention_seq);
+    if (
+      prev === undefined ||
+      d.attempt > prev.attempt ||
+      (d.attempt === prev.attempt && d.attempted_at > prev.attempted_at)
+    ) {
+      byMention.set(d.mention_seq, d);
+    }
+  }
+  return byMention;
+}
+
+async function fetchDigestWakeDeliveries(
+  server: string,
+  token: string,
+  channel: string,
+  viewer: string | null,
+  since: number,
+  limit: number,
+): Promise<WakeDelivery[]> {
+  if (viewer === null) return [];
+  try {
+    return await fetchWakeDeliveries(server, token, channel, {
+      since: since + 1,
+      target: viewer,
+      limit: Math.min(limit, 100),
+    });
+  } catch (e) {
+    if (e instanceof RestError && (e.status === 404 || e.status === 501)) return [];
+    throw e;
+  }
 }
 
 function printHuman(input: {
@@ -118,10 +177,11 @@ function printHuman(input: {
   statuses: StatusDigest[];
   inboxMentions: InboxMentionDigest[];
   respondedMentions: RespondedMentionDigest[];
+  wokenMentions: WokenMentionDigest[];
 }) {
   console.log(`digest ${input.channel} #${input.since + 1}..#${input.lastSeq} (${input.total} messages)`);
   console.log(`viewer: ${input.viewer ?? "unknown"}`);
-  console.log("wake: not claimed; mentions are inbox until a wake adapter and linked fresh ack/status");
+  console.log("wake: delivery ledger is separate from linked fresh ack/status");
   if (input.inboxMentions.length > 0) {
     console.log("");
     console.log("inbox mentions:");
@@ -133,7 +193,16 @@ function printHuman(input: {
     console.log("");
     console.log("responded mentions:");
     for (const m of input.respondedMentions) {
-      console.log(`- #${m.seq} ${m.from} -> #${m.response_seq} evidence=${m.evidence}`);
+      console.log(`- #${m.seq} ${m.from} -> #${m.response_seq} evidence=${m.evidence}${m.wake_invoked ? " wake=invoked" : ""}`);
+    }
+  }
+  if (input.wokenMentions.length > 0) {
+    console.log("");
+    console.log("wake deliveries:");
+    for (const m of input.wokenMentions) {
+      const status = m.http_status === null ? "" : ` status=${m.http_status}`;
+      const error = m.error ? ` error=${m.error}` : "";
+      console.log(`- #${m.seq} ${m.adapter} attempt=${m.attempt} result=${m.result}${status}${error}`);
     }
   }
   if (input.statuses.length > 0) {
@@ -210,8 +279,9 @@ export async function run(argv: string[]): Promise<number> {
         .then((me) => me.name)
         .catch(() => null));
     const messages = await fetchMessages(cfg.server, cfg.token, channel, sinceSeq, scanLimit);
+    const deliveries = await fetchDigestWakeDeliveries(cfg.server, cfg.token, channel, viewer, sinceSeq, scanLimit);
     const statuses = summarizeStatuses(messages);
-    const mentions = summarizeMentions(messages, viewer);
+    const mentions = summarizeMentions(messages, viewer, latestWakeDeliveries(deliveries));
     const lastSeq = messages.reduce((max, m) => Math.max(max, m.seq), sinceSeq);
     const frame = {
       type: "digest",
@@ -225,15 +295,16 @@ export async function run(argv: string[]): Promise<number> {
         statuses: statuses.length,
         inbox_mentions: mentions.inbox.length,
         responded_mentions: mentions.responded.length,
-        wake_invoked: 0,
-        resumed: 0,
+        wake_invoked: mentions.woken.length,
+        resumed: mentions.responded.length,
       },
       statuses,
       inbox_mentions: mentions.inbox,
       responded_mentions: mentions.responded,
+      woken_mentions: mentions.woken,
       wake_contract: {
         mentioned: "durable inbox item only",
-        wake_invoked: "not inferred by digest",
+        wake_invoked: "durable adapter delivery ledger",
         resumed: "requires linked fresh ack/status",
       },
     };
@@ -248,6 +319,7 @@ export async function run(argv: string[]): Promise<number> {
         statuses,
         inboxMentions: mentions.inbox,
         respondedMentions: mentions.responded,
+        wokenMentions: mentions.woken,
       });
     return 0;
   } catch (e) {

@@ -803,7 +803,7 @@ describe("party status/history channel flag", () => {
     expect(r.stderr).toContain("need a query");
   });
 
-  test("digest --json separates mentioned inbox from responded and never infers wake", async () => {
+  test("digest --json separates mentioned inbox, wake delivery, and linked responses", async () => {
     mock = startRestMock((req) => {
       if (req.method === "GET" && req.path === "/api/channels/dev/messages") {
         return Response.json({
@@ -916,6 +916,25 @@ describe("party status/history channel flag", () => {
           ],
         });
       }
+      if (req.method === "GET" && req.path === "/api/channels/dev/wake-deliveries") {
+        return Response.json({
+          deliveries: [
+            {
+              mention_seq: 14,
+              target_name: "agent",
+              webhook_name: "agent",
+              adapter_kind: "webhook",
+              attempt: 1,
+              result: "failed",
+              http_status: 503,
+              error: "Service Unavailable",
+              attempted_at: 116,
+              ack_seq: null,
+              resume_seq: null,
+            },
+          ],
+        });
+      }
       return undefined;
     });
     writeCfg(mock.url);
@@ -929,10 +948,10 @@ describe("party status/history channel flag", () => {
       since: 10,
       last_seq: 17,
       viewer: "agent",
-      counts: { messages: 7, statuses: 2, inbox_mentions: 1, responded_mentions: 2, wake_invoked: 0, resumed: 0 },
+      counts: { messages: 7, statuses: 2, inbox_mentions: 1, responded_mentions: 2, wake_invoked: 1, resumed: 2 },
       wake_contract: {
         mentioned: "durable inbox item only",
-        wake_invoked: "not inferred by digest",
+        wake_invoked: "durable adapter delivery ledger",
         resumed: "requires linked fresh ack/status",
       },
     });
@@ -941,11 +960,18 @@ describe("party status/history channel flag", () => {
       owner: "worker-a",
       scope: ["cli/src/commands/digest.ts"],
     });
-    expect(frame.inbox_mentions).toEqual([expect.objectContaining({ seq: 14, from: "host" })]);
+    expect(frame.inbox_mentions).toEqual([expect.objectContaining({ seq: 14, from: "host", wake_invoked: true })]);
     expect(frame.responded_mentions).toEqual([
       expect.objectContaining({ seq: 12, response_seq: 13, evidence: "status.summary_seq", wake_invoked: false }),
       expect.objectContaining({ seq: 16, response_seq: 17, evidence: "reply_to", wake_invoked: false }),
     ]);
+    expect(frame.woken_mentions).toEqual([
+      expect.objectContaining({ seq: 14, adapter: "webhook", attempt: 1, result: "failed", http_status: 503 }),
+    ]);
+    expect(reqsOf(mock, "GET", "/api/channels/dev/wake-deliveries")[0]!.query).toMatchObject({
+      since: "11",
+      target: "agent",
+    });
   });
 
   test("digest --since last-seen uses the bound channel cursor", async () => {

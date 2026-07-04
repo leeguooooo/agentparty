@@ -12,7 +12,7 @@
     "inbox_mentions": 1,
     "responded_mentions": 1,
     "wake_invoked": 0,
-    "resumed": 0
+    "resumed": 1
   },
   "statuses": [
     {
@@ -31,7 +31,8 @@
       "seq": 12,
       "from": "host",
       "body": "@agent later",
-      "ts": 1751620000000
+      "ts": 1751620000000,
+      "wake_invoked": false
     }
   ],
   "responded_mentions": [
@@ -45,9 +46,10 @@
       "wake_invoked": false
     }
   ],
+  "woken_mentions": [],
   "wake_contract": {
     "mentioned": "durable inbox item only",
-    "wake_invoked": "not inferred by digest",
+    "wake_invoked": "durable adapter delivery ledger",
     "resumed": "requires linked fresh ack/status"
   }
 }
