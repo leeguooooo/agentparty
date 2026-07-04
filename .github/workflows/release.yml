@@ -62,6 +62,28 @@ jobs:
           bun build --compile --target=${{ matrix.target }} \
             ./src/index.ts --outfile "party${{ matrix.ext }}"
 
+      # #9 release-asset smoke：跑「真二进制」验 json 契约 + stdout/stderr/exit，
+      # 堵 v0.2.7 那种「源码测试过了但打包入口/旧 binary 行为脱节」。只在 runner 原生的 linux-x64 跑。
+      - name: json contract smoke
+        if: matrix.target == 'bun-linux-x64'
+        working-directory: cli
+        env:
+          AGENTPARTY_HOME: ${{ runner.temp }}/ap-smoke # 干净隔离，无残留 config/account
+        run: |
+          set -euo pipefail
+          echo "version=$(./party --version)"
+          # whoami --json（未登录）：schema/type/logged_in 且 stdout-only（stderr 须空）
+          out="$(./party whoami --json 2>/tmp/w.err)"
+          echo "$out" | jq -e '.schema=="agentparty.v1" and .type=="whoami" and .logged_in==false' >/dev/null
+          if [ -s /tmp/w.err ]; then echo "FAIL: whoami --json 不该往 stderr 写"; cat /tmp/w.err; exit 1; fi
+          # per-command --help：exit 0 + usage 到 stdout
+          ./party history --help | grep -q usage
+          # 错误路径 history --json（无 config）：exit≠0 + stdout 空 + stderr 有错（transport 契约）
+          if ./party history --json >/tmp/hj.out 2>/tmp/hj.err; then echo "FAIL: 应非零退出"; exit 1; fi
+          if [ -s /tmp/hj.out ]; then echo "FAIL: 错误路径 stdout 应为空"; cat /tmp/hj.out; exit 1; fi
+          grep -q "no config" /tmp/hj.err
+          echo "json contract smoke ✅"
+
       # 打 tar.gz + sha256（资产名与 install.sh/ps1 请求一致：party-<asset>.tar.gz）
       # sha256 文件里存 tar.gz 的名字，install 侧直接取第一段 hash 比对。
       - name: package

@@ -105,6 +105,21 @@ describe("cli subprocess", () => {
     expect(r.stdout.trim()).toBe("TIMEOUT");
   }, 15_000);
 
+  test("watch accepts --exclude-self as an explicit no-op flag", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") sock.send(welcomeFrame(0));
+    });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ server: server.url, token: "ap_tok" }),
+    );
+    const r = await runCli(["watch", "dev", "--exclude-self", "--timeout", "1"]);
+    expect(r.code).toBe(2);
+    expect(r.stdout.trim()).toBe("TIMEOUT");
+    expect(r.stderr).toBe("");
+  }, 15_000);
+
   test("watch --channel 优先于绑定频道", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") sock.send(welcomeFrame(0));

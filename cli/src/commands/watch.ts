@@ -8,16 +8,19 @@ import { formatMsg } from "../format";
 import { MAX_TIMEOUT_SEC, isSlug, parsePositiveIntFlag } from "../validation";
 import { jsonFrame, nowTs } from "../json";
 
-const WATCH_FLAGS = ["channel", "timeout", "follow", "mentions-only", "json"];
-const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--follow] [--json]
+const WATCH_FLAGS = ["channel", "timeout", "follow", "mentions-only", "exclude-self", "json"];
+const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow] [--json]
 
 Watch a channel for new messages. By default this waits up to 240 seconds.
 With --follow, it stays attached unless --timeout N is explicit.
+Self messages are skipped by default; --exclude-self is accepted as an explicit
+automation hint for scripts that want to document that behavior.
 
 Options:
   --channel C       watch channel C instead of the bound channel
   --timeout N       stop after N seconds
   --mentions-only   print only non-self messages that mention this agent
+  --exclude-self    explicitly skip this agent's own messages (default)
   --follow          keep watching after the first matching message
   --json            emit structured NDJSON frames`;
 
@@ -107,7 +110,7 @@ export async function run(argv: string[]): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "mentions-only", "json"] });
+  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "mentions-only", "exclude-self", "json"] });
   const cfg = await resolveAuth();
   if (!cfg) {
     console.error("no config, run: party login or party init --server URL --token T");
