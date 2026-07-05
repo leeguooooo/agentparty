@@ -31,16 +31,18 @@ export interface ExtractedBearer {
 export interface OidcConfig {
   issuer: string;
   clientId: string;
+  acceptedClientIds: string[];
 }
 
 export function oidcConfigFromEnv(env: {
   OIDC_ISSUER?: string;
   OIDC_CLIENT_ID?: string;
-}): OidcConfig | null {
+}, extraClientIds: string[] = []): OidcConfig | null {
   const issuer = env.OIDC_ISSUER?.trim();
   const clientId = env.OIDC_CLIENT_ID?.trim();
   if (!issuer || !clientId) return null;
-  return { issuer: issuer.replace(/\/+$/, ""), clientId };
+  const acceptedClientIds = [...new Set([clientId, ...extraClientIds.map((id) => id.trim()).filter(Boolean)])];
+  return { issuer: issuer.replace(/\/+$/, ""), clientId, acceptedClientIds };
 }
 
 export async function sha256Hex(input: string): Promise<string> {
@@ -233,10 +235,11 @@ async function verifyOidcToken(token: string, oidc: OidcConfig): Promise<TokenId
   if (!claims || !claims.sub) return null;
   // iss / aud / exp 校验（aud 允许字符串或数组）
   if (claims.iss !== oidc.issuer) return null;
+  const acceptedClientIds = oidc.acceptedClientIds.length > 0 ? oidc.acceptedClientIds : [oidc.clientId];
   const audMatch =
     typeof claims.aud === "string"
-      ? claims.aud === oidc.clientId
-      : Array.isArray(claims.aud) && claims.aud.includes(oidc.clientId);
+      ? acceptedClientIds.includes(claims.aud)
+      : Array.isArray(claims.aud) && claims.aud.some((aud) => acceptedClientIds.includes(aud));
   if (!audMatch) return null;
   const nowSec = Math.floor(Date.now() / 1000);
   if (typeof claims.exp !== "number" || claims.exp <= nowSec) return null;

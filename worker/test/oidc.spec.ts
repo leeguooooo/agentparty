@@ -72,6 +72,12 @@ describe("oidcConfigFromEnv", () => {
     expect(oidcConfigFromEnv({ OIDC_ISSUER: "https://x/", OIDC_CLIENT_ID: "c" })).toEqual({
       issuer: "https://x",
       clientId: "c",
+      acceptedClientIds: ["c"],
+    });
+    expect(oidcConfigFromEnv({ OIDC_ISSUER: "https://x/", OIDC_CLIENT_ID: "web" }, ["cli"])).toEqual({
+      issuer: "https://x",
+      clientId: "web",
+      acceptedClientIds: ["web", "cli"],
     });
   });
 });
@@ -110,6 +116,14 @@ describe("lookupToken OIDC verification", () => {
   it("rejects a JWT whose aud is not the client_id", async () => {
     const issuer = freshIssuer();
     expect(await lookupToken(env.DB, await signJwt(claims(issuer, { aud: "other" })), oidc(issuer))).toBeNull();
+  });
+
+  it("accepts a JWT whose aud is an extra trusted client_id", async () => {
+    const issuer = freshIssuer();
+    mockJwks(issuer);
+    const config = oidcConfigFromEnv({ OIDC_ISSUER: issuer, OIDC_CLIENT_ID: CLIENT_ID }, ["agentparty-cli"]);
+    const id = await lookupToken(env.DB, await signJwt(claims(issuer, { aud: "agentparty-cli" })), config);
+    expect(id).toMatchObject({ role: "human", account: "u@leeguoo.com" });
   });
 
   it("rejects a JWT whose iss mismatches the configured issuer", async () => {
@@ -166,6 +180,18 @@ describe("oidc end-to-end via SELF.fetch", () => {
       channel_scope: null,
       lineage: null,
       // OIDC 人类：非 readonly 能发/建频道；有 account 能自助铸 agent；无 scope；spawn 只给 scoped parent agent
+      caps: { send: true, create_channel: true, mint_agents: true, spawn_children: false, scoped_to: null },
+    });
+
+    const cliAudJwt = await signJwt(
+      claims(CONFIGURED_ISSUER, { aud: "agentparty-cli", sub: "cli-user", email: "cli@leeguoo.com" }),
+    );
+    const cliMe = await SELF.fetch("http://ap.test/api/me", { headers: { authorization: `Bearer ${cliAudJwt}` } });
+    expect(cliMe.status).toBe(200);
+    expect(await cliMe.json()).toMatchObject({
+      name: "cli-user",
+      email: "cli@leeguoo.com",
+      role: "human",
       caps: { send: true, create_channel: true, mint_agents: true, spawn_children: false, scoped_to: null },
     });
 

@@ -209,7 +209,7 @@ const requireBearer = createMiddleware<AppContext>(async (c, next) => {
         c.req.path.endsWith("/ws") &&
         c.req.header("upgrade")?.toLowerCase() === "websocket",
     });
-    const identity = bearer ? await lookupToken(c.env.DB, bearer.token, oidcConfigFromEnv(c.env)) : null;
+    const identity = bearer ? await lookupToken(c.env.DB, bearer.token, oidcConfigFromEnv(c.env, [CLI_CLIENT_ID])) : null;
     if (!identity) {
       return c.json(errorBody("unauthorized", "invalid or revoked token"), 401);
     }
@@ -337,7 +337,7 @@ app.get("/openapi.json", (c) => c.json(openapiDocument));
 // 公开配置：web 据此决定是否显示 "Sign in with leeguoo"（未配 OIDC 时 oidc:null）；
 // cli_client_id 供 CLI party login 知道用哪个 public client 跑回环 PKCE（spec §4）
 app.get("/api/config", (c) => {
-  const oidc = oidcConfigFromEnv(c.env);
+  const oidc = oidcConfigFromEnv(c.env, [CLI_CLIENT_ID]);
   return c.json({
     oidc: oidc ? { issuer: oidc.issuer, client_id: oidc.clientId } : null,
     cli_client_id: CLI_CLIENT_ID,
