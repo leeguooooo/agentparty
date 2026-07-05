@@ -220,4 +220,39 @@ describe("webhook dispatch is off the send path", () => {
       ],
     });
   });
+
+  it("links wake delivery rows when the target resumes before delivery is recorded", async () => {
+    const { token } = await seedToken("agent");
+    const target = uniq("wake-target");
+    const { token: targetToken } = await seedToken("agent", target);
+    const slug = await createChannel(token);
+    expect((await addWebhook(slug, token, target, "https://race-ledger.test/wake", "mentions")).status).toBe(201);
+
+    fetchMock
+      .get("https://race-ledger.test")
+      .intercept({ path: "/wake", method: "POST" })
+      .reply(200, "ok")
+      .delay(150);
+
+    expect((await sendMessage(slug, token, `@${target} ping`, [target])).status).toBe(200);
+    expect(
+      (
+        await api(`/api/channels/${slug}/messages`, targetToken, {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "status",
+            state: "done",
+            note: "resumed before ledger insert",
+            mentions: [],
+            summary_seq: 1,
+          }),
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise((r) => setTimeout(r, 250));
+
+    expect(await ledgerRows(slug)).toEqual([
+      expect.objectContaining({ mention_seq: 1, target_name: target, ack_seq: null, resume_seq: 2 }),
+    ]);
+  });
 });

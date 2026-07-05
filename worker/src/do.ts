@@ -1192,12 +1192,13 @@ export class ChannelDO extends Server<Env> {
     attempt: number;
     delivery: WebhookDeliveryResult;
   }) {
+    const resume = this.findExistingWakeResume(args.targetName, args.mentionSeq);
     this.ctx.storage.sql.exec(
       `INSERT INTO wake_delivery_ledger (
          mention_seq, target_name, webhook_name, adapter_kind, attempt,
          result, http_status, error, attempted_at, ack_seq, resume_seq
        )
-       VALUES (?, ?, ?, 'webhook', ?, ?, ?, ?, ?, NULL, NULL)`,
+       VALUES (?, ?, ?, 'webhook', ?, ?, ?, ?, ?, ?, ?)`,
       args.mentionSeq,
       args.targetName,
       args.webhookName,
@@ -1206,7 +1207,38 @@ export class ChannelDO extends Server<Env> {
       args.delivery.status,
       args.delivery.error,
       Date.now(),
+      resume.ackSeq,
+      resume.resumeSeq,
     );
+  }
+
+  private findExistingWakeResume(targetName: string, mentionSeq: number): { ackSeq: number | null; resumeSeq: number | null } {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT seq, reply_to, status_summary_seq
+           FROM messages
+          WHERE seq > ?
+            AND sender_name = ?
+            AND retracted_at IS NULL
+            AND (reply_to = ? OR status_summary_seq = ?)
+          ORDER BY seq`,
+        mentionSeq,
+        targetName,
+        mentionSeq,
+        mentionSeq,
+      )
+      .toArray();
+    let ackSeq: number | null = null;
+    let resumeSeq: number | null = null;
+    for (const row of rows) {
+      const seq = Number(row.seq);
+      if (ackSeq === null && row.reply_to !== null && Number(row.reply_to) === mentionSeq) ackSeq = seq;
+      if (resumeSeq === null && row.status_summary_seq !== null && Number(row.status_summary_seq) === mentionSeq) {
+        resumeSeq = seq;
+      }
+      if (ackSeq !== null && resumeSeq !== null) break;
+    }
+    return { ackSeq, resumeSeq };
   }
 
   private seqFromWebhookPayload(payload: string): number {
