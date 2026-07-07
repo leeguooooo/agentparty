@@ -2,8 +2,16 @@
 // 用外部 supervisor 唤醒（wake GOAL 的 session 型那半；有入站 URL 的 runtime 走 webhook）。
 // 复用 client.connect 的自动重连帧流，真正常驻；命令串行执行（一条处理完再下一条，不并发抢跑）。
 import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, type MsgFrame } from "@agentparty/shared";
-import { unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
@@ -20,6 +28,48 @@ const PROTOCOL_REMINDER =
 // context file 里附带的最近频道消息条数上限（冷起的 runner 不用先跑 history 也有基本上下文）
 const RECENT_MAX = 20;
 const RECENT_BODY_MAX = 400;
+const RUNNER_SESSION_FILE = "wake-session.json";
+const RUNNER_LOG_FILE = "serve-runner.log";
+
+export type RunnerHarness = "codex" | "claude";
+
+export interface RunnerProcessResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface RunnerProcessOptions {
+  cwd: string;
+  env: Record<string, string | undefined>;
+}
+
+export type RunnerProcess = (
+  args: string[],
+  opts: RunnerProcessOptions,
+) => Promise<RunnerProcessResult>;
+
+interface WakeSessionState {
+  harness: RunnerHarness;
+  session_id: string;
+  created_at: number;
+  last_wake_ts: number;
+  wakes: number;
+}
+
+export interface BuiltinRunnerOptions {
+  server: string;
+  token: string;
+  channel: string;
+  harness: RunnerHarness;
+  workdir: string;
+  repo?: string;
+  runProcess?: RunnerProcess;
+  runGit?: RunnerProcess;
+  authSourceFile?: string;
+  now?: () => number;
+  post?: typeof postMessage;
+}
 
 // 把一条 @mention 的完整上下文落成 JSON 文件，命令拿路径读——避开 env/stdin 的 shell quoting/注入，
 // 也让 runner 能一次拿全 channel/seq/sender/body/reply_to/recent/protocol_reminder（评审建议）。
@@ -58,8 +108,8 @@ export function writeContextFile(frame: MsgFrame, channel: string, self: string,
   return path;
 }
 
-const SERVE_FLAGS = ["channel", "on-mention", "all"];
-const HELP = `usage: party serve [channel|--channel C] --on-mention "<cmd>" [--all]
+const SERVE_FLAGS = ["channel", "on-mention", "all", "runner", "workdir", "repo"];
+const HELP = `usage: party serve [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude) [--all]
 
 Stay attached to a channel and run one local command for each matching message.
 The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
@@ -67,6 +117,10 @@ The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
 Options:
   --channel C          serve channel C instead of the bound channel
   --on-mention "<cmd>" command to run for each wake
+  --runner codex|claude
+                       use the built-in isolated wake runner instead of a custom command
+  --workdir DIR        runner workdir (default: ~/.agentparty/runners/<channel>)
+  --repo URL           clone into workdir/repo once, then git pull --ff-only before each wake
   --all                run for every non-self message, not only @mentions`;
 
 export interface ServeOptions {
@@ -77,6 +131,7 @@ export interface ServeOptions {
   sinceRev?: number; // 修订游标（hello.since_rev）
   cmd: string;
   mentionsOnly: boolean;
+  builtinRunner?: BuiltinRunnerOptions;
   onCursor?: (cursor: number) => void;
   onRevCursor?: (revCursor: number) => void;
   // 测试注入点：默认用 sh -c 起子进程
@@ -144,9 +199,257 @@ async function defaultRun(
   }
 }
 
+function compactEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+async function defaultRunnerProcess(
+  args: string[],
+  opts: RunnerProcessOptions,
+): Promise<RunnerProcessResult> {
+  const proc = Bun.spawn(args, {
+    cwd: opts.cwd,
+    env: compactEnv(opts.env),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+function readSession(path: string, harness: RunnerHarness): WakeSessionState | null {
+  try {
+    const state = JSON.parse(readFileSync(path, "utf8")) as WakeSessionState;
+    return state.harness === harness && typeof state.session_id === "string" ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSession(path: string, state: WakeSessionState): void {
+  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+}
+
+function shortSid(sid: string | null | undefined): string {
+  return sid ? sid.slice(0, 8) : "unknown";
+}
+
+function appendRunnerLog(workdir: string, line: string): void {
+  appendFileSync(join(workdir, RUNNER_LOG_FILE), line + "\n");
+}
+
+function parseCodexSessionId(stdout: string): string | null {
+  return stdout.match(/session id:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})/i)?.[1] ?? null;
+}
+
+function parseClaudeJson(stdout: string): { sessionId: string | null; text: string } {
+  try {
+    const body = JSON.parse(stdout) as Record<string, unknown>;
+    const sessionId = typeof body.session_id === "string" ? body.session_id : null;
+    for (const key of ["result", "text", "message", "content"]) {
+      if (typeof body[key] === "string") return { sessionId, text: body[key] };
+    }
+    return { sessionId, text: stdout };
+  } catch {
+    return { sessionId: null, text: stdout };
+  }
+}
+
+function prepareCodexHome(workdir: string, authSourceFile?: string): Record<string, string | undefined> {
+  const codexHome = join(workdir, ".codex");
+  mkdirSync(codexHome, { recursive: true });
+  const authDest = join(codexHome, "auth.json");
+  const authSource = authSourceFile ?? join(homedir(), ".codex", "auth.json");
+  // 隔离 CODEX_HOME 会把登录态也隔离掉；只在目标缺失时拷贝一次，后续由该 home 自己刷新。
+  if (!existsSync(authDest) && existsSync(authSource)) {
+    copyFileSync(authSource, authDest);
+  }
+  return { ...process.env, CODEX_HOME: codexHome };
+}
+
+async function ensureRepo(
+  opts: BuiltinRunnerOptions,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  if (!opts.repo) return null;
+  const repoDir = join(opts.workdir, "repo");
+  const runGit = opts.runGit ?? defaultRunnerProcess;
+  const args = existsSync(repoDir)
+    ? ["git", "-C", repoDir, "pull", "--ff-only"]
+    : ["git", "clone", opts.repo, repoDir];
+  const res = await runGit(args, { cwd: opts.workdir, env });
+  if (res.code !== 0) {
+    appendRunnerLog(
+      opts.workdir,
+      `${new Date((opts.now ?? Date.now)()).toISOString()} repo_exit=${res.code} cmd=${args.join(" ")} stderr=${JSON.stringify(res.stderr.slice(0, 500))}`,
+    );
+  }
+  return existsSync(repoDir) ? repoDir : null;
+}
+
+interface HarnessRun {
+  result: RunnerProcessResult;
+  text: string;
+  sessionId: string | null;
+  outFile?: string;
+}
+
+async function runHarness(
+  opts: BuiltinRunnerOptions,
+  prompt: string,
+  sid: string | null,
+  cwd: string,
+  env: Record<string, string | undefined>,
+  seq: number,
+): Promise<HarnessRun> {
+  const runProcess = opts.runProcess ?? defaultRunnerProcess;
+  if (opts.harness === "codex") {
+    const outFile = join(opts.workdir, `runner-${seq}-${Date.now()}.out`);
+    const base = ["--skip-git-repo-check", "--sandbox", "workspace-write", "-o", outFile, prompt];
+    const args = sid ? ["codex", "exec", "resume", sid, ...base] : ["codex", "exec", ...base];
+    const result = await runProcess(args, { cwd, env });
+    const text = result.code === 0 && existsSync(outFile) ? readFileSync(outFile, "utf8").trimEnd() : "";
+    return { result, text, sessionId: sid ? sid : parseCodexSessionId(result.stdout), outFile };
+  }
+
+  const args = sid
+    ? ["claude", "-p", "--resume", sid, prompt]
+    : ["claude", "-p", "--output-format", "json", prompt];
+  const result = await runProcess(args, { cwd, env });
+  if (sid) return { result, text: result.stdout.trimEnd(), sessionId: sid };
+  const parsed = parseClaudeJson(result.stdout);
+  return { result, text: parsed.text.trimEnd(), sessionId: parsed.sessionId };
+}
+
+async function postBlocked(
+  opts: BuiltinRunnerOptions,
+  frame: MsgFrame,
+  note: string,
+): Promise<void> {
+  await (opts.post ?? postMessage)(opts.server, opts.token, opts.channel, {
+    kind: "status",
+    state: "blocked",
+    note,
+    mentions: [],
+    blocked_reason: note,
+  });
+}
+
+export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<ServeOptions["runCommand"]> {
+  return async (frame, ctx) => {
+    const started = opts.now?.() ?? Date.now();
+    mkdirSync(opts.workdir, { recursive: true });
+    const env = opts.harness === "codex" ? prepareCodexHome(opts.workdir, opts.authSourceFile) : { ...process.env };
+    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
+    const prior = readSession(sessionPath, opts.harness);
+    let oldSid = prior?.session_id ?? null;
+    let forked = false;
+    let exitCode: number | null = null;
+    let finalSid = oldSid;
+    const post = opts.post ?? postMessage;
+
+    await post(opts.server, opts.token, opts.channel, {
+      kind: "status",
+      state: "working",
+      note: `wake ack: ${ctx.self} builtin ${opts.harness} runner handling seq=${frame.seq}`,
+      mentions: [],
+    });
+
+    const repoCwd = await ensureRepo(opts, env);
+    const cwd = repoCwd ?? opts.workdir;
+    const contextFile = writeContextFile(frame, ctx.channel, ctx.self, ctx.recent);
+    const prompt = readFileSync(contextFile, "utf8");
+
+    let run = await runHarness(opts, prompt, oldSid, cwd, env, frame.seq);
+    exitCode = run.result.code;
+    if (oldSid && run.result.code !== 0) {
+      forked = true;
+      run = await runHarness(opts, prompt, null, cwd, env, frame.seq);
+      exitCode = run.result.code;
+    }
+
+    try {
+      unlinkSync(contextFile);
+    } catch {
+      /* 保留失败的清理不影响唤醒结果 */
+    }
+
+    const now = opts.now?.() ?? Date.now();
+    if (run.result.code !== 0) {
+      appendRunnerLog(
+        opts.workdir,
+        `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(oldSid)} duration_ms=${now - started} exit=${run.result.code}`,
+      );
+      await postBlocked(
+        opts,
+        frame,
+        `builtin ${opts.harness} runner blocked: exit code ${run.result.code}; log: ${join(opts.workdir, RUNNER_LOG_FILE)}`,
+      );
+      return;
+    }
+
+    finalSid = run.sessionId;
+    if (!finalSid) {
+      appendRunnerLog(
+        opts.workdir,
+        `${new Date(now).toISOString()} seq=${frame.seq} sid=unknown duration_ms=${now - started} exit=${exitCode ?? 0} missing_session_id=true`,
+      );
+      await postBlocked(
+        opts,
+        frame,
+        `builtin ${opts.harness} runner blocked: no session id parsed; log: ${join(opts.workdir, RUNNER_LOG_FILE)}`,
+      );
+      return;
+    }
+
+    const wakes = prior && !forked ? prior.wakes + 1 : 1;
+    writeSession(sessionPath, {
+      harness: opts.harness,
+      session_id: finalSid,
+      created_at: prior && !forked ? prior.created_at : now,
+      last_wake_ts: now,
+      wakes,
+    });
+
+    const marker = oldSid
+      ? forked
+        ? `[session reset: ${shortSid(oldSid)} → ${shortSid(finalSid)}]`
+        : null
+      : `[session start: ${shortSid(finalSid)}]`;
+    const body = marker ? `${marker}\n${run.text}` : run.text;
+    await post(opts.server, opts.token, opts.channel, {
+      kind: "message",
+      body,
+      mentions: [],
+      reply_to: frame.seq,
+    });
+
+    appendRunnerLog(
+      opts.workdir,
+      `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(finalSid)} duration_ms=${now - started} exit=${exitCode ?? 0}` +
+        (forked ? ` fork=${shortSid(oldSid)}->${shortSid(finalSid)}` : ""),
+    );
+  };
+}
+
+function expandHomePath(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return path;
+}
+
 export async function runServe(o: ServeOptions): Promise<number> {
   const out = o.out ?? ((line: string) => console.error(line));
-  const run = o.runCommand ?? defaultRun;
+  const run = o.runCommand ?? (o.builtinRunner ? createBuiltinRunner(o.builtinRunner) : defaultRun);
   const conn = connect(o.server, o.token, o.channel, o.since, {
     onCursor: o.onCursor,
     sinceRev: o.sinceRev,
@@ -235,19 +538,26 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["channel", "on-mention"]);
+  const flagError = valueFlagError(flags, ["channel", "on-mention", "runner", "workdir", "repo"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
   }
   const cmd = str(flags["on-mention"]);
-  if (!cmd) {
+  const runner = str(flags.runner);
+  if ((cmd ? 1 : 0) + (runner ? 1 : 0) !== 1) {
     console.error(
-      'need --on-mention "<command>"：每条 @你 的消息跑一次。\n' +
-        "  上下文：命令里的 {file} 替成 context JSON 路径（= AP_CONTEXT_FILE）；正文也在 stdin；元信息在 AP_*。",
+      'choose exactly one of --on-mention or --runner.\n' +
+        '  自定义：--on-mention "<command>"（{file}=context JSON，正文在 stdin，元信息在 AP_*）。\n' +
+        "  内建：--runner codex|claude（自动隔离 workdir、续接 session、外层发回频道）。",
     );
     return 1;
   }
+  if (runner && runner !== "codex" && runner !== "claude") {
+    console.error("--runner must be codex or claude");
+    return 1;
+  }
+  const harness = runner as RunnerHarness | undefined;
   const channel = resolveChannel(str(flags.channel) ?? positionals[0]);
   if (!channel) {
     console.error("no channel, pass one or bind with: party init --channel C");
@@ -263,10 +573,20 @@ export async function run(argv: string[]): Promise<number> {
     channel,
     since: loadCursor(channel),
     sinceRev: loadRevCursor(channel),
-    cmd,
+    cmd: cmd ?? "",
     mentionsOnly: flags.all !== true,
     onCursor: (c) => saveCursor(channel, c),
     onRevCursor: (r) => saveRevCursor(channel, r),
     advertise: () => advertiseServeWake(auth, channel),
+    builtinRunner: harness
+      ? {
+          server: auth.server,
+          token: auth.token,
+          channel,
+          harness,
+          workdir: expandHomePath(str(flags.workdir) ?? join(homedir(), ".agentparty", "runners", channel)),
+          repo: str(flags.repo),
+        }
+      : undefined,
   });
 }
