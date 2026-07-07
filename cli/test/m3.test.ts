@@ -1376,6 +1376,24 @@ describe("party status/history channel flag", () => {
     });
   });
 
+  test("complete sends --replaces for reworked completion", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+    const r = await runCli(["complete", "reworked", "--channel", "dev", "--kickoff-seq", "3", "--replaces", "7"]);
+    expect(r.code).toBe(0);
+    const req = reqsOf(mock!, "POST", "/api/channels/dev/messages")[0]!;
+    expect(req.body).toMatchObject({
+      kind: "message",
+      body: "reworked",
+      reply_to: 3,
+      replaces: 7,
+      completion_artifact: {
+        kind: "final_synthesis",
+        kickoff_seq: 3,
+      },
+    });
+  });
+
   test("complete reports pending_review when server gates completion", async () => {
     mock = startRestMock((req) => {
       if (req.method === "POST" && req.path === "/api/channels/dev/messages") {
@@ -2644,6 +2662,7 @@ describe("party channel gate", () => {
     expect(mock.requests.length).toBe(0);
   });
 });
+
 
 describe("party channel role", () => {
   test("role set/list/unset 调用频道角色 API", async () => {

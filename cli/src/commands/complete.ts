@@ -5,8 +5,8 @@ import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
 import { isName, isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
-const COMPLETE_FLAGS = ["channel", "kickoff-seq", "replies", "timeout", "issue", "pr", "mention"];
-const HELP = `usage: party complete <text|-> --kickoff-seq seq [--channel C] [--replies n] [--timeout] [--issue n]... [--pr n]... [--mention name]...
+const COMPLETE_FLAGS = ["channel", "kickoff-seq", "replaces", "replies", "timeout", "issue", "pr", "mention"];
+const HELP = `usage: party complete <text|-> --kickoff-seq seq [--channel C] [--replaces seq] [--replies n] [--timeout] [--issue n]... [--pr n]... [--mention name]...
 
 Publish a final synthesis completion artifact. The message replies to kickoff seq.
 If review gate is enabled, approve/reject it with: party review approve|reject <seq>
@@ -15,6 +15,7 @@ Otherwise mark done with: party status <channel> done --summary-seq <seq>
 Options:
   --channel C       send to channel C instead of the bound channel
   --kickoff-seq n   kickoff message seq this synthesis closes
+  --replaces n      previous rejected completion seq this synthesis replaces
   --replies n       participant replies counted before synthesis (default 0)
   --timeout         mark that collection ended by timeout
   --issue n         related GitHub issue number; repeatable
@@ -45,7 +46,7 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(parsed.flags, ["channel", "kickoff-seq", "replies"], ["issue", "pr", "mention"]);
+  const flagError = valueFlagError(parsed.flags, ["channel", "kickoff-seq", "replaces", "replies"], ["issue", "pr", "mention"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -59,6 +60,11 @@ export async function run(argv: string[]): Promise<number> {
   const replies = parseNonNegativeIntFlag(str(parsed.flags.replies) ?? "0", "replies");
   if (typeof replies === "string" || replies === undefined) {
     console.error(replies ?? "--replies must be a non-negative integer");
+    return 1;
+  }
+  const replaces = str(parsed.flags.replaces) === undefined ? undefined : parsePositiveIntFlag(str(parsed.flags.replaces), "replaces");
+  if (typeof replaces === "string") {
+    console.error(replaces);
     return 1;
   }
   const relatedIssues = parsePositiveList(strArray(parsed.flags.issue), "issue");
@@ -116,6 +122,7 @@ export async function run(argv: string[]): Promise<number> {
         related_issues: relatedIssues,
         related_prs: relatedPrs,
       },
+      ...(replaces === undefined ? {} : { replaces }),
     });
     saveCursor(channel, seq);
     if (completion_review?.state === "pending_review") {

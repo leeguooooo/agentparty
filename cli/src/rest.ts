@@ -63,6 +63,24 @@ export interface ChannelRoleInfo {
   assigned_at: number;
 }
 
+export interface ChannelMemberInfo {
+  account: string;
+  added_by: string;
+  added_at: number;
+}
+
+export interface JoinLinkInfo {
+  code: string;
+  url?: string;
+  channel_slug: string;
+  created_by: string;
+  created_at: number;
+  expires_at: number | null;
+  max_uses: number | null;
+  uses: number;
+  revoked_at: number | null;
+}
+
 function extractError(status: number, body: unknown, raw: string): RestError {
   let code: string | null = null;
   let message = raw || `http ${status}`;
@@ -432,6 +450,80 @@ export async function setCompletionGate(
     headers: bearerJson(token),
     body: JSON.stringify(body),
   })) as { gate: CompletionGate; policy: CompletionReviewPolicy };
+}
+
+export async function setChannelVisibility(
+  server: string,
+  token: string,
+  slug: string,
+  body: { visibility: ChannelVisibility; confirm?: true },
+): Promise<{ visibility: ChannelVisibility }> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/visibility`, {
+    method: "PUT",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as { visibility: ChannelVisibility };
+}
+
+export async function listChannelMembers(
+  server: string,
+  token: string,
+  slug: string,
+): Promise<ChannelMemberInfo[]> {
+  const body = await req(server, `/api/channels/${encodeURIComponent(slug)}/members`, {
+    headers: bearerJson(token),
+  });
+  const members = (body as Record<string, unknown> | null)?.members;
+  return Array.isArray(members) ? (members as ChannelMemberInfo[]) : [];
+}
+
+export async function addChannelMember(
+  server: string,
+  token: string,
+  slug: string,
+  account: string,
+): Promise<ChannelMemberInfo> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/members/${encodeURIComponent(account)}`, {
+    method: "PUT",
+    headers: bearerJson(token),
+  })) as ChannelMemberInfo;
+}
+
+export async function removeChannelMember(
+  server: string,
+  token: string,
+  slug: string,
+  account: string,
+): Promise<void> {
+  await req(server, `/api/channels/${encodeURIComponent(slug)}/members/${encodeURIComponent(account)}`, {
+    method: "DELETE",
+    headers: bearerJson(token),
+  });
+}
+
+export async function createJoinLink(
+  server: string,
+  token: string,
+  slug: string,
+  body: { expires_in_sec?: number; max_uses?: number },
+): Promise<JoinLinkInfo> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/join-links`, {
+    method: "POST",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as JoinLinkInfo;
+}
+
+export async function revokeJoinLink(
+  server: string,
+  token: string,
+  slug: string,
+  code: string,
+): Promise<void> {
+  await req(server, `/api/channels/${encodeURIComponent(slug)}/join-links/${encodeURIComponent(code)}`, {
+    method: "DELETE",
+    headers: bearerJson(token),
+  });
 }
 
 export async function searchMessages(

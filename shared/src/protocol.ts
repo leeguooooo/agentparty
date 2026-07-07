@@ -251,6 +251,7 @@ export interface SendMessageFrame {
   mentions: string[];
   reply_to: number | null;
   completion_artifact?: CompletionArtifact;
+  replaces?: number;
 }
 
 export interface SendStatusFrame {

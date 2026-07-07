@@ -553,6 +553,11 @@ function parseSendFrame(input: unknown): SendFrame | null {
     if (reply_to === undefined) return null;
     const completionArtifact = parseCompletionArtifact(f.completion_artifact, reply_to);
     if (completionArtifact === null) return null;
+    let replaces: number | undefined;
+    if (f.replaces !== undefined) {
+      if (typeof f.replaces !== "number" || !Number.isInteger(f.replaces) || f.replaces <= 0) return null;
+      replaces = f.replaces;
+    }
     return {
       type: "send",
       kind: "message",
@@ -560,6 +565,7 @@ function parseSendFrame(input: unknown): SendFrame | null {
       mentions,
       reply_to,
       ...(completionArtifact !== undefined ? { completion_artifact: completionArtifact } : {}),
+      ...(completionArtifact !== undefined && replaces !== undefined ? { replaces } : {}),
     };
   }
   if (f.kind === "status") {
@@ -1516,6 +1522,25 @@ export class ChannelDO extends Server<Env> {
               .toArray();
       return Response.json({ messages: rows.map((r) => this.rowToFrame(r)) });
     }
+    if (url.pathname === "/internal/message-stats" && request.method === "GET") {
+      const row = this.ctx.storage.sql
+        .exec("SELECT COUNT(*) AS message_count, MIN(ts) AS earliest_ts FROM messages")
+        .one();
+      return Response.json({
+        message_count: Number(row.message_count ?? 0),
+        earliest_ts: row.earliest_ts === null || row.earliest_ts === undefined ? null : Number(row.earliest_ts),
+      });
+    }
+    if (url.pathname === "/internal/system-status" && request.method === "POST") {
+      const body = (await request.json().catch(() => null)) as { note?: unknown; ts?: unknown } | null;
+      const note = typeof body?.note === "string" ? body.note : "";
+      if (!note || note.length > 1000) {
+        return Response.json({ error: { code: "bad_request", message: "valid note required" } }, { status: 400 });
+      }
+      const ts = typeof body?.ts === "number" && Number.isInteger(body.ts) ? body.ts : Date.now();
+      this.insertSystemStatus(note, ts);
+      return Response.json({ ok: true });
+    }
     const auditMatch = url.pathname.match(/^\/internal\/messages\/([1-9]\d*)\/audit$/);
     if (auditMatch && request.method === "GET") {
       const seq = Number(auditMatch[1]);
@@ -2068,6 +2093,37 @@ export class ChannelDO extends Server<Env> {
         : frame.kind === "status" && frame.role !== undefined
           ? "self"
           : undefined;
+    const completionGate = this.getMeta("completion_gate");
+    const completionReviewPolicy = (this.getMeta("completion_review_policy") ?? "sender") as CompletionReviewPolicy;
+    const completionArtifact = frame.kind === "message" ? frame.completion_artifact : undefined;
+    const replacesSeq =
+      frame.kind === "message" && completionArtifact !== undefined && completionGate === "reviewer"
+        ? frame.replaces
+        : undefined;
+    if (replacesSeq !== undefined) {
+      const replacedRow = sql.exec("SELECT * FROM messages WHERE seq = ?", replacesSeq).one();
+      if (!replacedRow) {
+        return { ok: false, code: "bad_request", message: `replacement target seq ${replacesSeq} not found` };
+      }
+      if (
+        String(replacedRow.kind) !== "message" ||
+        replacedRow.completion_artifact_json === null ||
+        replacedRow.completion_artifact_json === undefined
+      ) {
+        return { ok: false, code: "bad_request", message: "replacement target is not a completion message" };
+      }
+      const replacedState =
+        replacedRow.completion_review_state === null || replacedRow.completion_review_state === undefined
+          ? null
+          : String(replacedRow.completion_review_state);
+      if (replacedState !== "rejected") {
+        return { ok: false, code: "bad_request", message: "replacement target is not a rejected completion" };
+      }
+      const replacedArtifact = parseStoredCompletionArtifact(replacedRow.completion_artifact_json);
+      if (completionArtifact === undefined || replacedArtifact === undefined || replacedArtifact.kickoff_seq !== completionArtifact.kickoff_seq) {
+        return { ok: false, code: "bad_request", message: "replacement target kickoff_seq does not match" };
+      }
+    }
     const msg: MsgFrame =
       frame.kind === "message"
         ? {
@@ -2083,12 +2139,13 @@ export class ChannelDO extends Server<Env> {
             status: null,
             ...(effectiveRole === undefined ? {} : { role: effectiveRole }),
             ...(roleSource === undefined ? {} : { role_source: roleSource }),
-            ...(frame.completion_artifact !== undefined ? { completion_artifact: frame.completion_artifact } : {}),
-            ...(frame.completion_artifact !== undefined && this.getMeta("completion_gate") === "reviewer"
+            ...(completionArtifact !== undefined ? { completion_artifact: completionArtifact } : {}),
+            ...(completionArtifact !== undefined && completionGate === "reviewer"
               ? {
                   completion_review: {
                     state: "pending_review",
-                    policy: (this.getMeta("completion_review_policy") ?? "sender") as CompletionReviewPolicy,
+                    policy: completionReviewPolicy,
+                    ...(replacesSeq === undefined ? {} : { replaces_seq: replacesSeq }),
                   },
                 }
               : {}),
@@ -2114,9 +2171,10 @@ export class ChannelDO extends Server<Env> {
          seq, sender_name, sender_kind, sender_owner, sender_lineage_json, kind, body, mentions_json, reply_to,
          state, note, status_scope_json, status_summary_seq, status_blocked_reason, status_context_json,
          status_decision_json, status_workflow_json,
-         sender_role, sender_role_source, completion_artifact_json, completion_review_state, completion_review_policy, ts
+         sender_role, sender_role_source, completion_artifact_json, completion_review_state, completion_review_policy,
+         completion_review_replaces_seq, ts
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       seq,
       identity.name,
       identity.kind,
@@ -2141,8 +2199,23 @@ export class ChannelDO extends Server<Env> {
         : null,
       msg.completion_review?.state ?? null,
       msg.completion_review?.policy ?? null,
+      replacesSeq ?? null,
       now,
     );
+    let replacedUpdate: MessageUpdateFrame | undefined;
+    if (replacesSeq !== undefined) {
+      this.ctx.storage.sql.exec(
+        `UPDATE messages
+            SET completion_review_replaced_by_seq = ?,
+                rev_seq = ?
+          WHERE seq = ?`,
+        seq,
+        this.nextRevSeq(),
+        replacesSeq,
+      );
+      const replacedRow = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", replacesSeq).one();
+      if (replacedRow) replacedUpdate = this.messageUpdate("review", identity, this.rowToFrame(replacedRow), now);
+    }
     this.linkWakeResume(identity.name, msg);
     if (identity.kind === "agent") {
       this.setMeta("agent_streak", String(this.agentStreak() + 1));
@@ -2157,7 +2230,7 @@ export class ChannelDO extends Server<Env> {
       );
     }
 
-    const frames: ServerFrame[] = [msg];
+    const frames: ServerFrame[] = replacedUpdate === undefined ? [msg] : [msg, replacedUpdate];
     if (frame.kind === "status") {
       const wakeProvided = frame.wake !== undefined ? 1 : 0;
       sql.exec(
