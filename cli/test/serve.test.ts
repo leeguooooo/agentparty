@@ -5,11 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createBuiltinRunner,
+  createSdkRunner,
   run as runServeCommand,
   runServe,
   writeContextFile,
+  type CodexLike,
   type RunnerProcess,
   type ServeOptions,
+  type ThreadLike,
 } from "../src/commands/serve";
 import type { MessagePayload } from "../src/rest";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
@@ -516,5 +519,238 @@ describe("builtin runner", () => {
       console.error = oldError;
     }
     expect(errors.join("\n")).toContain("choose exactly one of --on-mention or --runner");
+  });
+});
+
+describe("codex-sdk runner", () => {
+  function sdkRunner(
+    over: Partial<Parameters<typeof createSdkRunner>[0]> & {
+      workdir: string;
+      codexFactory: () => CodexLike;
+    },
+  ) {
+    return createSdkRunner({
+      server: "http://agentparty.test",
+      token: "ap_tok",
+      channel: "dev",
+      ...over,
+    });
+  }
+
+  test("first start calls startThread and persists the thread id", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    let startCalls = 0;
+    let resumeCalls = 0;
+    const thread: ThreadLike = {
+      id: "thread_first_12345678",
+      run: async () => ({ final_response: "first answer" }),
+    };
+    const run = sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => {
+          startCalls++;
+          return thread;
+        },
+        resumeThread: () => {
+          resumeCalls++;
+          return thread;
+        },
+      }),
+    });
+
+    await run(triggerFrame(101), runnerCtx());
+
+    const state = JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8"));
+    expect(startCalls).toBe(1);
+    expect(resumeCalls).toBe(0);
+    expect(state).toMatchObject({
+      harness: "codex-sdk",
+      thread_id: "thread_first_12345678",
+      wakes: 1,
+    });
+  });
+
+  test("restart with an existing session resumes the stored thread id", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    writeFileSync(
+      join(workdir, "wake-session.json"),
+      JSON.stringify({
+        harness: "codex-sdk",
+        thread_id: "thread_stored_12345678",
+        created_at: 1,
+        last_wake_ts: 1,
+        wakes: 3,
+      }),
+    );
+    const resumed: string[] = [];
+    const thread: ThreadLike = {
+      id: "thread_stored_12345678",
+      run: async () => ({ final_response: "resumed answer" }),
+    };
+
+    await sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => {
+          throw new Error("should not cold-start");
+        },
+        resumeThread: (id) => {
+          resumed.push(id);
+          return thread;
+        },
+      }),
+    })(triggerFrame(102), runnerCtx());
+
+    expect(resumed).toEqual(["thread_stored_12345678"]);
+    expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8")).wakes).toBe(4);
+  });
+
+  test("passes the full wake context prompt and full_access sandbox to thread.run", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    const prompts: string[] = [];
+    const sandboxes: string[] = [];
+    const thread: ThreadLike = {
+      id: "thread_prompt_12345678",
+      run: async (prompt, opts) => {
+        prompts.push(prompt);
+        sandboxes.push(opts.sandbox);
+        return { final_response: "ok" };
+      },
+    };
+    const prior = msgFrame(99, "recent context", { sender: { name: "bob", kind: "human" } }) as unknown as MsgFrame;
+
+    await sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => thread,
+        resumeThread: () => thread,
+      }),
+    })(
+      msgFrame(103, "do it", { mentions: ["me"], sender: { name: "alice", kind: "human" } }) as unknown as MsgFrame,
+      { cmd: "", channel: "dev", self: "me", recent: [prior] },
+    );
+
+    const ctx = JSON.parse(prompts[0]!);
+    expect(ctx).toMatchObject({
+      channel: "dev",
+      seq: 103,
+      sender: "alice",
+      body: "do it",
+      mentions: ["me"],
+      reply_to: 103,
+      self: "me",
+    });
+    expect(ctx.recent).toEqual([
+      expect.objectContaining({ seq: 99, sender: "bob", body: "recent context" }),
+    ]);
+    expect(ctx.protocol_reminder).toContain("party history");
+    expect(sandboxes).toEqual(["full_access"]);
+  });
+
+  test("posts the final response verbatim as a reply without session markers or truncation", async () => {
+    const { posts, post } = postRecorder();
+    const workdir = tempDir();
+    const final = "first line\n\n[session start: should stay payload]\ntrailing space \n";
+    const thread: ThreadLike = {
+      id: "thread_final_12345678",
+      run: async () => ({ final_response: final }),
+    };
+
+    await sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => thread,
+        resumeThread: () => thread,
+      }),
+    })(triggerFrame(104), runnerCtx());
+
+    const finalPost = posts.at(-1)!;
+    expect(finalPost.body).toMatchObject({ kind: "message", reply_to: 104 });
+    expect((finalPost.body as { body: string }).body).toBe(final);
+  });
+
+  test("run errors post blocked status and keep the resident thread for the next wake", async () => {
+    const { posts, post } = postRecorder();
+    const workdir = tempDir();
+    let startCalls = 0;
+    let runCalls = 0;
+    const thread: ThreadLike = {
+      id: "thread_error_12345678",
+      run: async () => {
+        runCalls++;
+        if (runCalls === 1) throw new Error("sdk exploded");
+        return { final_response: "second answer" };
+      },
+    };
+    const run = sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => {
+          startCalls++;
+          return thread;
+        },
+        resumeThread: () => {
+          throw new Error("resident thread should not be discarded");
+        },
+      }),
+    });
+
+    await run(triggerFrame(105), runnerCtx());
+    await run(triggerFrame(106), runnerCtx());
+
+    expect(startCalls).toBe(1);
+    expect(runCalls).toBe(2);
+    expect(posts.some((p) => (p.body as { state?: string }).state === "blocked")).toBe(true);
+    expect(String((posts.find((p) => (p.body as { state?: string }).state === "blocked")!.body as { note?: unknown }).note)).toContain(
+      "sdk exploded",
+    );
+    expect((posts.at(-1)!.body as { body: string }).body).toBe("second answer");
+    expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8")).thread_id).toBe("thread_error_12345678");
+  });
+
+  test("calls to thread.run are serialized even when wakes arrive concurrently", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    const resolvers: Array<(value: unknown) => void> = [];
+    const prompts: string[] = [];
+    const thread: ThreadLike = {
+      id: "thread_serial_12345678",
+      run: (prompt) => new Promise((resolve) => {
+        prompts.push(prompt);
+        resolvers.push(resolve);
+      }),
+    };
+    const run = sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => thread,
+        resumeThread: () => thread,
+      }),
+    });
+
+    const first = run(triggerFrame(107), runnerCtx());
+    const second = run(triggerFrame(108), runnerCtx());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(prompts).toHaveLength(1);
+
+    resolvers[0]!({ final_response: "first" });
+    await first;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(prompts).toHaveLength(2);
+
+    resolvers[1]!({ final_response: "second" });
+    await second;
+    expect(JSON.parse(prompts[0]!).seq).toBe(107);
+    expect(JSON.parse(prompts[1]!).seq).toBe(108);
   });
 });

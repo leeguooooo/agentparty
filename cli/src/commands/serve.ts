@@ -57,6 +57,14 @@ interface WakeSessionState {
   wakes: number;
 }
 
+interface SdkWakeSessionState {
+  harness: "codex-sdk";
+  thread_id: string;
+  created_at: number;
+  last_wake_ts: number;
+  wakes: number;
+}
+
 export interface BuiltinRunnerOptions {
   server: string;
   token: string;
@@ -71,45 +79,67 @@ export interface BuiltinRunnerOptions {
   post?: typeof postMessage;
 }
 
+export interface ThreadLike {
+  id?: string;
+  thread_id?: string;
+  run(prompt: string, opts: { sandbox: string }): Promise<unknown>;
+}
+
+export interface CodexLike {
+  startThread(): ThreadLike | Promise<ThreadLike>;
+  resumeThread(threadId: string): ThreadLike | Promise<ThreadLike>;
+}
+
+export interface SdkRunnerOptions {
+  server: string;
+  token: string;
+  channel: string;
+  workdir: string;
+  sandbox?: string;
+  codexFactory?: () => CodexLike | Promise<CodexLike>;
+  now?: () => number;
+  post?: typeof postMessage;
+}
+
 // 把一条 @mention 的完整上下文落成 JSON 文件，命令拿路径读——避开 env/stdin 的 shell quoting/注入，
 // 也让 runner 能一次拿全 channel/seq/sender/body/reply_to/recent/protocol_reminder（评审建议）。
 // recent = 触发消息之前、serve 在线期间看到的最近频道消息（含自己/未 @ 的闲聊，正文截断），
 // 让冷起的 runner 开箱有上下文；完整脉络仍以 party history 为准。
-export function writeContextFile(frame: MsgFrame, channel: string, self: string, recent: MsgFrame[]): string {
+function buildWakeContext(frame: MsgFrame, channel: string, self: string, recent: MsgFrame[]) {
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
+  return {
+    channel,
+    seq: frame.seq,
+    sender: frame.sender.name,
+    owner: frame.sender.owner ?? null,
+    kind: frame.kind,
+    body,
+    mentions: frame.mentions,
+    reply_to: frame.seq, // 回这条就 --reply-to 它
+    self,
+    recent: recent.map((m) => ({
+      seq: m.seq,
+      sender: m.sender.name,
+      kind: m.kind,
+      body: (m.kind === "message" ? m.body : (m.note ?? "")).slice(0, RECENT_BODY_MAX),
+      ts: m.ts,
+    })),
+    protocol_reminder: PROTOCOL_REMINDER,
+  };
+}
+
+export function writeContextFile(frame: MsgFrame, channel: string, self: string, recent: MsgFrame[]): string {
   const path = join(tmpdir(), `agentparty-serve-${channel}-${frame.seq}.json`);
   writeFileSync(
     path,
-    JSON.stringify(
-      {
-        channel,
-        seq: frame.seq,
-        sender: frame.sender.name,
-        owner: frame.sender.owner ?? null,
-        kind: frame.kind,
-        body,
-        mentions: frame.mentions,
-        reply_to: frame.seq, // 回这条就 --reply-to 它
-        self,
-        recent: recent.map((m) => ({
-          seq: m.seq,
-          sender: m.sender.name,
-          kind: m.kind,
-          body: (m.kind === "message" ? m.body : (m.note ?? "")).slice(0, RECENT_BODY_MAX),
-          ts: m.ts,
-        })),
-        protocol_reminder: PROTOCOL_REMINDER,
-      },
-      null,
-      2,
-    ) + "\n",
+    JSON.stringify(buildWakeContext(frame, channel, self, recent), null, 2) + "\n",
     { mode: 0o600 },
   );
   return path;
 }
 
 const SERVE_FLAGS = ["channel", "on-mention", "all", "runner", "workdir", "repo"];
-const HELP = `usage: party serve [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude) [--all]
+const HELP = `usage: party serve [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude|codex-sdk) [--all]
 
 Stay attached to a channel and run one local command for each matching message.
 The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
@@ -117,7 +147,7 @@ The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
 Options:
   --channel C          serve channel C instead of the bound channel
   --on-mention "<cmd>" command to run for each wake
-  --runner codex|claude
+  --runner codex|claude|codex-sdk
                        use the built-in isolated wake runner instead of a custom command
   --workdir DIR        runner workdir (default: ~/.agentparty/runners/<channel>)
   --repo URL           clone into workdir/repo once, then git pull --ff-only before each wake
@@ -139,6 +169,7 @@ export interface ServeOptions {
     frame: MsgFrame,
     ctx: { cmd: string; channel: string; self: string; recent: MsgFrame[] },
   ) => Promise<void>;
+  sdkRunner?: SdkRunnerOptions;
   // serve 挂上后声明自己「可被唤醒」的钩子；run() 注入真实实现，测试可省略/替换
   advertise?: () => Promise<void>;
   out?: (line: string) => void;
@@ -256,6 +287,19 @@ function writeSession(path: string, state: WakeSessionState): void {
   writeFileSync(path, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
 }
 
+function readSdkSession(path: string): SdkWakeSessionState | null {
+  try {
+    const state = JSON.parse(readFileSync(path, "utf8")) as SdkWakeSessionState;
+    return state.harness === "codex-sdk" && typeof state.thread_id === "string" ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSdkSession(path: string, state: SdkWakeSessionState): void {
+  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+}
+
 function shortSid(sid: string | null | undefined): string {
   return sid ? sid.slice(0, 8) : "unknown";
 }
@@ -266,6 +310,48 @@ function appendRunnerLog(workdir: string, line: string): void {
 
 function parseCodexSessionId(stdout: string): string | null {
   return stdout.match(/session id:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})/i)?.[1] ?? null;
+}
+
+function sdkPrompt(frame: MsgFrame, channel: string, self: string, recent: MsgFrame[]): string {
+  return JSON.stringify(buildWakeContext(frame, channel, self, recent), null, 2) + "\n";
+}
+
+function sdkThreadId(thread: ThreadLike): string {
+  if (typeof thread.id === "string") return thread.id;
+  if (typeof thread.thread_id === "string") return thread.thread_id;
+  throw new Error("@openai/codex-sdk thread did not expose an id/thread_id");
+}
+
+async function defaultCodexFactory(): Promise<CodexLike> {
+  const specifier = "@openai/codex-sdk";
+  let mod: unknown;
+  try {
+    mod = await import(specifier);
+  } catch {
+    throw new Error(
+      "runner codex-sdk requires @openai/codex-sdk and Node >=18. Install it with: npm i @openai/codex-sdk",
+    );
+  }
+  const record = mod && typeof mod === "object" ? (mod as Record<string, unknown>) : {};
+  const nestedDefault = record.default && typeof record.default === "object"
+    ? (record.default as Record<string, unknown>)
+    : {};
+  const Codex = record.Codex ?? nestedDefault.Codex ?? record.default;
+  if (typeof Codex !== "function") {
+    throw new Error("@openai/codex-sdk did not export Codex");
+  }
+  const CodexCtor = Codex as new () => CodexLike;
+  return new CodexCtor();
+}
+
+export function finalText(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object") return String(result ?? "");
+  const body = result as Record<string, unknown>;
+  for (const key of ["final_response", "finalResponse", "text", "message", "content", "result"]) {
+    if (typeof body[key] === "string") return body[key];
+  }
+  return String(result);
 }
 
 function parseClaudeJson(stdout: string): { sessionId: string | null; text: string } {
@@ -359,6 +445,112 @@ async function postBlocked(
     mentions: [],
     blocked_reason: note,
   });
+}
+
+export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOptions["runCommand"]> {
+  let codexPromise: Promise<CodexLike> | null = null;
+  let thread: ThreadLike | null = null;
+  let session: SdkWakeSessionState | null = null;
+  let queue = Promise.resolve();
+
+  const codex = (): Promise<CodexLike> => {
+    codexPromise ??= Promise.resolve((opts.codexFactory ?? defaultCodexFactory)());
+    return codexPromise;
+  };
+
+  const ensureThread = async (started: number): Promise<{ thread: ThreadLike; session: SdkWakeSessionState }> => {
+    if (thread && session) return { thread, session };
+    mkdirSync(opts.workdir, { recursive: true });
+    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
+    const prior = readSdkSession(sessionPath);
+    const client = await codex();
+    if (prior) {
+      thread = await client.resumeThread(prior.thread_id);
+      session = prior;
+      return { thread, session };
+    }
+    thread = await client.startThread();
+    const threadId = sdkThreadId(thread);
+    session = {
+      harness: "codex-sdk",
+      thread_id: threadId,
+      created_at: started,
+      last_wake_ts: started,
+      wakes: 0,
+    };
+    writeSdkSession(sessionPath, session);
+    return { thread, session };
+  };
+
+  const handle = async (
+    frame: MsgFrame,
+    ctx: { cmd: string; channel: string; self: string; recent: MsgFrame[] },
+  ): Promise<void> => {
+    const started = opts.now?.() ?? Date.now();
+    mkdirSync(opts.workdir, { recursive: true });
+    const post = opts.post ?? postMessage;
+    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
+
+    await post(opts.server, opts.token, opts.channel, {
+      kind: "status",
+      state: "working",
+      note: `wake ack: ${ctx.self} builtin codex-sdk runner handling seq=${frame.seq}`,
+      mentions: [],
+    });
+
+    let threadId = session?.thread_id ?? null;
+    try {
+      const active = await ensureThread(started);
+      threadId = active.session.thread_id;
+      const result = await active.thread.run(sdkPrompt(frame, ctx.channel, ctx.self, ctx.recent), {
+        sandbox: opts.sandbox ?? "full_access",
+      });
+      const body = finalText(result);
+      const now = opts.now?.() ?? Date.now();
+      session = {
+        ...active.session,
+        last_wake_ts: now,
+        wakes: active.session.wakes + 1,
+      };
+      writeSdkSession(sessionPath, session);
+      await post(opts.server, opts.token, opts.channel, {
+        kind: "message",
+        body,
+        mentions: [],
+        reply_to: frame.seq,
+      });
+      appendRunnerLog(
+        opts.workdir,
+        `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(threadId)} duration_ms=${now - started} status=ok`,
+      );
+    } catch (err) {
+      const now = opts.now?.() ?? Date.now();
+      const message = err instanceof Error ? err.message : String(err);
+      if (session) {
+        session = { ...session, last_wake_ts: now, wakes: session.wakes + 1 };
+        writeSdkSession(sessionPath, session);
+        threadId = session.thread_id;
+      }
+      appendRunnerLog(
+        opts.workdir,
+        `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(threadId)} duration_ms=${now - started} status=error error=${JSON.stringify(message.slice(0, 500))}`,
+      );
+      const note = `builtin codex-sdk runner blocked: ${message}; log: ${join(opts.workdir, RUNNER_LOG_FILE)}`;
+      await post(opts.server, opts.token, opts.channel, {
+        kind: "status",
+        state: "blocked",
+        note,
+        mentions: [],
+        blocked_reason: note,
+      });
+    }
+  };
+
+  return (frame, ctx) => {
+    const next = queue.then(() => handle(frame, ctx));
+    queue = next.catch(() => {});
+    return next;
+  };
 }
 
 export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<ServeOptions["runCommand"]> {
@@ -477,7 +669,7 @@ function expandHomePath(path: string): string {
 
 export async function runServe(o: ServeOptions): Promise<number> {
   const out = o.out ?? ((line: string) => console.error(line));
-  const run = o.runCommand ?? (o.builtinRunner ? createBuiltinRunner(o.builtinRunner) : defaultRun);
+  const run = o.runCommand ?? (o.sdkRunner ? createSdkRunner(o.sdkRunner) : o.builtinRunner ? createBuiltinRunner(o.builtinRunner) : defaultRun);
   const conn = connect(o.server, o.token, o.channel, o.since, {
     onCursor: o.onCursor,
     sinceRev: o.sinceRev,
@@ -577,15 +769,16 @@ export async function run(argv: string[]): Promise<number> {
     console.error(
       'choose exactly one of --on-mention or --runner.\n' +
         '  自定义：--on-mention "<command>"（{file}=context JSON，正文在 stdin，元信息在 AP_*）。\n' +
-        "  内建：--runner codex|claude（自动隔离 workdir、续接 session、外层发回频道）。",
+        "  内建：--runner codex|claude|codex-sdk（自动隔离 workdir、续接 session、外层发回频道）。",
     );
     return 1;
   }
-  if (runner && runner !== "codex" && runner !== "claude") {
-    console.error("--runner must be codex or claude");
+  if (runner && runner !== "codex" && runner !== "claude" && runner !== "codex-sdk") {
+    console.error("--runner must be codex, claude, or codex-sdk");
     return 1;
   }
-  const harness = runner as RunnerHarness | undefined;
+  const harness = runner === "codex" || runner === "claude" ? runner : undefined;
+  const useSdkRunner = runner === "codex-sdk";
   const channel = resolveChannel(str(flags.channel) ?? positionals[0]);
   if (!channel) {
     console.error("no channel, pass one or bind with: party init --channel C");
@@ -614,6 +807,14 @@ export async function run(argv: string[]): Promise<number> {
           harness,
           workdir: expandHomePath(str(flags.workdir) ?? join(homedir(), ".agentparty", "runners", channel)),
           repo: str(flags.repo),
+        }
+      : undefined,
+    sdkRunner: useSdkRunner
+      ? {
+          server: auth.server,
+          token: auth.token,
+          channel,
+          workdir: expandHomePath(str(flags.workdir) ?? join(homedir(), ".agentparty", "runners", channel)),
         }
       : undefined,
   });
