@@ -34,6 +34,7 @@ interface Props {
   canMintAgent: boolean;
   canResetGuard: boolean;
   agentNamePrefix: string; // 生成 agent 名的前缀来源（email/name 前缀，退回 slug）
+  inviterName: string; // 当前邀请人的频道身份名，接入包报到时 @ 他
   onAuthFailed(message: string): void;
 }
 
@@ -471,6 +472,7 @@ export function ChannelPage({
   canMintAgent,
   canResetGuard,
   agentNamePrefix,
+  inviterName,
   onAuthFailed,
 }: Props) {
   const [state, dispatch] = useReducer(channelReducer, initialChannelState);
@@ -850,7 +852,7 @@ export function ChannelPage({
       />
       {canMintAgent && !state.archived && (
         <div className="chan-toolbar">
-          <AgentJoin slug={slug} token={token} namePrefix={agentNamePrefix} />
+          <AgentJoin slug={slug} token={token} namePrefix={agentNamePrefix} inviterName={inviterName} />
         </div>
       )}
       {/* chat-first：这些协调/元信息面板默认折叠，避免把核心对话流挤出首屏。展开查看 digest/过滤/host board 等。 */}

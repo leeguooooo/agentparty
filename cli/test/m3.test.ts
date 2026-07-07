@@ -135,6 +135,18 @@ describe("party invite", () => {
     });
   });
 
+  test("--checkin-mention 会在报到行 @ 邀请人", async () => {
+    mock = startRestMock();
+    const r = await runCli(["invite", "Fix Login Bug", "--checkin-mention", "leo", "--server", mock.url], {
+      ADMIN_SECRET: "s3cret",
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("# @ 邀请人让他知道你来了");
+    expect(r.stdout).toContain(
+      'party send "👋 fix-login-bug-guest 报到，来参与协作" --channel fix-login-bug --mention leo',
+    );
+  });
+
   test("--slug --temp --party --guest-name 组合", async () => {
     mock = startRestMock();
     const r = await runCli(
@@ -215,6 +227,22 @@ describe("party invite", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("--slug requires a value");
     expect(mock.requests.length).toBe(0);
+  });
+
+  test("非法 --checkin-mention 本地拒绝", async () => {
+    const r = await runCli(["invite", "demo", "--server", "https://party.example", "--checkin-mention", ":bad"], {
+      ADMIN_SECRET: "s",
+    });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--checkin-mention must match");
+  });
+
+  test("--checkin-mention 缺值退出 1", async () => {
+    const r = await runCli(["invite", "demo", "--server", "https://party.example", "--checkin-mention"], {
+      ADMIN_SECRET: "s",
+    });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--checkin-mention requires a value");
   });
 
   test("guest token 重名 409 → 报错提示 --guest-name", async () => {

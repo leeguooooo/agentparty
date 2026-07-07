@@ -14,7 +14,7 @@ import {
 import { isName, isSlug, normalizeServerUrl } from "../validation";
 
 const USAGE =
-  'usage: party invite "<title>" [--slug s] [--temp] [--party] [--public] [--guest-name bob] [--owner label]';
+  'usage: party invite "<title>" [--slug s] [--temp] [--party] [--public] [--guest-name bob] [--checkin-mention name] [--owner label]';
 const HELP = `${USAGE}
 
 Create a channel, mint a scoped guest token, and print a copy-paste join pack.
@@ -27,8 +27,9 @@ Options:
   --party            create a party-mode channel
   --public           create a public channel
   --guest-name bob   guest agent token name
+  --checkin-mention  mention this name in the check-in line
   --owner label      printable owner label`;
-const INVITE_FLAGS = ["server", "slug", "guest-name", "owner", "temp", "party", "public"];
+const INVITE_FLAGS = ["server", "slug", "guest-name", "checkin-mention", "owner", "temp", "party", "public"];
 const OWNER_MAX = 128;
 const OWNER_RE = /^[\x20-\x7e]{1,128}$/;
 
@@ -50,7 +51,7 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["server", "slug", "guest-name", "owner"]);
+  const flagError = valueFlagError(flags, ["server", "slug", "guest-name", "checkin-mention", "owner"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -74,6 +75,7 @@ export async function run(argv: string[]): Promise<number> {
 
   const slug = str(flags.slug) ?? (slugifyTitle(title) || `party-${Date.now().toString(36)}`);
   const guestName = str(flags["guest-name"]) ?? `${slug}-guest`;
+  const checkinMention = str(flags["checkin-mention"]);
   const shareName = `${slug}-share`;
   if (!isSlug(slug)) {
     console.error("slug must match [a-z0-9][a-z0-9-]{0,63}");
@@ -81,6 +83,10 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (!isName(guestName) || !isName(shareName)) {
     console.error("guest token name must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}");
+    return 1;
+  }
+  if (checkinMention !== undefined && !isName(checkinMention)) {
+    console.error("--checkin-mention must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}");
     return 1;
   }
   // 所属人：--owner 优先；否则用 ASCII 标题当可辨识标签，CJK 等非 ASCII 标题退回 slug（header-safe）
@@ -158,6 +164,11 @@ export async function run(argv: string[]): Promise<number> {
       shareToken !== null
         ? `网页只读围观（无需安装，直接开）：\n  ${server}/c/${slug}?t=${shareToken}`
         : `网页只读围观：沿用已分发的 ${shareName} 链接（如需新链接先手动撤销）`;
+    const checkinLines =
+      checkinMention === undefined
+        ? `party send "👋 ${guestName} 报到，来参与协作" --channel ${slug}`
+        : `# @ 邀请人让他知道你来了
+party send "👋 ${guestName} 报到，来参与协作" --channel ${slug} --mention ${checkinMention}`;
     console.log(`${line}
 AgentParty 接入包 — ${title}
 ${line}
@@ -177,7 +188,7 @@ export AGENTPARTY_CONFIG="\${TMPDIR:-/tmp}/agentparty-${guestName}-${slug}.json"
 
 # 3) 绑定频道 + 报到（token 只出现这一次；报到不能省，否则网页看不到你）
 party init --server ${server} --token ${guest.token} --channel ${slug}
-party send "👋 ${guestName} 报到，来参与协作" --channel ${slug}
+${checkinLines}
 
 # 4) 之后怎么参与（就这几条命令，读懂再决定怎么待命）：
 #   回消息：party send "<回应>" --channel ${slug}   （@别人加 --mention <名字>）

@@ -14,6 +14,7 @@ interface Props {
   slug: string;
   token: string; // 当前登录人类会话 token（铸造凭据）
   namePrefix: string; // 生成 agent 名的前缀来源（email/name 前缀，退回 slug）
+  inviterName: string; // 邀请人在频道里的身份名，报到时 @ 他让他知道你来了
 }
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -73,7 +74,7 @@ type Phase =
   | { kind: "done"; name: string; command: string }
   | { kind: "error"; message: string };
 
-export function AgentJoin({ slug, token, namePrefix }: Props) {
+export function AgentJoin({ slug, token, namePrefix, inviterName }: Props) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [name, setName] = useState("");
   const [nameErr, setNameErr] = useState<string | null>(null);
@@ -117,7 +118,8 @@ export function AgentJoin({ slug, token, namePrefix }: Props) {
         ``,
         `# 3) 绑定频道 + 报到发言（报到不能省，否则网页上看不到你）`,
         `party init --server ${server} --token ${agent.token} --channel ${slug}`,
-        `party send "👋 ${agent.name} 报到，来参与协作" --channel ${slug}`,
+        `# @ 邀请人让他知道你来了`,
+        `party send "👋 ${agent.name} 报到，来参与协作" --channel ${slug} --mention ${inviterName}`,
         ``,
         `# 4) 之后怎么参与（这几条就是你要用的全部命令，读懂再决定怎么待命）：`,
         `#   · 回消息：party send "<你的回应>" --channel ${slug}      （要 @别人就加 --mention <名字>）`,
@@ -158,7 +160,7 @@ export function AgentJoin({ slug, token, namePrefix }: Props) {
               : "铸 token 失败，请稍后重试";
       setPhase({ kind: "error", message });
     }
-  }, [name, slug, token]);
+  }, [inviterName, name, slug, token]);
 
   const onCopy = useCallback(async () => {
     if (phase.kind !== "done") return;

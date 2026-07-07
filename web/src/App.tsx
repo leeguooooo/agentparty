@@ -380,6 +380,7 @@ export function App() {
               canMintAgent={!isShareMode() && me?.role === "human"}
               canResetGuard={!isShareMode() && me?.role === "human"}
               agentNamePrefix={(me?.email ?? me?.name ?? slug).split("@")[0] ?? slug}
+              inviterName={me?.name ?? slug}
               onAuthFailed={onAuthFailed}
             />
           ) : (
