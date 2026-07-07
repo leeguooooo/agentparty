@@ -38,3 +38,11 @@ export function normalizeServerUrl(value: string): string | null {
     return null;
   }
 }
+
+// config 里手写/脚本生成的 server 常缺协议头（"agentparty.example.com"）——init 会规范化，
+// 但绕过 init 的路径不会。直接喂给 fetch 会炸出 Bun 原始报错 "fetch() URL is invalid"，
+// 外层 runner 的 party send 因此静默丢交付（生产实锤，#agentparty seq=725）。这里透明自愈：
+// 合法则归一化原值，缺协议补 https:// 再试，治不了返回 null 让调用方给明确错误。
+export function healServerUrl(value: string): string | null {
+  return normalizeServerUrl(value) ?? normalizeServerUrl(`https://${value}`);
+}

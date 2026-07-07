@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { accountPath, readAccount, writeAccount, type AccountSession } from "./account";
 import { readConfigWithSource, type ConfigSourceInfo } from "./config";
 import { fetchPublicConfig } from "./rest";
+import { healServerUrl } from "./validation";
 
 const SCOPE = "openid profile email offline_access";
 // 固定回环端口，事先登记到 SSO 白名单；占用则依次退，三个都占用报错（不随机挑端口）
@@ -328,7 +329,13 @@ function accountInfo(sess: AccountSession | null): AccountInfo {
 export async function resolveAuthDetailed(): Promise<ResolvedAuthDetailed> {
   const { config: cfg, source } = readConfigWithSource();
   const sess = readAccount();
-  const server = cfg?.server ?? sess?.server;
+  const rawServer = cfg?.server ?? sess?.server;
+  // 自愈缺协议头的 server（手改 config 的常见事故，生产实锤 #agentparty seq=725）：
+  // 治不了就明确报出来，别让它流进 fetch 变成不可诊断的 "fetch() URL is invalid"
+  const server = rawServer ? healServerUrl(rawServer) : undefined;
+  if (rawServer && !server) {
+    console.error(`config server url invalid: "${rawServer}" — expected like https://agentparty.example.com`);
+  }
   if (!server) {
     return { server: null, token: null, auth_source: "none", config: source, account: accountInfo(sess) };
   }
