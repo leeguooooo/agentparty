@@ -34,6 +34,27 @@ describe("websocket", () => {
     ws.close();
   });
 
+  it("surfaces duplicate live sessions for the same token identity", async () => {
+    const { token, name } = await seedToken("agent");
+    const slug = await createChannel(token);
+    const first = await WsClient.open(slug, token);
+    await first.nextOfType("welcome");
+    await first.nextOfType("participants");
+
+    const second = await WsClient.open(slug, token);
+    const secondWelcome = await second.nextOfType("welcome");
+    expect(secondWelcome.participants).toContainEqual({ name, kind: "agent", connection_count: 2 });
+
+    const duplicateUpdate = await first.nextOfType("participants");
+    expect(duplicateUpdate.participants).toContainEqual({ name, kind: "agent", connection_count: 2 });
+
+    second.close();
+    const afterClose = await first.nextOfType("participants");
+    expect(afterClose.participants).toContainEqual({ name, kind: "agent" });
+    expect(afterClose.participants).not.toContainEqual({ name, kind: "agent", connection_count: 2 });
+    first.close();
+  });
+
   it("accepts browser websocket token through Sec-WebSocket-Protocol", async () => {
     const { token, name } = await seedToken("agent");
     const slug = await createChannel(token);

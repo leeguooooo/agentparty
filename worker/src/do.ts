@@ -1073,7 +1073,10 @@ export class ChannelDO extends Server<Env> {
     const st = connection.state;
     if (!st || !st.name || st.archived) return;
     for (const other of this.getConnections<ConnState>()) {
-      if (other.id !== connection.id && other.state?.name === st.name) return;
+      if (other.id !== connection.id && other.state?.name === st.name) {
+        this.broadcastFrame({ type: "participants", participants: this.participants() });
+        return;
+      }
     }
     const removedAt = Number(this.getMeta(this.removedPresenceKey(st.name)) ?? "");
     if (Number.isInteger(removedAt) && Date.now() - removedAt < PRESENCE_SCAN_MS) {
@@ -2872,13 +2875,31 @@ export class ChannelDO extends Server<Env> {
 
   private participants(): Sender[] {
     const seen = new Map<string, Sender>();
+    const counts = new Map<string, number>();
     for (const connection of this.getConnections<ConnState>()) {
       const st = connection.state;
-      if (st?.name && !seen.has(st.name)) {
-        seen.set(st.name, senderFromIdentity(st));
+      if (st?.name) {
+        counts.set(st.name, (counts.get(st.name) ?? 0) + 1);
+        if (!seen.has(st.name)) {
+          seen.set(st.name, senderFromIdentity(st));
+        }
       }
     }
-    return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+    return [...seen.values()]
+      .map((sender) => {
+        const count = counts.get(sender.name) ?? 1;
+        return count > 1 ? { ...sender, connection_count: count } : sender;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  private liveConnectionCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const connection of this.getConnections<ConnState>()) {
+      const name = connection.state?.name;
+      if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return counts;
   }
 
   private getMeta(key: string): string | null {
@@ -2908,6 +2929,7 @@ export class ChannelDO extends Server<Env> {
   }
 
   private presenceList(): PresenceEntry[] {
+    const liveCounts = this.liveConnectionCounts();
     return this.ctx.storage.sql
       .exec(
         `SELECT name, kind, account, state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
@@ -2916,10 +2938,11 @@ export class ChannelDO extends Server<Env> {
          FROM presence ORDER BY name`,
       )
       .toArray()
-      .map((r) => this.presenceRowToEntry(r));
+      .map((r) => this.withConnectionCount(this.presenceRowToEntry(r), liveCounts));
   }
 
   private presenceFor(name: string): PresenceEntry | null {
+    const liveCounts = this.liveConnectionCounts();
     const rows = this.ctx.storage.sql
       .exec(
         `SELECT name, kind, account, state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
@@ -2929,7 +2952,12 @@ export class ChannelDO extends Server<Env> {
         name,
       )
       .toArray();
-    return rows.length > 0 ? this.presenceRowToEntry(rows[0]!) : null;
+    return rows.length > 0 ? this.withConnectionCount(this.presenceRowToEntry(rows[0]!), liveCounts) : null;
+  }
+
+  private withConnectionCount(entry: PresenceEntry, liveCounts: Map<string, number>): PresenceEntry {
+    const count = liveCounts.get(entry.name) ?? 0;
+    return count > 1 ? { ...entry, connection_count: count } : entry;
   }
 
   private presenceRowToEntry(r: Record<string, unknown>): PresenceEntry {

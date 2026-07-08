@@ -34,6 +34,7 @@ interface Row {
   tier: Tier;
   wake?: WakeKind;
   age_ms: number;
+  connection_count?: number;
 }
 
 // kind 已知取 kind；旧 presence 行没回填时 UUID 名判 human（网页登录会话），其余判 agent。
@@ -58,7 +59,16 @@ function classify(e: PresenceEntry, now: number): Row | null {
     if (kind === "human") return null; // 围观的人类只在线才列
     if (age > DEAD_MS) return null; // 幽灵清理
   }
-  return { name: e.name, kind, tier, ...(wake === undefined ? {} : { wake }), age_ms: age };
+  return {
+    name: e.name,
+    kind,
+    tier,
+    ...(wake === undefined ? {} : { wake }),
+    age_ms: age,
+    ...(typeof e.connection_count === "number" && e.connection_count > 1
+      ? { connection_count: e.connection_count }
+      : {}),
+  };
 }
 
 const RANK: Record<Tier, number> = { online: 0, wakeable: 1, recent: 2 };
@@ -122,7 +132,8 @@ export async function run(argv: string[]): Promise<number> {
     for (const r of rows) {
       const wake = r.tier === "wakeable" && r.wake ? ` ${r.wake}` : "";
       const age = r.tier === "online" ? "" : ` (${humanAge(r.age_ms)})`;
-      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${wake}${age}`);
+      const duplicate = r.connection_count !== undefined ? ` x${r.connection_count} sessions` : "";
+      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${wake}${duplicate}${age}`);
     }
     return 0;
   } catch (e) {

@@ -340,6 +340,10 @@
   box-shadow: 1.5px 2px 0 var(--d-shadow);
 }
 .presence-group--blocked { background: var(--d-red-soft); }
+.presence-group--duplicate {
+  border-color: var(--d-red);
+  background: var(--d-red-soft);
+}
 .presence-group--full {
   grid-template-columns: 1fr;
   align-items: stretch;
@@ -373,6 +377,17 @@
   border-radius: 999px;
   color: var(--t-dim);
   background: var(--t-panel2);
+  font-size: 10px;
+}
+.presence-group-duplicate,
+.presence-agent-duplicate,
+.presence-duplicate {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid var(--d-red);
+  border-radius: 999px;
+  color: var(--d-red);
+  background: #fff;
   font-size: 10px;
 }
 .presence-group-agents {
@@ -429,6 +444,9 @@
   color: var(--d-red);
   background: var(--d-red-soft);
 }
+.presence-alert--duplicate {
+  background: #fff;
+}
 
 /* chat-first：协调/元信息面板默认折叠成一行，消息流才是主视图 */
 .chan-panels {
@@ -472,6 +490,10 @@
 }
 .presence-pill--blocked { background: var(--d-red-soft); }
 .presence-pill--active-host { background: var(--d-green-soft); }
+.presence-pill--duplicate {
+  border-color: var(--d-red);
+  background: var(--d-red-soft);
+}
 .presence-name {
   max-width: min(160px, 22vw);
   min-width: 0;
