@@ -285,122 +285,124 @@ function DivisionBoard({
   }
 
   return (
-    <section className="role-board" aria-label={t("Channel.roles.label")}>
-      <header className="role-board-head">
+    <details className="role-board" aria-label={t("Channel.roles.label")}>
+      <summary className="role-board-head">
         <div>
           <h2>{t("Channel.roles.label")}</h2>
           <p className="t-mono">{t("Channel.roles.help")}</p>
         </div>
         <span className="t-mono role-board-count">{t("Channel.roles.count", { count: String(roles.length) })}</span>
-      </header>
-      {groups.length > 0 ? (
-        <div className="role-account-list">
-          {groups.map((group) => (
-            <section key={group.accountLabel} className="role-account-group">
-              <header className="role-account-head">
-                <span className="role-account-label">{group.accountLabel}</span>
-                <span className="t-mono role-account-count">
-                  {t("Channel.roles.accountCount", { count: String(group.roles.length) })}
-                </span>
-              </header>
-              <div className="role-list">
-                {group.roles.map(({ role, display, owner, accountLabel }) => {
-                  const draftForRole = roleDrafts[role.name] ?? roleDraftFrom(role);
-                  const kind = role.kind ?? "agent";
-                  const title = [
-                    role.name !== display ? role.name : null,
-                    t("Composer.owner", { account: accountLabel }),
-                    t(`Composer.kind.${kind}`),
-                    t("Composer.role", { role: role.role }),
-                    role.responsibility ? t("Composer.responsibility", { responsibility: role.responsibility }) : null,
-                  ].filter((part): part is string => part !== null).join("\n");
-                  return (
-                    <div key={role.name} className="role-row">
-                      <div className="role-person" title={title}>
-                        <span className="role-person-name t-mono">{display}</span>
-                        <span className={`role-kind role-kind--${kind}`}>{t(`Composer.kind.${kind}`)}</span>
-                        {owner !== null && <span className="role-owner t-mono">{owner}</span>}
+      </summary>
+      <div className="role-board-body">
+        {groups.length > 0 ? (
+          <div className="role-account-list">
+            {groups.map((group) => (
+              <section key={group.accountLabel} className="role-account-group">
+                <header className="role-account-head">
+                  <span className="role-account-label">{group.accountLabel}</span>
+                  <span className="t-mono role-account-count">
+                    {t("Channel.roles.accountCount", { count: String(group.roles.length) })}
+                  </span>
+                </header>
+                <div className="role-list">
+                  {group.roles.map(({ role, display, owner, accountLabel }) => {
+                    const draftForRole = roleDrafts[role.name] ?? roleDraftFrom(role);
+                    const kind = role.kind ?? "agent";
+                    const title = [
+                      role.name !== display ? role.name : null,
+                      t("Composer.owner", { account: accountLabel }),
+                      t(`Composer.kind.${kind}`),
+                      t("Composer.role", { role: role.role }),
+                      role.responsibility ? t("Composer.responsibility", { responsibility: role.responsibility }) : null,
+                    ].filter((part): part is string => part !== null).join("\n");
+                    return (
+                      <div key={role.name} className="role-row">
+                        <div className="role-person" title={title}>
+                          <span className="role-person-name t-mono">{display}</span>
+                          <span className={`role-kind role-kind--${kind}`}>{t(`Composer.kind.${kind}`)}</span>
+                          {owner !== null && <span className="role-owner t-mono">{owner}</span>}
+                        </div>
+                        {canModerate ? (
+                          <>
+                            <select
+                              className="role-select t-mono"
+                              value={draftForRole.role}
+                              onChange={(e) => onRoleDraft(role.name, { ...draftForRole, role: e.target.value as CollaborationRole })}
+                            >
+                              {COLLAB_ROLES.map((item) => (
+                                <option key={item} value={item}>{item}</option>
+                              ))}
+                            </select>
+                            <input
+                              className="role-input"
+                              value={draftForRole.responsibility}
+                              onChange={(e) => onRoleDraft(role.name, { ...draftForRole, responsibility: e.target.value })}
+                              autoComplete="off"
+                              placeholder={t("Channel.roles.responsibilityPlaceholder")}
+                            />
+                            <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => onSaveRole(role.name, draftForRole)}>
+                              {roleSaving === role.name ? t("Channel.roles.saving") : t("Channel.roles.save")}
+                            </button>
+                            <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => onDeleteRole(role.name)}>
+                              {t("Channel.roles.clear")}
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <span className="role-badge t-mono">{role.role}</span>
+                            <span className="role-text">{role.responsibility ?? t("Channel.roles.noResponsibility")}</span>
+                          </>
+                        )}
                       </div>
-                      {canModerate ? (
-                        <>
-                          <select
-                            className="role-select t-mono"
-                            value={draftForRole.role}
-                            onChange={(e) => onRoleDraft(role.name, { ...draftForRole, role: e.target.value as CollaborationRole })}
-                          >
-                            {COLLAB_ROLES.map((item) => (
-                              <option key={item} value={item}>{item}</option>
-                            ))}
-                          </select>
-                          <input
-                            className="role-input"
-                            value={draftForRole.responsibility}
-                            onChange={(e) => onRoleDraft(role.name, { ...draftForRole, responsibility: e.target.value })}
-                            autoComplete="off"
-                            placeholder={t("Channel.roles.responsibilityPlaceholder")}
-                          />
-                          <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => onSaveRole(role.name, draftForRole)}>
-                            {roleSaving === role.name ? t("Channel.roles.saving") : t("Channel.roles.save")}
-                          </button>
-                          <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => onDeleteRole(role.name)}>
-                            {t("Channel.roles.clear")}
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <span className="role-badge t-mono">{role.role}</span>
-                          <span className="role-text">{role.responsibility ?? t("Channel.roles.noResponsibility")}</span>
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          ))}
-        </div>
-      ) : (
-        <p className="charter-empty">{t("Channel.roles.empty")}</p>
-      )}
-      {canModerate && (
-        <div className="role-row role-row--new">
-          <input
-            className="role-name-input t-mono"
-            value={roleName}
-            onChange={(e) => onNewRoleName(e.target.value)}
-            list="channel-role-targets"
-            autoComplete="off"
-            spellCheck={false}
-            placeholder={t("Channel.roles.namePlaceholder")}
-          />
-          <select
-            className="role-select t-mono"
-            value={roleDraft.role}
-            onChange={(e) => onNewRoleDraft({ ...roleDraft, role: e.target.value as CollaborationRole })}
-          >
-            {COLLAB_ROLES.map((item) => (
-              <option key={item} value={item}>{item}</option>
+                    );
+                  })}
+                </div>
+              </section>
             ))}
-          </select>
-          <input
-            className="role-input"
-            value={roleDraft.responsibility}
-            onChange={(e) => onNewRoleDraft({ ...roleDraft, responsibility: e.target.value })}
-            autoComplete="off"
-            placeholder={t("Channel.roles.responsibilityPlaceholder")}
-          />
-          <button className="d-btn d-btn--primary" type="button" disabled={roleSaving === "__new__"} onClick={() => onSaveRole(roleName, roleDraft)}>
-            {roleSaving === "__new__" ? t("Channel.roles.saving") : t("Channel.roles.add")}
-          </button>
-          <datalist id="channel-role-targets">
-            {identities.map((identity) => (
-              <option key={identity.name} value={identity.name}>{identity.display}</option>
-            ))}
-          </datalist>
-        </div>
-      )}
-      {roleError !== null && <p className="banner banner--red">{roleError}</p>}
-    </section>
+          </div>
+        ) : (
+          <p className="charter-empty">{t("Channel.roles.empty")}</p>
+        )}
+        {canModerate && (
+          <div className="role-row role-row--new">
+            <input
+              className="role-name-input t-mono"
+              value={roleName}
+              onChange={(e) => onNewRoleName(e.target.value)}
+              list="channel-role-targets"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={t("Channel.roles.namePlaceholder")}
+            />
+            <select
+              className="role-select t-mono"
+              value={roleDraft.role}
+              onChange={(e) => onNewRoleDraft({ ...roleDraft, role: e.target.value as CollaborationRole })}
+            >
+              {COLLAB_ROLES.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
+            <input
+              className="role-input"
+              value={roleDraft.responsibility}
+              onChange={(e) => onNewRoleDraft({ ...roleDraft, responsibility: e.target.value })}
+              autoComplete="off"
+              placeholder={t("Channel.roles.responsibilityPlaceholder")}
+            />
+            <button className="d-btn d-btn--primary" type="button" disabled={roleSaving === "__new__"} onClick={() => onSaveRole(roleName, roleDraft)}>
+              {roleSaving === "__new__" ? t("Channel.roles.saving") : t("Channel.roles.add")}
+            </button>
+            <datalist id="channel-role-targets">
+              {identities.map((identity) => (
+                <option key={identity.name} value={identity.name}>{identity.display}</option>
+              ))}
+            </datalist>
+          </div>
+        )}
+        {roleError !== null && <p className="banner banner--red">{roleError}</p>}
+      </div>
+    </details>
   );
 }
 

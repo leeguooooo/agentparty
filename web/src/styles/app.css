@@ -285,7 +285,7 @@
 }
 .role-board {
   margin-top: 10px;
-  padding: 10px 12px 12px;
+  padding: 0;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -300,11 +300,32 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin: 0;
+  padding: 10px 12px;
   font-weight: 700;
+  list-style: none;
+  cursor: pointer;
+}
+.role-board-head::-webkit-details-marker {
+  display: none;
+}
+.role-board-head::before {
+  content: "▸";
+  flex: none;
+  margin-top: 1px;
+  color: var(--t-dim);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.role-board[open] .role-board-head {
+  border-bottom: 1px dashed var(--t-faint);
+}
+.role-board[open] .role-board-head::before {
+  content: "▾";
 }
 .role-board-head > div {
   min-width: 0;
+  flex: 1;
 }
 .role-board-head h2 {
   margin: 0;
@@ -321,6 +342,12 @@
   color: var(--t-dim);
   font-size: 11px;
   font-weight: 600;
+}
+.role-board-body {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px 12px;
 }
 .role-account-list {
   display: grid;
@@ -2605,7 +2632,11 @@
 /* ---- 窄屏：侧栏横排折叠 ---- */
 @media (max-width: 760px) {
   .app-shell {
-    grid-template-columns: 1fr;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: clip;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
     gap: 10px;
     padding: 0 14px 14px;
@@ -2613,11 +2644,24 @@
   .app-head { padding: 12px 16px 8px; flex-wrap: wrap; }
   .app-me { order: 2; max-width: 100%; margin-left: 0; flex-basis: 100%; }
   .app-tag { display: none; }
-  .app-side { overflow: visible; }
-  .side { flex-direction: row; overflow-x: auto; align-items: center; padding-bottom: 4px; }
+  .app-side {
+    min-width: 0;
+    max-width: 100%;
+    overflow: visible;
+  }
+  .side {
+    min-width: 0;
+    max-width: 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    align-items: center;
+    padding-bottom: 4px;
+  }
   .side-label { display: none; }
   .chan-pill { width: auto; flex: none; }
   .presence-bar {
+    min-width: 0;
+    max-width: 100%;
     grid-template-columns: minmax(0, 1fr) auto auto;
   }
   .presence-meta {
@@ -2648,8 +2692,11 @@
     align-items: stretch;
   }
   .role-board-head {
-    flex-direction: column;
-    gap: 2px;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .role-board-head p {
+    display: none;
   }
   .mention-responsibility {
     max-width: 38vw;
