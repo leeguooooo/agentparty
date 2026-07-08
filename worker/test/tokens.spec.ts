@@ -70,4 +70,21 @@ describe("tokens", () => {
     const res = await api("/api/channels", "ap_deadbeefdeadbeefdeadbeefdeadbeef");
     expect(res.status).toBe(401);
   });
+
+  // 反向唯一性（Task A5）：human 账号先占了某个 handle，之后铸一个同名的 token 必须 409——
+  // handle 与 token name 共用 @ 命名空间，两个方向都得挡撞车。
+  it("409 when minting a token whose name collides with an existing handle", async () => {
+    const handle = uniq("leohandle");
+    const owner = uniq("acct");
+    const { token: humanToken } = await seedToken("human", uniq("tok-human"), { owner });
+
+    const put = await api("/api/me/handle", humanToken, {
+      method: "PUT",
+      body: JSON.stringify({ handle }),
+    });
+    expect(put.status).toBe(200);
+
+    const res = await mint(handle, "agent");
+    expect(res.status).toBe(409);
+  });
 });
