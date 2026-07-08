@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WsClient, createChannel, seedToken } from "./helpers";
+import { api, WsClient, createChannel, seedToken } from "./helpers";
 
 async function postMessage(ws: WsClient, body: string): Promise<number> {
   ws.send({ type: "send", kind: "message", body, mentions: [], reply_to: null });
@@ -80,5 +80,24 @@ describe("read cursor (Phase 2)", () => {
 
     wa.close();
     wb.close();
+  });
+
+  it("REST /read-cursors returns the cursor snapshot + channel last_seq (for party who)", async () => {
+    const a = await seedToken("human");
+    const slug = await createChannel(a.token);
+    const wa = await WsClient.open(slug, a.token);
+    await wa.nextOfType("welcome");
+    await wa.nextOfType("participants");
+    await postMessage(wa, "m1");
+    const s2 = await postMessage(wa, "m2");
+    wa.send({ type: "seen", seq: s2 });
+    await wa.nextOfType("read_cursor");
+
+    const res = await api(`/api/channels/${slug}/read-cursors`, a.token);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { cursors: Array<{ name: string; last_seen_seq: number }>; last_seq: number };
+    expect(body.last_seq).toBe(s2);
+    expect(body.cursors).toContainEqual(expect.objectContaining({ name: a.name, last_seen_seq: s2 }));
+    wa.close();
   });
 });

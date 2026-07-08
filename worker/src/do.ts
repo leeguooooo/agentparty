@@ -2048,6 +2048,10 @@ export class ChannelDO extends Server<Env> {
         }));
       return Response.json({ deliveries });
     }
+    if (url.pathname === "/internal/read-cursors" && request.method === "GET") {
+      // 已读游标快照 + 频道最新 seq，供 `party who` 标注每个身份读到第几条 / 落后多少（Phase 2 · CLI）。
+      return Response.json({ cursors: this.readCursors(), last_seq: this.lastSeq() });
+    }
     if (url.pathname === "/internal/messages" && request.method === "POST") {
       this.cacheChannelMeta(request.headers, request.headers.get("x-ap-host"));
       const identity: Identity = {

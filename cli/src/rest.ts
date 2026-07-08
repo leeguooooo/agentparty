@@ -15,6 +15,7 @@ import {
   type CompletionReviewPolicy,
   type MsgFrame,
   type PresenceEntry,
+  type ReadCursor,
   type SearchHit,
   type SendMessageFrame,
   type SendStatusFrame,
@@ -355,6 +356,20 @@ export async function fetchPresence(server: string, token: string, slug: string)
   });
   const presence = (body as Record<string, unknown> | null)?.presence;
   return Array.isArray(presence) ? (presence as PresenceEntry[]) : [];
+}
+
+// 已读游标快照 + 频道最新 seq（Phase 2 · CLI）：给 `party who` 标注每个身份读到第几条 / 落后多少。
+export async function fetchReadCursors(
+  server: string,
+  token: string,
+  slug: string,
+): Promise<{ cursors: ReadCursor[]; last_seq: number }> {
+  const body = (await req(server, `/api/channels/${encodeURIComponent(slug)}/read-cursors`, {
+    headers: bearerJson(token),
+  })) as Record<string, unknown> | null;
+  const cursors = Array.isArray(body?.cursors) ? (body.cursors as ReadCursor[]) : [];
+  const last_seq = typeof body?.last_seq === "number" ? body.last_seq : 0;
+  return { cursors, last_seq };
 }
 
 export async function reviseMessage(

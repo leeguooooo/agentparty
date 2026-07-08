@@ -1357,6 +1357,21 @@ app.get("/api/channels/:slug/wake-deliveries", async (c) => {
   );
 });
 
+app.get("/api/channels/:slug/read-cursors", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const stub = await getServerByName(c.env.CHANNELS, slug);
+  return stub.fetch(
+    new Request("https://do/internal/read-cursors", {
+      headers: { "x-partykit-room": slug },
+    }),
+  );
+});
+
 app.get("/api/channels/:slug/captures", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
