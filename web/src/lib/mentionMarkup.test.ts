@@ -9,7 +9,7 @@ describe("replaceMentionLabels", () => {
         [raw]: { display: "thejacks@163.com", kind: "human", account: "thejacks@163.com" },
       }),
     ).toBe(
-      '<span class="ap-mention" title="@61ec302c-6c31-4bca-a1df-88152372f6d9">@thejacks@163.com</span> hello',
+      '<span class="ap-mention" title="@61ec302c-6c31-4bca-a1df-88152372f6d9">@thejacks&#64;163.com</span> hello',
     );
   });
 

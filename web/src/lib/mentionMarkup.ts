@@ -13,6 +13,7 @@ function escapeHtmlAttr(value: string): string {
 function escapeHtmlText(value: string): string {
   return value
     .replaceAll("&", "&amp;")
+    .replaceAll("@", "&#64;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
