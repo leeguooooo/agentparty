@@ -1,10 +1,10 @@
 // party task — channel-scoped task ledger.
-import type { TaskAssigneeKind, TaskRecord, TaskState } from "../rest";
+import type { MsgFrame, TaskAssigneeKind, TaskRecord, TaskState } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel } from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { createTask, handleRestError, listTasks, updateTask } from "../rest";
+import { createTask, fetchMessages, handleRestError, listTasks, updateTask } from "../rest";
 import { isName, isSlug, parsePositiveIntFlag } from "../validation";
 
 const TASK_STATES: readonly string[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] satisfies TaskState[];
@@ -26,6 +26,7 @@ const FLAGS = [
 ];
 
 const HELP = `usage: party task create <title|-> [--channel C] [--desc text] [--assignee @name] [--label bug]... [--priority N] [--parent ID] [--anchor seq]...
+  party task from <seq> [--channel C] [--title text] [--desc text] [--assignee @name] [--label bug]...
   party task list [--channel C] [--state S] [--assignee @name] [--limit N] [--json]
   party task assign <id> @name [--channel C] [--assignee-kind agent|human|squad]
   party task claim <id> [--channel C]
@@ -58,6 +59,12 @@ function readStdin(): Promise<string> {
 
 function compact(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function titleFromMessage(msg: MsgFrame): string {
+  const raw = compact(msg.kind === "status" ? (msg.note ?? msg.body) : msg.body);
+  const label = raw === "" ? `${msg.sender.name} message #${msg.seq}` : raw;
+  return label.length > 120 ? `${label.slice(0, 117)}...` : label;
 }
 
 function formatTask(task: TaskRecord): string {
@@ -148,10 +155,27 @@ export async function run(argv: string[]): Promise<number> {
       return 0;
     }
 
-    if (sub === "create") {
-      const title = await titleArg(str(flags.title) ?? positionals[1]);
+    if (sub === "create" || sub === "from") {
+      const sourceSeq = sub === "from" ? parsePositiveIntFlag(positionals[1], "seq") : undefined;
+      if (typeof sourceSeq === "string") {
+        console.error(sourceSeq);
+        return 1;
+      }
+      if (sub === "from" && sourceSeq === undefined) {
+        console.error("usage: party task from <seq> [--channel C]");
+        return 1;
+      }
+      const source =
+        sourceSeq === undefined
+          ? undefined
+          : (await fetchMessages(cfg.server, cfg.token, slug, sourceSeq - 1, 1)).find((msg) => msg.seq === sourceSeq);
+      if (sourceSeq !== undefined && source === undefined) {
+        console.error(`message #${sourceSeq} not found`);
+        return 1;
+      }
+      const title = await titleArg(str(flags.title) ?? (sub === "create" ? positionals[1] : undefined)) ?? (source === undefined ? null : titleFromMessage(source));
       if (!title) {
-        console.error("usage: party task create <title|-> [--channel C]");
+        console.error(sub === "from" ? "usage: party task from <seq> [--channel C]" : "usage: party task create <title|-> [--channel C]");
         return 1;
       }
       const state = parseState(str(flags.state));
@@ -182,6 +206,7 @@ export async function run(argv: string[]): Promise<number> {
       }
       const anchorRaw = Array.isArray(flags.anchor) ? flags.anchor : flags.anchor === undefined ? [] : [flags.anchor];
       const anchors: number[] = [];
+      if (sourceSeq !== undefined) anchors.push(sourceSeq);
       for (const item of anchorRaw) {
         const anchor = parsePositiveIntFlag(typeof item === "string" ? item : undefined, "anchor");
         if (typeof anchor === "string" || anchor === undefined) {

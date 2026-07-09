@@ -223,6 +223,80 @@ describe("cli subprocess", () => {
     });
   });
 
+  test("task from creates a task anchored to the source message", async () => {
+    const seen: { method: string; path: string; body: unknown }[] = [];
+    const task = {
+      type: "task",
+      id: 2,
+      channel: "dev",
+      title: "Investigate login timeout with traces",
+      desc: "needs owner",
+      state: "triage",
+      assignee: null,
+      created_by: "me",
+      created_by_kind: "agent",
+      priority: 0,
+      labels: ["bug"],
+      parent_id: null,
+      anchor_seqs: [7],
+      completion_artifact: null,
+      workflow_id: null,
+      created_at: 1,
+      updated_at: 1,
+    };
+    restServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        const body = req.method === "GET" ? null : await req.json().catch(() => null);
+        seen.push({ method: req.method, path: `${url.pathname}${url.search}`, body });
+        if (url.pathname === "/api/channels/dev/messages" && req.method === "GET") {
+          return Response.json({
+            messages: [
+              {
+                type: "msg",
+                channel: "dev",
+                seq: 7,
+                ts: 1,
+                sender: { name: "evan", kind: "human" },
+                kind: "message",
+                body: "Investigate login timeout\nwith traces",
+                mentions: [],
+                reply_to: null,
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/api/channels/dev/tasks" && req.method === "POST") {
+          return Response.json(task, { status: 201 });
+        }
+        return Response.json({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      },
+    });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ server: `http://127.0.0.1:${restServer.port}`, token: "ap_tok" }),
+    );
+
+    const result = await runCli(["task", "from", "7", "--channel", "dev", "--label", "bug", "--desc", "needs owner"]);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("created #2");
+
+    expect(seen).toContainEqual({ method: "GET", path: "/api/channels/dev/messages?since=6&limit=1", body: null });
+    expect(seen).toContainEqual({
+      method: "POST",
+      path: "/api/channels/dev/tasks",
+      body: {
+        title: "Investigate login timeout with traces",
+        desc: "needs owner",
+        labels: ["bug"],
+        anchor_seqs: [7],
+      },
+    });
+  });
+
   test("charter template works without config", async () => {
     const r = await runCli(["charter", "template"]);
     expect(r.code).toBe(0);
