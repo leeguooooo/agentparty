@@ -460,37 +460,39 @@ export function PresenceBar({
 
   return (
     <div className={`presence-bar${expanded ? "" : " presence-bar--collapsed"}`}>
-      <div className="presence-meta" aria-label="channel presence summary">
-        {isPublic && <span className="d-hl public-badge">PUBLIC</span>}
-        {party && <span className="d-hl party-badge">PARTY</span>}
-        <button
-          type="button"
-          className="presence-toggle"
-          aria-expanded={expanded}
-          aria-label={t(expanded ? "PresenceBar.collapse" : "PresenceBar.expand")}
-          onClick={toggleExpanded}
-        >
-          <span className="t-mono presence-summary">
-            {liveGroups}/{totalGroups} live
-          </span>
-          <span className="presence-toggle-arrow" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
-        </button>
-        {blockedCount > 0 && <span className="t-mono presence-alert">{blockedCount} blocked</span>}
-        {duplicateCount > 0 && <span className="t-mono presence-alert presence-alert--duplicate">{duplicateCount} duplicate</span>}
+      <div className="presence-head">
+        <div className="presence-meta" aria-label="channel presence summary">
+          {isPublic && <span className="d-hl public-badge">PUBLIC</span>}
+          {party && <span className="d-hl party-badge">PARTY</span>}
+          {blockedCount > 0 && <span className="t-mono presence-alert">{blockedCount} blocked</span>}
+          {duplicateCount > 0 && <span className="t-mono presence-alert presence-alert--duplicate">{duplicateCount} duplicate</span>}
+          {items.length === 0 && (
+            <span className="t-mono presence-empty" role="status" aria-live="polite">
+              nobody here yet
+            </span>
+          )}
+        </div>
+        <span className="conn t-mono" data-s={status} role="status" aria-live="polite">
+          {status === "open" ? "● live" : `◌ ${status}…`}
+        </span>
       </div>
+      <button
+        type="button"
+        className="presence-toggle"
+        aria-expanded={expanded}
+        aria-label={t(expanded ? "PresenceBar.collapse" : "PresenceBar.expand")}
+        onClick={toggleExpanded}
+      >
+        <span className="t-mono presence-summary">
+          {liveGroups}/{totalGroups} live
+        </span>
+        <span className="presence-toggle-arrow" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+      </button>
       {expanded && (
         <div className="presence-strip" aria-label="participant groups by owner">
           {sortedGroups.map((group) => renderGroup(group, "compact"))}
         </div>
       )}
-      {items.length === 0 && (
-        <span className="t-mono presence-empty" role="status" aria-live="polite">
-          nobody here yet
-        </span>
-      )}
-      <span className="conn t-mono" data-s={status} role="status" aria-live="polite">
-        {status === "open" ? "● live" : `◌ ${status}…`}
-      </span>
       {activePopoverGroup !== null && hoveredGroup !== null && (
         <div
           className="presence-popover"

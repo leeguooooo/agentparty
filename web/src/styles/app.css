@@ -646,10 +646,10 @@
 
 /* ---- presence 条 ---- */
 .presence-bar {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   padding: 4px 4px 8px;
   flex: none;
 }
@@ -657,6 +657,16 @@
 .presence-bar--collapsed {
   padding-bottom: 4px;
 }
+/* 第一行：属性/告警 + 右侧连接状态 */
+.presence-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.presence-head .conn {
+  margin-left: auto;
+} /* ● live 推到第一行最右 */
 .presence-meta,
 .presence-strip {
   display: flex;
@@ -820,6 +830,7 @@
 .presence-toggle {
   display: inline-flex;
   align-items: center;
+  align-self: flex-start; /* 独立一行，宽度贴合内容、左对齐 */
   gap: 5px;
   flex: none;
   padding: 2px 8px 3px;
@@ -830,6 +841,12 @@
   font: inherit;
   cursor: pointer;
   transition: transform 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+.presence-toggle::before {
+  content: "❯";
+  color: var(--t-faint);
+  font-size: 11px;
+  margin-right: 1px;
 }
 .presence-toggle:hover {
   border-color: var(--d-ink);
