@@ -154,6 +154,17 @@ describe("cli subprocess", () => {
         if (url.pathname === "/api/channels/dev/tasks/1" && req.method === "PATCH") {
           return Response.json({ ...task, ...(body && typeof body === "object" ? body : {}) });
         }
+        if (url.pathname === "/api/spawn" && req.method === "POST") {
+          return Response.json({
+            token: "ap_child",
+            name: "worker-a",
+            role: "agent",
+            owner: "me",
+            channel_scope: "dev",
+            lineage: { parent_agent: "me", root_agent: "me", depth: 1, team_id: "team-a", expires_at: 1234 },
+            expires_at: 1234,
+          });
+        }
         if (url.pathname === "/api/me") {
           return Response.json({ name: "me", email: null, kind: "agent", role: "member", owner: null });
         }
@@ -182,6 +193,7 @@ describe("cli subprocess", () => {
       expect(tools.tools.map((tool) => tool.name)).toContain("party_task_from_message");
       expect(tools.tools.map((tool) => tool.name)).toContain("party_task_list");
       expect(tools.tools.map((tool) => tool.name)).toContain("party_task_update");
+      expect(tools.tools.map((tool) => tool.name)).toContain("party_spawn_worker");
 
       const result = await client.callTool({
         name: "party_send",
@@ -231,6 +243,13 @@ describe("cli subprocess", () => {
       expect(status.isError).not.toBe(true);
       expect(status.structuredContent).toMatchObject({ type: "status", task: { id: 1, state: "in_progress" } });
 
+      const spawned = await client.callTool({
+        name: "party_spawn_worker",
+        arguments: { name: "worker-a", ttl_sec: 3600, team_id: "team-a" },
+      });
+      expect(spawned.isError).not.toBe(true);
+      expect(spawned.structuredContent).toMatchObject({ type: "spawn_worker", channel: "dev", worker: { name: "worker-a", channel_scope: "dev" } });
+
       expect(seen).toContainEqual(expect.objectContaining({
         method: "POST",
         path: "/api/channels/dev/tasks",
@@ -265,6 +284,11 @@ describe("cli subprocess", () => {
         method: "PATCH",
         path: "/api/channels/dev/tasks/1",
         body: { state: "in_progress" },
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "POST",
+        path: "/api/spawn",
+        body: { name: "worker-a", channel_scope: "dev", ttl_sec: 3600, team_id: "team-a" },
       }));
     } finally {
       await client.close();

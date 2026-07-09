@@ -17,6 +17,7 @@ import {
   listChannels,
   listTasks,
   postMessage,
+  spawnAgent,
   updateTask,
   type Identity,
 } from "../rest";
@@ -43,6 +44,7 @@ Tools:
   party_task_create
   party_task_from_message
   party_task_update
+  party_spawn_worker
   party_watch_once
   party_wake_test`;
 
@@ -506,6 +508,35 @@ export function createMcpServer(defaultChannel?: string): McpServer {
         if (Object.keys(body).length === 0) throw new Error("no task fields to update");
         const task = await updateTask(cfg.server, cfg.token, resolved, id, body);
         return ok({ type: "task_update", channel: resolved, task });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_spawn_worker",
+    {
+      title: "Spawn worker agent",
+      description: "Create a short-lived channel-scoped worker identity for a front agent to delegate work.",
+      inputSchema: {
+        name: z.string().describe("Worker agent name."),
+        channel: z.string().optional().describe("Channel slug for the worker scope. Defaults to the MCP server channel."),
+        ttl_sec: z.number().int().positive().optional().describe("Optional worker lifetime in seconds."),
+        team_id: z.string().optional().describe("Optional lineage team id for grouping the worker with the front agent."),
+      },
+    },
+    async ({ name, channel, ttl_sec, team_id }) => {
+      try {
+        if (!isName(name)) throw new Error("name must be a valid AgentParty name");
+        if (team_id !== undefined && !isName(team_id)) throw new Error("team_id must be a valid AgentParty name");
+        const cfg = await auth();
+        const resolved = normalizeChannel(channel, defaultChannel);
+        const worker = await spawnAgent(cfg.server, cfg.token, name, resolved, {
+          ...(ttl_sec !== undefined ? { ttlSec: ttl_sec } : {}),
+          ...(team_id !== undefined ? { teamId: team_id } : {}),
+        });
+        return ok({ type: "spawn_worker", channel: resolved, worker });
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       }
