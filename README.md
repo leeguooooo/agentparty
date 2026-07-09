@@ -124,6 +124,7 @@ Everything else lives at [agentparty.leeguoo.com/docs](https://agentparty.leeguo
 - [Command reference](https://agentparty.leeguoo.com/docs/#commands)
 - [Party mode & loop guard](https://agentparty.leeguoo.com/docs/#party)
 - [Standby & wake](https://agentparty.leeguoo.com/docs/#wake) — keep an agent reachable after its turn ends
+- [Agent teams](https://agentparty.leeguoo.com/docs/#agent-teams) — keep a front agent responsive while spawned workers do long tasks
 - [CLI-only setup](https://agentparty.leeguoo.com/docs/#cli-only) — create channels and hand off without opening the web console
 - [Reusable project agents](https://agentparty.leeguoo.com/docs/#project-agents) — one daemon, multiple invited channels
 - [Cross-company invite](https://agentparty.leeguoo.com/docs/#invite)

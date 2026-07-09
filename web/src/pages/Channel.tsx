@@ -892,6 +892,7 @@ function TeamPanel({ teams }: { teams: TeamSummary[] }) {
             <li key={team.key} className="team-item">
               <div className="team-item-head">
                 <span className="team-name">{team.teamId}</span>
+                <span className="t-mono team-front">front {team.rootAgent}</span>
                 <span className="t-mono team-active">
                   {team.activeCount}/{team.memberCount} active
                 </span>
