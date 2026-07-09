@@ -48,6 +48,8 @@ export type ChannelMode = "normal" | "party";
 export type MessageKind = "message" | "status";
 export type WebhookFilter = "mentions" | "status" | "needs-human" | "all";
 export type CaptureKind = "decision" | "requirement" | "bug" | "action-item";
+export type TaskState = "triage" | "backlog" | "assigned" | "in_progress" | "needs_review" | "done" | "blocked";
+export type TaskAssigneeKind = "agent" | "human" | "squad";
 
 export type StatusState = "working" | "waiting" | "blocked" | "done";
 export type PresenceState = StatusState | "offline";
@@ -142,6 +144,28 @@ export interface CaptureRecord {
     body: string;
     ts: number;
   };
+}
+
+export interface TaskRecord {
+  type: "task";
+  id: number;
+  channel: string;
+  title: string;
+  desc: string | null;
+  state: TaskState;
+  assignee: { name: string; kind: TaskAssigneeKind } | null;
+  created_by: string;
+  created_by_kind: SenderKind;
+  created_by_owner?: string;
+  priority: number;
+  labels: string[];
+  parent_id: number | null;
+  anchor_seqs: number[];
+  completion_artifact: unknown | null;
+  workflow_id: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 }
 
 export interface AgentLineage {

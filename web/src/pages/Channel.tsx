@@ -2,7 +2,7 @@
 // App 用 key={slug} 挂载本组件，切频道即整体重建（socket/状态零残留）。
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { buildHostBoard, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type ReadCursor, type SearchHit, type Sender, type WakeDelivery } from "@agentparty/shared";
+import { buildHostBoard, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type ReadCursor, type SearchHit, type Sender, type TaskRecord, type WakeDelivery } from "@agentparty/shared";
 import { AgentJoin } from "../components/AgentJoin";
 import { AgentTokens } from "../components/AgentTokens";
 import { VisibilityToggle } from "../components/VisibilityToggle";
@@ -24,6 +24,7 @@ import {
   fetchChannelIdentities,
   fetchChannelRoles,
   fetchMessages,
+  fetchTasks,
   fetchWakeDeliveries,
   kickParticipant,
   resetGuard,
@@ -150,7 +151,7 @@ interface RoleDraft {
   responsibility: string;
 }
 
-type ChannelPanel = "charter" | "roles" | "coordination" | "search" | "settings";
+type ChannelPanel = "charter" | "roles" | "coordination" | "tasks" | "search" | "settings";
 type AdminSurface = "agentJoin" | "agentTokens" | "joinLink";
 
 function roleDraftFrom(role: ChannelRoleInfo): RoleDraft {
@@ -982,6 +983,67 @@ function HostBoardPanel({ board }: { board: HostBoard }) {
   );
 }
 
+function TaskLedgerPanel({
+  tasks,
+  loading,
+  error,
+  onRefresh,
+}: {
+  tasks: TaskRecord[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+}) {
+  const counts = tasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.state] = (acc[task.state] ?? 0) + 1;
+    return acc;
+  }, {});
+  return (
+    <section className="task-ledger-panel" aria-label="channel tasks">
+      <header className="task-ledger-head">
+        <div>
+          <h2>Tasks</h2>
+          <p className="t-mono">{tasks.length} total</p>
+        </div>
+        <button className="d-btn" type="button" disabled={loading} onClick={onRefresh}>
+          {loading ? "Refreshing" : "Refresh"}
+        </button>
+      </header>
+      {Object.keys(counts).length > 0 && (
+        <div className="task-ledger-counts">
+          {Object.entries(counts).map(([state, count]) => (
+            <span key={state} className={`t-mono task-state task-state--${state}`}>{state} {count}</span>
+          ))}
+        </div>
+      )}
+      {error !== null && <p className="banner banner--red">{error}</p>}
+      {tasks.length === 0 && error === null ? (
+        <p className="charter-empty">No tasks yet. Use <code>party task create</code> to add one.</p>
+      ) : (
+        <ol className="task-list">
+          {tasks.map((task) => (
+            <li key={task.id} className="task-card">
+              <div className="task-card-main">
+                <span className="t-mono task-id">#{task.id}</span>
+                <strong>{task.title}</strong>
+                <span className={`t-mono task-state task-state--${task.state}`}>{task.state}</span>
+              </div>
+              {task.desc !== null && <p>{task.desc}</p>}
+              <div className="task-card-meta">
+                <span className="t-mono">P{task.priority}</span>
+                {task.assignee !== null && <span className="t-mono">@{task.assignee.name}</span>}
+                {task.parent_id !== null && <span className="t-mono">parent #{task.parent_id}</span>}
+                {task.anchor_seqs.map((seq) => <span key={seq} className="t-mono">msg #{seq}</span>)}
+                {task.labels.map((label) => <span key={label} className="t-mono task-label">{label}</span>)}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  );
+}
+
 function TeamThread({
   thread,
   self,
@@ -1119,6 +1181,9 @@ export function ChannelPage({
   const [charterSaving, setCharterSaving] = useState(false);
   const [charterError, setCharterError] = useState<string | null>(null);
   const [channelRoles, setChannelRoles] = useState<ChannelRoleInfo[]>([]);
+  const [tasks, setTasks] = useState<TaskRecord[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksError, setTasksError] = useState<string | null>(null);
   const [roleDrafts, setRoleDrafts] = useState<Record<string, RoleDraft>>({});
   const [newRoleName, setNewRoleName] = useState("");
   const [newRoleDraft, setNewRoleDraft] = useState<RoleDraft>({ role: "worker", responsibility: "" });
@@ -1208,6 +1273,21 @@ export function ChannelPage({
         else if (!(err instanceof ForbiddenError)) setRoleError(t("Channel.roles.loadFailed"));
       });
   }, [slug, token, t]);
+
+  const loadTaskLedger = useCallback(() => {
+    setTasksLoading(true);
+    return fetchTasks(token, slug)
+      .then((items) => {
+        setTasks(items);
+        setTasksError(null);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof AuthError) authFailedRef.current("token revoked — paste a new one");
+        else if (err instanceof ForbiddenError) setTasksError("tasks are not visible for this channel");
+        else setTasksError("tasks failed to load");
+      })
+      .finally(() => setTasksLoading(false));
+  }, [slug, token]);
 
   const removeParticipant = useCallback((name: string) => {
     if (removingName !== null) return;
@@ -1535,8 +1615,9 @@ export function ChannelPage({
       writeSeenCharterRev(slug, charter.charter_rev);
       setSeenCharterRev(charter.charter_rev);
     }
+    if (panel === "tasks") void loadTaskLedger();
     setActivePanel(panel);
-  }, [charter, slug]);
+  }, [charter, loadTaskLedger, slug]);
 
   const setAdminSurface = useCallback((surface: AdminSurface, open: boolean) => {
     setActivePanel(null);
@@ -2123,6 +2204,10 @@ export function ChannelPage({
               <span className="t-mono chan-tool-badge chan-tool-badge--hot">{t("Channel.tools.active")}</span>
             )}
           </button>
+          <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("tasks")}>
+            <span>Tasks</span>
+            <span className="t-mono chan-tool-badge">{tasks.length}</span>
+          </button>
           <button type="button" className={"d-btn chan-tool-btn" + (q !== "" ? " is-active" : "")} onClick={() => openPanel("search")}>
             <span>{t("Channel.tools.search")}</span>
             {q !== "" && <span className="t-mono chan-tool-badge">{searchLoading ? "..." : searchHits.length}</span>}
@@ -2199,12 +2284,14 @@ export function ChannelPage({
             activePanel === "charter" ? t("Channel.tools.charter") :
             activePanel === "roles" ? t("Channel.tools.roles") :
             activePanel === "coordination" ? t("Channel.tools.coordination") :
+            activePanel === "tasks" ? "Tasks" :
             activePanel === "settings" ? t("Channel.tools.settings") :
             t("Channel.tools.search")
           }
           subtitle={
             activePanel === "charter" && charter !== null ? `rev ${charter.charter_rev}` :
             activePanel === "roles" ? t("Channel.roles.count", { count: String(structuredRoleCount) }) :
+            activePanel === "tasks" ? `${tasks.length} tasks` :
             activePanel === "settings" ? (localLoopGuardEnabled ? t("Channel.settings.enabled") : t("Channel.settings.unlimited")) :
             activePanel === "search" && q !== "" ? t("Channel.search.hits", { count: searchHits.length }) :
             undefined
@@ -2249,6 +2336,14 @@ export function ChannelPage({
             />
           )}
           {activePanel === "coordination" && coordinationContent}
+          {activePanel === "tasks" && (
+            <TaskLedgerPanel
+              tasks={tasks}
+              loading={tasksLoading}
+              error={tasksError}
+              onRefresh={loadTaskLedger}
+            />
+          )}
           {activePanel === "settings" && (
             <GuardSettingsPanel
               canModerate={canModerate}

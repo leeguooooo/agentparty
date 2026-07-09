@@ -19,6 +19,9 @@ import {
   type SearchHit,
   type SendMessageFrame,
   type SendStatusFrame,
+  type TaskAssigneeKind,
+  type TaskRecord,
+  type TaskState,
   type TokenRole,
   type WakeDelivery,
   type WebhookFilter,
@@ -28,6 +31,7 @@ import pkg from "../package.json" with { type: "json" };
 export type { ChannelMode, WebhookFilter };
 export type { CompletionGate, CompletionReview, CompletionReviewPolicy };
 export type { CaptureKind, CaptureRecord };
+export type { TaskAssigneeKind, TaskRecord, TaskState };
 
 // 频道可见性：public = 任何鉴权身份可进；private（默认）= 仅 leo 的 ap_ token + 房主（spec §3.2）
 export type ChannelVisibility = "public" | "private";
@@ -509,6 +513,68 @@ export async function disableLarkNotify(
     method: "DELETE",
     headers: bearerJson(token),
   })) as LarkNotifyStatus;
+}
+
+export async function listTasks(
+  server: string,
+  token: string,
+  slug: string,
+  opts: { state?: TaskState; assignee?: string; limit?: number } = {},
+): Promise<TaskRecord[]> {
+  const params = new URLSearchParams();
+  if (opts.state !== undefined) params.set("state", opts.state);
+  if (opts.assignee !== undefined) params.set("assignee", opts.assignee);
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const body = await req(server, `/api/channels/${encodeURIComponent(slug)}/tasks${suffix}`, {
+    headers: bearerJson(token),
+  });
+  const tasks = (body as Record<string, unknown> | null)?.tasks;
+  return Array.isArray(tasks) ? (tasks as TaskRecord[]) : [];
+}
+
+export async function createTask(
+  server: string,
+  token: string,
+  slug: string,
+  body: {
+    title: string;
+    desc?: string;
+    state?: TaskState;
+    assignee?: { name: string; kind: TaskAssigneeKind } | null;
+    priority?: number;
+    labels?: string[];
+    parent_id?: number;
+    anchor_seqs?: number[];
+    workflow_id?: string;
+  },
+): Promise<TaskRecord> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/tasks`, {
+    method: "POST",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as TaskRecord;
+}
+
+export async function updateTask(
+  server: string,
+  token: string,
+  slug: string,
+  id: number,
+  body: {
+    title?: string;
+    desc?: string | null;
+    state?: TaskState;
+    assignee?: { name: string; kind: TaskAssigneeKind } | null;
+    priority?: number;
+    labels?: string[];
+  },
+): Promise<TaskRecord> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/tasks/${id}`, {
+    method: "PATCH",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as TaskRecord;
 }
 
 export async function fetchMessages(

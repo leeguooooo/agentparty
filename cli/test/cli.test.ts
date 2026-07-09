@@ -67,6 +67,7 @@ describe("cli subprocess", () => {
       "serve",
       "mcp",
       "lark",
+      "task",
       "charter",
       "statusline",
     ];
@@ -148,6 +149,79 @@ describe("cli subprocess", () => {
       await client.close();
     }
   }, 15_000);
+
+  test("task command creates, lists, and assigns through REST", async () => {
+    const seen: { method: string; path: string; body: unknown }[] = [];
+    const tasks = [
+      {
+        type: "task",
+        id: 1,
+        channel: "dev",
+        title: "Fix login",
+        desc: null,
+        state: "triage",
+        assignee: null,
+        created_by: "me",
+        created_by_kind: "agent",
+        priority: 2,
+        labels: ["bug"],
+        parent_id: null,
+        anchor_seqs: [7],
+        completion_artifact: null,
+        workflow_id: null,
+        created_at: 1,
+        updated_at: 1,
+      },
+    ];
+    restServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url);
+        const body = req.method === "GET" ? null : await req.json().catch(() => null);
+        seen.push({ method: req.method, path: `${url.pathname}${url.search}`, body });
+        if (url.pathname === "/api/channels/dev/tasks" && req.method === "POST") {
+          return Response.json(tasks[0], { status: 201 });
+        }
+        if (url.pathname === "/api/channels/dev/tasks" && req.method === "GET") {
+          return Response.json({ tasks });
+        }
+        if (url.pathname === "/api/channels/dev/tasks/1" && req.method === "PATCH") {
+          return Response.json({ ...tasks[0], state: "assigned", assignee: { name: "alice", kind: "agent" } });
+        }
+        return Response.json({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      },
+    });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ server: `http://127.0.0.1:${restServer.port}`, token: "ap_tok" }),
+    );
+
+    const create = await runCli(["task", "create", "Fix login", "--channel", "dev", "--label", "bug", "--priority", "2", "--anchor", "7"]);
+    expect(create.code).toBe(0);
+    expect(create.stdout).toContain("created #1");
+
+    const list = await runCli(["task", "list", "--channel", "dev", "--state", "triage"]);
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("#1\ttriage");
+
+    const assign = await runCli(["task", "assign", "1", "@alice", "--channel", "dev"]);
+    expect(assign.code).toBe(0);
+    expect(assign.stdout).toContain("@alice");
+
+    expect(seen).toContainEqual({
+      method: "POST",
+      path: "/api/channels/dev/tasks",
+      body: { title: "Fix login", priority: 2, labels: ["bug"], anchor_seqs: [7] },
+    });
+    expect(seen).toContainEqual({ method: "GET", path: "/api/channels/dev/tasks?state=triage", body: null });
+    expect(seen).toContainEqual({
+      method: "PATCH",
+      path: "/api/channels/dev/tasks/1",
+      body: { state: "assigned", assignee: { name: "alice", kind: "agent" } },
+    });
+  });
 
   test("charter template works without config", async () => {
     const r = await runCli(["charter", "template"]);

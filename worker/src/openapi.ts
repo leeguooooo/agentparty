@@ -398,6 +398,121 @@ export const openapiDocument = {
         },
       },
     },
+    "/api/channels/{slug}/tasks": {
+      get: {
+        summary: "list channel-scoped tasks",
+        security: [{ bearer: [] }],
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "state", in: "query", schema: { type: "string", enum: ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] } },
+          { name: "assignee", in: "query", schema: { type: "string", description: "agent/human/squad name, optional @ prefix" } },
+          { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 500, default: 100 } },
+        ],
+        responses: {
+          "200": { description: "{tasks:[TaskRecord]}" },
+          "400": { description: "invalid state/assignee/limit" },
+          "403": { description: "not allowed in this channel" },
+          "404": { description: "channel not found" },
+        },
+      },
+      post: {
+        summary: "create a channel-scoped task",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["title"],
+                properties: {
+                  title: { type: "string", maxLength: 200 },
+                  desc: { type: ["string", "null"], maxLength: 8000 },
+                  description: { type: ["string", "null"], maxLength: 8000 },
+                  state: { type: "string", enum: ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] },
+                  assignee: {
+                    type: ["object", "null"],
+                    properties: {
+                      name: { type: "string" },
+                      kind: { type: "string", enum: ["agent", "human", "squad"], default: "agent" },
+                    },
+                  },
+                  labels: { type: "array", maxItems: 20, items: { type: "string", maxLength: 40 } },
+                  priority: { type: "integer", minimum: -100, maximum: 100, default: 0 },
+                  parent_id: { type: ["integer", "null"], minimum: 1 },
+                  anchor_seqs: { type: "array", items: { type: "integer", minimum: 1 } },
+                  workflow_id: { type: ["string", "null"], maxLength: 128 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "TaskRecord" },
+          "400": { description: "invalid task body" },
+          "403": { description: "readonly token or not allowed in this channel" },
+          "404": { description: "channel or parent task not found" },
+          "410": { description: "channel archived" },
+        },
+      },
+    },
+    "/api/channels/{slug}/tasks/{id}": {
+      get: {
+        summary: "read a channel-scoped task",
+        security: [{ bearer: [] }],
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+        ],
+        responses: {
+          "200": { description: "TaskRecord" },
+          "400": { description: "invalid id" },
+          "403": { description: "not allowed in this channel" },
+          "404": { description: "channel or task not found" },
+        },
+      },
+      patch: {
+        summary: "update channel-scoped task state, assignee, title, description, labels, or priority",
+        security: [{ bearer: [] }],
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "id", in: "path", required: true, schema: { type: "integer", minimum: 1 } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  title: { type: "string", maxLength: 200 },
+                  desc: { type: ["string", "null"], maxLength: 8000 },
+                  description: { type: ["string", "null"], maxLength: 8000 },
+                  state: { type: "string", enum: ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] },
+                  assignee: {
+                    type: ["object", "null"],
+                    properties: {
+                      name: { type: "string" },
+                      kind: { type: "string", enum: ["agent", "human", "squad"], default: "agent" },
+                    },
+                  },
+                  labels: { type: "array", maxItems: 20, items: { type: "string", maxLength: 40 } },
+                  priority: { type: "integer", minimum: -100, maximum: 100 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "TaskRecord" },
+          "400": { description: "invalid task body" },
+          "403": { description: "readonly token or not allowed in this channel" },
+          "404": { description: "channel or task not found" },
+          "410": { description: "channel archived" },
+        },
+      },
+    },
     "/api/channels/{slug}/search": {
       get: {
         summary: "server-side retained history search",

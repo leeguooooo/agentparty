@@ -1,7 +1,7 @@
 // rest 封装 + token 存取。
 // 规则（spec §10 / M2 契约）：URL 带 ?t= 时优先用它，并立即从地址栏移除；
 // share token 只放 sessionStorage，本次标签页可刷新，避免长期落 localStorage。
-import type { ChannelRoleAssignment, CollaborationRole, MsgFrame, PresenceEntry, SearchHit, WakeDelivery } from "@agentparty/shared";
+import type { ChannelRoleAssignment, CollaborationRole, MsgFrame, PresenceEntry, SearchHit, TaskRecord, WakeDelivery } from "@agentparty/shared";
 import type { WebSession } from "./oidc";
 
 const TOKEN_KEY = "ap_token";
@@ -328,6 +328,17 @@ export async function fetchChannelRoles(token: string, slug: string): Promise<Ch
   if (!res.ok) throw new Error(`GET /api/channels/${slug}/roles failed (${res.status})`);
   const data = (await res.json()) as { roles: ChannelRoleInfo[] };
   return data.roles;
+}
+
+export async function fetchTasks(token: string, slug: string): Promise<TaskRecord[]> {
+  const res = await fetch(`/api/channels/${encodeURIComponent(slug)}/tasks`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("forbidden");
+  if (!res.ok) throw new Error(`GET /api/channels/${slug}/tasks failed (${res.status})`);
+  const data = (await res.json()) as { tasks: TaskRecord[] };
+  return data.tasks;
 }
 
 export async function setChannelRole(

@@ -12,6 +12,9 @@ import type {
   CollaborationRole,
   MsgFrame,
   RestErrorCode,
+  TaskAssigneeKind,
+  TaskRecord,
+  TaskState,
   TokenRole,
   WebhookFilter,
 } from "@agentparty/shared";
@@ -66,6 +69,8 @@ const VISIBILITIES: readonly string[] = ["public", "private"];
 const COMPLETION_GATES: readonly string[] = ["off", "reviewer"] satisfies CompletionGate[];
 const COMPLETION_REVIEW_POLICIES: readonly string[] = ["sender", "owner"] satisfies CompletionReviewPolicy[];
 const COLLAB_ROLES: readonly string[] = ["host", "worker", "reviewer", "observer"] satisfies CollaborationRole[];
+const TASK_STATES: readonly string[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] satisfies TaskState[];
+const TASK_ASSIGNEE_KINDS: readonly string[] = ["agent", "human", "squad"] satisfies TaskAssigneeKind[];
 
 function isDurableObjectReset(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -185,6 +190,10 @@ const OWNER_RE = /^[\x20-\x7e]{1,128}$/;
 // CLI 用来跑回环 PKCE 的 public client（account.leeguoo.com 已登记）。CLI 拉 /api/config 得知用哪个
 const CLI_CLIENT_ID = "agentparty-cli";
 const CAPTURE_NOTE_MAX = 4000;
+const TASK_TITLE_MAX = 200;
+const TASK_DESC_MAX = 8000;
+const TASK_LABEL_MAX = 40;
+const TASK_LABELS_MAX = 20;
 const SPAWN_DEFAULT_TTL_SEC = 2 * 60 * 60;
 const SPAWN_MAX_TTL_SEC = 24 * 60 * 60;
 const PROFILE_TEXT_MAX = 4096;
@@ -536,6 +545,117 @@ function captureRowToRecord(row: {
       ts: row.message_ts,
     },
   };
+}
+
+function safeJsonArray<T>(raw: string | null, fallback: T[] = []): T[] {
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function taskRowToRecord(row: {
+  id: number;
+  channel_slug: string;
+  title: string;
+  description: string | null;
+  state: string;
+  assignee_name: string | null;
+  assignee_kind: string | null;
+  created_by: string;
+  created_by_kind: string;
+  created_by_owner: string | null;
+  priority: number;
+  labels_json: string;
+  parent_id: number | null;
+  anchor_seqs_json: string;
+  completion_artifact_json: string | null;
+  workflow_id: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+}): TaskRecord {
+  const assignee =
+    row.assignee_name === null || row.assignee_kind === null
+      ? null
+      : { name: row.assignee_name, kind: row.assignee_kind as TaskAssigneeKind };
+  let completionArtifact: unknown | null = null;
+  if (row.completion_artifact_json !== null) {
+    try {
+      completionArtifact = JSON.parse(row.completion_artifact_json);
+    } catch {
+      completionArtifact = null;
+    }
+  }
+  return {
+    type: "task",
+    id: row.id,
+    channel: row.channel_slug,
+    title: row.title,
+    desc: row.description,
+    state: row.state as TaskState,
+    assignee,
+    created_by: row.created_by,
+    created_by_kind: row.created_by_kind === "human" ? "human" : "agent",
+    ...(row.created_by_owner === null ? {} : { created_by_owner: row.created_by_owner }),
+    priority: row.priority,
+    labels: safeJsonArray<string>(row.labels_json).filter((label): label is string => typeof label === "string"),
+    parent_id: row.parent_id,
+    anchor_seqs: safeJsonArray<number>(row.anchor_seqs_json).filter((seq): seq is number => Number.isInteger(seq) && seq > 0),
+    completion_artifact: completionArtifact,
+    workflow_id: row.workflow_id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    completed_at: row.completed_at,
+  };
+}
+
+function parseTaskLabels(input: unknown): string[] | null {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) return null;
+  const labels: string[] = [];
+  for (const item of input) {
+    if (typeof item !== "string") return null;
+    const label = item.trim();
+    if (label === "") continue;
+    if (label.length > TASK_LABEL_MAX || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(label)) return null;
+    if (!labels.includes(label)) labels.push(label);
+    if (labels.length > TASK_LABELS_MAX) return null;
+  }
+  return labels;
+}
+
+function parseTaskAnchors(input: unknown): number[] | null {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) return null;
+  const anchors: number[] = [];
+  for (const item of input) {
+    const seq = positiveInt(item);
+    if (seq === null) return null;
+    if (!anchors.includes(seq)) anchors.push(seq);
+  }
+  return anchors;
+}
+
+function parseTaskAssignee(input: unknown): { name: string; kind: TaskAssigneeKind } | null | undefined {
+  if (input === undefined) return undefined;
+  if (input === null) return null;
+  if (!isRecord(input)) return undefined;
+  const name = typeof input.name === "string" ? input.name.trim().replace(/^@/, "") : "";
+  const kind = typeof input.kind === "string" ? input.kind : "agent";
+  if (!NAME_RE.test(name) || !TASK_ASSIGNEE_KINDS.includes(kind)) return undefined;
+  return { name, kind: kind as TaskAssigneeKind };
+}
+
+type TaskRow = Parameters<typeof taskRowToRecord>[0];
+
+async function loadTaskRow(db: D1Database, slug: string, id: number): Promise<TaskRow | null> {
+  return db.prepare("SELECT * FROM channel_tasks WHERE channel_slug = ? AND id = ?")
+    .bind(slug, id)
+    .first<TaskRow>();
 }
 
 // 铸/重铸 token 的落库逻辑（/api/tokens 与 /api/agents 共用）：
@@ -2724,6 +2844,232 @@ app.get("/api/channels/:slug/read-cursors", async (c) => {
       headers: { "x-partykit-room": slug },
     }),
   );
+});
+
+app.get("/api/channels/:slug/tasks", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const url = new URL(c.req.url);
+  const state = url.searchParams.get("state");
+  if (state !== null && !TASK_STATES.includes(state)) {
+    return c.json(errorBody("bad_request", "state must be triage|backlog|assigned|in_progress|needs_review|done|blocked"), 400);
+  }
+  const assignee = url.searchParams.get("assignee");
+  if (assignee !== null && !NAME_RE.test(assignee.replace(/^@/, ""))) {
+    return c.json(errorBody("bad_request", "assignee must be a valid name"), 400);
+  }
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    return c.json(errorBody("bad_request", "limit must be 1..500"), 400);
+  }
+  const clauses = ["channel_slug = ?"];
+  const bindings: unknown[] = [slug];
+  if (state !== null) {
+    clauses.push("state = ?");
+    bindings.push(state);
+  }
+  if (assignee !== null) {
+    clauses.push("assignee_name = ?");
+    bindings.push(assignee.replace(/^@/, ""));
+  }
+  bindings.push(limit);
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM channel_tasks WHERE ${clauses.join(" AND ")} ORDER BY
+      CASE state
+        WHEN 'blocked' THEN 0
+        WHEN 'needs_review' THEN 1
+        WHEN 'in_progress' THEN 2
+        WHEN 'assigned' THEN 3
+        WHEN 'triage' THEN 4
+        WHEN 'backlog' THEN 5
+        ELSE 6
+      END,
+      priority DESC,
+      updated_at DESC,
+      id DESC
+     LIMIT ?`,
+  )
+    .bind(...bindings)
+    .all<TaskRow>();
+  return c.json({ tasks: results.map(taskRowToRecord) });
+});
+
+app.get("/api/channels/:slug/tasks/:id", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const id = positiveInt(Number(c.req.param("id")));
+  if (id === null) return c.json(errorBody("bad_request", "id must be a positive integer"), 400);
+  const row = await loadTaskRow(c.env.DB, slug, id);
+  if (!row) return c.json(errorBody("not_found", "task not found"), 404);
+  return c.json(taskRowToRecord(row));
+});
+
+app.post("/api/channels/:slug/tasks", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!(await canAccessLoadedChannel(c.env.DB, identity, channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  if (identity.role === "readonly") {
+    return c.json(errorBody("forbidden", "readonly token cannot create tasks"), 403);
+  }
+  if (channel.archived_at !== null) {
+    return c.json(errorBody("archived", "channel is archived"), 410);
+  }
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  const title = typeof body?.title === "string" ? body.title.trim() : "";
+  const desc = typeof body?.desc === "string" ? body.desc : typeof body?.description === "string" ? body.description : null;
+  if (title === "" || textEncoder.encode(title).byteLength > TASK_TITLE_MAX) {
+    return c.json(errorBody("bad_request", `title must be a non-empty string <= ${TASK_TITLE_MAX} bytes`), 400);
+  }
+  if (desc !== null && textEncoder.encode(desc).byteLength > TASK_DESC_MAX) {
+    return c.json(errorBody("bad_request", `description must be <= ${TASK_DESC_MAX} bytes`), 400);
+  }
+  const requestedState = typeof body?.state === "string" ? body.state : null;
+  if (requestedState !== null && !TASK_STATES.includes(requestedState)) {
+    return c.json(errorBody("bad_request", "state must be triage|backlog|assigned|in_progress|needs_review|done|blocked"), 400);
+  }
+  const assignee = parseTaskAssignee(body?.assignee);
+  if (assignee === undefined && body !== null && Object.prototype.hasOwnProperty.call(body, "assignee")) {
+    return c.json(errorBody("bad_request", "assignee must be null or {name, kind: agent|human|squad}"), 400);
+  }
+  const labels = parseTaskLabels(body?.labels);
+  if (labels === null) {
+    return c.json(errorBody("bad_request", `labels must be <= ${TASK_LABELS_MAX} valid name tokens`), 400);
+  }
+  const anchorSeqs = parseTaskAnchors(body?.anchor_seqs);
+  if (anchorSeqs === null) return c.json(errorBody("bad_request", "anchor_seqs must be positive integer array"), 400);
+  const priority = body?.priority === undefined ? 0 : typeof body?.priority === "number" && Number.isInteger(body.priority) ? body.priority : null;
+  if (priority === null || priority < -100 || priority > 100) {
+    return c.json(errorBody("bad_request", "priority must be an integer between -100 and 100"), 400);
+  }
+  const parentId = body?.parent_id === undefined || body?.parent_id === null ? null : positiveInt(body.parent_id);
+  if (parentId === null && body?.parent_id !== undefined && body?.parent_id !== null) {
+    return c.json(errorBody("bad_request", "parent_id must be a positive integer"), 400);
+  }
+  if (parentId !== null && !(await loadTaskRow(c.env.DB, slug, parentId))) {
+    return c.json(errorBody("not_found", "parent task not found in this channel"), 404);
+  }
+  const workflowId = body?.workflow_id === undefined || body?.workflow_id === null ? null : body.workflow_id;
+  if (workflowId !== null && (typeof workflowId !== "string" || workflowId.length > 128 || /[\x00-\x1f\x7f]/.test(workflowId))) {
+    return c.json(errorBody("bad_request", "workflow_id must be printable text <= 128 chars"), 400);
+  }
+  const state = (requestedState ?? (assignee ? "assigned" : identity.kind === "agent" ? "triage" : "backlog")) as TaskState;
+  const now = Date.now();
+  const result = await c.env.DB.prepare(
+    `INSERT INTO channel_tasks (
+       channel_slug, title, description, state, assignee_name, assignee_kind,
+       created_by, created_by_kind, created_by_owner, priority, labels_json,
+       parent_id, anchor_seqs_json, workflow_id, created_at, updated_at, completed_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      slug,
+      title,
+      desc,
+      state,
+      assignee?.name ?? null,
+      assignee?.kind ?? null,
+      identity.name,
+      identity.kind,
+      identity.owner ?? null,
+      priority,
+      JSON.stringify(labels),
+      parentId,
+      JSON.stringify(anchorSeqs),
+      workflowId,
+      now,
+      now,
+      state === "done" ? now : null,
+    )
+    .run();
+  const id = Number(result.meta.last_row_id);
+  const row = await loadTaskRow(c.env.DB, slug, id);
+  await insertSystemStatus(c.env, slug, `task #${id} created: ${title}`).catch(() => false);
+  return c.json(taskRowToRecord(row!), 201);
+});
+
+app.patch("/api/channels/:slug/tasks/:id", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!(await canAccessLoadedChannel(c.env.DB, identity, channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  if (identity.role === "readonly") {
+    return c.json(errorBody("forbidden", "readonly token cannot update tasks"), 403);
+  }
+  if (channel.archived_at !== null) {
+    return c.json(errorBody("archived", "channel is archived"), 410);
+  }
+  const id = positiveInt(Number(c.req.param("id")));
+  if (id === null) return c.json(errorBody("bad_request", "id must be a positive integer"), 400);
+  const existing = await loadTaskRow(c.env.DB, slug, id);
+  if (!existing) return c.json(errorBody("not_found", "task not found"), 404);
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!body) return c.json(errorBody("bad_request", "json body required"), 400);
+
+  const state = body.state === undefined ? existing.state : typeof body.state === "string" && TASK_STATES.includes(body.state) ? body.state : null;
+  if (state === null) {
+    return c.json(errorBody("bad_request", "state must be triage|backlog|assigned|in_progress|needs_review|done|blocked"), 400);
+  }
+  const assignee = parseTaskAssignee(body.assignee);
+  if (assignee === undefined && Object.prototype.hasOwnProperty.call(body, "assignee")) {
+    return c.json(errorBody("bad_request", "assignee must be null or {name, kind: agent|human|squad}"), 400);
+  }
+  const title = body.title === undefined ? existing.title : typeof body.title === "string" ? body.title.trim() : null;
+  if (title === null || title === "" || textEncoder.encode(title).byteLength > TASK_TITLE_MAX) {
+    return c.json(errorBody("bad_request", `title must be a non-empty string <= ${TASK_TITLE_MAX} bytes`), 400);
+  }
+  const desc = body.desc === undefined && body.description === undefined
+    ? existing.description
+    : body.desc === null || body.description === null
+      ? null
+      : typeof body.desc === "string"
+        ? body.desc
+        : typeof body.description === "string"
+          ? body.description
+          : undefined;
+  if (desc === undefined || (desc !== null && textEncoder.encode(desc).byteLength > TASK_DESC_MAX)) {
+    return c.json(errorBody("bad_request", `description must be <= ${TASK_DESC_MAX} bytes`), 400);
+  }
+  const labels = body.labels === undefined ? safeJsonArray<string>(existing.labels_json) : parseTaskLabels(body.labels);
+  if (labels === null) {
+    return c.json(errorBody("bad_request", `labels must be <= ${TASK_LABELS_MAX} valid name tokens`), 400);
+  }
+  const priority = body.priority === undefined ? existing.priority : typeof body.priority === "number" && Number.isInteger(body.priority) ? body.priority : null;
+  if (priority === null || priority < -100 || priority > 100) {
+    return c.json(errorBody("bad_request", "priority must be an integer between -100 and 100"), 400);
+  }
+
+  const nextAssigneeName =
+    assignee === undefined ? existing.assignee_name : assignee === null ? null : assignee.name;
+  const nextAssigneeKind =
+    assignee === undefined ? existing.assignee_kind : assignee === null ? null : assignee.kind;
+  const now = Date.now();
+  const completedAt = state === "done" ? existing.completed_at ?? now : null;
+  await c.env.DB.prepare(
+    `UPDATE channel_tasks
+        SET title = ?, description = ?, state = ?, assignee_name = ?, assignee_kind = ?,
+            priority = ?, labels_json = ?, updated_at = ?, completed_at = ?
+      WHERE channel_slug = ? AND id = ?`,
+  )
+    .bind(title, desc, state, nextAssigneeName, nextAssigneeKind, priority, JSON.stringify(labels), now, completedAt, slug, id)
+    .run();
+  const row = await loadTaskRow(c.env.DB, slug, id);
+  await insertSystemStatus(c.env, slug, `task #${id} ${state}`).catch(() => false);
+  return c.json(taskRowToRecord(row!));
 });
 
 app.get("/api/channels/:slug/captures", async (c) => {

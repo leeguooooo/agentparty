@@ -2566,6 +2566,96 @@
   font-size: 12px;
 }
 
+.task-ledger-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.task-ledger-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.task-ledger-head h2 {
+  margin: 0;
+  font-size: 14px;
+}
+.task-ledger-head p {
+  margin: 2px 0 0;
+  color: var(--t-dim);
+  font-size: 11px;
+}
+.task-ledger-counts,
+.task-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.task-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.task-card {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1.5px solid var(--t-faint);
+  border-radius: 8px;
+  background: var(--t-panel2);
+}
+.task-card-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.task-card-main strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-card p {
+  margin: 6px 0 0;
+  color: var(--t-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.task-card-meta {
+  margin-top: 7px;
+  color: var(--t-dim);
+  font-size: 10.5px;
+}
+.task-id,
+.task-label,
+.task-state {
+  flex: none;
+  padding: 1px 6px;
+  border: 1.5px solid var(--t-faint);
+  border-radius: 7px;
+  background: var(--t-panel);
+  font-size: 10.5px;
+}
+.task-state--blocked {
+  border-color: var(--p-blocked);
+  color: var(--p-blocked);
+  background: color-mix(in srgb, var(--p-blocked) 10%, var(--t-panel));
+}
+.task-state--done {
+  border-color: var(--p-done);
+  color: var(--p-done);
+  background: color-mix(in srgb, var(--p-done) 10%, var(--t-panel));
+}
+.task-state--needs_review {
+  border-color: var(--d-blue);
+  color: var(--d-blue);
+  background: var(--d-blue-soft);
+}
+
 /* 浮层：脱离 grid 流铺满视口（沿用抽屉遮罩修复的做法），居中放手绘卡 */
 .agent-join-overlay {
   position: fixed;
