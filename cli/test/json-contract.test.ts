@@ -257,25 +257,17 @@ describe("json contract fixtures", () => {
 
   test("wake test --json output matches the agentparty.v1 fixture shape", async () => {
     restMock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: Date.now(),
-                  last_seen: Date.now(),
-                  residency: "human_driven",
-                  wake: { kind: "none" },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: Date.now(),
+              last_seen: Date.now(),
+              residency: "human_driven",
+              wake: { kind: "none" },
             },
           ],
         });

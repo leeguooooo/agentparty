@@ -7,7 +7,7 @@ import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../
 import { resolveChannel } from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { fetchMessages, handleRestError, listChannels } from "../rest";
+import { fetchMessages, fetchPresence, handleRestError } from "../rest";
 import { isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
 const HOST_FLAGS = ["channel", "since", "limit", "json"];
@@ -16,7 +16,7 @@ const HELP = `usage: party host board [channel|--channel C] [--since seq] [--lim
 Show a derived coordinator board for host/failover review.
 
 The board is read-only and uses existing data only:
-  - /api/channels presence for host lease/residency
+  - /api/channels/:channel/presence for host lease/residency
   - retained status history for open claims, blockers, and host decisions
 
 Options:
@@ -113,11 +113,10 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const [channels, messages] = await Promise.all([
-      listChannels(cfg.server, cfg.token),
+    const [presence, messages] = await Promise.all([
+      fetchPresence(cfg.server, cfg.token, channel),
       fetchMessages(cfg.server, cfg.token, channel, since ?? 0, limit ?? 500),
     ]);
-    const presence = channels.find((c) => c.slug === channel)?.presence ?? [];
     const board = buildHostBoard(channel, presence, messages);
     if (flags.json === true) console.log(JSON.stringify(jsonFrame(board as unknown as Record<string, unknown>)));
     else printBoard(board);

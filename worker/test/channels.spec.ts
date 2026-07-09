@@ -22,7 +22,7 @@ describe("channels", () => {
     expect(found).toMatchObject({ slug, kind: "temp", archived_at: null });
   });
 
-  it("list aggregates last message + presence per channel (spec §9 第 1 块)", async () => {
+  it("list stays lightweight by default and aggregates summary only when requested", async () => {
     const { token, name } = await seedToken("agent");
     const slug = uniq("ch");
     const created = await api("/api/channels", token, {
@@ -49,6 +49,10 @@ describe("channels", () => {
     expect(status.status).toBe(200);
 
     list = await api("/api/channels", token);
+    found = ((await list.json()) as { channels: Listed[] }).channels.find((c) => c.slug === slug);
+    expect(found).toMatchObject({ last_message: null, presence: [] });
+
+    list = await api("/api/channels?summary=1", token);
     found = ((await list.json()) as { channels: Listed[] }).channels.find((c) => c.slug === slug);
     expect(found?.last_message).toMatchObject({ sender: name, kind: "status", body: "digging" });
     expect(found?.presence).toContainEqual(expect.objectContaining({ name, state: "working" }));

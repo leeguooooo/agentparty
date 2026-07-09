@@ -1760,7 +1760,8 @@ app.use("/api/channels", requireBearer);
 app.use("/api/channels/*", requireBearer);
 app.use("/api/join/*", requireBearer);
 
-// 频道列表页要「最近一条消息 + 参与者状态点」（spec §9 第 1 块），逐 do 聚合 summary
+// 频道列表默认只读 D1，避免每次列表刷新都按频道数 fan-out 到所有 ChannelDO。
+// 调试/兼容场景可显式带 ?summary=1 拉「最近一条消息 + 参与者状态点」。
 interface ChannelSummary {
   last: { sender: string; kind: string; body: string; ts: number } | null;
   presence: { name: string; state: string; note: string | null; ts: number }[];
@@ -1768,6 +1769,7 @@ interface ChannelSummary {
 
 app.get("/api/channels", async (c) => {
   const identity = c.get("identity");
+  const includeSummary = c.req.query("summary") === "1" || c.req.query("summary") === "true";
   // created_by / owner_account 仅用于 ACL 判定，不回给客户端（保持列表响应契约不变）
   const { results } = await c.env.DB.prepare(
     "SELECT slug, title, topic, kind, mode, visibility, created_by, owner_account, created_at, archived_at, charter_rev FROM channels ORDER BY created_at, id",
@@ -1804,15 +1806,17 @@ app.get("/api/channels", async (c) => {
       const canModerate = isChannelModerator(identity, full);
       const { created_by, owner_account, ...row } = full;
       let summary: ChannelSummary = { last: null, presence: [] };
-      try {
-        const res = await fetchChannelDO(
-          c.env,
-          row.slug,
-          new Request("https://do/internal/summary", { headers: { "x-partykit-room": row.slug } }),
-        );
-        if (res.ok) summary = (await res.json()) as ChannelSummary;
-      } catch {
-        // do 不可达时列表仍可用，摘要降级为空
+      if (includeSummary) {
+        try {
+          const res = await fetchChannelDO(
+            c.env,
+            row.slug,
+            new Request("https://do/internal/summary", { headers: { "x-partykit-room": row.slug } }),
+          );
+          if (res.ok) summary = (await res.json()) as ChannelSummary;
+        } catch {
+          // do 不可达时列表仍可用，摘要降级为空
+        }
       }
       return { ...row, can_moderate: canModerate, last_message: summary.last, presence: summary.presence };
     }),

@@ -792,38 +792,30 @@ describe("party status/history channel flag", () => {
   test("host board summarizes host lease, claims, blockers, and decisions", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: "Dev",
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "host-a",
-                  state: "working",
-                  note: "coordinating",
-                  ts: now - 1000,
-                  last_seen: now - 1000,
-                  role: "host",
-                  role_source: "assigned",
-                  residency: "supervised",
-                  wake: { kind: "serve", verified_at: now - 2000 },
-                },
-                {
-                  name: "host-b",
-                  state: "working",
-                  note: "manual",
-                  ts: now - 1000,
-                  last_seen: now - 1000,
-                  role: "host",
-                  role_source: "self",
-                  residency: "human_driven",
-                  wake: { kind: "none" },
-                },
-              ],
+              name: "host-a",
+              state: "working",
+              note: "coordinating",
+              ts: now - 1000,
+              last_seen: now - 1000,
+              role: "host",
+              role_source: "assigned",
+              residency: "supervised",
+              wake: { kind: "serve", verified_at: now - 2000 },
+            },
+            {
+              name: "host-b",
+              state: "working",
+              note: "manual",
+              ts: now - 1000,
+              last_seen: now - 1000,
+              role: "host",
+              role_source: "self",
+              residency: "human_driven",
+              wake: { kind: "none" },
             },
           ],
         });
@@ -959,27 +951,19 @@ describe("party status/history channel flag", () => {
   test("host board recommends human guard reset and takeover when only stale hosts remain", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: "Dev",
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "host-old",
-                  state: "working",
-                  note: "manual host",
-                  ts: now - 120_000,
-                  last_seen: now - 120_000,
-                  role: "host",
-                  role_source: "self",
-                  residency: "human_driven",
-                  wake: { kind: "none" },
-                },
-              ],
+              name: "host-old",
+              state: "working",
+              note: "manual host",
+              ts: now - 120_000,
+              last_seen: now - 120_000,
+              role: "host",
+              role_source: "self",
+              residency: "human_driven",
+              wake: { kind: "none" },
             },
           ],
         });
@@ -1047,27 +1031,19 @@ describe("party status/history channel flag", () => {
   test("host board does not recommend guard reset after a human message clears loop guard", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: "Dev",
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "host-old",
-                  state: "working",
-                  note: "manual host",
-                  ts: now - 120_000,
-                  last_seen: now - 120_000,
-                  role: "host",
-                  role_source: "self",
-                  residency: "human_driven",
-                  wake: { kind: "none" },
-                },
-              ],
+              name: "host-old",
+              state: "working",
+              note: "manual host",
+              ts: now - 120_000,
+              last_seen: now - 120_000,
+              role: "host",
+              role_source: "self",
+              residency: "human_driven",
+              wake: { kind: "none" },
             },
           ],
         });
@@ -1204,27 +1180,19 @@ describe("party status/history channel flag", () => {
   test("host board detects overlapping claim scopes for coordinator triage", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: "Dev",
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "host-a",
-                  state: "working",
-                  note: "coordinating",
-                  ts: now - 1000,
-                  last_seen: now - 1000,
-                  role: "host",
-                  role_source: "assigned",
-                  residency: "supervised",
-                  wake: { kind: "serve", verified_at: now - 2000 },
-                },
-              ],
+              name: "host-a",
+              state: "working",
+              note: "coordinating",
+              ts: now - 1000,
+              last_seen: now - 1000,
+              role: "host",
+              role_source: "assigned",
+              residency: "supervised",
+              wake: { kind: "serve", verified_at: now - 2000 },
             },
           ],
         });
@@ -1889,25 +1857,17 @@ describe("party status/history channel flag", () => {
 
   test("wake test reports human-driven wake=none as inbox-only and does not send", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: 111,
-                  last_seen: 111,
-                  residency: "human_driven",
-                  wake: { kind: "none" },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: 111,
+              last_seen: 111,
+              residency: "human_driven",
+              wake: { kind: "none" },
             },
           ],
         });
@@ -1936,26 +1896,18 @@ describe("party status/history channel flag", () => {
 
   test("wake test sends to a serve adapter even when residency=bare (empirical, not refused)", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         const now = Date.now();
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: now,
-                  last_seen: now,
-                  residency: "bare",
-                  wake: { kind: "serve", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: now,
+              last_seen: now,
+              residency: "bare",
+              wake: { kind: "serve", verified_at: 100 },
             },
           ],
         });
@@ -2001,25 +1953,17 @@ describe("party status/history channel flag", () => {
 
   test("wake test refuses stale watch/serve adapters before sending", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "offline",
-                  note: null,
-                  ts: 111,
-                  last_seen: 111,
-                  residency: "supervised",
-                  wake: { kind: "watch", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "offline",
+              note: null,
+              ts: 111,
+              last_seen: 111,
+              residency: "supervised",
+              wake: { kind: "watch", verified_at: 100 },
             },
           ],
         });
@@ -2046,26 +1990,18 @@ describe("party status/history channel flag", () => {
 
   test("wake test sends to advertised wake adapter and accepts linked status summary as resume", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         const now = Date.now();
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: now,
-                  last_seen: now,
-                  residency: "supervised",
-                  wake: { kind: "serve", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: now,
+              last_seen: now,
+              residency: "supervised",
+              wake: { kind: "serve", verified_at: 100 },
             },
           ],
         });
@@ -2123,25 +2059,17 @@ describe("party status/history channel flag", () => {
 
   test("wake test reports audited webhook delivery without treating it as resume", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: 111,
-                  last_seen: 111,
-                  residency: "webhook",
-                  wake: { kind: "webhook", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: 111,
+              last_seen: 111,
+              residency: "webhook",
+              wake: { kind: "webhook", verified_at: 100 },
             },
           ],
         });
@@ -2195,25 +2123,17 @@ describe("party status/history channel flag", () => {
 
   test("wake test accepts durable ledger resume evidence", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: 111,
-                  last_seen: 111,
-                  residency: "webhook",
-                  wake: { kind: "webhook", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: 111,
+              last_seen: 111,
+              residency: "webhook",
+              wake: { kind: "webhook", verified_at: 100 },
             },
           ],
         });
@@ -2262,25 +2182,17 @@ describe("party status/history channel flag", () => {
 
   test("wake test timeout keeps mention delivery separate from resume", async () => {
     mock = startRestMock((req) => {
-      if (req.method === "GET" && req.path === "/api/channels") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
         return Response.json({
-          channels: [
+          presence: [
             {
-              slug: "dev",
-              title: null,
-              kind: "standing",
-              archived_at: null,
-              presence: [
-                {
-                  name: "agent",
-                  state: "waiting",
-                  note: null,
-                  ts: 111,
-                  last_seen: 111,
-                  residency: "webhook",
-                  wake: { kind: "webhook", verified_at: 100 },
-                },
-              ],
+              name: "agent",
+              state: "waiting",
+              note: null,
+              ts: 111,
+              last_seen: 111,
+              residency: "webhook",
+              wake: { kind: "webhook", verified_at: 100 },
             },
           ],
         });

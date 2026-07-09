@@ -119,7 +119,7 @@ export class ChannelSocket {
   private async probeThenRetry() {
     let revoked = false;
     try {
-      const res = await fetch("/api/channels", {
+      const res = await fetch("/api/me", {
         headers: { authorization: `Bearer ${this.token}` },
       });
       revoked = res.status === 401;

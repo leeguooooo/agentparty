@@ -4,7 +4,7 @@ import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../
 import { resolveChannel } from "../config";
 import { jsonFrame, nowTs } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { RestError, fetchMessages, fetchWakeDeliveries, handleRestError, listChannels, postMessage } from "../rest";
+import { RestError, fetchMessages, fetchPresence, fetchWakeDeliveries, handleRestError, postMessage } from "../rest";
 import { MAX_TIMEOUT_SEC, isName, isSlug, parsePositiveIntFlag } from "../validation";
 
 const WAKE_FLAGS = ["channel", "timeout", "json"];
@@ -225,9 +225,8 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const channels = await listChannels(cfg.server, cfg.token);
-    const info = channels.find((c) => c.slug === channel);
-    const presence = info?.presence?.find((p) => p.name === target) ?? null;
+    const presenceList = await fetchPresence(cfg.server, cfg.token, channel);
+    const presence = presenceList.find((p) => p.name === target) ?? null;
     const generatedAt = nowTs();
     const reason = notWakeableReason(presence, generatedAt);
     const adapter = presence?.wake?.kind ?? null;

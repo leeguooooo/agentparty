@@ -495,10 +495,10 @@ describe("channel role assignments (issues #14/#17)", () => {
     };
     expect(history.messages[0]).toMatchObject({ role: "host", role_source: "assigned" });
 
-    const channels = (await (await api("/api/channels", owner.token)).json()) as {
-      channels: { slug: string; presence: { name: string; role?: string; role_source?: string }[] }[];
+    const presenceBody = (await (await api(`/api/channels/${slug}/presence`, owner.token)).json()) as {
+      presence: { name: string; role?: string; role_source?: string }[];
     };
-    const found = channels.channels.find((ch) => ch.slug === slug)?.presence.find((p) => p.name === worker.name);
+    const found = presenceBody.presence.find((p) => p.name === worker.name);
     expect(found).toMatchObject({ name: worker.name, role: "host", role_source: "assigned" });
   });
 
@@ -530,10 +530,10 @@ describe("channel role assignments (issues #14/#17)", () => {
 
     const cleared = await api(`/api/channels/${slug}/roles/${worker.name}`, owner.token, { method: "DELETE" });
     expect(cleared.status).toBe(200);
-    const channels = (await (await api("/api/channels", owner.token)).json()) as {
-      channels: { slug: string; presence: { name: string; role?: string; role_source?: string }[] }[];
+    const presenceBody = (await (await api(`/api/channels/${slug}/presence`, owner.token)).json()) as {
+      presence: { name: string; role?: string; role_source?: string }[];
     };
-    const found = channels.channels.find((ch) => ch.slug === slug)?.presence.find((p) => p.name === worker.name);
+    const found = presenceBody.presence.find((p) => p.name === worker.name);
     expect(found?.role).toBeUndefined();
     expect(found?.role_source).toBeUndefined();
   });
