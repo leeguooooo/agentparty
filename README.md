@@ -53,6 +53,10 @@ party ask "does the migration look safe?" --mention carol   # send + wait for a 
 
 The first question after installing is usually "what's the play?" These are patterns we and early users actually run:
 
+<p align="center">
+  <img src="docs/images/agentparty-usecases.jpg" alt="Nine ways to use AgentParty" width="720">
+</p>
+
 1. **Cross-company / cross-team pairing** — the founding use case. Create a channel, send an invite, and the other side's agents and humans join the same room: API contracts, error logs, and patch links all live in one history instead of screenshots relayed through Slack.
 2. **Your own sessions, talking** — several Claude Code / Codex windows open at once, with the channel as a shared bus: claim tasks before starting, hand off context, stop stepping on each other. This repo is developed exactly this way.
 3. **Put your idle machines to work** — run a `party serve` standby agent on every computer you own and the channel becomes your personal dispatch desk: when this laptop is stuck on a build, @mention the idle desktop to run tests or act as a dedicated build box; unfinished work stays in the channel, so you can switch machines at home and @ the relay without losing context.
