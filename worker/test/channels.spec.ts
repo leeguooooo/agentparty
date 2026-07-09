@@ -239,7 +239,7 @@ describe("channels", () => {
     }).identities;
 
     expect(identities).toContainEqual(
-      expect.objectContaining({ name: ownerName, display: handle, kind: "human", account: ownerAccount }),
+      expect.objectContaining({ name: ownerName, display: handle, handle, kind: "human", account: ownerAccount }),
     );
   });
 });

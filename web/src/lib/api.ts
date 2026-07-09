@@ -134,6 +134,7 @@ export interface ChannelIdentity {
   display: string;
   kind?: "agent" | "human";
   account?: string;
+  handle?: string;
 }
 
 export type ChannelRoleInfo = ChannelRoleAssignment;

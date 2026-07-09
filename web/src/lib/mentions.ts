@@ -10,6 +10,7 @@ export interface MentionIdentity {
   display: string;
   kind?: "agent" | "human";
   account?: string;
+  handle?: string;
 }
 
 export interface MentionCandidate {
@@ -32,6 +33,7 @@ const DEAD_MS = 14 * 24 * 60 * 60 * 1000; // 14 天没露面才视为幽灵
 // OIDC 设备验证流 = login-verify-*。过渡期旧 presence 行没回填 kind 时靠名字把它们判为 human。
 const SYSTEM_HUMAN_SESSION_RE =
   /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|login-verify-.+)$/i;
+const NAME_TOKEN_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 
 // 档位：① 在线（当前有 WS 连接） ② 可唤醒（autoWakeReachable 统一口径 #47/#55：
 // serve/watch 需不 stale 且不能是 human_driven，webhook 服务端投递、离线也算） ③ 最近活跃（其余 presence）。
@@ -97,7 +99,11 @@ export function mentionCandidates(
       const account = identity?.account ?? assigned?.account ?? p?.account;
       // 人类全局唯一昵称（handle）：有则用它做 @ 插入 token 和显示名——UUID 会话名打不出来，
       // handle 才能被后端 R5 按 handle 识别为「被 @」。agent 不适用（其 name 本身就是可读 handle）。
-      const handle = kind === "human" ? (participantByName.get(name)?.handle ?? p?.handle) : undefined;
+      const identityHandle =
+        identity?.handle !== undefined && identity.handle !== "" && NAME_TOKEN_RE.test(identity.handle)
+          ? identity.handle
+          : undefined;
+      const handle = kind === "human" ? (participantByName.get(name)?.handle ?? p?.handle ?? identityHandle) : undefined;
       // 人类网页会话名是 UUID，显示账号 email 才认得出「是谁」；agent 名本身可读，用 name。
       const display = handle
         ? handle
@@ -123,7 +129,12 @@ export function mentionCandidates(
     })
     .filter((c) => {
       if (c.tier === "online") return true; // 当前连着的都留（含在线的人类）
-      if (c.kind === "human") return false; // 不在线的人类围观者不作候选
+      if (c.kind === "human") {
+        // 离线人类也可以是明确收件人：例如 Lark/OIDC 人类已经发过消息，identity API 能给出
+        // handle/display；但没有账号/显示名的围观 session 仍然隐藏，避免菜单里出现裸 UUID。
+        if (SYSTEM_HUMAN_SESSION_RE.test(c.name)) return c.account !== undefined && c.display !== c.name && c.display !== c.account;
+        return c.account !== undefined || (c.display !== c.name && c.display !== c.account);
+      }
       if (roleByName.has(c.name)) return true;
       if (identityByName.has(c.name)) return true;
       const p = presence[c.name];

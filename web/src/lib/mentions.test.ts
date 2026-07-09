@@ -120,6 +120,36 @@ describe("mentionCandidates", () => {
     expect(filterCandidates(c, "agent").map((candidate) => candidate.name)).toEqual(["lark-14c1a0719d91"]);
   });
 
+  test("offline human identity with handle stays mentionable by readable handle", () => {
+    const c = mentionCandidates([], {}, null, NOW, [
+      {
+        name: "lark-14c1a0719d91",
+        display: "Evan",
+        handle: "Evan",
+        kind: "human",
+        account: "lark:on_acda4d50062e089bf3b2401b907decde",
+      },
+    ]);
+    expect(c).toHaveLength(1);
+    expect(c[0]!.name).toBe("Evan");
+    expect(c[0]!.display).toBe("Evan");
+    expect(filterCandidates(c, "ev").map((candidate) => candidate.name)).toEqual(["Evan"]);
+  });
+
+  test("offline human identity without handle is still selectable by readable display", () => {
+    const c = mentionCandidates([], {}, null, NOW, [
+      {
+        name: "lark-14c1a0719d91",
+        display: "Evan",
+        kind: "human",
+        account: "lark:on_acda4d50062e089bf3b2401b907decde",
+      },
+    ]);
+    expect(c).toHaveLength(1);
+    expect(c[0]!.name).toBe("lark-14c1a0719d91");
+    expect(c[0]!.display).toBe("Evan");
+  });
+
   test("assigned channel roles add offline agents and carry structured responsibility", () => {
     const c = mentionCandidates([], {}, null, NOW, [], [
       {

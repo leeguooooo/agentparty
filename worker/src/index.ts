@@ -2941,16 +2941,18 @@ app.get("/api/channels/:slug/identities", async (c) => {
   if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
     return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
   }
-  const identities = new Map<string, { name: string; kind?: "agent" | "human"; account?: string; display: string }>();
-  const add = (identity: { name: string; kind?: "agent" | "human"; account?: string; display?: string }) => {
+  const identities = new Map<string, { name: string; kind?: "agent" | "human"; account?: string; display: string; handle?: string }>();
+  const add = (identity: { name: string; kind?: "agent" | "human"; account?: string; display?: string; handle?: string | null }) => {
     const prev = identities.get(identity.name);
     const kind = identity.kind ?? prev?.kind;
     const account = identity.account ?? prev?.account;
+    const handle = typeof identity.handle === "string" && identity.handle !== "" ? identity.handle : prev?.handle;
     const explicitDisplay = typeof identity.display === "string" && identity.display !== "" ? identity.display : undefined;
     identities.set(identity.name, {
       name: identity.name,
       ...(kind === undefined ? {} : { kind }),
       ...(account === undefined ? {} : { account }),
+      ...(handle === undefined ? {} : { handle }),
       display: explicitDisplay ?? (kind === "human" && account ? account : (prev?.display ?? identity.name)),
     });
   };
@@ -2980,10 +2982,11 @@ app.get("/api/channels/:slug/identities", async (c) => {
     )
       .bind(account)
       .first<{ handle: string | null; display_name: string | null }>();
-    const display = profile?.handle || profile?.display_name || null;
+    const handle = profile?.handle || null;
+    const display = handle || profile?.display_name || null;
     if (display === null) continue;
     for (const identity of identities.values()) {
-      if (identity.kind === "human" && identity.account === account) add({ ...identity, display });
+      if (identity.kind === "human" && identity.account === account) add({ ...identity, display, handle });
     }
   }
 
