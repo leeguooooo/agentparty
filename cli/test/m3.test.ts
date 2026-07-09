@@ -704,6 +704,26 @@ describe("party status/history channel flag", () => {
     expect((req.body as { context: { worktree_label?: string } }).context.worktree_label).toContain(":");
   });
 
+  test("status --task scopes the status and updates the task ledger", async () => {
+    mock = startRestMock((req) => {
+      if (req.method === "PATCH" && req.path === "/api/channels/dev/tasks/12") {
+        return Response.json({ type: "task", id: 12, state: (req.body as { state: string }).state });
+      }
+      return undefined;
+    });
+    writeCfg(mock.url);
+    const r = await runCli(["status", "dev", "working", "-m", "started", "--scope", "web", "--task", "12"]);
+    expect(r.code).toBe(0);
+    const send = reqsOf(mock, "POST", "/api/channels/dev/messages")[0]!;
+    expect(send.body).toMatchObject({
+      kind: "status",
+      state: "working",
+      note: "started",
+      scope: ["web", "task:12"],
+    });
+    expect(reqsOf(mock, "PATCH", "/api/channels/dev/tasks/12")[0]!.body).toEqual({ state: "in_progress" });
+  });
+
   test("status debug-auth prints safe runtime/config source without raw token", async () => {
     mock = startRestMock();
     writeCfg(mock.url);
@@ -1324,6 +1344,8 @@ describe("party status/history channel flag", () => {
       "5",
       "--pr",
       "8",
+      "--task",
+      "12",
       "--mention",
       "alice",
     ]);
@@ -1342,6 +1364,7 @@ describe("party status/history channel flag", () => {
         timeout: true,
         related_issues: [5],
         related_prs: [8],
+        task_id: 12,
       },
     });
   });

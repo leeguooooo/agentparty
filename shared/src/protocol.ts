@@ -427,6 +427,7 @@ export interface CompletionArtifact {
   timeout: boolean;
   related_issues: number[];
   related_prs: number[];
+  task_id?: number;
 }
 
 export interface CompletionReview {

@@ -5,8 +5,8 @@ import { resolveAuth } from "../oidc-cli";
 import { handleRestError, postMessage } from "../rest";
 import { isName, isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
-const COMPLETE_FLAGS = ["channel", "kickoff-seq", "replaces", "replies", "timeout", "issue", "pr", "mention"];
-const HELP = `usage: party complete <text|-> --kickoff-seq seq [--channel C] [--replaces seq] [--replies n] [--timeout] [--issue n]... [--pr n]... [--mention name]...
+const COMPLETE_FLAGS = ["channel", "kickoff-seq", "replaces", "replies", "timeout", "issue", "pr", "mention", "task"];
+const HELP = `usage: party complete <text|-> --kickoff-seq seq [--channel C] [--task id] [--replaces seq] [--replies n] [--timeout] [--issue n]... [--pr n]... [--mention name]...
 
 Publish a final synthesis completion artifact. The message replies to kickoff seq.
 If review gate is enabled, approve/reject it with: party review approve|reject <seq>
@@ -20,6 +20,7 @@ Options:
   --timeout         mark that collection ended by timeout
   --issue n         related GitHub issue number; repeatable
   --pr n            related GitHub PR number; repeatable
+  --task n          channel task this completion closes
   --mention name    mention a user or agent; repeatable`;
 
 function parsePositiveList(values: string[] | undefined, flag: string): number[] | string {
@@ -46,7 +47,7 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(parsed.flags, ["channel", "kickoff-seq", "replaces", "replies"], ["issue", "pr", "mention"]);
+  const flagError = valueFlagError(parsed.flags, ["channel", "kickoff-seq", "replaces", "replies", "task"], ["issue", "pr", "mention"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -65,6 +66,11 @@ export async function run(argv: string[]): Promise<number> {
   const replaces = str(parsed.flags.replaces) === undefined ? undefined : parsePositiveIntFlag(str(parsed.flags.replaces), "replaces");
   if (typeof replaces === "string") {
     console.error(replaces);
+    return 1;
+  }
+  const taskId = str(parsed.flags.task) === undefined ? undefined : parsePositiveIntFlag(str(parsed.flags.task), "task");
+  if (typeof taskId === "string") {
+    console.error(taskId);
     return 1;
   }
   const relatedIssues = parsePositiveList(strArray(parsed.flags.issue), "issue");
@@ -121,6 +127,7 @@ export async function run(argv: string[]): Promise<number> {
         timeout: parsed.flags.timeout === true,
         related_issues: relatedIssues,
         related_prs: relatedPrs,
+        ...(taskId === undefined ? {} : { task_id: taskId }),
       },
       ...(replaces === undefined ? {} : { replaces }),
     });

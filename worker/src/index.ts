@@ -672,6 +672,61 @@ async function loadTaskRow(db: D1Database, slug: string, id: number): Promise<Ta
     .first<TaskRow>();
 }
 
+function completionTaskIdFromPayload(input: unknown): number | null | undefined {
+  if (!isRecord(input) || input.kind !== "message") return undefined;
+  const artifact = input.completion_artifact;
+  if (!isRecord(artifact) || artifact.kind !== "final_synthesis" || artifact.task_id === undefined) return undefined;
+  return positiveInt(artifact.task_id);
+}
+
+function taskAnchorsWithCompletion(row: TaskRow, artifact: unknown, seq: number): number[] {
+  const anchors = taskRowToRecord(row).anchor_seqs;
+  if (isRecord(artifact)) {
+    const kickoff = positiveInt(artifact.kickoff_seq);
+    if (kickoff !== null && !anchors.includes(kickoff)) anchors.push(kickoff);
+  }
+  if (!anchors.includes(seq)) anchors.push(seq);
+  return anchors;
+}
+
+async function syncTaskCompletion(
+  env: AppEnv,
+  slug: string,
+  taskId: number,
+  artifact: unknown,
+  seq: number,
+  state: Extract<TaskState, "needs_review" | "done" | "in_progress">,
+): Promise<void> {
+  const row = await loadTaskRow(env.DB, slug, taskId);
+  if (!row) return;
+  const now = Date.now();
+  const anchors = taskAnchorsWithCompletion(row, artifact, seq);
+  await env.DB.prepare(
+    `UPDATE channel_tasks
+        SET state = ?,
+            completion_artifact_json = ?,
+            anchor_seqs_json = ?,
+            updated_at = ?,
+            completed_at = ?
+      WHERE channel_slug = ? AND id = ?`,
+  )
+    .bind(
+      state,
+      JSON.stringify(artifact),
+      JSON.stringify(anchors),
+      now,
+      state === "done" ? row.completed_at ?? now : null,
+      slug,
+      taskId,
+    )
+    .run();
+  const note =
+    state === "needs_review" ? `task #${taskId} needs_review via completion #${seq}` :
+    state === "done" ? `task #${taskId} done via completion #${seq}` :
+    `task #${taskId} back to in_progress after rejected completion #${seq}`;
+  await insertSystemStatus(env, slug, note).catch(() => false);
+}
+
 // 铸/重铸 token 的落库逻辑（/api/tokens 与 /api/agents 共用）：
 // 同名活 token 冲突返回 conflict；同名已吊销 token 复用行覆盖（owner/channel_scope 一并刷新），
 // 否则插新行。返回一次性明文 token。
@@ -3604,7 +3659,7 @@ app.post("/api/channels/:slug/messages/:seq/review", async (c) => {
   const seq = positiveInt(Number(c.req.param("seq")));
   if (seq === null) return c.json(errorBody("bad_request", "seq must be a positive integer"), 400);
   const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
-  return fetchChannelDO(
+  const res = await fetchChannelDO(
     c.env,
     slug,
     new Request(`https://do/internal/messages/${seq}/review`, {
@@ -3625,6 +3680,19 @@ app.post("/api/channels/:slug/messages/:seq/review", async (c) => {
       },
     }),
   );
+  if (!res.ok) return res;
+  const payload = (await res.clone().json().catch(() => null)) as { message?: MsgFrame } | null;
+  const message = payload?.message;
+  const taskId = message?.completion_artifact?.task_id;
+  const reviewState = message?.completion_review?.state;
+  if (message !== undefined && typeof taskId === "number" && Number.isInteger(taskId) && taskId > 0) {
+    if (reviewState === "approved") {
+      await syncTaskCompletion(c.env, slug, taskId, message.completion_artifact, message.seq, "done");
+    } else if (reviewState === "rejected") {
+      await syncTaskCompletion(c.env, slug, taskId, message.completion_artifact, message.seq, "in_progress");
+    }
+  }
+  return res;
 });
 
 app.post("/api/channels/:slug/messages/:seq/:action", async (c) => {
@@ -3699,13 +3767,26 @@ app.post("/api/channels/:slug/messages", async (c) => {
   if (channel.archived_at !== null) {
     return c.json(errorBody("archived", "channel is archived"), 410);
   }
+  const rawBody = await c.req.text();
+  const parsedBody = ((): unknown => {
+    try {
+      return JSON.parse(rawBody || "null");
+    } catch {
+      return null;
+    }
+  })();
+  const taskId = completionTaskIdFromPayload(parsedBody);
+  if (taskId === null) return c.json(errorBody("bad_request", "completion task_id must be a positive integer"), 400);
+  if (taskId !== undefined && !(await loadTaskRow(c.env.DB, slug, taskId))) {
+    return c.json(errorBody("not_found", "task not found in this channel"), 404);
+  }
   const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
-  return fetchChannelDO(
+  const res = await fetchChannelDO(
     c.env,
     slug,
     new Request("https://do/internal/messages", {
       method: "POST",
-      body: await c.req.text(),
+      body: rawBody,
       headers: {
         "content-type": "application/json",
         "x-partykit-room": slug,
@@ -3721,6 +3802,14 @@ app.post("/api/channels/:slug/messages", async (c) => {
       },
     }),
   );
+  if (!res.ok || taskId === undefined || !isRecord(parsedBody)) return res;
+  const payload = (await res.clone().json().catch(() => null)) as { seq?: unknown; completion_review?: { state?: unknown } } | null;
+  const seq = positiveInt(payload?.seq);
+  if (seq !== null) {
+    const state = payload?.completion_review?.state === "pending_review" ? "needs_review" : "done";
+    await syncTaskCompletion(c.env, slug, taskId, parsedBody.completion_artifact, seq, state);
+  }
+  return res;
 });
 
 // outbound webhook 注册 / 列表 / 删除（spec §7/§15），存储在频道 do 里

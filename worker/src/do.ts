@@ -205,6 +205,8 @@ function parseCompletionArtifact(input: unknown, replyTo: number | null): Comple
   const relatedIssues = parsePositiveIntArray(raw.related_issues);
   const relatedPrs = parsePositiveIntArray(raw.related_prs);
   if (relatedIssues === null || relatedPrs === null) return null;
+  const taskId = parseOptionalPositiveSeq(raw.task_id);
+  if (taskId === null) return null;
   const artifact: CompletionArtifact = {
     kind: "final_synthesis",
     kickoff_seq: kickoffSeq,
@@ -212,6 +214,7 @@ function parseCompletionArtifact(input: unknown, replyTo: number | null): Comple
     timeout: raw.timeout,
     related_issues: relatedIssues,
     related_prs: relatedPrs,
+    ...(taskId === undefined ? {} : { task_id: taskId }),
   };
   if (byteLength(JSON.stringify(artifact)) > COMPLETION_ARTIFACT_JSON_LIMIT) return null;
   return artifact;

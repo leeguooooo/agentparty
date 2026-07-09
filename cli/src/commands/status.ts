@@ -7,13 +7,14 @@ import type {
   SendHostDecision,
   SendStatusWorkflow,
   StatusState,
+  TaskState,
   WakeKind,
   WorkflowKind,
 } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel, saveCursor, workspaceId, workspaceLabel, worktreeLabel } from "../config";
 import { formatAuthDebugLine, resolveAuthDetailed } from "../oidc-cli";
-import { fetchMe, handleRestError, postMessage } from "../rest";
+import { fetchMe, handleRestError, postMessage, updateTask } from "../rest";
 import { isName, isSlug, parsePositiveIntFlag } from "../validation";
 
 const STATES: StatusState[] = ["working", "waiting", "blocked", "done"];
@@ -44,6 +45,7 @@ const STATUS_FLAGS = [
   "workflow-run",
   "workflow-step",
   "workflow-parent-summary-seq",
+  "task",
   "debug-auth",
 ];
 const HELP = `usage: party status [channel|--channel C] working|waiting|blocked|done [-m note] [--mention name]... [--debug-auth]
@@ -79,6 +81,7 @@ Options:
                    workflow step id
   --workflow-parent-summary-seq N
                    parent summary/status seq this workflow status refines
+  --task N         link this status to a channel task and update its task state
   --debug-auth     print resolved auth/config source to stderr`;
 
 export function buildContext(auth: Awaited<ReturnType<typeof resolveAuthDetailed>>): AgentContext {
@@ -139,6 +142,7 @@ export async function run(argv: string[]): Promise<number> {
       "workflow-run",
       "workflow-step",
       "workflow-parent-summary-seq",
+      "task",
     ],
     ["mention", "scope"],
   );
@@ -177,6 +181,11 @@ export async function run(argv: string[]): Promise<number> {
   const scope = strArray(flags.scope) ?? [];
   if (scope.some((item) => item.trim() === "")) {
     console.error("--scope must not be empty");
+    return 1;
+  }
+  const taskId = parsePositiveIntFlag(str(flags.task), "task");
+  if (typeof taskId === "string") {
+    console.error(taskId);
     return 1;
   }
   const summarySeq = parsePositiveIntFlag(str(flags["summary-seq"]), "summary-seq");
@@ -297,12 +306,14 @@ export async function run(argv: string[]): Promise<number> {
         console.error(`${formatAuthDebugLine(auth)} runtime-error=${message}`);
       }
     }
+    const taskScope = taskId === undefined ? [] : [`task:${taskId}`];
+    const effectiveScope = [...scope, ...taskScope];
     const { seq } = await postMessage(auth.server, auth.token, channel, {
       kind: "status",
       state: state as StatusState,
       note: str(flags.note) ?? "",
       mentions,
-      ...(scope.length > 0 ? { scope } : {}),
+      ...(effectiveScope.length > 0 ? { scope: effectiveScope } : {}),
       ...(summarySeq !== undefined ? { summary_seq: summarySeq } : {}),
       ...(blockedReason !== undefined ? { blocked_reason: blockedReason } : {}),
       ...(role !== undefined ? { role: role as CollaborationRole } : {}),
@@ -312,6 +323,13 @@ export async function run(argv: string[]): Promise<number> {
       ...(workflow !== undefined ? { workflow } : {}),
       context: buildContext(auth),
     });
+    if (taskId !== undefined) {
+      const taskState: TaskState =
+        state === "working" ? "in_progress" :
+        state === "waiting" ? "assigned" :
+        state as TaskState;
+      await updateTask(auth.server, auth.token, channel, taskId, { state: taskState });
+    }
     saveCursor(channel, seq);
     console.log(`status seq=${seq}`);
     return 0;

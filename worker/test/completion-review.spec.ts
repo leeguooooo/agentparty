@@ -6,7 +6,7 @@ interface MsgLike {
   body: string;
   mentions: string[];
   reply_to: number | null;
-  completion_artifact?: { kickoff_seq: number };
+  completion_artifact?: { kickoff_seq: number; task_id?: number };
   completion_review?: {
     state: "pending_review" | "approved" | "rejected";
     policy: "sender" | "owner";
@@ -36,7 +36,7 @@ async function fixture() {
   return { slug, owner, writer, reviewer, readonly, kickoffSeq };
 }
 
-async function postCompletion(slug: string, token: string, kickoffSeq: number, opts: { replaces?: number; body?: string } = {}) {
+async function postCompletion(slug: string, token: string, kickoffSeq: number, opts: { replaces?: number; body?: string; taskId?: number } = {}) {
   return api(`/api/channels/${slug}/messages`, token, {
     method: "POST",
     body: JSON.stringify({
@@ -51,10 +51,32 @@ async function postCompletion(slug: string, token: string, kickoffSeq: number, o
         timeout: false,
         related_issues: [],
         related_prs: [],
+        ...(opts.taskId === undefined ? {} : { task_id: opts.taskId }),
       },
       ...(opts.replaces === undefined ? {} : { replaces: opts.replaces }),
     }),
   });
+}
+
+async function createTask(slug: string, token: string, title = "Ship task-linked completion"): Promise<number> {
+  const res = await api(`/api/channels/${slug}/tasks`, token, {
+    method: "POST",
+    body: JSON.stringify({ title }),
+  });
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { id: number }).id;
+}
+
+async function getTask(slug: string, token: string, id: number) {
+  const res = await api(`/api/channels/${slug}/tasks/${id}`, token);
+  expect(res.status).toBe(200);
+  return (await res.json()) as {
+    id: number;
+    state: string;
+    completion_artifact: { task_id?: number } | null;
+    anchor_seqs: number[];
+    completed_at: number | null;
+  };
 }
 
 async function history(slug: string, token: string): Promise<MsgLike[]> {
@@ -141,6 +163,46 @@ describe("review-gated completion (#34)", () => {
       mentions: [writer.name],
       body: `@${writer.name} review rejected #${seq}: missing test evidence`,
     });
+  });
+
+  it("syncs task state and artifact across completion review", async () => {
+    const { slug, writer, reviewer, kickoffSeq } = await fixture();
+    const taskId = await createTask(slug, writer.token);
+    const completion = await postCompletion(slug, writer.token, kickoffSeq, { taskId });
+    expect(completion.status).toBe(200);
+    const completionBody = (await completion.json()) as { seq: number; completion_review?: { state: string } };
+    expect(completionBody.completion_review?.state).toBe("pending_review");
+
+    const pendingTask = await getTask(slug, writer.token, taskId);
+    expect(pendingTask.state).toBe("needs_review");
+    expect(pendingTask.completion_artifact?.task_id).toBe(taskId);
+    expect(pendingTask.anchor_seqs).toEqual([kickoffSeq, completionBody.seq]);
+    expect(pendingTask.completed_at).toBeNull();
+
+    const rejected = await api(`/api/channels/${slug}/messages/${completionBody.seq}/review`, reviewer.token, {
+      method: "POST",
+      body: JSON.stringify({ action: "reject", reason: "needs more detail" }),
+    });
+    expect(rejected.status).toBe(200);
+    expect((await getTask(slug, writer.token, taskId)).state).toBe("in_progress");
+
+    const replacement = await postCompletion(slug, writer.token, kickoffSeq, {
+      taskId,
+      replaces: completionBody.seq,
+      body: "reworked final synthesis",
+    });
+    expect(replacement.status).toBe(200);
+    const replacementBody = (await replacement.json()) as { seq: number };
+    expect((await getTask(slug, writer.token, taskId)).state).toBe("needs_review");
+
+    const approved = await api(`/api/channels/${slug}/messages/${replacementBody.seq}/review`, reviewer.token, {
+      method: "POST",
+      body: JSON.stringify({ action: "approve" }),
+    });
+    expect(approved.status).toBe(200);
+    const doneTask = await getTask(slug, writer.token, taskId);
+    expect(doneTask.state).toBe("done");
+    expect(doneTask.completed_at).toBeTypeOf("number");
   });
 
   it("links a reworked completion to the rejected one and bumps the old row rev_seq", async () => {
