@@ -1,6 +1,6 @@
 // party mcp — stdio MCP server exposing AgentParty as structured tools.
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { StatusState } from "@agentparty/shared";
+import type { MsgFrame, StatusState, TaskAssigneeKind, TaskState } from "@agentparty/shared";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -8,7 +8,18 @@ import pkg from "../../package.json" with { type: "json" };
 import { loadCursor, loadRevCursor, resolveChannel, saveCursor, saveRevCursor } from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth, resolveAuthDetailed } from "../oidc-cli";
-import { fetchMe, fetchMessages, fetchPresence, handleRestError, listChannels, postMessage, type Identity } from "../rest";
+import {
+  createTask,
+  fetchMe,
+  fetchMessages,
+  fetchPresence,
+  handleRestError,
+  listChannels,
+  listTasks,
+  postMessage,
+  updateTask,
+  type Identity,
+} from "../rest";
 import { isName, isSlug } from "../validation";
 import { buildContext } from "./status";
 import { runWatch } from "./watch";
@@ -28,10 +39,16 @@ Tools:
   party_who
   party_history
   party_digest
+  party_task_list
+  party_task_create
+  party_task_from_message
+  party_task_update
   party_watch_once
   party_wake_test`;
 
 const StateSchema = z.enum(["working", "waiting", "blocked", "done"]);
+const TaskStateSchema = z.enum(["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"]);
+const TaskAssigneeKindSchema = z.enum(["agent", "human", "squad"]);
 
 function ok(data: Record<string, unknown>, text?: string): CallToolResult {
   return {
@@ -59,6 +76,30 @@ function normalizeMentions(mentions?: string[]): string[] {
   const bad = values.find((mention) => !isName(mention));
   if (bad !== undefined) throw new Error(`invalid mention: ${bad}`);
   return values;
+}
+
+function normalizeLabels(labels?: string[]): string[] | undefined {
+  if (labels === undefined) return undefined;
+  const trimmed = labels.map((label) => label.trim());
+  if (trimmed.some((label) => label === "")) throw new Error("labels must not be empty");
+  return [...new Set(trimmed)];
+}
+
+function normalizeAssignee(name?: string, kind?: TaskAssigneeKind): { name: string; kind: TaskAssigneeKind } | undefined {
+  if (name === undefined) return undefined;
+  const normalized = name.replace(/^@/, "");
+  if (!isName(normalized)) throw new Error("assignee_name must be a valid AgentParty name");
+  return { name: normalized, kind: kind ?? "agent" };
+}
+
+function compact(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function titleFromMessage(msg: MsgFrame): string {
+  const raw = compact(msg.kind === "status" ? (msg.note ?? msg.body) : msg.body);
+  const label = raw === "" ? `${msg.sender.name} message #${msg.seq}` : raw;
+  return label.length > 120 ? `${label.slice(0, 117)}...` : label;
 }
 
 async function auth(): Promise<{ server: string; token: string; me?: Identity }> {
@@ -202,25 +243,36 @@ export function createMcpServer(defaultChannel?: string): McpServer {
         mentions: z.array(z.string()).optional(),
         scope: z.array(z.string()).optional(),
         summary_seq: z.number().int().positive().optional(),
+        task_id: z.number().int().positive().optional(),
       },
     },
-    async ({ channel, state, note, mentions, scope, summary_seq }) => {
+    async ({ channel, state, note, mentions, scope, summary_seq, task_id }) => {
       try {
         const authInfo = await resolveAuthDetailed();
         if (!authInfo.server || !authInfo.token) throw new Error("no config, run: party login or party init --server URL --token T");
         const resolved = normalizeChannel(channel, defaultChannel);
         const normalizedMentions = normalizeMentions(mentions);
+        const taskScope = task_id === undefined ? [] : [`task:${task_id}`];
+        const effectiveScope = [...(scope ?? []), ...taskScope];
         const { seq } = await postMessage(authInfo.server, authInfo.token, resolved, {
           kind: "status",
           state: state as StatusState,
           note: note ?? "",
           mentions: normalizedMentions,
-          ...(scope && scope.length > 0 ? { scope } : {}),
+          ...(effectiveScope.length > 0 ? { scope: effectiveScope } : {}),
           ...(summary_seq !== undefined ? { summary_seq } : {}),
           context: buildContext(authInfo),
         });
+        let task = undefined;
+        if (task_id !== undefined) {
+          const taskState: TaskState =
+            state === "working" ? "in_progress" :
+            state === "waiting" ? "assigned" :
+            state as TaskState;
+          task = await updateTask(authInfo.server, authInfo.token, resolved, task_id, { state: taskState });
+        }
         saveCursor(resolved, seq);
-        return ok({ type: "status", channel: resolved, seq, state });
+        return ok({ type: "status", channel: resolved, seq, state, ...(task !== undefined ? { task } : {}) });
       } catch (e) {
         const code = handleRestError(e);
         return fail(code === 1 && e instanceof Error ? e.message : `status failed with exit ${code}`);
@@ -295,6 +347,168 @@ export function createMcpServer(defaultChannel?: string): McpServer {
       ];
       const captured = await captureCommand(async () => (await import("./digest")).run(argv));
       return capturedResult("digest", captured);
+    },
+  );
+
+  server.registerTool(
+    "party_task_list",
+    {
+      title: "List channel tasks",
+      description: "List AgentParty channel tasks from the task ledger.",
+      inputSchema: {
+        channel: z.string().optional(),
+        state: TaskStateSchema.optional(),
+        assignee: z.string().optional().describe("Assignee name, with or without @ prefix."),
+        limit: z.number().int().positive().max(500).optional(),
+      },
+    },
+    async ({ channel, state, assignee, limit }) => {
+      try {
+        const cfg = await auth();
+        const resolved = normalizeChannel(channel, defaultChannel);
+        const normalizedAssignee = assignee?.replace(/^@/, "");
+        if (normalizedAssignee !== undefined && !isName(normalizedAssignee)) throw new Error("assignee must be a valid AgentParty name");
+        const tasks = await listTasks(cfg.server, cfg.token, resolved, {
+          ...(state !== undefined ? { state: state as TaskState } : {}),
+          ...(normalizedAssignee !== undefined ? { assignee: normalizedAssignee } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        });
+        return ok({ type: "task_list", channel: resolved, tasks });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_task_create",
+    {
+      title: "Create channel task",
+      description: "Create an AgentParty channel task.",
+      inputSchema: {
+        channel: z.string().optional(),
+        title: z.string().min(1),
+        desc: z.string().optional(),
+        state: TaskStateSchema.optional(),
+        assignee_name: z.string().optional().describe("Assignee name, with or without @ prefix."),
+        assignee_kind: TaskAssigneeKindSchema.optional(),
+        priority: z.number().int().min(-100).max(100).optional(),
+        labels: z.array(z.string()).optional(),
+        parent_id: z.number().int().positive().optional(),
+        anchor_seqs: z.array(z.number().int().positive()).optional(),
+        workflow_id: z.string().optional(),
+      },
+    },
+    async ({ channel, title, desc, state, assignee_name, assignee_kind, priority, labels, parent_id, anchor_seqs, workflow_id }) => {
+      try {
+        const cfg = await auth();
+        const resolved = normalizeChannel(channel, defaultChannel);
+        const normalizedLabels = normalizeLabels(labels);
+        const assignee = normalizeAssignee(assignee_name, assignee_kind as TaskAssigneeKind | undefined);
+        const task = await createTask(cfg.server, cfg.token, resolved, {
+          title,
+          ...(desc !== undefined ? { desc } : {}),
+          ...(state !== undefined ? { state: state as TaskState } : {}),
+          ...(assignee !== undefined ? { assignee } : {}),
+          ...(priority !== undefined ? { priority } : {}),
+          ...(normalizedLabels !== undefined && normalizedLabels.length > 0 ? { labels: normalizedLabels } : {}),
+          ...(parent_id !== undefined ? { parent_id } : {}),
+          ...(anchor_seqs !== undefined && anchor_seqs.length > 0 ? { anchor_seqs } : {}),
+          ...(workflow_id !== undefined ? { workflow_id } : {}),
+        });
+        return ok({ type: "task_create", channel: resolved, task });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_task_from_message",
+    {
+      title: "Create task from message",
+      description: "Create an AgentParty task from an existing message and anchor the source seq.",
+      inputSchema: {
+        channel: z.string().optional(),
+        source_seq: z.number().int().positive(),
+        title: z.string().min(1).optional(),
+        desc: z.string().optional(),
+        state: TaskStateSchema.optional(),
+        assignee_name: z.string().optional(),
+        assignee_kind: TaskAssigneeKindSchema.optional(),
+        priority: z.number().int().min(-100).max(100).optional(),
+        labels: z.array(z.string()).optional(),
+        parent_id: z.number().int().positive().optional(),
+        anchor_seqs: z.array(z.number().int().positive()).optional(),
+        workflow_id: z.string().optional(),
+      },
+    },
+    async ({ channel, source_seq, title, desc, state, assignee_name, assignee_kind, priority, labels, parent_id, anchor_seqs, workflow_id }) => {
+      try {
+        const cfg = await auth();
+        const resolved = normalizeChannel(channel, defaultChannel);
+        const source = (await fetchMessages(cfg.server, cfg.token, resolved, source_seq - 1, 1)).find((msg) => msg.seq === source_seq);
+        if (source === undefined) throw new Error(`message #${source_seq} not found`);
+        const normalizedLabels = normalizeLabels(labels);
+        const assignee = normalizeAssignee(assignee_name, assignee_kind as TaskAssigneeKind | undefined);
+        const anchors = [...new Set([source_seq, ...(anchor_seqs ?? [])])];
+        const task = await createTask(cfg.server, cfg.token, resolved, {
+          title: title ?? titleFromMessage(source),
+          ...(desc !== undefined ? { desc } : {}),
+          ...(state !== undefined ? { state: state as TaskState } : {}),
+          ...(assignee !== undefined ? { assignee } : {}),
+          ...(priority !== undefined ? { priority } : {}),
+          ...(normalizedLabels !== undefined && normalizedLabels.length > 0 ? { labels: normalizedLabels } : {}),
+          ...(parent_id !== undefined ? { parent_id } : {}),
+          anchor_seqs: anchors,
+          ...(workflow_id !== undefined ? { workflow_id } : {}),
+        });
+        return ok({ type: "task_from_message", channel: resolved, source_seq, task });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_task_update",
+    {
+      title: "Update channel task",
+      description: "Update title, state, assignee, priority, labels, or description for an AgentParty task.",
+      inputSchema: {
+        channel: z.string().optional(),
+        id: z.number().int().positive(),
+        title: z.string().min(1).optional(),
+        desc: z.string().nullable().optional(),
+        state: TaskStateSchema.optional(),
+        assignee_name: z.string().optional(),
+        assignee_kind: TaskAssigneeKindSchema.optional(),
+        clear_assignee: z.boolean().optional(),
+        priority: z.number().int().min(-100).max(100).optional(),
+        labels: z.array(z.string()).optional(),
+      },
+    },
+    async ({ channel, id, title, desc, state, assignee_name, assignee_kind, clear_assignee, priority, labels }) => {
+      try {
+        const cfg = await auth();
+        const resolved = normalizeChannel(channel, defaultChannel);
+        if (clear_assignee === true && assignee_name !== undefined) throw new Error("clear_assignee cannot be combined with assignee_name");
+        const normalizedLabels = normalizeLabels(labels);
+        const assignee = clear_assignee === true ? null : normalizeAssignee(assignee_name, assignee_kind as TaskAssigneeKind | undefined);
+        const body = {
+          ...(title !== undefined ? { title } : {}),
+          ...(desc !== undefined ? { desc } : {}),
+          ...(state !== undefined ? { state: state as TaskState } : {}),
+          ...(assignee !== undefined ? { assignee } : {}),
+          ...(priority !== undefined ? { priority } : {}),
+          ...(normalizedLabels !== undefined ? { labels: normalizedLabels } : {}),
+        };
+        if (Object.keys(body).length === 0) throw new Error("no task fields to update");
+        const task = await updateTask(cfg.server, cfg.token, resolved, id, body);
+        return ok({ type: "task_update", channel: resolved, task });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
     },
   );
 

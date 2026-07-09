@@ -95,7 +95,26 @@ describe("cli subprocess", () => {
   });
 
   test("mcp server lists tools and sends via REST（#66）", async () => {
-    const seen: { path: string; auth: string | null; body: unknown }[] = [];
+    const seen: { method: string; path: string; auth: string | null; body: unknown }[] = [];
+    const task = {
+      type: "task",
+      id: 1,
+      channel: "dev",
+      title: "Fix login",
+      desc: null,
+      state: "triage",
+      assignee: null,
+      created_by: "me",
+      created_by_kind: "agent",
+      priority: 2,
+      labels: ["bug"],
+      parent_id: null,
+      anchor_seqs: [7],
+      completion_artifact: null,
+      workflow_id: null,
+      created_at: 1,
+      updated_at: 1,
+    };
     restServer = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
@@ -105,9 +124,35 @@ describe("cli subprocess", () => {
         if (req.method !== "GET") {
           body = await req.json().catch(() => null);
         }
-        seen.push({ path: url.pathname, auth: req.headers.get("authorization"), body });
+        seen.push({ method: req.method, path: `${url.pathname}${url.search}`, auth: req.headers.get("authorization"), body });
         if (url.pathname === "/api/channels/dev/messages" && req.method === "POST") {
           return Response.json({ seq: 42 });
+        }
+        if (url.pathname === "/api/channels/dev/messages" && req.method === "GET") {
+          return Response.json({
+            messages: [
+              {
+                type: "msg",
+                channel: "dev",
+                seq: 7,
+                ts: 1,
+                sender: { name: "evan", kind: "human" },
+                kind: "message",
+                body: "Fix login from message",
+                mentions: [],
+                reply_to: null,
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/api/channels/dev/tasks" && req.method === "GET") {
+          return Response.json({ tasks: [task] });
+        }
+        if (url.pathname === "/api/channels/dev/tasks" && req.method === "POST") {
+          return Response.json(task, { status: 201 });
+        }
+        if (url.pathname === "/api/channels/dev/tasks/1" && req.method === "PATCH") {
+          return Response.json({ ...task, ...(body && typeof body === "object" ? body : {}) });
         }
         if (url.pathname === "/api/me") {
           return Response.json({ name: "me", email: null, kind: "agent", role: "member", owner: null });
@@ -133,6 +178,10 @@ describe("cli subprocess", () => {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toContain("party_send");
       expect(tools.tools.map((tool) => tool.name)).toContain("party_watch_once");
+      expect(tools.tools.map((tool) => tool.name)).toContain("party_task_create");
+      expect(tools.tools.map((tool) => tool.name)).toContain("party_task_from_message");
+      expect(tools.tools.map((tool) => tool.name)).toContain("party_task_list");
+      expect(tools.tools.map((tool) => tool.name)).toContain("party_task_update");
 
       const result = await client.callTool({
         name: "party_send",
@@ -140,11 +189,83 @@ describe("cli subprocess", () => {
       });
       expect(result.isError).not.toBe(true);
       expect(result.structuredContent).toMatchObject({ type: "send", channel: "dev", seq: 42 });
-      expect(seen).toContainEqual({
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "POST",
         path: "/api/channels/dev/messages",
         auth: "Bearer ap_tok",
         body: { kind: "message", body: "hello mcp", mentions: ["bob"], reply_to: null },
+      }));
+
+      const created = await client.callTool({
+        name: "party_task_create",
+        arguments: { title: "Fix login", labels: ["bug"], priority: 2, anchor_seqs: [7] },
       });
+      expect(created.isError).not.toBe(true);
+      expect(created.structuredContent).toMatchObject({ type: "task_create", channel: "dev", task: { id: 1 } });
+
+      const fromMessage = await client.callTool({
+        name: "party_task_from_message",
+        arguments: { source_seq: 7, labels: ["bug"] },
+      });
+      expect(fromMessage.isError).not.toBe(true);
+      expect(fromMessage.structuredContent).toMatchObject({ type: "task_from_message", source_seq: 7, task: { id: 1 } });
+
+      const listed = await client.callTool({
+        name: "party_task_list",
+        arguments: { state: "triage", assignee: "@alice" },
+      });
+      expect(listed.isError).not.toBe(true);
+      expect(listed.structuredContent).toMatchObject({ type: "task_list", channel: "dev", tasks: [{ id: 1 }] });
+
+      const updated = await client.callTool({
+        name: "party_task_update",
+        arguments: { id: 1, state: "assigned", assignee_name: "@alice" },
+      });
+      expect(updated.isError).not.toBe(true);
+      expect(updated.structuredContent).toMatchObject({ type: "task_update", task: { id: 1, state: "assigned" } });
+
+      const status = await client.callTool({
+        name: "party_status",
+        arguments: { state: "working", note: "started", task_id: 1 },
+      });
+      expect(status.isError).not.toBe(true);
+      expect(status.structuredContent).toMatchObject({ type: "status", task: { id: 1, state: "in_progress" } });
+
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "POST",
+        path: "/api/channels/dev/tasks",
+        body: { title: "Fix login", priority: 2, labels: ["bug"], anchor_seqs: [7] },
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "GET",
+        path: "/api/channels/dev/messages?since=6&limit=1",
+        body: null,
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "POST",
+        path: "/api/channels/dev/tasks",
+        body: { title: "Fix login from message", labels: ["bug"], anchor_seqs: [7] },
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "GET",
+        path: "/api/channels/dev/tasks?state=triage&assignee=alice",
+        body: null,
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "PATCH",
+        path: "/api/channels/dev/tasks/1",
+        body: { state: "assigned", assignee: { name: "alice", kind: "agent" } },
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "POST",
+        path: "/api/channels/dev/messages",
+        body: { kind: "status", state: "working", note: "started", mentions: [], scope: ["task:1"], context: expect.any(Object) },
+      }));
+      expect(seen).toContainEqual(expect.objectContaining({
+        method: "PATCH",
+        path: "/api/channels/dev/tasks/1",
+        body: { state: "in_progress" },
+      }));
     } finally {
       await client.close();
     }
