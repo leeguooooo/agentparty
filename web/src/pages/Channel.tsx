@@ -2,7 +2,7 @@
 // App 用 key={slug} 挂载本组件，切频道即整体重建（socket/状态零残留）。
 import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { buildHostBoard, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type ReadCursor, type SearchHit, type Sender, type TaskRecord, type WakeDelivery } from "@agentparty/shared";
+import { buildHostBoard, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type ReadCursor, type SearchHit, type Sender, type TaskAssigneeKind, type TaskRecord, type TaskState, type WakeDelivery } from "@agentparty/shared";
 import { AgentJoin } from "../components/AgentJoin";
 import { AgentTokens } from "../components/AgentTokens";
 import { VisibilityToggle } from "../components/VisibilityToggle";
@@ -35,6 +35,7 @@ import {
   setLoopGuard,
   setWorkflowGuard,
   setChannelRole,
+  updateTask,
   ValidationError,
 } from "../lib/api";
 import { agentHue } from "../lib/agentColor";
@@ -998,17 +999,30 @@ function TaskLedgerPanel({
   tasks,
   loading,
   error,
+  canWrite,
+  busyTaskId,
+  actionError,
   onRefresh,
+  onSetState,
+  onAssign,
 }: {
   tasks: TaskRecord[];
   loading: boolean;
   error: string | null;
+  canWrite: boolean;
+  busyTaskId: number | null;
+  actionError: string | null;
   onRefresh: () => void;
+  onSetState: (id: number, state: TaskState) => void;
+  onAssign: (id: number, name: string, kind: TaskAssigneeKind) => void;
 }) {
+  const [assignDrafts, setAssignDrafts] = useState<Record<number, string>>({});
+  const [assignKinds, setAssignKinds] = useState<Record<number, TaskAssigneeKind>>({});
   const counts = tasks.reduce<Record<string, number>>((acc, task) => {
     acc[task.state] = (acc[task.state] ?? 0) + 1;
     return acc;
   }, {});
+  const disabled = loading || !canWrite;
   return (
     <section className="task-ledger-panel" aria-label="channel tasks">
       <header className="task-ledger-head">
@@ -1028,27 +1042,72 @@ function TaskLedgerPanel({
         </div>
       )}
       {error !== null && <p className="banner banner--red">{error}</p>}
+      {actionError !== null && <p className="banner banner--red">{actionError}</p>}
       {tasks.length === 0 && error === null ? (
         <p className="charter-empty">No tasks yet. Use <code>party task create</code> to add one.</p>
       ) : (
         <ol className="task-list">
-          {tasks.map((task) => (
-            <li key={task.id} className="task-card">
-              <div className="task-card-main">
-                <span className="t-mono task-id">#{task.id}</span>
-                <strong>{task.title}</strong>
-                <span className={`t-mono task-state task-state--${task.state}`}>{task.state}</span>
-              </div>
-              {task.desc !== null && <p>{task.desc}</p>}
-              <div className="task-card-meta">
-                <span className="t-mono">P{task.priority}</span>
-                {task.assignee !== null && <span className="t-mono">@{task.assignee.name}</span>}
-                {task.parent_id !== null && <span className="t-mono">parent #{task.parent_id}</span>}
-                {task.anchor_seqs.map((seq) => <span key={seq} className="t-mono">msg #{seq}</span>)}
-                {task.labels.map((label) => <span key={label} className="t-mono task-label">{label}</span>)}
-              </div>
-            </li>
-          ))}
+          {tasks.map((task) => {
+            const taskBusy = busyTaskId === task.id;
+            const assignDraft = assignDrafts[task.id] ?? task.assignee?.name ?? "";
+            const assignKind = assignKinds[task.id] ?? task.assignee?.kind ?? "agent";
+            return (
+              <li key={task.id} className="task-card">
+                <div className="task-card-main">
+                  <span className="t-mono task-id">#{task.id}</span>
+                  <strong>{task.title}</strong>
+                  <span className={`t-mono task-state task-state--${task.state}`}>{task.state}</span>
+                </div>
+                {task.desc !== null && <p>{task.desc}</p>}
+                <div className="task-card-meta">
+                  <span className="t-mono">P{task.priority}</span>
+                  {task.assignee !== null && <span className="t-mono">@{task.assignee.name}</span>}
+                  {task.parent_id !== null && <span className="t-mono">parent #{task.parent_id}</span>}
+                  {task.anchor_seqs.map((seq) => <span key={seq} className="t-mono">msg #{seq}</span>)}
+                  {task.labels.map((label) => <span key={label} className="t-mono task-label">{label}</span>)}
+                </div>
+                <div className="task-card-actions">
+                  <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "in_progress"} onClick={() => onSetState(task.id, "in_progress")}>
+                    Claim
+                  </button>
+                  <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "blocked"} onClick={() => onSetState(task.id, "blocked")}>
+                    Block
+                  </button>
+                  <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "done"} onClick={() => onSetState(task.id, "done")}>
+                    Done
+                  </button>
+                  <form
+                    className="task-assign-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      onAssign(task.id, assignDraft, assignKind);
+                    }}
+                  >
+                    <input
+                      aria-label={`Assign task ${task.id}`}
+                      disabled={disabled || taskBusy}
+                      value={assignDraft}
+                      placeholder="@agent"
+                      onChange={(event) => setAssignDrafts((current) => ({ ...current, [task.id]: event.currentTarget.value }))}
+                    />
+                    <select
+                      aria-label={`Assignee kind for task ${task.id}`}
+                      disabled={disabled || taskBusy}
+                      value={assignKind}
+                      onChange={(event) => setAssignKinds((current) => ({ ...current, [task.id]: event.currentTarget.value as TaskAssigneeKind }))}
+                    >
+                      <option value="agent">agent</option>
+                      <option value="human">human</option>
+                      <option value="squad">squad</option>
+                    </select>
+                    <button className="task-action-btn" type="submit" disabled={disabled || taskBusy || assignDraft.trim() === ""}>
+                      Assign
+                    </button>
+                  </form>
+                </div>
+              </li>
+            );
+          })}
         </ol>
       )}
     </section>
@@ -1195,6 +1254,8 @@ export function ChannelPage({
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksError, setTasksError] = useState<string | null>(null);
+  const [taskActionBusyId, setTaskActionBusyId] = useState<number | null>(null);
+  const [taskActionError, setTaskActionError] = useState<string | null>(null);
   const [roleDrafts, setRoleDrafts] = useState<Record<string, RoleDraft>>({});
   const [newRoleName, setNewRoleName] = useState("");
   const [newRoleDraft, setNewRoleDraft] = useState<RoleDraft>({ role: "worker", responsibility: "" });
@@ -1304,6 +1365,7 @@ export function ChannelPage({
       .then((items) => {
         setTasks(items);
         setTasksError(null);
+        setTaskActionError(null);
       })
       .catch((err: unknown) => {
         if (err instanceof AuthError) authFailedRef.current("token revoked — paste a new one");
@@ -1312,6 +1374,36 @@ export function ChannelPage({
       })
       .finally(() => setTasksLoading(false));
   }, [slug, token]);
+
+  const applyTaskUpdate = useCallback((id: number, body: Parameters<typeof updateTask>[3]) => {
+    if (taskActionBusyId !== null) return;
+    setTaskActionBusyId(id);
+    setTaskActionError(null);
+    updateTask(token, slug, id, body)
+      .then((task) => {
+        setTasks((current) => current.map((item) => item.id === task.id ? task : item));
+      })
+      .catch((err: unknown) => {
+        if (err instanceof AuthError) authFailedRef.current("token revoked — paste a new one");
+        else if (err instanceof ForbiddenError) setTaskActionError("task update is not allowed for this token");
+        else if (err instanceof ValidationError) setTaskActionError("task update was rejected");
+        else setTaskActionError("task update failed");
+      })
+      .finally(() => setTaskActionBusyId(null));
+  }, [slug, taskActionBusyId, token]);
+
+  const setTaskState = useCallback((id: number, state: TaskState) => {
+    applyTaskUpdate(id, { state });
+  }, [applyTaskUpdate]);
+
+  const assignTask = useCallback((id: number, rawName: string, kind: TaskAssigneeKind) => {
+    const name = rawName.trim().replace(/^@/, "");
+    if (name === "") {
+      setTaskActionError("assignee is required");
+      return;
+    }
+    applyTaskUpdate(id, { state: "assigned", assignee: { name, kind } });
+  }, [applyTaskUpdate]);
 
   const removeParticipant = useCallback((name: string) => {
     if (removingName !== null) return;
@@ -2401,7 +2493,12 @@ export function ChannelPage({
               tasks={tasks}
               loading={tasksLoading}
               error={tasksError}
+              canWrite={canWrite}
+              busyTaskId={taskActionBusyId}
+              actionError={taskActionError}
               onRefresh={loadTaskLedger}
+              onSetState={setTaskState}
+              onAssign={assignTask}
             />
           )}
           {activePanel === "settings" && (

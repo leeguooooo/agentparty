@@ -2724,6 +2724,60 @@
   color: var(--t-dim);
   font-size: 10.5px;
 }
+.task-card-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.task-action-btn {
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 1.5px solid var(--d-ink);
+  border-radius: 0;
+  background: var(--t-panel);
+  color: var(--t-text);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  box-shadow: 1.5px 1.5px 0 var(--d-shadow);
+  cursor: pointer;
+}
+.task-action-btn:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: 2.5px 2.5px 0 var(--d-shadow);
+}
+.task-action-btn:disabled {
+  color: var(--t-faint);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+.task-assign-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: min(100%, 330px);
+}
+.task-assign-form input,
+.task-assign-form select {
+  min-height: 28px;
+  border: 1.5px solid var(--t-faint);
+  border-radius: 0;
+  background: var(--t-panel);
+  color: var(--t-text);
+  font: inherit;
+  font-size: 11px;
+}
+.task-assign-form input {
+  width: 124px;
+  padding: 3px 7px;
+}
+.task-assign-form select {
+  width: 78px;
+  padding: 3px 5px;
+}
 .task-id,
 .task-label,
 .task-state {

@@ -1,7 +1,7 @@
 // rest 封装 + token 存取。
 // 规则（spec §10 / M2 契约）：URL 带 ?t= 时优先用它，并立即从地址栏移除；
 // share token 只放 sessionStorage，本次标签页可刷新，避免长期落 localStorage。
-import type { ChannelRoleAssignment, CollaborationRole, MsgFrame, PresenceEntry, SearchHit, TaskRecord, WakeDelivery } from "@agentparty/shared";
+import type { ChannelRoleAssignment, CollaborationRole, MsgFrame, PresenceEntry, SearchHit, TaskAssigneeKind, TaskRecord, TaskState, WakeDelivery } from "@agentparty/shared";
 import type { WebSession } from "./oidc";
 
 const TOKEN_KEY = "ap_token";
@@ -340,6 +340,31 @@ export async function fetchTasks(token: string, slug: string): Promise<TaskRecor
   if (!res.ok) throw new Error(`GET /api/channels/${slug}/tasks failed (${res.status})`);
   const data = (await res.json()) as { tasks: TaskRecord[] };
   return data.tasks;
+}
+
+export async function updateTask(
+  token: string,
+  slug: string,
+  id: number,
+  body: {
+    title?: string;
+    desc?: string | null;
+    state?: TaskState;
+    assignee?: { name: string; kind: TaskAssigneeKind } | null;
+    priority?: number;
+    labels?: string[];
+  },
+): Promise<TaskRecord> {
+  const res = await fetch(`/api/channels/${encodeURIComponent(slug)}/tasks/${id}`, {
+    method: "PATCH",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("forbidden");
+  if (res.status === 400) throw new ValidationError("invalid task update");
+  if (!res.ok) throw new Error(`PATCH /api/channels/${slug}/tasks/${id} failed (${res.status})`);
+  return (await res.json()) as TaskRecord;
 }
 
 export async function setChannelRole(
