@@ -31,6 +31,8 @@ interface Props {
   onReply(seq: number): void;
   onEdit(seq: number): void;
   onRetract(seq: number): void;
+  canCreateTask: boolean;
+  onCreateTask(seq: number): void;
   editing: boolean;
   editDraft: string;
   editSaving: boolean;
@@ -96,6 +98,8 @@ export function MessageCard({
   onReply,
   onEdit,
   onRetract,
+  canCreateTask,
+  onCreateTask,
   editing,
   editDraft,
   editSaving,
@@ -148,10 +152,11 @@ export function MessageCard({
   const canRevise = (self !== null && msg.sender.name === self) || canModerate;
   const canShowActions = msg.kind === "message";
   const canReply = canShowActions && !msg.retracted;
+  const canTask = canReply && canCreateTask;
   const canEdit = canReply && canRevise;
   const canRetract = canReply && canRevise;
   const saveDisabled = editSaving || editDraft.trim() === "" || editDraft === msg.body;
-  const menuItemCount = Number(canReply) + Number(canEdit) + Number(canRetract) + 1;
+  const menuItemCount = Number(canReply) + Number(canTask) + Number(canEdit) + Number(canRetract) + 1;
   // 引用预览：quotedMessage 为 null 有两种含义——没引用，或引用目标不在已加载窗口内；
   // 后者在渲染处降级回纯编号 ↩ #N（见下方 JSX），这里只在真有内容时才算标签/预览文字。
   const quotedSenderLabel = quotedMessage !== null ? resolveSenderLabel(quotedMessage.sender, identityDisplay) : null;
@@ -388,6 +393,18 @@ export function MessageCard({
               }}
             >
               {t("MessageCard.menu.edit")}
+            </button>
+          )}
+          {canTask && (
+            <button
+              type="button"
+              className="msg-menu-item"
+              onClick={() => {
+                setMenu(null);
+                onCreateTask(msg.seq);
+              }}
+            >
+              {t("MessageCard.menu.task")}
             </button>
           )}
           {canRetract && (

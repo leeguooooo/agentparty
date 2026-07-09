@@ -342,6 +342,33 @@ export async function fetchTasks(token: string, slug: string): Promise<TaskRecor
   return data.tasks;
 }
 
+export async function createTask(
+  token: string,
+  slug: string,
+  body: {
+    title: string;
+    desc?: string;
+    state?: TaskState;
+    assignee?: { name: string; kind: TaskAssigneeKind } | null;
+    priority?: number;
+    labels?: string[];
+    parent_id?: number;
+    anchor_seqs?: number[];
+    workflow_id?: string;
+  },
+): Promise<TaskRecord> {
+  const res = await fetch(`/api/channels/${encodeURIComponent(slug)}/tasks`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("forbidden");
+  if (res.status === 400) throw new ValidationError("invalid task");
+  if (!res.ok) throw new Error(`POST /api/channels/${slug}/tasks failed (${res.status})`);
+  return (await res.json()) as TaskRecord;
+}
+
 export async function updateTask(
   token: string,
   slug: string,

@@ -19,6 +19,7 @@ import {
   type ChannelCharter,
   type ChannelIdentity,
   type ChannelRoleInfo,
+  createTask,
   deleteChannelRole,
   ForbiddenError,
   fetchChannelCharter,
@@ -155,6 +156,12 @@ interface RoleDraft {
 
 type ChannelPanel = "charter" | "roles" | "coordination" | "tasks" | "search" | "settings";
 type AdminSurface = "agentJoin" | "agentTokens" | "joinLink";
+
+function compactTaskTitle(text: string, fallback: string): string {
+  const raw = text.replace(/\s+/g, " ").trim();
+  const label = raw === "" ? fallback : raw;
+  return label.length > 120 ? `${label.slice(0, 117)}...` : label;
+}
 
 function roleDraftFrom(role: ChannelRoleInfo): RoleDraft {
   return { role: role.role, responsibility: role.responsibility ?? "" };
@@ -1131,6 +1138,8 @@ function TeamThread({
   onReply,
   onEdit,
   onRetract,
+  canCreateTask,
+  onCreateTask,
   onEditDraftChange,
   onEditCancel,
   onEditSave,
@@ -1152,6 +1161,8 @@ function TeamThread({
   onReply: (seq: number) => void;
   onEdit: (seq: number) => void;
   onRetract: (seq: number) => void;
+  canCreateTask: boolean;
+  onCreateTask: (seq: number) => void;
   onEditDraftChange: (value: string) => void;
   onEditCancel: () => void;
   onEditSave: () => void;
@@ -1193,6 +1204,8 @@ function TeamThread({
             onReply={onReply}
             onEdit={onEdit}
             onRetract={onRetract}
+            canCreateTask={canCreateTask}
+            onCreateTask={onCreateTask}
             editing={editingSeq === message.seq}
             editDraft={editingSeq === message.seq ? editDraft : message.body}
             editSaving={editSaving && editingSeq === message.seq}
@@ -1404,6 +1417,31 @@ export function ChannelPage({
     }
     applyTaskUpdate(id, { state: "assigned", assignee: { name, kind } });
   }, [applyTaskUpdate]);
+
+  const createTaskFromMessage = useCallback((seq: number) => {
+    if (messageActionBusySeq !== null) return;
+    const message = state.messages.find((item) => item.seq === seq);
+    if (message === undefined || message.kind !== "message" || message.retracted) return;
+    setMessageActionBusySeq(seq);
+    setMessageActionError(null);
+    createTask(token, slug, {
+      title: compactTaskTitle(message.body, `${message.sender.name} message #${message.seq}`),
+      anchor_seqs: [message.seq],
+    })
+      .then((task) => {
+        setTasks((current) => current.some((item) => item.id === task.id) ? current : [task, ...current]);
+        setTasksError(null);
+        setActiveAdminSurface(null);
+        setActivePanel("tasks");
+      })
+      .catch((err: unknown) => {
+        if (err instanceof AuthError) authFailedRef.current("token revoked — paste a new one");
+        else if (err instanceof ForbiddenError) setMessageActionError({ seq, message: "task creation is not allowed for this token" });
+        else if (err instanceof ValidationError) setMessageActionError({ seq, message: "task creation was rejected" });
+        else setMessageActionError({ seq, message: "task creation failed" });
+      })
+      .finally(() => setMessageActionBusySeq(null));
+  }, [messageActionBusySeq, slug, state.messages, token]);
 
   const removeParticipant = useCallback((name: string) => {
     if (removingName !== null) return;
@@ -2539,6 +2577,8 @@ export function ChannelPage({
                   onReply={startReply}
                   onEdit={startEdit}
                   onRetract={retractMessage}
+                  canCreateTask={canWrite}
+                  onCreateTask={createTaskFromMessage}
                   editing={editingSeq === item.message.seq}
                   editDraft={editingSeq === item.message.seq ? editDraft : item.message.body}
                   editSaving={editSaving && editingSeq === item.message.seq}
@@ -2567,6 +2607,8 @@ export function ChannelPage({
                   onReply={startReply}
                   onEdit={startEdit}
                   onRetract={retractMessage}
+                  canCreateTask={canWrite}
+                  onCreateTask={createTaskFromMessage}
                   onEditDraftChange={setEditDraft}
                   onEditCancel={cancelEdit}
                   onEditSave={saveEdit}
