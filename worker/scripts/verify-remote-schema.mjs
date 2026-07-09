@@ -4,7 +4,23 @@ const database = process.env.AGENTPARTY_D1_DATABASE ?? "agentparty";
 const wranglerConfig = process.env.AGENTPARTY_WRANGLER_CONFIG;
 
 const required = {
-  channels: ["id", "slug", "title", "topic", "kind", "mode", "created_by", "created_at", "archived_at"],
+  channels: [
+    "id",
+    "slug",
+    "title",
+    "topic",
+    "kind",
+    "mode",
+    "created_by",
+    "created_at",
+    "archived_at",
+    "charter_write_policy",
+    "charter_write_agents",
+    "charter_write_agent_allowlist_json",
+    "members_list_policy",
+    "members_list_agents",
+    "members_list_agent_allowlist_json",
+  ],
   tokens: ["id", "hash", "name", "role", "owner", "created_at", "revoked_at"],
   account_profiles: [
     "account",

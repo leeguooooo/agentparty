@@ -62,7 +62,30 @@ export interface ChannelCharter {
   charter_rev: number;
   updated_at: number | null;
   updated_by: string | null;
+  permissions?: ChannelPerms;
 }
+
+export type HumanChannelPermPolicy = "owner" | "moderators" | "members";
+export type HumanChannelListPolicy = HumanChannelPermPolicy | "off";
+export type AgentChannelPermPolicy = "off" | "moderators" | "members" | "allowlist";
+
+export interface ChannelPerms {
+  charter_write: HumanChannelPermPolicy;
+  charter_write_agents: AgentChannelPermPolicy;
+  charter_write_agent_allowlist: string[];
+  members_list: HumanChannelListPolicy;
+  members_list_agents: AgentChannelPermPolicy;
+  members_list_agent_allowlist: string[];
+}
+
+export type ChannelPermsUpdate = Partial<{
+  charter_write: HumanChannelPermPolicy;
+  charter_write_agents: AgentChannelPermPolicy;
+  charter_write_agent_allowlist: string[];
+  members_list: HumanChannelListPolicy;
+  members_list_agents: AgentChannelPermPolicy;
+  members_list_agent_allowlist: string[];
+}>;
 
 export interface WebhookInfo {
   name: string;
@@ -424,6 +447,29 @@ export async function setChannelCharter(
     headers: bearerJson(token),
     body: JSON.stringify(body),
   })) as ChannelCharter;
+}
+
+export async function fetchChannelPerms(server: string, token: string, slug: string): Promise<ChannelPerms> {
+  const body = (await req(server, `/api/channels/${encodeURIComponent(slug)}/perms`, {
+    headers: bearerJson(token),
+  })) as { permissions?: ChannelPerms };
+  if (!body.permissions) throw new Error("server did not return channel permissions");
+  return body.permissions;
+}
+
+export async function setChannelPerms(
+  server: string,
+  token: string,
+  slug: string,
+  update: ChannelPermsUpdate,
+): Promise<ChannelPerms> {
+  const body = (await req(server, `/api/channels/${encodeURIComponent(slug)}/perms`, {
+    method: "PUT",
+    headers: bearerJson(token),
+    body: JSON.stringify(update),
+  })) as { permissions?: ChannelPerms };
+  if (!body.permissions) throw new Error("server did not return channel permissions");
+  return body.permissions;
 }
 
 export async function createChannel(

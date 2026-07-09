@@ -12,7 +12,18 @@ describe("channel charter", () => {
 
     const initial = await api(`/api/channels/${slug}/charter`, owner.token);
     expect(initial.status).toBe(200);
-    expect(await json(initial)).toMatchObject({ charter: null, charter_rev: 0, updated_at: null, updated_by: null });
+    expect(await json(initial)).toMatchObject({
+      charter: null,
+      charter_rev: 0,
+      updated_at: null,
+      updated_by: null,
+      permissions: {
+        charter_write: "moderators",
+        charter_write_agents: "moderators",
+        members_list: "members",
+        members_list_agents: "members",
+      },
+    });
 
     const updated = await api(`/api/channels/${slug}/charter`, owner.token, {
       method: "PUT",
@@ -78,6 +89,102 @@ describe("channel charter", () => {
     });
     expect(hostWrite.status).toBe(200);
     expect(await json(hostWrite)).toMatchObject({ charter: "host maintained charter", charter_rev: 1, updated_by: host.name });
+  });
+
+  it("configures charter write permissions separately for humans and agents", async () => {
+    const owner = await seedToken("agent", uniq("owner"), { owner: `${uniq("owner")}@example.com` });
+    const slug = await createChannel(owner.token);
+    const memberAccount = `${uniq("member")}@example.com`;
+    const member = await seedToken("human", uniq("human"), { owner: memberAccount });
+    const host = await seedToken("agent", uniq("host"), { owner: `${uniq("host")}@example.com`, channelScope: slug });
+
+    expect((await api(`/api/channels/${slug}/members/${encodeURIComponent(memberAccount)}`, owner.token, { method: "PUT" })).status).toBe(200);
+    expect((await api(`/api/channels/${slug}/roles/${host.name}`, owner.token, {
+      method: "PUT",
+      body: JSON.stringify({ role: "host" }),
+    })).status).toBe(200);
+
+    expect((await api(`/api/channels/${slug}/charter`, member.token, {
+      method: "PUT",
+      body: JSON.stringify({ charter: "member before policy" }),
+    })).status).toBe(403);
+    expect((await api(`/api/channels/${slug}/charter`, host.token, {
+      method: "PUT",
+      body: JSON.stringify({ charter: "host before policy" }),
+    })).status).toBe(200);
+
+    const configured = await api(`/api/channels/${slug}/perms`, owner.token, {
+      method: "PUT",
+      body: JSON.stringify({
+        charter_write: "members",
+        charter_write_agents: "off",
+      }),
+    });
+    expect(configured.status).toBe(200);
+    expect(await json(configured)).toMatchObject({
+      permissions: {
+        charter_write: "members",
+        charter_write_agents: "off",
+      },
+    });
+    expect((await api(`/api/channels/${slug}/charter`, member.token, {
+      method: "PUT",
+      body: JSON.stringify({ charter: "human member edit" }),
+    })).status).toBe(200);
+    expect((await api(`/api/channels/${slug}/charter`, host.token, {
+      method: "PUT",
+      body: JSON.stringify({ charter: "host after off" }),
+    })).status).toBe(403);
+
+    expect((await api(`/api/channels/${slug}/perms`, owner.token, {
+      method: "PUT",
+      body: JSON.stringify({
+        charter_write_agents: "allowlist",
+        charter_write_agent_allowlist: [host.name],
+      }),
+    })).status).toBe(200);
+    const allowlisted = await api(`/api/channels/${slug}/charter`, host.token, {
+      method: "PUT",
+      body: JSON.stringify({ charter: "allowlisted host edit" }),
+    });
+    expect(allowlisted.status).toBe(200);
+  });
+
+  it("configures member-list visibility separately for humans and agents", async () => {
+    const ownerAccount = `${uniq("owner")}@example.com`;
+    const owner = await seedToken("agent", uniq("owner"), { owner: ownerAccount });
+    const ownerHuman = await seedToken("human", uniq("owner-human"), { owner: ownerAccount });
+    const slug = await createChannel(owner.token);
+    const memberAccount = `${uniq("member")}@example.com`;
+    const member = await seedToken("human", uniq("human"), { owner: memberAccount });
+    const memberAgent = await seedToken("agent", uniq("agent"), { owner: memberAccount, channelScope: slug });
+    expect((await api(`/api/channels/${slug}/members/${encodeURIComponent(memberAccount)}`, owner.token, { method: "PUT" })).status).toBe(200);
+
+    expect((await api(`/api/channels/${slug}/members`, member.token)).status).toBe(200);
+    expect((await api(`/api/channels/${slug}/members`, memberAgent.token)).status).toBe(200);
+
+    const moderatorsOnly = await api(`/api/channels/${slug}/perms`, owner.token, {
+      method: "PUT",
+      body: JSON.stringify({
+        members_list: "moderators",
+        members_list_agents: "off",
+      }),
+    });
+    expect(moderatorsOnly.status).toBe(200);
+    expect((await api(`/api/channels/${slug}/members`, member.token)).status).toBe(403);
+    expect((await api(`/api/channels/${slug}/members`, memberAgent.token)).status).toBe(403);
+    expect((await api(`/api/channels/${slug}/members`, owner.token)).status).toBe(403);
+    expect((await api(`/api/channels/${slug}/members`, ownerHuman.token)).status).toBe(200);
+
+    const allowlisted = await api(`/api/channels/${slug}/perms`, owner.token, {
+      method: "PUT",
+      body: JSON.stringify({
+        members_list_agents: "allowlist",
+        members_list_agent_allowlist: [memberAgent.name],
+      }),
+    });
+    expect(allowlisted.status).toBe(200);
+    expect((await api(`/api/channels/${slug}/members`, memberAgent.token)).status).toBe(200);
   });
 
   it("rejects oversized charters and expected_rev conflicts", async () => {

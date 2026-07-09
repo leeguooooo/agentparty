@@ -585,6 +585,48 @@ export const openapiDocument = {
         },
       },
     },
+    "/api/channels/{slug}/perms": {
+      get: {
+        summary: "read configurable channel metadata permissions",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": { description: "{permissions:{charter_write,charter_write_agents,charter_write_agent_allowlist,members_list,members_list_agents,members_list_agent_allowlist}}" },
+          "403": { description: "not allowed in this channel" },
+          "404": { description: "channel not found" },
+        },
+      },
+      put: {
+        summary: "configure charter and member-list permissions",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  charter_write: { type: "string", enum: ["owner", "moderators", "members"] },
+                  charter_write_agents: { type: "string", enum: ["off", "moderators", "members", "allowlist"] },
+                  charter_write_agent_allowlist: { type: "array", items: { type: "string" } },
+                  members_list: { type: "string", enum: ["off", "owner", "moderators", "members"] },
+                  members_list_agents: { type: "string", enum: ["off", "moderators", "members", "allowlist"] },
+                  members_list_agent_allowlist: { type: "array", items: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "{permissions:{...}}" },
+          "400": { description: "invalid permission policy" },
+          "403": { description: "only channel moderators can change channel permissions" },
+          "404": { description: "channel not found" },
+          "410": { description: "channel archived" },
+        },
+      },
+    },
     "/api/channels/{slug}/roles/{name}": {
       put: {
         summary: "assign a soft collaboration role for a channel participant",

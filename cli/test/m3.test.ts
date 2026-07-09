@@ -2680,6 +2680,76 @@ describe("party channel guard config", () => {
   });
 });
 
+describe("party channel perms", () => {
+  test("prints current channel permissions as json", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+
+    const r = await runCli(["channel", "perms", "ops", "--json"]);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      channel_slug: "ops",
+      permissions: {
+        charter_write: "moderators",
+        charter_write_agents: "moderators",
+        members_list: "members",
+        members_list_agents: "members",
+      },
+    });
+    expect(reqsOf(mock, "GET", "/api/channels/ops/perms")).toHaveLength(1);
+  });
+
+  test("updates charter and member-list policies with separate agent allowlists", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+
+    const r = await runCli([
+      "channel",
+      "perms",
+      "ops",
+      "--charter-write",
+      "members",
+      "--charter-write-agents",
+      "allowlist",
+      "--agent",
+      "leo-codex",
+      "--agent",
+      "qa.bot",
+      "--members-list",
+      "moderators",
+      "--members-list-agents",
+      "allowlist",
+      "--members-agent",
+      "auditor",
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("charter_write\tmembers");
+    expect(reqsOf(mock, "PUT", "/api/channels/ops/perms")[0]!.body).toEqual({
+      charter_write: "members",
+      charter_write_agents: "allowlist",
+      charter_write_agent_allowlist: ["leo-codex", "qa.bot"],
+      members_list: "moderators",
+      members_list_agents: "allowlist",
+      members_list_agent_allowlist: ["auditor"],
+    });
+  });
+
+  test("validates policies and allowlist names locally", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+    for (const args of [
+      ["channel", "perms", "ops", "--charter-write", "off"],
+      ["channel", "perms", "ops", "--charter-write-agents", "owners"],
+      ["channel", "perms", "ops", "--members-list", "public"],
+      ["channel", "perms", "ops", "--agent", ":bad"],
+    ]) {
+      const r = await runCli(args);
+      expect(r.code).toBe(1);
+    }
+    expect(mock.requests.length).toBe(0);
+  });
+});
+
 
 describe("party channel role", () => {
   test("role set/list/unset 调用频道角色 API", async () => {

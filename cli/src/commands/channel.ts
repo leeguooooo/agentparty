@@ -1,5 +1,5 @@
 // party channel create|list|archive|reset-guard
-import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
+import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import {
@@ -9,6 +9,7 @@ import {
   createChannel,
   handleRestError,
   inviteProjectAgent,
+  fetchChannelPerms,
   kickParticipant,
   listChannelMembers,
   listChannelRoles,
@@ -18,18 +19,45 @@ import {
   resetGuard,
   revokeJoinLink,
   setChannelRole,
+  setChannelPerms,
   setChannelVisibility,
   setCompletionGate,
   setLoopGuard,
   setWorkflowGuard,
+  type AgentChannelPermPolicy,
+  type ChannelPerms,
+  type ChannelPermsUpdate,
+  type HumanChannelListPolicy,
+  type HumanChannelPermPolicy,
 } from "../rest";
 import { isName, isSlug } from "../validation";
 
-const CHANNEL_FLAGS = ["title", "temp", "party", "public", "policy", "confirm", "expires", "max-uses", "remove", "responsibility"];
+const CHANNEL_FLAGS = [
+  "title",
+  "temp",
+  "party",
+  "public",
+  "policy",
+  "confirm",
+  "expires",
+  "max-uses",
+  "remove",
+  "responsibility",
+  "charter-write",
+  "charter-write-agents",
+  "agent",
+  "members-list",
+  "members-list-agents",
+  "members-agent",
+  "json",
+];
 const COLLAB_ROLES = ["host", "worker", "reviewer", "observer"] as const;
 const COMPLETION_GATES = ["reviewer", "off"] as const;
 const COMPLETION_REVIEW_POLICIES = ["sender", "owner"] as const;
 const VISIBILITIES = ["public", "private"] as const;
+const HUMAN_PERM_POLICIES = ["owner", "moderators", "members"] as const;
+const HUMAN_LIST_POLICIES = ["off", "owner", "moderators", "members"] as const;
+const AGENT_PERM_POLICIES = ["off", "moderators", "members", "allowlist"] as const;
 const HELP = `usage: party channel create <slug> [--title t] [--temp] [--party] [--public]
        party channel list
        party channel archive [slug]                 archive, kick live agents, keep history
@@ -42,6 +70,13 @@ const HELP = `usage: party channel create <slug> [--title t] [--temp] [--party] 
        party channel workflow-guard off|<limit> [slug]
        party channel visibility <slug> public|private [--confirm]
        party channel members <slug>
+       party channel perms <slug> [--json]
+       party channel perms <slug> [--charter-write owner|moderators|members]
+                                  [--charter-write-agents off|moderators|members|allowlist]
+                                  [--agent name ...]
+                                  [--members-list off|owner|moderators|members]
+                                  [--members-list-agents off|moderators|members|allowlist]
+                                  [--members-agent name ...]
        party channel join-link <slug> [--expires 7d] [--max-uses N]
        party channel join-link revoke <slug> <code>
        party channel leave <slug>
@@ -65,6 +100,18 @@ Options:
   --remove    revoke the channel-scoped token and remove membership when kicking
   --expires d join-link expiry like 7d, 12h, 30m, 60s
   --max-uses n join-link redemption limit
+  --json      output channel permission policy as JSON
+  --charter-write p
+              human charter writers: owner, moderators, or members
+  --charter-write-agents p
+              agent charter writers: off, moderators, members, or allowlist
+  --agent n   repeatable allowlist entry for --charter-write-agents allowlist
+  --members-list p
+              human member-list readers: off, owner, moderators, or members
+  --members-list-agents p
+              agent member-list readers: off, moderators, members, or allowlist
+  --members-agent n
+              repeatable allowlist entry for --members-list-agents allowlist
   --responsibility text, -m text
               structured responsibility shown in web division board and @ suggestions`;
 
@@ -94,13 +141,36 @@ function parseProfileRef(input: string | undefined): { owner: string; handle: st
   return { owner, handle };
 }
 
+function printPerms(slug: string, perms: ChannelPerms, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify({ channel_slug: slug, permissions: perms }, null, 2));
+    return;
+  }
+  console.log(`channel ${slug} permissions`);
+  console.log(`charter_write\t${perms.charter_write}`);
+  console.log(`charter_write_agents\t${perms.charter_write_agents}\t${perms.charter_write_agent_allowlist.join(",")}`);
+  console.log(`members_list\t${perms.members_list}`);
+  console.log(`members_list_agents\t${perms.members_list_agents}\t${perms.members_list_agent_allowlist.join(",")}`);
+}
+
+function repeatedNames(value: string[] | undefined, label: string): string[] | null | undefined {
+  if (value === undefined) return undefined;
+  const names = [...new Set(value.map((item) => item.trim()).filter(Boolean))].sort();
+  if (names.some((name) => !isName(name))) {
+    console.error(`${label} must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}`);
+    return null;
+  }
+  return names;
+}
+
 export async function run(argv: string[]): Promise<number> {
   if (isHelpArg(argv, { allowHelpPositional: true })) {
     console.log(HELP);
     return 0;
   }
   const { positionals, flags } = parseArgs(argv, {
-    booleans: ["temp", "party", "public", "confirm", "remove"],
+    booleans: ["temp", "party", "public", "confirm", "remove", "json"],
+    repeatable: ["agent", "members-agent"],
     aliases: { m: "responsibility" },
   });
   const unknown = unknownFlagError(flags, CHANNEL_FLAGS);
@@ -108,7 +178,11 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["title", "policy", "expires", "max-uses", "responsibility"]);
+  const flagError = valueFlagError(
+    flags,
+    ["title", "policy", "expires", "max-uses", "responsibility", "charter-write", "charter-write-agents", "members-list", "members-list-agents"],
+    ["agent", "members-agent"],
+  );
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -349,6 +423,55 @@ export async function run(argv: string[]): Promise<number> {
         }
         return 0;
       }
+      case "perms": {
+        const slug = resolveChannel(positionals[1]);
+        if (!slug) {
+          console.error("usage: party channel perms <slug> [--json] [--charter-write owner|moderators|members] [--charter-write-agents off|moderators|members|allowlist] [--agent name]");
+          return 1;
+        }
+        if (!isSlug(slug)) {
+          console.error("slug must match [a-z0-9][a-z0-9-]{0,63}");
+          return 1;
+        }
+        const charterWrite = str(flags["charter-write"]);
+        const charterWriteAgents = str(flags["charter-write-agents"]);
+        const membersList = str(flags["members-list"]);
+        const membersListAgents = str(flags["members-list-agents"]);
+        if (charterWrite !== undefined && !HUMAN_PERM_POLICIES.includes(charterWrite as HumanChannelPermPolicy)) {
+          console.error("--charter-write must be owner, moderators, or members");
+          return 1;
+        }
+        if (charterWriteAgents !== undefined && !AGENT_PERM_POLICIES.includes(charterWriteAgents as AgentChannelPermPolicy)) {
+          console.error("--charter-write-agents must be off, moderators, members, or allowlist");
+          return 1;
+        }
+        if (membersList !== undefined && !HUMAN_LIST_POLICIES.includes(membersList as HumanChannelListPolicy)) {
+          console.error("--members-list must be off, owner, moderators, or members");
+          return 1;
+        }
+        if (membersListAgents !== undefined && !AGENT_PERM_POLICIES.includes(membersListAgents as AgentChannelPermPolicy)) {
+          console.error("--members-list-agents must be off, moderators, members, or allowlist");
+          return 1;
+        }
+        const charterAgents = repeatedNames(strArray(flags.agent), "--agent");
+        if (charterAgents === null) return 1;
+        const membersAgents = repeatedNames(strArray(flags["members-agent"]), "--members-agent");
+        if (membersAgents === null) return 1;
+        const update: ChannelPermsUpdate = {
+          ...(charterWrite === undefined ? {} : { charter_write: charterWrite as HumanChannelPermPolicy }),
+          ...(charterWriteAgents === undefined ? {} : { charter_write_agents: charterWriteAgents as AgentChannelPermPolicy }),
+          ...(charterAgents === undefined ? {} : { charter_write_agent_allowlist: charterAgents }),
+          ...(membersList === undefined ? {} : { members_list: membersList as HumanChannelListPolicy }),
+          ...(membersListAgents === undefined ? {} : { members_list_agents: membersListAgents as AgentChannelPermPolicy }),
+          ...(membersAgents === undefined ? {} : { members_list_agent_allowlist: membersAgents }),
+        };
+        const changed = Object.keys(update).length > 0;
+        const perms = changed
+          ? await setChannelPerms(cfg.server, cfg.token, slug, update)
+          : await fetchChannelPerms(cfg.server, cfg.token, slug);
+        printPerms(slug, perms, flags.json === true);
+        return 0;
+      }
       case "join-link": {
         const actionOrSlug = positionals[1];
         if (actionOrSlug === "revoke") {
@@ -473,7 +596,7 @@ export async function run(argv: string[]): Promise<number> {
         return 1;
       }
       default:
-        console.error("usage: party channel create|list|archive|reset-guard|kick|invite-agent|gate|visibility|members|join-link|leave|role");
+        console.error("usage: party channel create|list|archive|reset-guard|kick|invite-agent|gate|visibility|members|perms|join-link|leave|role");
         return 1;
     }
   } catch (e) {

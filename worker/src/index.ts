@@ -71,6 +71,20 @@ const COMPLETION_REVIEW_POLICIES: readonly string[] = ["sender", "owner"] satisf
 const COLLAB_ROLES: readonly string[] = ["host", "worker", "reviewer", "observer"] satisfies CollaborationRole[];
 const TASK_STATES: readonly string[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] satisfies TaskState[];
 const TASK_ASSIGNEE_KINDS: readonly string[] = ["agent", "human", "squad"] satisfies TaskAssigneeKind[];
+const HUMAN_METADATA_POLICIES = ["owner", "moderators", "members"] as const;
+const AGENT_METADATA_POLICIES = ["off", "moderators", "members", "allowlist"] as const;
+
+type HumanMetadataPolicy = (typeof HUMAN_METADATA_POLICIES)[number];
+type AgentMetadataPolicy = (typeof AGENT_METADATA_POLICIES)[number];
+
+interface ChannelPerms {
+  charter_write: HumanMetadataPolicy;
+  charter_write_agents: AgentMetadataPolicy;
+  charter_write_agent_allowlist: string[];
+  members_list: HumanMetadataPolicy | "off";
+  members_list_agents: AgentMetadataPolicy;
+  members_list_agent_allowlist: string[];
+}
 
 function isDurableObjectReset(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -879,7 +893,9 @@ async function loadChannel(db: D1Database, slug: string) {
       `SELECT slug, kind, mode, archived_at, created_by, visibility, owner_account,
               completion_gate, completion_review_policy, loop_guard_enabled, loop_guard_limit,
               workflow_guard_enabled, workflow_guard_limit,
-              charter, charter_rev, charter_updated_at, charter_updated_by
+              charter, charter_rev, charter_updated_at, charter_updated_by,
+              charter_write_policy, charter_write_agents, charter_write_agent_allowlist_json,
+              members_list_policy, members_list_agents, members_list_agent_allowlist_json
          FROM channels WHERE slug = ?`,
     )
     .bind(slug)
@@ -901,6 +917,12 @@ async function loadChannel(db: D1Database, slug: string) {
       charter_rev: number;
       charter_updated_at: number | null;
       charter_updated_by: string | null;
+      charter_write_policy: string;
+      charter_write_agents: string;
+      charter_write_agent_allowlist_json: string;
+      members_list_policy: string;
+      members_list_agents: string;
+      members_list_agent_allowlist_json: string;
     }>();
 }
 
@@ -1010,10 +1032,126 @@ async function canConfigureChannel(db: D1Database, identity: TokenIdentity, chan
   return (await loadAssignedRole(db, channel.slug, identity.name)) === "host";
 }
 
+function parseNameListJson(value: string | null | undefined): string[] {
+  try {
+    const parsed = JSON.parse(value ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && NAME_RE.test(item));
+  } catch {
+    return [];
+  }
+}
+
+function channelPerms(channel: LoadedChannel): ChannelPerms {
+  const charterWrite = HUMAN_METADATA_POLICIES.includes(channel.charter_write_policy as HumanMetadataPolicy)
+    ? (channel.charter_write_policy as HumanMetadataPolicy)
+    : "moderators";
+  const charterWriteAgents = AGENT_METADATA_POLICIES.includes(channel.charter_write_agents as AgentMetadataPolicy)
+    ? (channel.charter_write_agents as AgentMetadataPolicy)
+    : "moderators";
+  const membersList = (["off", ...HUMAN_METADATA_POLICIES] as const).includes(channel.members_list_policy as ChannelPerms["members_list"])
+    ? (channel.members_list_policy as ChannelPerms["members_list"])
+    : "members";
+  const membersListAgents = AGENT_METADATA_POLICIES.includes(channel.members_list_agents as AgentMetadataPolicy)
+    ? (channel.members_list_agents as AgentMetadataPolicy)
+    : "members";
+  return {
+    charter_write: charterWrite,
+    charter_write_agents: charterWriteAgents,
+    charter_write_agent_allowlist: parseNameListJson(channel.charter_write_agent_allowlist_json),
+    members_list: membersList,
+    members_list_agents: membersListAgents,
+    members_list_agent_allowlist: parseNameListJson(channel.members_list_agent_allowlist_json),
+  };
+}
+
+function canByHumanPolicy(policy: HumanMetadataPolicy | "off", identity: TokenIdentity, channel: LoadedChannel, isMember: boolean): boolean {
+  if (policy === "off") return false;
+  if (policy === "owner") return identity.account != null && identity.account === channel.owner_account;
+  if (isChannelModerator(identity, channel)) return true;
+  return policy === "members" && isMember;
+}
+
+function canByAgentPolicy(
+  policy: AgentMetadataPolicy,
+  allowlist: string[],
+  identity: TokenIdentity,
+  channel: LoadedChannel,
+  isMember: boolean,
+  assignedRole: CollaborationRole | null,
+): boolean {
+  if (identity.role === "readonly" || policy === "off") return false;
+  if (policy === "allowlist") return allowlist.includes(identity.name);
+  if (isChannelModerator(identity, channel)) return true;
+  if (policy === "moderators") return assignedRole === "host";
+  return policy === "members" && isMember;
+}
+
+async function canListMembers(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
+  const perms = channelPerms(channel);
+  const isMember = await isChannelMember(db, channel.slug, identity.account);
+  if (identity.kind === "agent") {
+    const role = await loadAssignedRole(db, channel.slug, identity.name);
+    return canByAgentPolicy(perms.members_list_agents, perms.members_list_agent_allowlist, identity, channel, isMember, role);
+  }
+  return canByHumanPolicy(perms.members_list, identity, channel, isMember);
+}
+
 async function canEditCharter(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
   if (identity.role === "readonly") return false;
-  if (isChannelModerator(identity, channel)) return true;
-  return (await loadAssignedRole(db, channel.slug, identity.name)) === "host";
+  const perms = channelPerms(channel);
+  const isMember = await isChannelMember(db, channel.slug, identity.account);
+  if (identity.kind === "agent") {
+    const role = await loadAssignedRole(db, channel.slug, identity.name);
+    return canByAgentPolicy(perms.charter_write_agents, perms.charter_write_agent_allowlist, identity, channel, isMember, role);
+  }
+  return canByHumanPolicy(perms.charter_write, identity, channel, isMember);
+}
+
+function stringArrayBody(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const items = value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
+  if (items.some((item) => !NAME_RE.test(item))) return null;
+  return [...new Set(items)].sort();
+}
+
+function channelPermsPatch(body: Record<string, unknown>): { sets: string[]; values: string[] } | null {
+  const sets: string[] = [];
+  const values: string[] = [];
+  const setString = (column: string, value: string) => {
+    sets.push(`${column} = ?`);
+    values.push(value);
+  };
+  const maybeHumanPolicy = (key: string, column: string, allowOff = false) => {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return true;
+    const value = body[key];
+    if (typeof value !== "string") return false;
+    const allowed = allowOff ? (["off", ...HUMAN_METADATA_POLICIES] as readonly string[]) : HUMAN_METADATA_POLICIES;
+    if (!allowed.includes(value)) return false;
+    setString(column, value);
+    return true;
+  };
+  const maybeAgentPolicy = (key: string, column: string) => {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return true;
+    const value = body[key];
+    if (typeof value !== "string" || !AGENT_METADATA_POLICIES.includes(value as AgentMetadataPolicy)) return false;
+    setString(column, value);
+    return true;
+  };
+  const maybeAllowlist = (key: string, column: string) => {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) return true;
+    const list = stringArrayBody(body[key]);
+    if (list === null) return false;
+    setString(column, JSON.stringify(list));
+    return true;
+  };
+  if (!maybeHumanPolicy("charter_write", "charter_write_policy")) return null;
+  if (!maybeAgentPolicy("charter_write_agents", "charter_write_agents")) return null;
+  if (!maybeAllowlist("charter_write_agent_allowlist", "charter_write_agent_allowlist_json")) return null;
+  if (!maybeHumanPolicy("members_list", "members_list_policy", true)) return null;
+  if (!maybeAgentPolicy("members_list_agents", "members_list_agents")) return null;
+  if (!maybeAllowlist("members_list_agent_allowlist", "members_list_agent_allowlist_json")) return null;
+  return { sets, values };
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<Record<string, unknown>> {
@@ -2413,9 +2551,8 @@ app.get("/api/channels/:slug/members", async (c) => {
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
   const identity = c.get("identity");
-  const isMember = await isChannelMember(c.env.DB, slug, identity.account);
-  if (!isChannelModerator(identity, channel) && !isMember) {
-    return c.json(errorBody("forbidden", "only channel moderators or members can list members"), 403);
+  if (!(await canListMembers(c.env.DB, identity, channel))) {
+    return c.json(errorBody("forbidden", "not allowed to list channel members"), 403);
   }
   const { results } = await c.env.DB.prepare(
     "SELECT account, added_by, added_at FROM channel_members WHERE channel_slug = ? ORDER BY account",
@@ -2423,6 +2560,44 @@ app.get("/api/channels/:slug/members", async (c) => {
     .bind(slug)
     .all<{ account: string; added_by: string; added_at: number }>();
   return c.json({ members: results });
+});
+
+app.get("/api/channels/:slug/perms", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  return c.json({ permissions: channelPerms(channel) });
+});
+
+app.put("/api/channels/:slug/perms", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!isChannelModerator(identity, channel)) {
+    return c.json(errorBody("forbidden", "only channel moderators can change channel permissions"), 403);
+  }
+  if (channel.archived_at !== null) {
+    return c.json(errorBody("archived", "channel is archived"), 410);
+  }
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (body === null || Array.isArray(body)) {
+    return c.json(errorBody("bad_request", "permission policy object required"), 400);
+  }
+  const patch = channelPermsPatch(body);
+  if (patch === null) {
+    return c.json(errorBody("bad_request", "invalid permission policy"), 400);
+  }
+  if (patch.sets.length > 0) {
+    await c.env.DB.prepare(`UPDATE channels SET ${patch.sets.join(", ")} WHERE slug = ?`)
+      .bind(...patch.values, slug)
+      .run();
+  }
+  const updated = await loadChannel(c.env.DB, slug);
+  return c.json({ permissions: channelPerms(updated ?? channel) });
 });
 
 app.put("/api/channels/:slug/members/:account", async (c) => {
@@ -2654,6 +2829,7 @@ app.get("/api/channels/:slug/charter", async (c) => {
     charter_rev: channel.charter_rev,
     updated_at: channel.charter_updated_at,
     updated_by: channel.charter_updated_by,
+    permissions: channelPerms(channel),
   });
 });
 
@@ -2725,6 +2901,7 @@ app.put("/api/channels/:slug/charter", async (c) => {
     charter_rev: rev,
     updated_at: now,
     updated_by: updatedBy,
+    permissions: channelPerms(updated ?? channel),
   });
 });
 
