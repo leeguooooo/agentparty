@@ -48,7 +48,11 @@ import {
   logoutDesktopSession,
   migrateLegacyDesktopCredential,
 } from "./lib/desktopCredentials";
-import { isDesktopRuntime } from "./lib/desktopRuntime";
+import {
+  isDesktopRuntime,
+  listenForDesktopNotificationActions,
+  showAndFocusDesktopWindow,
+} from "./lib/desktopRuntime";
 import { setApiBase } from "./lib/base";
 import {
   addCustomServerProfile,
@@ -134,6 +138,24 @@ export function App() {
     }
     return stored;
   });
+
+  useEffect(() => {
+    if (!desktop) return;
+    let alive = true;
+    let stop = () => {};
+    void listenForDesktopNotificationActions(({ slug, seq }) => {
+      void showAndFocusDesktopWindow();
+      navigate(`/c/${slug}`);
+      window.location.hash = `#msg-${seq}`;
+    }).then((unlisten) => {
+      if (alive) stop = unlisten;
+      else unlisten();
+    });
+    return () => {
+      alive = false;
+      stop();
+    };
+  }, [desktop, navigate]);
 
   const restoreDesktop = useCallback(() => {
     setDesktopBoot("loading");

@@ -16,6 +16,15 @@ export interface MentionNotification {
   seq: number;
 }
 
+export interface DesktopNotificationAction {
+  slug: string;
+  seq: number;
+}
+
+interface NotificationListener {
+  unregister(): Promise<void>;
+}
+
 interface NotificationModule {
   isPermissionGranted(): Promise<boolean>;
   requestPermission(): Promise<Exclude<DesktopNotificationPermission, "unsupported">>;
@@ -24,6 +33,7 @@ interface NotificationModule {
     body: string;
     extra: { slug: string; seq: number };
   }): void;
+  onAction(handler: (notification: { extra?: Record<string, unknown> }) => void): Promise<NotificationListener>;
 }
 
 interface AutostartModule {
@@ -136,6 +146,30 @@ export async function sendMentionNotification(input: MentionNotification): Promi
     return true;
   } catch {
     return false;
+  }
+}
+
+export async function listenForDesktopNotificationActions(
+  onAction: (action: DesktopNotificationAction) => void,
+): Promise<() => void> {
+  if (!isDesktopRuntime()) return () => {};
+  try {
+    const notification = await dependencies.loadNotification();
+    const listener = await notification.onAction(({ extra }) => {
+      const slug = extra?.slug;
+      const seq = extra?.seq;
+      if (
+        typeof slug !== "string" ||
+        !/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug) ||
+        typeof seq !== "number" ||
+        !Number.isSafeInteger(seq) ||
+        seq <= 0
+      ) return;
+      onAction({ slug, seq });
+    });
+    return () => { void listener.unregister(); };
+  } catch {
+    return () => {};
   }
 }
 

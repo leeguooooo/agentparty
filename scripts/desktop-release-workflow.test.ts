@@ -10,6 +10,9 @@ const desktopDocs = readFileSync(
 const tauriConfig = JSON.parse(
   readFileSync(resolve(import.meta.dir, "../desktop/src-tauri/tauri.conf.json"), "utf8"),
 );
+const desktopCapability = JSON.parse(
+  readFileSync(resolve(import.meta.dir, "../desktop/src-tauri/capabilities/default.json"), "utf8"),
+);
 
 describe("desktop release workflow", () => {
   test("hands every signed updater artifact to the release job", () => {
@@ -25,6 +28,19 @@ describe("desktop release workflow", () => {
     expect(workflow).toContain("bun scripts/desktop-update-manifest.ts");
     expect(workflow).toContain("--output dist/latest.json");
     expect(workflow).toContain("dist/latest.json");
+  });
+
+  test("allows the desktop shell to receive notification click actions", () => {
+    expect(desktopCapability.permissions).toContain("notification:allow-register-listener");
+  });
+
+  test("ships the desktop webview with a restrictive content security policy", () => {
+    const csp = tauriConfig.app.security.csp;
+    expect(typeof csp).toBe("string");
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).not.toContain("script-src 'self' 'unsafe-eval'");
   });
 
   test("gates desktop distribution and falls back to an honest unnotarized preview", () => {

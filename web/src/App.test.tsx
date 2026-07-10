@@ -45,6 +45,9 @@ const unpairedOrigin = "https://agentparty.pwtk-dev.work";
 let renderer: ReactTestRenderer | null = null;
 let credentialDeletes = 0;
 let storedCredential: string | null = null;
+let notificationActionHandler: ((notification: { extra?: Record<string, unknown> }) => void) | null = null;
+let desktopFocusCalls: string[] = [];
+let pushedPaths: string[] = [];
 
 beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
@@ -56,7 +59,12 @@ beforeEach(() => {
   });
   Object.defineProperty(globalThis, "history", {
     configurable: true,
-    value: { pushState: () => {}, replaceState: () => {} },
+    value: {
+      pushState: (_state: unknown, _unused: string, url?: string | URL | null) => {
+        pushedPaths.push(String(url ?? ""));
+      },
+      replaceState: () => {},
+    },
   });
 
   const windowEvents = new EventTarget();
@@ -74,6 +82,7 @@ beforeEach(() => {
       clearInterval,
       addEventListener: windowEvents.addEventListener.bind(windowEvents),
       removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
+      focus: () => { desktopFocusCalls.push("browser-focus"); },
     },
   });
   const documentEvents = new EventTarget();
@@ -93,6 +102,9 @@ beforeEach(() => {
   addCustomServerProfile(localStorage, { label: "Private", origin: "https://private.example.com" });
   saveActiveServerOrigin(localStorage, activeOrigin);
   credentialDeletes = 0;
+  notificationActionHandler = null;
+  desktopFocusCalls = [];
+  pushedPaths = [];
   storedCredential = JSON.stringify({
     refreshToken: "old-refresh",
     deviceSecret: "old-device-secret",
@@ -121,6 +133,23 @@ beforeEach(() => {
     loadDeepLink: async () => ({
       getCurrent: async () => null,
       onOpenUrl: async () => () => {},
+    }),
+    loadNotification: async () => ({
+      isPermissionGranted: async () => true,
+      requestPermission: async () => "granted",
+      sendNotification: () => {},
+      onAction: async (handler) => {
+        notificationActionHandler = handler;
+        return { unregister: async () => {} };
+      },
+    }),
+    loadWindow: async () => ({
+      getCurrentWindow: () => ({
+        setBadgeCount: async () => {},
+        show: async () => { desktopFocusCalls.push("show"); },
+        unminimize: async () => { desktopFocusCalls.push("unminimize"); },
+        setFocus: async () => { desktopFocusCalls.push("focus"); },
+      }),
     }),
   });
   Object.defineProperty(globalThis, "fetch", {
@@ -176,6 +205,24 @@ afterEach(async () => {
 });
 
 describe("App desktop server pairing behavior", () => {
+  test("opens a clicked desktop mention notification at the target message", async () => {
+    await act(async () => {
+      renderer = create(<LocaleProvider><App /></LocaleProvider>);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(notificationActionHandler).not.toBeNull();
+    await act(async () => {
+      notificationActionHandler?.({ extra: { slug: "general", seq: 42 } });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(desktopFocusCalls).toEqual(["show", "unminimize", "focus"]);
+    expect(pushedPaths).toContain("/c/general");
+    expect(location.hash).toBe("#msg-42");
+  });
+
   test("successful server switch leaves a channel route from the previous server", async () => {
     const privateOrigin = "https://private.example.com";
     const replacements: string[] = [];

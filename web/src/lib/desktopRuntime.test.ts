@@ -5,6 +5,7 @@ import {
   isAutostartEnabled,
   isDesktopNotificationPermissionGranted,
   isDesktopNotificationSupported,
+  listenForDesktopNotificationActions,
   listenForDesktopPairLinks,
   openDesktopVerificationUrl,
   requestDesktopNotificationPermission,
@@ -25,6 +26,7 @@ function notificationModule(overrides: Partial<NotificationModule> = {}): Notifi
     isPermissionGranted: async () => true,
     requestPermission: async () => "granted",
     sendNotification: () => {},
+    onAction: async () => ({ unregister: async () => {} }),
     ...overrides,
   };
 }
@@ -77,6 +79,8 @@ describe("browser fallback", () => {
     expect(await isDesktopNotificationPermissionGranted()).toBe(false);
     expect(await requestDesktopNotificationPermission()).toBe("unsupported");
     expect(await sendMentionNotification({ title: "Mention", body: "hello", slug: "general", seq: 7 })).toBe(false);
+    const stopNotificationActions = await listenForDesktopNotificationActions(() => {});
+    stopNotificationActions();
     expect(await setDesktopBadge(4)).toBe(false);
     expect(await showAndFocusDesktopWindow()).toBe(false);
     const unlisten = await listenForDesktopUpdateChecks(() => {});
@@ -167,6 +171,34 @@ describe("desktop notifications", () => {
 
     expect(await sendMentionNotification({ title: "Mention", body: "hello", slug: "general", seq: 8 })).toBe(false);
     expect(sends).toBe(0);
+  });
+
+  test("delivers validated notification actions and unregisters the native listener", async () => {
+    let actionHandler: ((notification: { extra?: Record<string, unknown> }) => void) | null = null;
+    let unregistered = false;
+    const actions: Array<{ slug: string; seq: number }> = [];
+    __setDesktopRuntimeDependenciesForTests({
+      isTauri: () => true,
+      loadNotification: async () => notificationModule({
+        onAction: async (handler) => {
+          actionHandler = handler;
+          return { unregister: async () => { unregistered = true; } };
+        },
+      }),
+    });
+
+    const stop = await listenForDesktopNotificationActions((action) => actions.push(action));
+    actionHandler?.({ extra: { slug: "general", seq: 42 } });
+    actionHandler?.({ extra: { slug: "../admin", seq: 43 } });
+    actionHandler?.({ extra: { slug: "general", seq: 0 } });
+    actionHandler?.({ extra: { slug: "general", seq: 1.5 } });
+    actionHandler?.({ extra: { slug: "general", seq: "44" } });
+    actionHandler?.({});
+    stop();
+    await Promise.resolve();
+
+    expect(actions).toEqual([{ slug: "general", seq: 42 }]);
+    expect(unregistered).toBe(true);
   });
 });
 
@@ -334,6 +366,8 @@ describe("native plugin failures", () => {
     expect(await isDesktopNotificationPermissionGranted()).toBe(false);
     expect(await requestDesktopNotificationPermission()).toBe("unsupported");
     expect(await sendMentionNotification({ title: "Mention", body: "hello", slug: "general", seq: 9 })).toBe(false);
+    const stopNotificationActions = await listenForDesktopNotificationActions(() => {});
+    stopNotificationActions();
     expect(await setDesktopBadge(2)).toBe(false);
     expect(await showAndFocusDesktopWindow()).toBe(false);
     expect(await isAutostartEnabled()).toBe(false);

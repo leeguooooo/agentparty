@@ -12,6 +12,7 @@
     "notification:allow-is-permission-granted",
     "notification:allow-request-permission",
     "notification:allow-notify",
+    "notification:allow-register-listener",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
