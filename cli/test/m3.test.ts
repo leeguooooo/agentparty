@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildHostBoard, type MsgFrame, type PresenceEntry } from "@agentparty/shared";
 import { workspaceId } from "../src/config";
-import { handleRestError, RestError } from "../src/rest";
+import { handleRestError, RestError, TAIL_BEFORE } from "../src/rest";
 import { startRestMock, type RestMock, type RestRequest } from "./rest-mock";
 
 const indexPath = join(import.meta.dir, "..", "src", "index.ts");
@@ -964,10 +964,16 @@ describe("party status/history channel flag", () => {
     expect(frame.recommended_actions).toEqual([
       expect.objectContaining({ kind: "review-blockers", target: "worker-b", requires_human: false }),
     ]);
-    expect(reqsOf(mock, "GET", "/api/channels/dev/messages")[0]!.query).toMatchObject({
-      since: "0",
-      limit: "500",
-    });
+    // #151 扩展：host board 默认取最近窗口（tail），不再是「取头 500 条」——否则频道超过
+    // limit 条后 last_seq 永久冻结、loop guard blocker 永远看不到最新发言。
+    // 消息端点这里被打两次：主窗口查询 + limit=1 的头探针（拿真实 head 供窗口显式化用），
+    // 用 limit 区分，不依赖并发到达顺序。
+    const messageReqs = reqsOf(mock, "GET", "/api/channels/dev/messages");
+    const mainReq = messageReqs.find((r) => r.query.limit !== "1");
+    expect(mainReq?.query).toMatchObject({ before: String(TAIL_BEFORE), limit: "500" });
+    expect(mainReq?.query.since).toBeUndefined();
+    const headProbeReq = messageReqs.find((r) => r.query.limit === "1");
+    expect(headProbeReq?.query.before).toBe(String(TAIL_BEFORE));
   });
 
   test("host board recommends human guard reset and takeover when only stale hosts remain", async () => {

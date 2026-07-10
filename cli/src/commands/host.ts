@@ -7,7 +7,7 @@ import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../
 import { resolveChannel } from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { fetchMessages, fetchPresence, handleRestError } from "../rest";
+import { fetchMessages, fetchPresence, fetchRecentMessages, handleRestError } from "../rest";
 import { isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
 const HOST_FLAGS = ["channel", "since", "limit", "json"];
@@ -22,15 +22,51 @@ The board is read-only and uses existing data only:
 Options:
   --channel C   read channel C instead of the bound channel
   --since seq   only inspect status messages after seq
-  --limit n     maximum messages to inspect (default 500, max 1000)
+  --limit n     maximum messages to inspect (default 500, max 1000). By default inspects the
+                MOST RECENT messages; use --since 0 to inspect from the beginning.
   --json        emit one structured JSON frame`;
 
 function scopeLabel(scope: string[]): string {
   return scope.length > 0 ? scope.join(",") : "(no scope)";
 }
 
-function printBoard(board: HostBoard) {
+// 窗口显式化（#151 扩展）：board 只看得到「取回窗口」这一段消息，不是整条频道历史。
+// 取尾能看到最新状态，但会漏报窗口之前开启、至今未关的 claim；取头则相反——两者都不健全，
+// 所以必须把窗口边界摊开给人看，而不是让 board 悄悄看起来正常。
+export interface BoardWindow {
+  from: number; // 窗口首条 seq，无消息为 0
+  to: number; // 窗口末条 seq，无消息为 0
+  head: number; // 频道真实 head（独立 tail 探针拿到的）
+  truncated: boolean; // to < head：窗口没看到最新消息，board 不是最新的
+  missingBefore: boolean; // from > 1：窗口之前开启、至今未关的 claim 在这个窗口里不可见
+}
+
+export function describeWindow(messages: { seq: number }[], head: number): BoardWindow {
+  const from = messages[0]?.seq ?? 0;
+  const to = messages.at(-1)?.seq ?? 0;
+  return {
+    from,
+    to,
+    head,
+    truncated: to < head,
+    missingBefore: from > 1,
+  };
+}
+
+export function formatWindowLines(w: BoardWindow): string[] {
+  const lines = [`window: seq ${w.from}..${w.to} (channel head = ${w.head})`];
+  if (w.missingBefore) {
+    lines.push(`note: claims opened before seq ${w.from} are not visible in this window; raise --limit or use --since 0`);
+  }
+  if (w.truncated) {
+    lines.push(`warn: window ends at seq ${w.to} but channel head is ${w.head} — this board is NOT current`);
+  }
+  return lines;
+}
+
+function printBoard(board: HostBoard, window: BoardWindow) {
   console.log(`host board ${board.channel} last_seq=${board.last_seq}`);
+  for (const line of formatWindowLines(window)) console.log(line);
   console.log(`hosts: ${board.hosts.length}`);
   for (const host of board.hosts) {
     const reason = host.stale_reason === null ? "" : ` reason=${host.stale_reason}`;
@@ -113,13 +149,23 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
-    const [presence, messages] = await Promise.all([
+    const resolvedLimit = limit ?? 500;
+    // flag 是否存在才决定走向——没给 --since 就取最近窗口（tail），否则频道超过 limit 条后
+    // last_seq 永久冻结在头部、loop guard blocker 永远看不到最新发言（见频道公告 rev347）。
+    const sinceGiven = flags.since !== undefined;
+    const [presence, messages, headProbe] = await Promise.all([
       fetchPresence(cfg.server, cfg.token, channel),
-      fetchMessages(cfg.server, cfg.token, channel, since ?? 0, limit ?? 500),
+      sinceGiven
+        ? fetchMessages(cfg.server, cfg.token, channel, since ?? 0, resolvedLimit)
+        : fetchRecentMessages(cfg.server, cfg.token, channel, resolvedLimit),
+      // 独立 tail 探针拿频道真实 head：取尾窗口本身推不出「后面还有没有更新」，取头窗口更推不出。
+      fetchRecentMessages(cfg.server, cfg.token, channel, 1),
     ]);
+    const head = headProbe.at(-1)?.seq ?? 0;
+    const window = describeWindow(messages, head);
     const board = buildHostBoard(channel, presence, messages);
-    if (flags.json === true) console.log(JSON.stringify(jsonFrame(board as unknown as Record<string, unknown>)));
-    else printBoard(board);
+    if (flags.json === true) console.log(JSON.stringify(jsonFrame({ ...board, window } as unknown as Record<string, unknown>)));
+    else printBoard(board, window);
     return 0;
   } catch (e) {
     return handleRestError(e);
