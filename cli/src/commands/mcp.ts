@@ -1,7 +1,7 @@
 // party mcp — stdio MCP server exposing AgentParty as structured tools.
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { MsgFrame, StatusState, TaskAssigneeKind, TaskState } from "@agentparty/shared";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import pkg from "../../package.json" with { type: "json" };
@@ -10,6 +10,7 @@ import { jsonFrame } from "../json";
 import { resolveAuth, resolveAuthDetailed } from "../oidc-cli";
 import {
   createTask,
+  fetchChannelCharter,
   fetchMe,
   fetchMessages,
   fetchPresence,
@@ -35,6 +36,7 @@ Example:
 
 Tools:
   party_whoami
+  party_charter
   party_channels
   party_send
   party_status
@@ -52,7 +54,11 @@ Tools:
   task_block
   party_spawn_worker
   party_watch_once
-  party_wake_test`;
+  party_wake_test
+
+Resources:
+  party://charter               charter for the bound channel (--channel or cwd binding, 用前必读)
+  party://{channel}/charter     charter for any channel by slug`;
 
 const StateSchema = z.enum(["working", "waiting", "blocked", "done"]);
 const TaskStateSchema = z.enum(["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"]);
@@ -171,11 +177,42 @@ function capturedResult(name: string, captured: { code: number; stdout: string; 
   return captured.code === 0 ? ok(data) : { ...fail(captured.stderr || captured.stdout || `${name} failed`), structuredContent: data };
 }
 
+// 被 @ 唤起时的第一屏提示：MCP 接入的 agent 没有 serve 的 context file，
+// 靠这条把它引到 charter。提示必须与实际注册的资源一致：绑定了频道（flag 或 cwd）才指向
+// 具体的 party://charter；否则只指 party_charter 工具与模板 party://{channel}/charter，
+// 绝不叫模型去读一个 resources/list 里不存在的资源。
+function charterReminder(boundChannel: string | undefined): string {
+  const where =
+    boundChannel !== undefined
+      ? "party_charter tool or party://charter resource"
+      : "party_charter tool (pass a channel), or the party://{channel}/charter resource";
+  return `read the channel charter first (${where}) — it defines this channel's scope and etiquette before you act.`;
+}
+
+async function charterData(channel: string): Promise<Record<string, unknown>> {
+  const cfg = await auth();
+  const body = await fetchChannelCharter(cfg.server, cfg.token, channel);
+  return { type: "charter", channel, ...body };
+}
+
+function charterText(data: Record<string, unknown>): string {
+  const charter = data.charter;
+  return typeof charter === "string" && charter.length > 0
+    ? charter
+    : `# ${String(data.channel)} charter not set (rev ${String(data.charter_rev ?? 0)})`;
+}
+
 export function createMcpServer(defaultChannel?: string): McpServer {
   const server = new McpServer({
     name: "agentparty",
     version: pkg.version,
   });
+
+  // 启动时解析一次「我在哪个频道」——flag 优先，否则吃 cwd 绑定（party init --channel）。
+  // 工具、concrete resource、whoami 提示三者共用这一个答案，不能各认各的。
+  const resolvedBound = resolveChannel(defaultChannel) ?? undefined;
+  const boundChannel = resolvedBound !== undefined && isSlug(resolvedBound) ? resolvedBound : undefined;
+  const reminder = charterReminder(boundChannel);
 
   server.registerTool(
     "party_whoami",
@@ -188,7 +225,39 @@ export function createMcpServer(defaultChannel?: string): McpServer {
       try {
         const cfg = await auth();
         const me = await fetchMe(cfg.server, cfg.token);
-        return ok({ type: "me", server: cfg.server, identity: me });
+        return ok({ type: "me", server: cfg.server, identity: me, protocol_reminder: reminder });
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_charter",
+    {
+      title: "Read channel charter",
+      description:
+        "Read the channel charter / 用前必读 — the channel's scope, etiquette, roles, and current host. Call this FIRST when you are @-woken into a channel, before acting.",
+      inputSchema: {
+        channel: z.string().optional().describe("Channel slug. Defaults to the workspace-bound channel."),
+      },
+    },
+    async ({ channel }) => {
+      try {
+        // charter 的三条路径（tool / resource / whoami 提示）必须恒等：resource 与提示在启动时
+        // 静态绑定 boundChannel（MCP resources 无法热更新），所以 tool 不传 channel 时也用同一个
+        // boundChannel，而不是每次重解析 cwd 绑定——否则运行中 rebind 会让 tool 漂到新频道、
+        // 资源/提示仍指旧频道，两者都不报错。显式传 channel 参数仍优先（保留读任意频道的能力）。
+        let resolved: string;
+        if (channel !== undefined) {
+          if (!isSlug(channel)) throw new Error("channel must match [a-z0-9][a-z0-9-]{0,63}");
+          resolved = channel;
+        } else if (boundChannel !== undefined) {
+          resolved = boundChannel;
+        } else {
+          throw new Error("no channel, pass channel or bind with: party init --channel C");
+        }
+        return ok(await charterData(resolved));
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       }
@@ -745,6 +814,44 @@ export function createMcpServer(defaultChannel?: string): McpServer {
       ];
       const captured = await captureCommand(async () => (await import("./wake")).run(argv));
       return capturedResult("wake_test", captured);
+    },
+  );
+
+  // Resources make the charter machine-discoverable via resources/list (#136) and give the
+  // MCP接入路径 a first-screen "用前必读" it otherwise never sees (#134). The concrete
+  // party://charter is registered whenever a channel resolves — from --channel OR the cwd
+  // binding (party init --channel) — so it stays consistent with the party_charter tool and
+  // the whoami reminder, which resolve the same way. Any channel is still readable via the
+  // template below. Only when neither flag nor binding names a channel is resources/list empty.
+  if (boundChannel !== undefined) {
+    server.registerResource(
+      "channel-charter",
+      "party://charter",
+      {
+        title: `Charter for #${boundChannel}`,
+        description: "The bound channel's charter / 用前必读: scope, etiquette, roles, current host. Read before acting.",
+        mimeType: "text/markdown",
+      },
+      async (uri) => {
+        const data = await charterData(boundChannel);
+        return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: charterText(data) }] };
+      },
+    );
+  }
+
+  server.registerResource(
+    "channel-charter-by-slug",
+    new ResourceTemplate("party://{channel}/charter", { list: undefined }),
+    {
+      title: "Channel charter by slug",
+      description: "Read any channel's charter / 用前必读 by slug: party://<channel>/charter.",
+      mimeType: "text/markdown",
+    },
+    async (uri, variables) => {
+      const raw = Array.isArray(variables.channel) ? variables.channel[0] : variables.channel;
+      const resolved = normalizeChannel(typeof raw === "string" ? raw : undefined, defaultChannel);
+      const data = await charterData(resolved);
+      return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: charterText(data) }] };
     },
   );
 

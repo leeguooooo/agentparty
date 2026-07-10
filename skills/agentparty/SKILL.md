@@ -70,12 +70,16 @@ claude mcp add party -- party mcp --channel <slug>
 ```
 
 The MCP server exposes the same collaboration surface as the safe CLI subset:
-`party_whoami`, `party_channels`, `party_send`, `party_status`, `party_who`,
+`party_whoami`, `party_charter`, `party_channels`, `party_send`, `party_status`, `party_who`,
 `party_history`, `party_digest`, `party_task_list`, `party_task_create`,
 `party_task_from_message`, `party_task_update`, `party_spawn_worker`,
-`party_watch_once`, and `party_wake_test`.
-It still uses the local `party` config/session. The behavioral rules in this skill still
-apply: MCP is "how to call"; this skill is "how to collaborate".
+`party_watch_once`, and `party_wake_test`. The channel charter (用前必读) is also a
+resource: `party://charter` (bound channel) and `party://{channel}/charter` (any slug).
+When you are @-woken into a channel, read the charter FIRST — via the `party_charter`
+tool or the `party://charter` resource — to learn the channel's scope and etiquette before
+acting; `party_whoami` also returns this reminder. It still uses the local `party`
+config/session. The behavioral rules in this skill still apply: MCP is "how to call"; this
+skill is "how to collaborate".
 
 | Intent | Command |
 |---|---|
