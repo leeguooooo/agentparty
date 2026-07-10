@@ -21,7 +21,9 @@ import langSql from "highlight.js/lib/languages/sql";
 import langTypescript from "highlight.js/lib/languages/typescript";
 import langXml from "highlight.js/lib/languages/xml";
 import langYaml from "highlight.js/lib/languages/yaml";
-import { marked } from "marked";
+import { Marked } from "marked";
+import type { IdentityDisplayMap } from "./identityDisplay";
+import { mentionExtension } from "./mentionMarkup";
 
 hljs.registerLanguage("bash", langBash);
 hljs.registerLanguage("c", langC);
@@ -41,17 +43,27 @@ hljs.registerLanguage("typescript", langTypescript);
 hljs.registerLanguage("xml", langXml);
 hljs.registerLanguage("yaml", langYaml);
 
-marked.use({
-  renderer: {
-    code({ text, lang }) {
-      const language = lang && hljs.getLanguage(lang) ? lang : undefined;
-      const html = language
-        ? hljs.highlight(text, { language }).value
-        : hljs.highlightAuto(text).value;
-      return `<pre><code class="hljs">${html}</code></pre>`;
+// 每次渲染新建一个 Marked 实例：代码块高亮 renderer 恒定，mention 扩展按本条消息的
+// identities 闭包注入。mention 在解析后的 token 流上美化，代码块/行内代码/自动链接 URL
+// 天然被排除（见 mentionMarkup.ts 与 #131），不再往原文里塞裸 HTML。
+function createMarked(identities: IdentityDisplayMap | undefined): Marked {
+  const instance = new Marked();
+  instance.use({
+    renderer: {
+      code({ text, lang }) {
+        const language = lang && hljs.getLanguage(lang) ? lang : undefined;
+        const html = language
+          ? hljs.highlight(text, { language }).value
+          : hljs.highlightAuto(text).value;
+        return `<pre><code class="hljs">${html}</code></pre>`;
+      },
     },
-  },
-});
+  });
+  if (identities !== undefined) {
+    instance.use({ extensions: [mentionExtension(identities)] });
+  }
+  return instance;
+}
 
 // span/class 是 hljs 高亮产物的载体，必须放行。
 // img 不放行：远程 src 会让每个看频道的人自动请求第三方主机（IP/时段追踪 beacon），
@@ -69,24 +81,37 @@ const ALLOWED_ATTR = ["href", "title", "class", "start"];
 // class 只留 hljs 产物和受控 mention 产物，防止消息正文借用应用自身样式伪装系统 UI。
 const SAFE_CLASS_RE = /^(?:hljs(?:-[\w-]+)?|ap-mention)$/;
 
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  // 外链新窗口 + noopener（净化后统一补，用户写不进 target/rel）
-  if (node.tagName === "A" && node.hasAttribute("href")) {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noopener noreferrer");
-  }
-  if (node.hasAttribute("class")) {
-    const kept = (node.getAttribute("class") ?? "")
-      .split(/\s+/)
-      .filter((c) => SAFE_CLASS_RE.test(c))
-      .join(" ");
-    if (kept === "") node.removeAttribute("class");
-    else node.setAttribute("class", kept);
-  }
-});
+// addHook 只在有 DOM 时可用；无 DOM 环境（bun 测试、SSR）里 DOMPurify 是未绑定 window 的
+// 工厂，addHook/sanitize 均为 undefined。此处守卫让 markdown.ts 在无 DOM 下也能被 import，
+// 从而单测能覆盖 markdownToHtmlUnsafe 那一步——净化本身只在浏览器里真正执行，行为不变。
+if (typeof DOMPurify.addHook === "function") {
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    // 外链新窗口 + noopener（净化后统一补，用户写不进 target/rel）
+    if (node.tagName === "A" && node.hasAttribute("href")) {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+    if (node.hasAttribute("class")) {
+      const kept = (node.getAttribute("class") ?? "")
+        .split(/\s+/)
+        .filter((c) => SAFE_CLASS_RE.test(c))
+        .join(" ");
+      if (kept === "") node.removeAttribute("class");
+      else node.setAttribute("class", kept);
+    }
+  });
+}
 
-export function renderMarkdown(md: string): string {
-  const raw = marked.parse(md, { async: false });
+// marked 解析 + mention 美化（DOMPurify 净化前的产物）。单独导出是因为 DOMPurify 依赖
+// DOM，在 bun 测试环境跑不起来（addHook 未定义）；这一步是纯 marked，可被单测覆盖，用来
+// 钉住「mention 在解析后美化、绝不在解析前注入」这条 #131 接线。DOMPurify 只做白名单，
+// 不改动 ap-mention span 的结构，所以这一步的输出即最终 HTML 的语义。
+export function markdownToHtmlUnsafe(md: string, identities?: IdentityDisplayMap): string {
+  return createMarked(identities).parse(md, { async: false });
+}
+
+export function renderMarkdown(md: string, identities?: IdentityDisplayMap): string {
+  const raw = markdownToHtmlUnsafe(md, identities);
   return DOMPurify.sanitize(raw, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,

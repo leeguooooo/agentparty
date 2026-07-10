@@ -5,7 +5,6 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
 import { displayForIdentity, resolveSenderLabel, type IdentityDisplayMap } from "../lib/identityDisplay";
-import { replaceMentionLabels } from "../lib/mentionMarkup";
 import { readStateFor } from "../lib/readList";
 import { summarizeReplyPreview } from "../lib/replyPreview";
 import { useT } from "../i18n/useT";
@@ -463,7 +462,7 @@ export function MessageCard({
       ) : msg.retracted ? (
         <p className="msg-retracted">{t("MessageCard.retracted")}</p>
       ) : (
-        <Markdown source={replaceMentionLabels(msg.body, identityDisplay)} />
+        <Markdown source={msg.body} identities={identityDisplay} />
       )}
       {!editing && actionError !== null && <p className="banner banner--red msg-action-error">{actionError}</p>}
     </article>
