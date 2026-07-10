@@ -79,7 +79,11 @@ function toSession(data: {
     accessToken: data.access_token,
     refreshToken: data.refresh_token ?? null,
     expiresAt: typeof data.expires_in === "number" ? nowSec() + data.expires_in : null,
-    identity: jwtSub(data.id_token) ?? jwtSub(data.access_token),
+    // 身份锚点用 access_token 的 sub：与 App 的 identityRef（jwtSub(token)）以及服务端的
+    // 授权口径（worker 按 access token 的 claims.sub 取身份）三方一致。id_token 仅作回退——
+    // 某些 IdP 的 id_token.sub 与 access_token.sub 不同（pairwise subject），若以 id_token 为准，
+    // 标签会把自己刚登录的会话判成「别人的」。
+    identity: jwtSub(data.access_token) ?? jwtSub(data.id_token),
   };
 }
 
