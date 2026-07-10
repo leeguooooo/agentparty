@@ -184,12 +184,17 @@ describe("buildHostBoard unlinked_claims legacy 段 (#204)", () => {
   });
 
   test("unlinked_claims 按 seq 去重与排序，不用 claimKey（M5 target）", () => {
-    // seq 与 claimKey 排序相反：zeta@200 / alpha@100。按 seq 降序 → [200,100]；按 claimKey 升序 → [100,200]。
+    // 三条而非两条：两条时 claimKey 降序会碰巧与 seq 降序同序，按 claimKey 排的实现能蒙混过关。
+    // 这里让 claimKey 的两个方向都区别于 seq 降序：
+    //   seq 降序        → [300, 200, 100]  (mid, zeta, alpha)
+    //   claimKey 升序   → [100, 300, 200]  (alpha, mid, zeta)
+    //   claimKey 降序   → [200, 300, 100]  (zeta, mid, alpha)
     const messages = [
+      statusMsg(300, "mid", "working", ["c"]),
       statusMsg(200, "zeta", "working", ["a"]),
       statusMsg(100, "alpha", "working", ["b"]),
     ];
-    expect(buildHostBoard("dev", [], messages, [], NOW).unlinked_claims.map((c) => c.seq)).toEqual([200, 100]);
+    expect(buildHostBoard("dev", [], messages, [], NOW).unlinked_claims.map((c) => c.seq)).toEqual([300, 200, 100]);
   });
 });
 
