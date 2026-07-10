@@ -393,8 +393,9 @@ describe("webhooks", () => {
     const agentA = await seedToken("agent");
     const agentB = await seedToken("agent");
     const slug = await createChannel(agentA.token);
-    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
-    await disableLoopGuard(slug, agentA.token);
+    const guardHuman = await seedToken("human");
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭（#119：关闭是 human-only）
+    await disableLoopGuard(slug, guardHuman.token);
     expect(
       (
         await addWebhook(slug, agentA.token, {

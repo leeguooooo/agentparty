@@ -219,6 +219,8 @@ async function importVerifyKey(issuer: string, kid?: string): Promise<CryptoKey 
 }
 
 interface OidcClaims {
+  /** OIDC standard claim（#100）：email 未验证时不得作为 ACL 账号锚点。部分 IdP 用字符串 "true"。 */
+  email_verified?: boolean | string;
   iss?: string;
   aud?: string | string[];
   exp?: number;
@@ -251,7 +253,13 @@ async function verifyOidcToken(token: string, oidc: OidcConfig): Promise<TokenId
   const ok = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, signature, signed);
   if (!ok) return null;
   // OIDC 人类：sub 作 name，role/kind=human；hash 用 oidc: 前哨（不落 D1，生命周期归 JWT exp）
-  const email = typeof claims.email === "string" ? claims.email : undefined;
+  //
+  // email 是私有频道 ACL 的唯一账号锚点（account = email ?? sub），所以只认经 IdP 验证过的
+  // email（#100）。允许自设未验证 email 的 IdP（Auth0 DB connection、GitHub 未验证邮箱等）
+  // 下，攻击者以 email=victim@corp.com 登录即可接管受害者的全部私有频道。
+  // email_verified 缺失或为 false → 忽略 email，回退到 sub（sub 由 IdP 保证唯一且不可伪造）。
+  const emailVerified = claims.email_verified === true || claims.email_verified === "true";
+  const email = emailVerified && typeof claims.email === "string" ? claims.email : undefined;
   return {
     name: claims.sub,
     email,

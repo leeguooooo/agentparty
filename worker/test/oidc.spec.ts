@@ -54,7 +54,8 @@ async function signJwt(claims: Record<string, unknown>, opts: { kid?: string; ta
 
 function claims(issuer: string, over: Record<string, unknown> = {}) {
   const now = Math.floor(Date.now() / 1000);
-  return { iss: issuer, aud: CLIENT_ID, sub: "user-abc", email: "u@leeguoo.com", exp: now + 3600, iat: now, ...over };
+  // email_verified: true = 正常 IdP 的姿态（#100）。未验证的场景在专门的用例里显式覆盖。
+  return { iss: issuer, aud: CLIENT_ID, sub: "user-abc", email: "u@leeguoo.com", email_verified: true, exp: now + 3600, iat: now, ...over };
 }
 
 // 每个需要验签的单元用例用独立 issuer，避开 JWKS 内存缓存，让 interceptor 恰好消费一次
@@ -148,6 +149,45 @@ describe("lookupToken OIDC verification", () => {
     // oidc=null：JWT 不走验证，落 D1 hash 查询 → 未命中 → null（保持机器 token 现状）
     expect(await lookupToken(env.DB, await signJwt(claims(issuer)), null)).toBeNull();
   });
+
+  // #100：email 是私有频道 ACL 的唯一账号锚点。允许自设未验证 email 的 IdP 下，
+  // 攻击者以 email=victim@corp.com 登录即可接管受害者的全部私有频道。
+  it("ignores an unverified email and falls back to sub as the account anchor", async () => {
+    const issuer = freshIssuer();
+    mockJwks(issuer);
+    const id = await lookupToken(
+      env.DB,
+      await signJwt(claims(issuer, { email: "victim@corp.com", email_verified: false })),
+      oidc(issuer),
+    );
+    expect(id).not.toBeNull();
+    expect(id?.email).toBeUndefined();
+    expect(id?.account).toBe("user-abc"); // sub，不是被冒充的 email
+    expect(id?.owner).toBe("user-abc");
+  });
+
+  it("ignores an email when email_verified is absent entirely", async () => {
+    const issuer = freshIssuer();
+    mockJwks(issuer);
+    const id = await lookupToken(
+      env.DB,
+      await signJwt(claims(issuer, { email: "victim@corp.com", email_verified: undefined })),
+      oidc(issuer),
+    );
+    expect(id?.account).toBe("user-abc");
+  });
+
+  it('accepts the string "true" form some IdPs emit', async () => {
+    const issuer = freshIssuer();
+    mockJwks(issuer);
+    const id = await lookupToken(
+      env.DB,
+      await signJwt(claims(issuer, { email: "u@leeguoo.com", email_verified: "true" })),
+      oidc(issuer),
+    );
+    expect(id?.account).toBe("u@leeguoo.com");
+  });
+
 });
 
 describe("oidc end-to-end via SELF.fetch", () => {
@@ -223,4 +263,5 @@ describe("oidc end-to-end via SELF.fetch", () => {
     expect(post.status).toBe(200);
     expect((await post.json()) as { seq: number }).toMatchObject({ seq: 1 });
   });
+
 });

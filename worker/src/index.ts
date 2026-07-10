@@ -1,5 +1,11 @@
 // worker 入口 — rest 路由 + ws 升级转发
-import { CHARTER_LIMIT, RESERVED_NAMES, ROLE_RESPONSIBILITY_LIMIT } from "@agentparty/shared";
+import {
+  CHARTER_LIMIT,
+  LOOP_GUARD_N,
+  LOOP_GUARD_PARTY_N,
+  RESERVED_NAMES,
+  ROLE_RESPONSIBILITY_LIMIT,
+} from "@agentparty/shared";
 import type {
   AgentLineage,
   CaptureKind,
@@ -3917,6 +3923,27 @@ app.put("/api/channels/:slug/completion-gate", async (c) => {
   return c.json({ gate, policy });
 });
 
+
+// #119：削弱 guard 的门禁不得弱于 reset-guard 的 human-only。
+// reset 只清计数，关闭/放宽 guard 是永久摘掉刹车——更强的动作，不能门禁更松。
+// 加强（开启、调低阈值）对任何 configurer 放行：那是往安全方向走。
+function loopGuardEffectiveLimit(channel: LoadedChannel): number {
+  if (channel.loop_guard_limit != null && channel.loop_guard_limit > 0) return channel.loop_guard_limit;
+  return channel.mode === "party" ? LOOP_GUARD_PARTY_N : LOOP_GUARD_N;
+}
+
+function weakensLoopGuard(channel: LoadedChannel, enabled: boolean, limit: number | null): boolean {
+  if (!enabled) return channel.loop_guard_enabled === 1; // 开→关 = 削弱；本就关着不算
+  if (channel.loop_guard_enabled !== 1) return false; // 关→开 = 加强
+  return limit !== null && limit > loopGuardEffectiveLimit(channel); // 放宽阈值 = 削弱
+}
+
+function weakensWorkflowGuard(channel: LoadedChannel, enabled: boolean, limit: number | null): boolean {
+  if (!enabled) return channel.workflow_guard_enabled === 1;
+  if (channel.workflow_guard_enabled !== 1) return false;
+  return limit !== null && limit > channel.workflow_guard_limit;
+}
+
 app.put("/api/channels/:slug/loop-guard", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
@@ -3935,6 +3962,9 @@ app.put("/api/channels/:slug/loop-guard", async (c) => {
   const limit = body.enabled ? positiveInt(body.limit) : null;
   if (body.enabled && (limit === null || limit > 10_000)) {
     return c.json(errorBody("bad_request", "limit must be an integer between 1 and 10000"), 400);
+  }
+  if (weakensLoopGuard(channel, body.enabled, limit) && identity.kind !== "human") {
+    return c.json(errorBody("forbidden", "only a human can disable or loosen the loop guard"), 403);
   }
   const enabled = body.enabled ? 1 : 0;
   await c.env.DB.prepare("UPDATE channels SET loop_guard_enabled = ?, loop_guard_limit = ? WHERE slug = ?")
@@ -3974,6 +4004,9 @@ app.put("/api/channels/:slug/workflow-guard", async (c) => {
     : null;
   if (body.enabled && (limit === null || limit > 1000)) {
     return c.json(errorBody("bad_request", "limit must be an integer between 1 and 1000"), 400);
+  }
+  if (weakensWorkflowGuard(channel, body.enabled, limit) && identity.kind !== "human") {
+    return c.json(errorBody("forbidden", "only a human can disable or loosen the workflow guard"), 403);
   }
   const enabled = body.enabled ? 1 : 0;
   const storedLimit = limit ?? channel.workflow_guard_limit;

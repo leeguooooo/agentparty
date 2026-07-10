@@ -55,9 +55,10 @@ describe("party mode", () => {
 
   it("party channel keeps accepting messages past the old loop guard thresholds", async () => {
     const { token } = await seedToken("agent");
+    const human = await seedToken("human");
     const slug = await createModeChannel(token, "party");
-    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
-    await disableLoopGuard(slug, token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭（#119：关闭是 human-only）
+    await disableLoopGuard(slug, human.token);
 
     // 首条消息让 do 缓存 mode=party
     expect((await postMessage(slug, token, "kickoff")).status).toBe(200);
@@ -73,9 +74,10 @@ describe("party mode", () => {
 
   it("normal channel keeps accepting messages past the old loop guard threshold", async () => {
     const { token } = await seedToken("agent");
+    const human = await seedToken("human");
     const slug = await createModeChannel(token);
-    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
-    await disableLoopGuard(slug, token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭（#119：关闭是 human-only）
+    await disableLoopGuard(slug, human.token);
     expect((await postMessage(slug, token, "kickoff")).status).toBe(200);
     await seedStreak(slug, LOOP_GUARD_N);
     const allowed = await postMessage(slug, token, "31st");
