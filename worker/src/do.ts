@@ -3224,16 +3224,22 @@ export class ChannelDO extends Server<Env> {
     this.ctx.storage.sql.exec("DELETE FROM meta WHERE key = ?", key);
   }
 
+  // issue #173：presence.kind 只有 status 帧写路径会盖，markOffline 新建的行、kind 列迁移前的旧行都是 NULL。
+  // 而 messages.sender_kind 每条消息落库时都从权威 token（identity.kind）盖，永远有真值。presence.kind 缺失时
+  // 回填该 name 最近一条消息的 sender_kind，让 `who`（读 presence）与 `history`（读 messages）对同一身份返回同一个
+  // kind——否则 CLI who.ts kindOf() 会按名字猜（非 UUID → "agent"），把只发过普通消息的人类谎报成 agent。
+  // presence.kind 非 NULL 时（即刚发过 status 帧、最新一手 token 快照）优先用它，不被历史消息覆盖。
+  private static readonly PRESENCE_COLUMNS = `name,
+                COALESCE(kind, (SELECT sender_kind FROM messages WHERE sender_name = presence.name ORDER BY seq DESC LIMIT 1)) AS kind,
+                account, handle, display_name, avatar_url, avatar_thumb,
+                state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
+                status_context_json, status_decision_json, status_workflow_json, role, role_source, residency, wake_kind, wake_verified_at,
+                context_json, lineage_json`;
+
   private presenceList(): PresenceEntry[] {
     const liveCounts = this.liveConnectionCounts();
     return this.ctx.storage.sql
-      .exec(
-        `SELECT name, kind, account, handle, display_name, avatar_url, avatar_thumb,
-                state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
-                status_context_json, status_decision_json, status_workflow_json, role, role_source, residency, wake_kind, wake_verified_at,
-                context_json, lineage_json
-         FROM presence ORDER BY name`,
-      )
+      .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence ORDER BY name`)
       .toArray()
       .map((r) => this.withLivePresence(this.presenceRowToEntry(r), liveCounts));
   }
@@ -3241,14 +3247,7 @@ export class ChannelDO extends Server<Env> {
   private presenceFor(name: string): PresenceEntry | null {
     const liveCounts = this.liveConnectionCounts();
     const rows = this.ctx.storage.sql
-      .exec(
-        `SELECT name, kind, account, handle, display_name, avatar_url, avatar_thumb,
-                state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
-                status_context_json, status_decision_json, status_workflow_json, role, role_source, residency, wake_kind, wake_verified_at,
-                context_json, lineage_json
-         FROM presence WHERE name = ?`,
-        name,
-      )
+      .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence WHERE name = ?`, name)
       .toArray();
     return rows.length > 0 ? this.withLivePresence(this.presenceRowToEntry(rows[0]!), liveCounts) : null;
   }
