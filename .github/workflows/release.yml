@@ -16,9 +16,33 @@ permissions:
   contents: read
 
 jobs:
+  # ── #247 变更范围探测：只在 PR 上判断「是不是纯 CLI 改动」──────────
+  # fail-safe 方向：cli_only 只在「PR + 有 cli/ 变更 + 没有任何非 cli/ 变更」时为真。
+  # 任何 cli/ 之外的文件（worker/web/shared/scripts/desktop/workflow/根 package.json…）
+  # 都让 non_cli=true → 回落全量 check。配错只会多跑，绝不漏测。
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      cli_only: ${{ github.event_name == 'pull_request' && steps.filter.outputs.cli == 'true' && steps.filter.outputs.non_cli == 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cli:
+              - 'cli/**'
+            non_cli:
+              - '!cli/**'
+
   # ── #9 pre-merge / release gate：必须覆盖测试文件 tsc ─────────────
+  # 唯一的 required 门禁，名字保持 "full check"（分支保护不用改）。
+  # #247：纯 CLI 的 PR 只跑 check:cli（秒级），否则跑全量 check（行为不变）。
   check:
     name: full check
+    needs: changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,8 +68,19 @@ jobs:
             exit 1
           fi
 
-      - name: run full workspace check
-        run: bun run check
+      # #247：纯 CLI 改动走 check:cli 快路径；其余一律全量。
+      # 快路径只由 changes.cli_only 决定，而它 fail-safe 偏向全量——判断在 changes job，
+      # 这里只是执行。tag/main push（非 PR）永远走全量。
+      - name: run check (cli-only fast path or full)
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.changes.outputs.cli_only }}" = "true" ]; then
+            echo "#247: 纯 CLI 改动 → 只跑 check:cli（快路径）"
+            bun run check:cli
+          else
+            echo "#247: 非纯 CLI（或非 PR）→ 全量 check"
+            bun run check
+          fi
 
   # ── 交叉编译 + 打包 + 构建溯源 ──────────────────────────────
   build:
