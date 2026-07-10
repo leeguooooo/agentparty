@@ -915,6 +915,13 @@ async function persistToken(
         now,
       )
       .run();
+    // 预分配认领（#101）：该 name 从无 token（existing 为 null）→ 这是它的【首次】铸造。
+    // 把此前预分配、尚未绑定的角色锚定到铸造账号。仅在首次铸造时绑定：重铸（existing 非 null，
+    // 见上面的 UPDATE 分支）绝不重绑，于是残留角色不会被易主的新账号继承。
+    await db
+      .prepare("UPDATE channel_roles SET owner_account = ? WHERE agent_name = ? AND owner_account IS NULL")
+      .bind(opts.owner ?? null, opts.name)
+      .run();
   }
   return { token };
 }
@@ -1219,7 +1226,7 @@ function channelHeaders(
 
 async function canConfigureChannel(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
   if (isChannelModerator(identity, channel)) return true;
-  return (await loadAssignedRole(db, channel.slug, identity.name)) === "host";
+  return (await loadAssignedRole(db, channel.slug, identity)) === "host";
 }
 
 function parseNameListJson(value: string | null | undefined): string[] {
@@ -1281,7 +1288,7 @@ async function canListMembers(db: D1Database, identity: TokenIdentity, channel: 
   const perms = channelPerms(channel);
   const isMember = await isChannelMember(db, channel.slug, identity.account);
   if (identity.kind === "agent") {
-    const role = await loadAssignedRole(db, channel.slug, identity.name);
+    const role = await loadAssignedRole(db, channel.slug, identity);
     return canByAgentPolicy(perms.members_list_agents, perms.members_list_agent_allowlist, identity, channel, isMember, role);
   }
   return canByHumanPolicy(perms.members_list, identity, channel, isMember);
@@ -1292,7 +1299,7 @@ async function canEditCharter(db: D1Database, identity: TokenIdentity, channel: 
   const perms = channelPerms(channel);
   const isMember = await isChannelMember(db, channel.slug, identity.account);
   if (identity.kind === "agent") {
-    const role = await loadAssignedRole(db, channel.slug, identity.name);
+    const role = await loadAssignedRole(db, channel.slug, identity);
     return canByAgentPolicy(perms.charter_write_agents, perms.charter_write_agent_allowlist, identity, channel, isMember, role);
   }
   return canByHumanPolicy(perms.charter_write, identity, channel, isMember);
@@ -1437,12 +1444,19 @@ async function exchangeOAuthCode(
   return { ...user, provider: provider.id, expiresIn: token.expiresIn };
 }
 
-async function loadAssignedRole(db: D1Database, slug: string, name: string): Promise<CollaborationRole | null> {
+// 协作角色按【账号】锚定，不认裸 name（#101）。一个 host 角色只对绑定账号的身份生效：
+//   - owner_account 为 null（预分配未认领 / 迁移无法确定账号）→ 一律不生效（安全失败方向）。
+//     预分配角色由 persistToken 在该 name 首次铸 token 时绑定到铸造账号；未绑定前无 token 能读到它。
+//   - owner_account 非 null → 仅当 identity.account 严格相等才返回角色。
+// 于是「撤销旧 token → 他人重铸同名」拿不到残留角色（account 不符）；同账号重铸同名则保留（account 相等）。
+async function loadAssignedRole(db: D1Database, slug: string, identity: TokenIdentity): Promise<CollaborationRole | null> {
   const row = await db
-    .prepare("SELECT role FROM channel_roles WHERE channel_slug = ? AND agent_name = ?")
-    .bind(slug, name)
-    .first<{ role: string }>();
-  return row && COLLAB_ROLES.includes(row.role) ? (row.role as CollaborationRole) : null;
+    .prepare("SELECT role, owner_account FROM channel_roles WHERE channel_slug = ? AND agent_name = ?")
+    .bind(slug, identity.name)
+    .first<{ role: string; owner_account: string | null }>();
+  if (!row || !COLLAB_ROLES.includes(row.role)) return null;
+  if (row.owner_account === null) return null;
+  return row.owner_account === (identity.account ?? null) ? (row.role as CollaborationRole) : null;
 }
 
 function assignedRoleHeaders(role: CollaborationRole | null): Record<string, string> {
@@ -3830,16 +3844,25 @@ app.put("/api/channels/:slug/roles/:name", async (c) => {
     return c.json(errorBody("bad_request", `responsibility must be a string <= ${ROLE_RESPONSIBILITY_LIMIT} bytes`), 400);
   }
   const assignedAt = Date.now();
+  // 角色按账号锚定（#101）：绑定到该 name 当前【存活】token 的 owner。
+  // 若无存活 token（预分配「先分工再铸 token」）→ null，等 persistToken 在首次铸造时认领绑定。
+  const liveOwner = await c.env.DB.prepare(
+    "SELECT owner FROM tokens WHERE name = ? AND revoked_at IS NULL",
+  )
+    .bind(name)
+    .first<{ owner: string | null }>();
+  const ownerAccount = liveOwner?.owner ?? null;
   await c.env.DB.prepare(
-    `INSERT INTO channel_roles (channel_slug, agent_name, role, assigned_by, assigned_at, responsibility)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO channel_roles (channel_slug, agent_name, role, assigned_by, assigned_at, responsibility, owner_account)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(channel_slug, agent_name) DO UPDATE SET
        role = excluded.role,
        assigned_by = excluded.assigned_by,
        assigned_at = excluded.assigned_at,
-       responsibility = ${responsibility.present ? "excluded.responsibility" : "channel_roles.responsibility"}`,
+       responsibility = ${responsibility.present ? "excluded.responsibility" : "channel_roles.responsibility"},
+       owner_account = COALESCE(excluded.owner_account, channel_roles.owner_account)`,
   )
-    .bind(slug, name, role, identity.name, assignedAt, responsibility.value)
+    .bind(slug, name, role, identity.name, assignedAt, responsibility.value, ownerAccount)
     .run();
   await fetchChannelDO(
     c.env,
@@ -4038,7 +4061,7 @@ app.post("/api/channels/:slug/messages/:seq/review", async (c) => {
   }
   const seq = positiveInt(Number(c.req.param("seq")));
   if (seq === null) return c.json(errorBody("bad_request", "seq must be a positive integer"), 400);
-  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
+  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity);
   const res = await fetchChannelDO(
     c.env,
     slug,
@@ -4092,7 +4115,7 @@ app.post("/api/channels/:slug/messages/:seq/:action", async (c) => {
   if (action !== "edit" && action !== "retract" && action !== "supersede") {
     return c.json(errorBody("bad_request", "action must be edit|retract|supersede"), 400);
   }
-  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
+  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity);
   return fetchChannelDO(
     c.env,
     slug,
@@ -4160,7 +4183,7 @@ app.post("/api/channels/:slug/messages", async (c) => {
   if (taskId !== undefined && !(await loadTaskRow(c.env.DB, slug, taskId))) {
     return c.json(errorBody("not_found", "task not found in this channel"), 404);
   }
-  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
+  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity);
   const res = await fetchChannelDO(
     c.env,
     slug,
@@ -4454,7 +4477,7 @@ app.get("/api/channels/:slug/ws", async (c) => {
   if (identity.owner) fwd.headers.set("x-ap-owner", identity.owner);
   fwd.headers.set("x-ap-token-hash", identity.hash);
   for (const [key, value] of Object.entries(lineageHeaders(identity))) fwd.headers.set(key, value);
-  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity.name);
+  const assignedRole = await loadAssignedRole(c.env.DB, slug, identity);
   if (assignedRole !== null) {
     fwd.headers.set("x-ap-collab-role", assignedRole);
     fwd.headers.set("x-ap-role-source", "assigned");
