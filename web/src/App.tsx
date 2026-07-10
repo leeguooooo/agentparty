@@ -160,7 +160,8 @@ export function App() {
     setMe(null);
     setToken(result.accessToken);
     setDesktopBoot("ready");
-  }, []);
+    replace("/");
+  }, [replace]);
 
   useEffect(() => {
     if (!desktop) return;

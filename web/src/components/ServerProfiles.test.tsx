@@ -107,6 +107,6 @@ test("custom servers are persisted only after successful probing", async () => {
       }), { status: 200 }),
   );
 
-  expect(result.probe.providers.map((provider) => provider.label)).toEqual(["Sign in with leeguoo"]);
+  expect(result.probe.providers.map((provider) => provider.label)).toEqual(["Sign in with account center"]);
   expect(result.profiles.at(-1)?.origin).toBe("https://party.example.com");
 });

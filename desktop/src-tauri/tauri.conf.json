@@ -35,9 +35,7 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
-    "macOS": {
-      "signingIdentity": "-"
-    }
+    "macOS": {}
   },
   "plugins": {
     "deep-link": {

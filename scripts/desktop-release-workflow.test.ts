@@ -23,8 +23,29 @@ describe("desktop release workflow", () => {
     expect(workflow).toContain("dist/latest.json");
   });
 
-  test("ad-hoc signs the complete macOS app bundle when Developer ID is unavailable", () => {
-    expect(tauriConfig.bundle.macOS.signingIdentity).toBe("-");
+  test("requires Developer ID signing and notarization for every desktop release", () => {
+    expect(tauriConfig.bundle.macOS.signingIdentity).not.toBe("-");
+    for (const secret of [
+      "APPLE_CERTIFICATE",
+      "APPLE_CERTIFICATE_PASSWORD",
+      "APPLE_ID",
+      "APPLE_PASSWORD",
+      "APPLE_TEAM_ID",
+      "KEYCHAIN_PASSWORD",
+    ]) {
+      expect(workflow).toContain(`secrets.${secret}`);
+    }
+    expect(workflow).toContain("security find-identity -v -p codesigning");
+    expect(workflow).toContain("spctl --assess --type execute");
+    expect(workflow).toContain("xcrun stapler validate");
+    expect(workflow).toContain('xcrun notarytool submit "$dmg"');
+    expect(workflow).toContain('xcrun stapler staple "$dmg"');
+    expect(workflow).toContain('spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"');
+  });
+
+  test("uses commands available on GitHub macOS runners for certificate import", () => {
+    expect(workflow).toContain("security list-keychains -d user");
+    expect(workflow).not.toContain("-maxdepth");
   });
 
   test("requires the tag, CLI package, and desktop package versions to match", () => {

@@ -21,7 +21,7 @@ export interface OAuthProviderConfig {
 
 export interface OidcProviderConfig extends OidcConfig {
   type: "oidc";
-  id: "oidc";
+  id: "@oidc";
   label: string;
 }
 
@@ -129,8 +129,8 @@ export function parseAuthConfigPayload(data: unknown): AuthConfig {
         scope: item.scope ?? "",
       });
     }
-    if (providers.length === 0 && oidc !== null) {
-      providers.push({ type: "oidc", id: "oidc", label: "Sign in with leeguoo", ...oidc });
+    if (oidc !== null) {
+      providers.push({ type: "oidc", id: "@oidc", label: "Sign in with account center", ...oidc });
     }
     return { oidc, providers };
   } catch {
