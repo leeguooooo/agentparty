@@ -53,12 +53,18 @@ export async function run(argv: string[]): Promise<number> {
         ts: nowTs(),
         logged_in: false,
         server: null,
+        // issue #140：命令实际会打到哪台 server 是最要紧的字段，即便还没登录也不该缺失——
+        // effective_server 是解析出来的落点（可能来自 config，即便没有可用 token），
+        // account_server 单独给账号会话的 server，二者不该被合并成一个含糊的字段。
+        effective_server: auth.server,
+        account_server: auth.account.server ?? null,
         auth_source: auth.auth_source,
         account: auth.account,
         config: auth.config,
       })));
     } else {
       console.log("runtime: not logged in");
+      console.log(`server: ${auth.server ?? "none (no config server and no account session)"}`);
       console.log(`account: ${auth.account.present ? `${auth.account.email ?? auth.account.sub ?? "present"} present server=${auth.account.server}` : `absent path=${auth.account.path}`}`);
       console.log(`config: ${auth.config.path ? `${auth.config.kind} ${auth.config.path}` : "none"}`);
       console.log(`auth-source: ${auth.auth_source}`);
@@ -91,6 +97,11 @@ export async function run(argv: string[]): Promise<number> {
         ts: nowTs(),
         logged_in: true,
         server: auth.server,
+        // issue #140：agent 不该靠解析 `account:` 那行的人话来判断落点——effective_server 是
+        // /api/me 实际打的 server（与顶层 server 同值，换个不含糊的名字方便工具直接取），
+        // account_server 是账号会话自己的 server，二者可能不同，分开给才不会被混用。
+        effective_server: auth.server,
+        account_server: auth.account.server ?? null,
         ...me,
         auth_source: auth.auth_source,
         runtime: {
@@ -107,10 +118,24 @@ export async function run(argv: string[]): Promise<number> {
       })));
     } else {
       const who = me.email ?? me.name;
-      console.log(`runtime: logged in as ${who} (${me.kind}/${me.role})`);
+      // issue #140：这行是 agent 读 whoami 时最先看到的一行，生效 server 必须就在这里，
+      // 不能只靠底下的 account: 行（那行印的是账号会话的 server，可能是另一台机器）。
+      console.log(`runtime: logged in as ${who} (${me.kind}/${me.role}) server=${auth.server}`);
       if (me.owner) console.log(`  owner: ${me.owner}`);
       console.log(`  scope: ${me.channel_scope ?? "none (all channels)"}`);
-      console.log(`account: ${auth.account.present ? `${auth.account.email ?? auth.account.sub ?? "present"} present server=${auth.account.server}` : `absent path=${auth.account.path}`}`);
+      // account session 的 server 可能和生效 server 不是同一台（人类登录过另一台部署的常态），
+      // 不标注清楚，agent 会把这行的 URL 误当成命令实际打到的地方。
+      const accountServerMismatch =
+        auth.account.present && auth.account.server !== undefined && auth.account.server !== auth.server;
+      console.log(
+        `account: ${
+          auth.account.present
+            ? `${auth.account.email ?? auth.account.sub ?? "present"} present server=${auth.account.server}${
+                accountServerMismatch ? " (different server — not used for this command)" : ""
+              }`
+            : `absent path=${auth.account.path}`
+        }`,
+      );
       console.log(`config: ${auth.config.path ? `${auth.config.kind} ${auth.config.path} token=${auth.config.token_fingerprint ?? "none"}` : "none"}`);
       console.log(`auth-source: ${auth.auth_source}`);
       if (rejoin) {

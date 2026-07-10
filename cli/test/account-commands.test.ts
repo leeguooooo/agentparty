@@ -448,6 +448,99 @@ describe("whoami", () => {
     expect(code).toBe(1);
     expect(errs.join("\n")).toContain("unknown option --bogus");
   });
+
+  // issue #140：runtime config 指向 server A，account.json 是另一台 server B 的人类会话——
+  // /api/me 打的是 A，但旧输出只印 account 那行的 B，agent 会误判自己在 B 上。
+  describe("effective server disambiguation (issue #140)", () => {
+    test("text mode: runtime line shows the server /api/me was actually called against", async () => {
+      restMock = startRestMock();
+      writeConfig({ server: restMock.url, token: "ap_effective" });
+      writeAccount({
+        server: "https://agentparty.other-server.example",
+        refresh_token: "ref",
+        access_token: "acc-live",
+        email: "human@example.com",
+        expires_at: nowSec() + 3600,
+      });
+
+      const code = await whoamiRun([]);
+      expect(code).toBe(0);
+      const stdout = logs.join("\n");
+      // 生效 server（runtime_config 那个，也是 /api/me 实打的那个）必须出现在 runtime 行
+      expect(stdout).toContain(`runtime: logged in as agent (agent/agent) server=${restMock.url}`);
+      expect(restMock.requests.some((r) => r.path === "/api/me" && r.method === "GET")).toBe(true);
+    });
+
+    test("text mode: account line flags a server mismatch instead of silently implying it's in effect", async () => {
+      restMock = startRestMock();
+      writeConfig({ server: restMock.url, token: "ap_effective" });
+      writeAccount({
+        server: "https://agentparty.other-server.example",
+        refresh_token: "ref",
+        access_token: "acc-live",
+        email: "human@example.com",
+        expires_at: nowSec() + 3600,
+      });
+
+      const code = await whoamiRun([]);
+      expect(code).toBe(0);
+      const stdout = logs.join("\n");
+      expect(stdout).toContain("account: human@example.com present server=https://agentparty.other-server.example");
+      expect(stdout).toContain("different server");
+      expect(stdout).toContain("not used for this command");
+    });
+
+    test("text mode: no mismatch annotation when the account session is on the effective server", async () => {
+      mock = startOidcMock();
+      liveAccount(mock.url); // config 里没 token，回落 account_session，同一台 server
+      const code = await whoamiRun([]);
+      expect(code).toBe(0);
+      const stdout = logs.join("\n");
+      expect(stdout).toContain(`runtime: logged in as fan@example.com (human/human) server=${mock.url}`);
+      expect(stdout).not.toContain("different server");
+    });
+
+    test("json mode: effective_server and account_server are distinct, unambiguous fields", async () => {
+      restMock = startRestMock();
+      writeConfig({ server: restMock.url, token: "ap_effective" });
+      writeAccount({
+        server: "https://agentparty.other-server.example",
+        refresh_token: "ref",
+        access_token: "acc-live",
+        email: "human@example.com",
+        expires_at: nowSec() + 3600,
+      });
+
+      const code = await whoamiRun(["--json"]);
+      expect(code).toBe(0);
+      const frame = JSON.parse(logs[0]!);
+      expect(frame.effective_server).toBe(restMock!.url);
+      expect(frame.account_server).toBe("https://agentparty.other-server.example");
+      // 生效 server 不能和 account server 撞车，否则整个字段就是摆设
+      expect(frame.effective_server).not.toBe(frame.account_server);
+      // 既有的顶层 server 字段必须继续等于生效 server（合约不能破）
+      expect(frame.server).toBe(frame.effective_server);
+    });
+
+    test("text mode: not-logged-in path still prints the resolved config server", async () => {
+      writeConfig({ server: "https://agentparty.config-only.example", token: "" });
+      const code = await whoamiRun([]);
+      expect(code).toBe(0);
+      const stdout = logs.join("\n");
+      expect(stdout).toContain("not logged in");
+      expect(stdout).toContain("server: https://agentparty.config-only.example");
+    });
+
+    test("json mode: not-logged-in path still reports effective_server/account_server", async () => {
+      writeConfig({ server: "https://agentparty.config-only.example", token: "" });
+      const code = await whoamiRun(["--json"]);
+      expect(code).toBe(0);
+      const frame = JSON.parse(logs[0]!);
+      expect(frame.logged_in).toBe(false);
+      expect(frame.effective_server).toBe("https://agentparty.config-only.example");
+      expect(frame.account_server).toBe(null);
+    });
+  });
 });
 
 describe("statusline", () => {
