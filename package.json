@@ -3,7 +3,12 @@
   "license": "BUSL-1.1",
   "private": true,
   "scripts": {
-    "check": "sh -n install.sh && bun test scripts/release-version.test.ts scripts/desktop-update-manifest.test.ts scripts/desktop-release-workflow.test.ts scripts/desktop-pairing-smoke.test.ts scripts/install.test.ts && bunx tsc --project scripts/tsconfig.json && cd cli && bun test && bunx tsc --noEmit && cd ../shared && bunx tsc --noEmit && cd ../web && bun test && bunx tsc --noEmit && bunx vite build && cd ../worker && bun run verify:test-runtime && bunx vitest run && bunx tsc --noEmit",
+    "check:scripts": "sh -n install.sh && bun test scripts/release-version.test.ts scripts/desktop-update-manifest.test.ts scripts/desktop-release-workflow.test.ts scripts/desktop-pairing-smoke.test.ts scripts/install.test.ts scripts/check-aggregate.test.ts && bunx tsc --project scripts/tsconfig.json",
+    "check:cli": "cd cli && bun test && bunx tsc --noEmit",
+    "check:shared": "cd shared && bunx tsc --noEmit",
+    "check:web": "cd web && bun test && bunx tsc --noEmit && bunx vite build",
+    "check:worker": "cd worker && bun run verify:test-runtime && bunx vitest run && bunx tsc --noEmit",
+    "check": "bun run check:scripts && bun run check:cli && bun run check:shared && bun run check:web && bun run check:worker",
     "desktop:dev": "cd desktop && bun run dev",
     "desktop:build": "cd desktop && bun run build",
     "desktop:build:prod": "cd desktop && bun run build:prod",
