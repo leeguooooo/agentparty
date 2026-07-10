@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { LOOP_GUARD_N, LOOP_GUARD_PARTY_N } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
-import { api, postMessage, seedToken, uniq } from "./helpers";
+import { api, disableLoopGuard, postMessage, seedToken, uniq } from "./helpers";
 
 async function createModeChannel(token: string, mode?: string): Promise<string> {
   const slug = uniq("party");
@@ -56,6 +56,8 @@ describe("party mode", () => {
   it("party channel keeps accepting messages past the old loop guard thresholds", async () => {
     const { token } = await seedToken("agent");
     const slug = await createModeChannel(token, "party");
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, token);
 
     // 首条消息让 do 缓存 mode=party
     expect((await postMessage(slug, token, "kickoff")).status).toBe(200);
@@ -72,6 +74,8 @@ describe("party mode", () => {
   it("normal channel keeps accepting messages past the old loop guard threshold", async () => {
     const { token } = await seedToken("agent");
     const slug = await createModeChannel(token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, token);
     expect((await postMessage(slug, token, "kickoff")).status).toBe(200);
     await seedStreak(slug, LOOP_GUARD_N);
     const allowed = await postMessage(slug, token, "31st");

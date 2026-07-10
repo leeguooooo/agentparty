@@ -2,7 +2,7 @@ import { env, fetchMock, runInDurableObject } from "cloudflare:test";
 import { LOOP_GUARD_N, MAX_WEBHOOKS_PER_CHANNEL, WEBHOOK_MAX_RETRIES } from "@agentparty/shared";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
-import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";
+import { api, createChannel, disableLoopGuard, postMessage, seedToken, uniq } from "./helpers";
 
 beforeAll(() => {
   fetchMock.activate();
@@ -393,6 +393,8 @@ describe("webhooks", () => {
     const agentA = await seedToken("agent");
     const agentB = await seedToken("agent");
     const slug = await createChannel(agentA.token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, agentA.token);
     expect(
       (
         await addWebhook(slug, agentA.token, {

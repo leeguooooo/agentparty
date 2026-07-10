@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { BODY_LIMIT, LOOP_GUARD_N, RATE_LIMIT_PER_MIN } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
-import { api, createChannel, postMessage, seedToken, WsClient } from "./helpers";
+import { api, createChannel, disableLoopGuard, postMessage, seedToken, WsClient } from "./helpers";
 
 async function errorCode(res: Response): Promise<string> {
   const body = (await res.json()) as { error: { code: string } };
@@ -22,6 +22,8 @@ describe("guards", () => {
     const agentB = await seedToken("agent");
     const human = await seedToken("human");
     const slug = await createChannel(agentA.token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, agentA.token);
 
     for (let i = 0; i < LOOP_GUARD_N + 5; i++) {
       const token = i % 2 === 0 ? agentA.token : agentB.token;
@@ -41,6 +43,8 @@ describe("guards", () => {
     const agent = await seedToken("agent");
     const human = await seedToken("human");
     const slug = await createChannel(agent.token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, agent.token);
     const init = await WsClient.open(slug, agent.token);
     await init.nextOfType("welcome");
     init.close();
@@ -62,6 +66,8 @@ describe("guards", () => {
     const agentA = await seedToken("agent");
     const agentB = await seedToken("agent");
     const slug = await createChannel(agentA.token);
+    // #96 起新频道默认开 guard；本用例测的是关闭态，必须显式关闭
+    await disableLoopGuard(slug, agentA.token);
 
     // 两个 agent token 交替，避开单 token 速率限制，streak 仍按 kind 累计
     for (let i = 0; i < LOOP_GUARD_N; i++) {

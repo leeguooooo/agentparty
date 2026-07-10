@@ -173,3 +173,13 @@ export class WsClient {
     this.ws.close();
   }
 }
+
+// #96 起新频道默认开启 loop guard。测「关闭态」行为的用例必须显式关闭，
+// 不能再借用默认值——否则默认值一变，这些用例就在测别的东西。
+export async function disableLoopGuard(slug: string, token: string): Promise<void> {
+  const res = await api(`/api/channels/${slug}/loop-guard`, token, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: false }),
+  });
+  if (!res.ok) throw new Error(`disableLoopGuard failed: ${res.status}`);
+}

@@ -2584,10 +2584,13 @@ app.post("/api/channels", async (c) => {
   const creator = c.get("identity");
   try {
     await c.env.DB.prepare(
-      "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, owner_account, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, owner_account, created_at, loop_guard_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
       // created_by 记具体铸造者（审计）；owner_account = 创建者账号（ACL 依据）。
       // legacy token 无 account → owner_account = null（老频道，仅 legacy 过渡放行）。
+      // loop_guard_enabled=1（#96）：新频道开箱即有熔断，否则两个 agent 可在无人值守下
+      // 互相唤醒到天亮（唯一约束仅 30 msg/min）。limit 留空 → 回退 mode 默认 30/200。
+      // 存量频道保持关闭：强开会立刻熔断正在工作的频道。房主可随时 PUT loop-guard 关闭。
       .bind(slug, title, kind, mode, visibility, creator.name, creator.account ?? null, now)
       .run();
   } catch {
