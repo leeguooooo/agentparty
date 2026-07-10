@@ -1,7 +1,7 @@
 // party wake test — prove mention/wake/resume as separate phases.
 import { autoWakeReachable, EXIT_TIMEOUT, type MsgFrame, type PresenceEntry, type WakeDelivery } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
-import { resolveChannel } from "../config";
+import { readConfig, resolveChannel } from "../config";
 import { jsonFrame, nowTs } from "../json";
 import { resolveAuth } from "../oidc-cli";
 import { RestError, fetchMessages, fetchPresence, fetchWakeDeliveries, handleRestError, postMessage } from "../rest";
@@ -16,12 +16,17 @@ Run a wake contract test. This separates mention delivery, wake adapter delivery
 and linked agent resume. Only a fresh reply/status linked to the test mention
 counts as resumed.
 
+A target that advertises no wake adapter is still probed empirically (the mention is
+delivered and the reply/timeout is conclusive), because "no adapter" is not proof of
+"unreachable" — the harness may be polling. Targeting your own identity fails fast
+without sending a probe (serve/watch ignore self-messages).
+
 Options:
   --channel C    test in channel C instead of the bound channel
   --timeout N    seconds to wait for linked ack/status (default: 30)
   --json         emit one structured wake_test frame`;
 
-type WakeResult = "not_auto_wakeable" | "healthy" | "timeout";
+type WakeResult = "not_auto_wakeable" | "healthy" | "timeout" | "self_target";
 type AckEvidence = "reply_to" | "status.summary_seq";
 
 interface WakePresence {
@@ -63,26 +68,30 @@ function summarizePresence(p: PresenceEntry | null): WakePresence {
   };
 }
 
-function notWakeableReason(p: PresenceEntry | null, now: number): string | null {
-  if (p === null) return "no presence for target";
-  if (p.residency === "human_driven") return "target is human-driven; mention is inbox only";
-  // wake_kind is the real capability; residency is a soft hint. If a real adapter is
-  // advertised, send the mention and let the empirical resume/timeout be conclusive —
-  // even when residency=bare. A running `party serve` is a live supervisor whether the
-  // agent labeled itself bare or supervised, so refusing on residency alone would skip a
-  // wake that actually works (issue: serve+bare wrongly judged not_auto_wakeable). Only
-  // refuse when there is genuinely no adapter to invoke.
+// wake test 的探针闸门（issue #181）。把「送不送探针」和「heartbeat 怎么判」拆开：
+//  - block !== null  → 不发探针，直接结论 not_auto_wakeable（沿用旧语义 + 现有测试）。
+//    仅在「探针无处可去」时 block：没 presence（不在频道）、human_driven（只进收件箱）、
+//    声明了适配器却无心跳、或适配器陈旧（serve/watch 的常驻 supervisor 已死，#47/#97）。
+//  - advisory !== null → 仍发探针，但 heartbeat 视角是负面的（没声明任何适配器）。#181 的实锤：
+//    没声明适配器 ≠ 不可达——agent 可能在轮询或人盯着，是 wake 模型没表达的模式。此时从
+//    self-reported 元数据下「不可达」结论是不可证伪的，必须发探针、按「观测到的答复」定论。
+//  - 两者皆 null → 声明了新鲜适配器，正常发探针。
+function wakeProbeGate(p: PresenceEntry | null, now: number): { block: string | null; advisory: string | null } {
+  if (p === null) return { block: "no presence for target", advisory: null };
+  if (p.residency === "human_driven") return { block: "target is human-driven; mention is inbox only", advisory: null };
   if (p.wake === undefined || p.wake.kind === "none") {
-    return p.residency === "bare"
-      ? "target has bare residency and advertises no wake adapter"
-      : "target advertises no wake adapter";
+    const advisory =
+      p.residency === "bare"
+        ? "target has bare residency and advertises no wake adapter"
+        : "target advertises no wake adapter";
+    return { block: null, advisory };
   }
   const seen = p.last_seen ?? p.ts ?? null;
-  if (seen === null) return "target wake adapter has no last_seen heartbeat";
+  if (seen === null) return { block: "target wake adapter has no last_seen heartbeat", advisory: null };
   if (!autoWakeReachable(p, now, STALE_MS)) {
-    return `target ${p.wake.kind} wake adapter is stale; last seen ${Math.max(0, now - seen)}ms ago`;
+    return { block: `target ${p.wake.kind} wake adapter is stale; last seen ${Math.max(0, now - seen)}ms ago`, advisory: null };
   }
-  return null;
+  return { block: null, advisory: null };
 }
 
 function ackEvidence(mentionSeq: number, candidate: MsgFrame): AckEvidence | null {
@@ -224,13 +233,45 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // #194: 目标解析为自己身份时立刻失败——serve/watch 按设计忽略发送者自己的消息，
+  // 自测必然 resumed:no。这个条件用本地缓存身份即可在发探针前判定，不必真往频道发一条
+  // mention（白烧 loop-guard 名额），更不必空等满 --timeout（把「误用」伪装成「agent 死了」）。
+  // 仅凭本地缓存身份判定（零网络请求）；身份未缓存时优雅降级到旧路径（发探针→timeout）。
+  const selfName = readConfig()?.identity?.name ?? null;
+  if (selfName !== null && selfName === target) {
+    const reason =
+      `wake test: @${target} is your own identity; serve/watch ignore self-messages. ` +
+      "Ask another identity to run this test.";
+    if (flags.json === true) {
+      const frame: WakeTestFrame = {
+        type: "wake_test",
+        channel,
+        target,
+        result: "self_target",
+        generated_at: nowTs(),
+        timeout_sec: timeoutSec,
+        presence: summarizePresence(null),
+        phases: {
+          mention_delivered: { ok: false, seq: null, evidence: "not sent because target is the caller's own identity" },
+          wake_invoked: { ok: false, adapter: null, evidence: reason },
+          agent_resumed: { ok: false, seq: null, evidence: null },
+        },
+        reason,
+      };
+      console.log(JSON.stringify(jsonFrame(frame)));
+    } else {
+      console.error(reason);
+    }
+    return 1;
+  }
+
   try {
     const presenceList = await fetchPresence(cfg.server, cfg.token, channel);
     const presence = presenceList.find((p) => p.name === target) ?? null;
     const generatedAt = nowTs();
-    const reason = notWakeableReason(presence, generatedAt);
+    const gate = wakeProbeGate(presence, generatedAt);
     const adapter = presence?.wake?.kind ?? null;
-    if (reason !== null) {
+    if (gate.block !== null) {
       const frame: WakeTestFrame = {
         type: "wake_test",
         channel,
@@ -241,10 +282,10 @@ export async function run(argv: string[]): Promise<number> {
         presence: summarizePresence(presence),
         phases: {
           mention_delivered: { ok: false, seq: null, evidence: "not sent because target is not auto-wakeable" },
-          wake_invoked: { ok: false, adapter, evidence: reason },
+          wake_invoked: { ok: false, adapter, evidence: gate.block },
           agent_resumed: { ok: false, seq: null, evidence: null },
         },
-        reason,
+        reason: gate.block,
       };
       if (flags.json === true) console.log(JSON.stringify(jsonFrame(frame)));
       else printHuman(frame);
@@ -284,20 +325,35 @@ export async function run(argv: string[]): Promise<number> {
         target +
         " is your own identity, retry from a different one)"
       : "timed out waiting for linked reply_to/status.summary_seq";
+    // #181: 探针已投递，按观测定论。收到 ack → healthy（哪怕它没声明任何 wake 适配器，
+    // 只要它真的答复了就是可达的）。没 ack 时，若 heartbeat 视角本就负面（没声明适配器），
+    // 结论仍是 not_auto_wakeable 但标注「探针已投递、未答复、未确认」——把 heartbeat 判定
+    // 和投递判定摊开，而不是当初那句不可证伪的 mention: not sent。
+    const result: WakeResult = ack !== null ? "healthy" : gate.advisory !== null ? "not_auto_wakeable" : "timeout";
+    const frameReason =
+      ack !== null
+        ? null
+        : gate.advisory !== null
+          ? `${gate.advisory} (unconfirmed — probe delivered #${seq}, no reply within ${timeoutSec}s)`
+          : timeoutReason;
+    const wakeInvoked =
+      gate.advisory !== null && wakeDelivery === null
+        ? { ok: false as const, adapter, evidence: gate.advisory }
+        : summarizeWakeDelivery(wakeDelivery, adapter);
     const frame: WakeTestFrame = {
       type: "wake_test",
       channel,
       target,
-      result: ack === null ? "timeout" : "healthy",
+      result,
       generated_at: nowTs(),
       timeout_sec: timeoutSec,
       presence: summarizePresence(presence),
       phases: {
         mention_delivered: { ok: true, seq, evidence: "message accepted by channel history" },
-        wake_invoked: summarizeWakeDelivery(wakeDelivery, adapter),
+        wake_invoked: wakeInvoked,
         agent_resumed: { ok: ack !== null, seq: ack?.seq ?? null, evidence: ack?.evidence ?? null },
       },
-      reason: ack === null ? timeoutReason : null,
+      reason: frameReason,
     };
     if (flags.json === true) console.log(JSON.stringify(jsonFrame(frame)));
     else printHuman(frame);
