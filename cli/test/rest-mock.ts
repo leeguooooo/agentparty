@@ -246,6 +246,10 @@ export function startRestMock(handler?: RestHandler): RestMock {
       if (r.method === "GET" && /^\/api\/channels\/[^/]+\/messages$/.test(r.path)) {
         return Response.json({ messages: [] });
       }
+      // #204 host board 现在会并行拉 tasks；未显式处理的用例默认返回空台账，避免 404 让命令报错。
+      if (r.method === "GET" && /^\/api\/channels\/[^/]+\/tasks$/.test(r.path)) {
+        return Response.json({ tasks: [] });
+      }
       if (r.method === "GET" && /^\/api\/channels\/[^/]+\/search$/.test(r.path)) {
         return Response.json({ hits: [] });
       }

@@ -811,7 +811,7 @@ describe("party status/history channel flag", () => {
     });
   });
 
-  test("host board summarizes host lease, claims, blockers, and decisions", async () => {
+  test("host board derives claims/blockers from the task ledger; decisions stay from messages (#204)", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
       if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
@@ -842,56 +842,60 @@ describe("party status/history channel flag", () => {
           ],
         });
       }
+      if (req.method === "GET" && req.path === "/api/channels/dev/tasks") {
+        // open_claims / blockers 现在从任务台账派生：worker-a 正在做 web/src（in_progress），worker-b 因缺 token 被 blocked。
+        return Response.json({
+          tasks: [
+            {
+              type: "task",
+              id: 1,
+              channel: "dev",
+              title: "ui work",
+              desc: null,
+              state: "in_progress",
+              assignee: { name: "worker-a", kind: "agent" },
+              created_by: "worker-a",
+              created_by_kind: "agent",
+              priority: 0,
+              labels: [],
+              parent_id: null,
+              anchor_seqs: [],
+              scope: ["web/src"],
+              blocked_reason: null,
+              completion_artifact: null,
+              workflow_id: null,
+              created_at: 10_000,
+              updated_at: 10_000,
+              completed_at: null,
+            },
+            {
+              type: "task",
+              id: 2,
+              channel: "dev",
+              title: "worker work",
+              desc: null,
+              state: "blocked",
+              assignee: { name: "worker-b", kind: "agent" },
+              created_by: "worker-b",
+              created_by_kind: "agent",
+              priority: 0,
+              labels: [],
+              parent_id: null,
+              anchor_seqs: [],
+              scope: ["worker/src"],
+              blocked_reason: "need token",
+              completion_artifact: null,
+              workflow_id: null,
+              created_at: 11_000,
+              updated_at: 11_000,
+              completed_at: null,
+            },
+          ],
+        });
+      }
       if (req.method === "GET" && req.path === "/api/channels/dev/messages") {
         return Response.json({
           messages: [
-            {
-              type: "status",
-              seq: 10,
-              sender: { name: "worker-a", kind: "agent" },
-              kind: "status",
-              body: "working ui",
-              mentions: [],
-              reply_to: null,
-              state: "working",
-              note: "working ui",
-              status: {
-                owner: "worker-a",
-                state: "working",
-                scope: ["web/src"],
-                summary_seq: null,
-                blocked_reason: null,
-                updated_at: 10000,
-              },
-              ts: 10000,
-            },
-            {
-              type: "status",
-              seq: 11,
-              sender: { name: "worker-b", kind: "agent" },
-              kind: "status",
-              body: "blocked",
-              mentions: [],
-              reply_to: null,
-              state: "blocked",
-              note: "blocked",
-              status: {
-                owner: "worker-b",
-                state: "blocked",
-                scope: ["worker/src"],
-                summary_seq: null,
-                blocked_reason: "need token",
-                updated_at: 11000,
-                workflow: {
-                  workflow_id: "wf-worker",
-                  kind: "parallel",
-                  run_id: "run-1",
-                  step_id: "worker-b",
-                  parent_summary_seq: 9,
-                },
-              },
-              ts: 11000,
-            },
             {
               type: "status",
               seq: 12,
@@ -931,8 +935,8 @@ describe("party status/history channel flag", () => {
     const frame = JSON.parse(r.stdout.trim()) as {
       type: string;
       hosts: Array<{ name: string; lease: string; stale_reason: string | null }>;
-      open_claims: Array<{ owner: string; state: string; scope: string[]; workflow: { workflow_id: string } | null }>;
-      blockers: Array<{ owner: string; blocked_reason: string | null; workflow: { workflow_id: string } | null }>;
+      open_claims: Array<{ task_id: number | null; owner: string; state: string; task_state: string | null; scope: string[] }>;
+      blockers: Array<{ task_id: number | null; owner: string; state: string; task_state: string | null; blocked_reason: string | null }>;
       decisions: Array<{ owner: string; kind: string; handoff_to: string | null }>;
       recommended_actions: Array<{ kind: string; target: string | null; requires_human: boolean }>;
     };
@@ -941,33 +945,21 @@ describe("party status/history channel flag", () => {
       expect.objectContaining({ name: "host-a", lease: "active", stale_reason: null }),
       expect.objectContaining({ name: "host-b", lease: "stale", stale_reason: "residency=human_driven" }),
     ]);
+    // claim 身份 = task id；blocked 的 task 只进 blockers、不进 open_claims。
     expect(frame.open_claims).toEqual([
-      expect.objectContaining({ owner: "host-a", state: "working", scope: [] }),
-      expect.objectContaining({
-        owner: "worker-b",
-        state: "blocked",
-        scope: ["worker/src"],
-        workflow: expect.objectContaining({ workflow_id: "wf-worker" }),
-      }),
-      expect.objectContaining({ owner: "worker-a", state: "working", scope: ["web/src"] }),
+      expect.objectContaining({ task_id: 1, owner: "worker-a", state: "working", task_state: "in_progress", scope: ["web/src"] }),
     ]);
     expect(frame.blockers).toEqual([
-      expect.objectContaining({
-        owner: "worker-b",
-        blocked_reason: "need token",
-        workflow: expect.objectContaining({ workflow_id: "wf-worker" }),
-      }),
+      expect.objectContaining({ task_id: 2, owner: "worker-b", state: "blocked", task_state: "blocked", blocked_reason: "need token" }),
     ]);
+    // decisions 仍旧从消息折叠来。
     expect(frame.decisions).toEqual([
       expect.objectContaining({ owner: "host-a", kind: "handoff", handoff_to: "reviewer-1" }),
     ]);
     expect(frame.recommended_actions).toEqual([
       expect.objectContaining({ kind: "review-blockers", target: "worker-b", requires_human: false }),
     ]);
-    // #151 扩展：host board 默认取最近窗口（tail），不再是「取头 500 条」——否则频道超过
-    // limit 条后 last_seq 永久冻结、loop guard blocker 永远看不到最新发言。
-    // 消息端点这里被打两次：主窗口查询 + limit=1 的头探针（拿真实 head 供窗口显式化用），
-    // 用 limit 区分，不依赖并发到达顺序。
+    // #151 扩展：host board 默认取最近窗口（tail）。消息端点被打两次：主查询 + limit=1 头探针。
     const messageReqs = reqsOf(mock, "GET", "/api/channels/dev/messages");
     const mainReq = messageReqs.find((r) => r.query.limit !== "1");
     expect(mainReq?.query).toMatchObject({ before: String(TAIL_BEFORE), limit: "500" });
@@ -1130,9 +1122,8 @@ describe("party status/history channel flag", () => {
         requires_human: boolean;
       }>;
     };
-    expect(frame.blockers).toEqual([
-      expect.objectContaining({ owner: "system", blocked_reason: "loop guard tripped: 200 consecutive agent messages" }),
-    ]);
+    // #204：blockers 现在从任务台账派生（此处无 tasks → 空）。loop-guard 是 system 消息，不再进 blockers 列表。
+    expect(frame.blockers).toEqual([]);
     expect(frame.hosts).toEqual([
       expect.objectContaining({ name: "host-old", lease: "stale", stale_reason: "residency=human_driven" }),
     ]);
@@ -1143,6 +1134,7 @@ describe("party status/history channel flag", () => {
         requires_human: false,
       }),
     ]);
+    // 人类消息已清 loop guard → 不建议 clear-loop-guard（loop-guard 检测仍走消息，不受 blockers 派生改动影响）。
     expect(frame.recommended_actions.some((action) => action.kind === "clear-loop-guard")).toBe(false);
   });
 
@@ -1197,15 +1189,15 @@ describe("party status/history channel flag", () => {
       },
     ];
 
-    const board = buildHostBoard("dev", presence, messages, now, { loopGuardActive: false });
+    // #204：blockers 现在从任务台账派生。这里无 tasks，故 board.blockers 为空；loop-guard 仅为 system 消息，
+    // 不再出现在 blockers 列表里，但仍被 recommendHostActions 内部用于 loop-guard 检测（此处 loopGuardActive:false 抑制）。
+    const board = buildHostBoard("dev", presence, messages, [], now, { loopGuardActive: false });
 
-    expect(board.blockers).toEqual([
-      expect.objectContaining({ owner: "system", blocked_reason: "loop guard tripped: 200 consecutive agent messages" }),
-    ]);
+    expect(board.blockers).toEqual([]);
     expect(board.recommended_actions.map((action) => action.kind)).toEqual(["takeover"]);
   });
 
-  test("host board detects overlapping claim scopes for coordinator triage", async () => {
+  test("host board detects overlapping task scopes for coordinator triage (#204)", async () => {
     const now = Date.now();
     mock = startRestMock((req) => {
       if (req.method === "GET" && req.path === "/api/channels/dev/presence") {
@@ -1225,71 +1217,34 @@ describe("party status/history channel flag", () => {
           ],
         });
       }
-      if (req.method === "GET" && req.path === "/api/channels/dev/messages") {
+      if (req.method === "GET" && req.path === "/api/channels/dev/tasks") {
+        // conflicts 用任务 scope 跑 overlap（不同 assignee + scope 重叠）：worker-a web/src 与 worker-b web/src/components 重叠。
+        const base = {
+          type: "task",
+          channel: "dev",
+          desc: null,
+          created_by_kind: "agent",
+          priority: 0,
+          labels: [],
+          parent_id: null,
+          anchor_seqs: [],
+          blocked_reason: null,
+          completion_artifact: null,
+          workflow_id: null,
+          created_at: 30_000,
+          updated_at: 30_000,
+          completed_at: null,
+        };
         return Response.json({
-          messages: [
-            {
-              type: "status",
-              seq: 30,
-              sender: { name: "worker-a", kind: "agent" },
-              kind: "status",
-              body: "working web",
-              mentions: [],
-              reply_to: null,
-              state: "working",
-              note: "working web",
-              status: {
-                owner: "worker-a",
-                state: "working",
-                scope: ["web/src"],
-                summary_seq: null,
-                blocked_reason: null,
-                updated_at: 30_000,
-              },
-              ts: 30_000,
-            },
-            {
-              type: "status",
-              seq: 31,
-              sender: { name: "worker-b", kind: "agent" },
-              kind: "status",
-              body: "working presence",
-              mentions: [],
-              reply_to: null,
-              state: "working",
-              note: "working presence",
-              status: {
-                owner: "worker-b",
-                state: "working",
-                scope: ["web/src/components"],
-                summary_seq: null,
-                blocked_reason: null,
-                updated_at: 31_000,
-              },
-              ts: 31_000,
-            },
-            {
-              type: "status",
-              seq: 32,
-              sender: { name: "worker-c", kind: "agent" },
-              kind: "status",
-              body: "working cli",
-              mentions: [],
-              reply_to: null,
-              state: "working",
-              note: "working cli",
-              status: {
-                owner: "worker-c",
-                state: "working",
-                scope: ["cli/src"],
-                summary_seq: null,
-                blocked_reason: null,
-                updated_at: 32_000,
-              },
-              ts: 32_000,
-            },
+          tasks: [
+            { ...base, id: 30, title: "web", state: "in_progress", assignee: { name: "worker-a", kind: "agent" }, created_by: "worker-a", scope: ["web/src"] },
+            { ...base, id: 31, title: "components", state: "in_progress", assignee: { name: "worker-b", kind: "agent" }, created_by: "worker-b", scope: ["web/src/components"] },
+            { ...base, id: 32, title: "cli", state: "in_progress", assignee: { name: "worker-c", kind: "agent" }, created_by: "worker-c", scope: ["cli/src"] },
           ],
         });
+      }
+      if (req.method === "GET" && req.path === "/api/channels/dev/messages") {
+        return Response.json({ messages: [] });
       }
       return undefined;
     });

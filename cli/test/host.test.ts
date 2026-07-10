@@ -50,6 +50,9 @@ function startMockServer(messages: { seq: number }[]): { seen: string[] } {
       if (url.pathname.endsWith("/presence")) {
         return Response.json({ presence: [] });
       }
+      if (url.pathname.endsWith("/tasks")) {
+        return Response.json({ tasks: [] });
+      }
       if (url.pathname.endsWith("/messages")) {
         seen.push(url.search);
         // 头探针恒 limit=1，只回最新一条；其余按传入的 messages 原样返回
@@ -169,5 +172,44 @@ describe("formatWindowLines 纯函数（#151 扩展）", () => {
     expect(text).toContain("channel head =");
     expect(text).toContain("claims opened before seq");
     expect(text).not.toContain("NOT current");
+  });
+});
+
+
+describe("party host board unlinked status claims 段（#204）", () => {
+  function statusMessage(seq: number, owner: string, scope: string[]) {
+    return {
+      type: "status",
+      seq,
+      sender: { name: owner, kind: "agent" },
+      kind: "status",
+      body: "working",
+      mentions: [],
+      reply_to: null,
+      state: "working",
+      note: null,
+      status: { owner, state: "working", scope, summary_seq: null, blocked_reason: null, updated_at: seq * 1000 },
+      ts: seq * 1000,
+    };
+  }
+
+  test("文本输出：没有对应 task 的 status claim 落进 unlinked 段，含转成 task 的命令", async () => {
+    startMockServer([statusMessage(221, "worker-a", ["web/src"])] as unknown as { seq: number }[]);
+    const code = await run(["board", "dev"]);
+    expect(code).toBe(0);
+    const text = stdout.join("\n");
+    expect(text).toContain("unlinked status claims (no task, legacy): 1");
+    expect(text).toContain("#221 worker-a working scope=web/src");
+    expect(text).toContain("party task from 221");
+  });
+
+  test("--json：unlinked_claims 带 seq、task_id 为 null", async () => {
+    startMockServer([statusMessage(221, "worker-a", ["web/src"])] as unknown as { seq: number }[]);
+    const code = await run(["board", "dev", "--json"]);
+    expect(code).toBe(0);
+    const frame = JSON.parse(stdout[0]!);
+    expect(Array.isArray(frame.unlinked_claims)).toBe(true);
+    expect(frame.unlinked_claims[0].seq).toBe(221);
+    expect(frame.unlinked_claims[0].task_id).toBe(null);
   });
 });
