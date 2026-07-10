@@ -49,6 +49,11 @@ import { buildReceipts, type MentionReceipt } from "../lib/wakeReceipt";
 import { completionMessages } from "../lib/completions";
 import { catchupKey, summarizeCatchup, type CatchupDigest } from "../lib/digest";
 import {
+  isDesktopRuntime,
+  sendMentionNotification,
+  setDesktopBadge,
+} from "../lib/desktopRuntime";
+import {
   agentFilterSearch,
   filterByAgent,
   parseAgentFilter,
@@ -58,7 +63,7 @@ import {
   type AgentFilterKind,
   type AgentFilterMode,
 } from "../lib/filters";
-import { shouldNotify, shouldToast } from "../lib/notify";
+import { nextMentionBadgeCount, shouldMarkSeen, shouldNotify, shouldToast } from "../lib/notify";
 import { summarizeReplyPreview } from "../lib/replyPreview";
 import { fmtTime } from "../lib/time";
 import { groupTeamMessages, summarizeTeams, type TeamMessageThread, type TeamSummary } from "../lib/teams";
@@ -1422,6 +1427,7 @@ export function ChannelPage({
   const tRef = useRef(t);
   tRef.current = t;
   const notifiedSeqRef = useRef<Set<number>>(new Set()); // seq 去重：防同一帧被重复处理时重复弹通知
+  const desktopMentionBadgeRef = useRef(0);
   const toastedSeqRef = useRef<Set<number>>(new Set()); // seq 去重：页内 toast 同一帧只弹一次
   const [toasts, setToasts] = useState<MentionToastItem[]>([]);
   const dismissToast = useCallback((seq: number) => {
@@ -1730,22 +1736,33 @@ export function ChannelPage({
           if (
             frame.type === "msg" &&
             !notifiedSeqRef.current.has(frame.seq) &&
-            shouldNotify(
+            shouldNotify(frame, selfHandleRef.current, document.hidden, optinRef.current)
+          ) {
+            notifiedSeqRef.current.add(frame.seq);
+            const title = tRef.current("Channel.notify.title", { channel: slug });
+            const body = summarizeReplyPreview(frame.body);
+            if (isDesktopRuntime()) {
+              void sendMentionNotification({ title, body, slug, seq: frame.seq });
+            } else if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+              const notification = new Notification(title, { body });
+              notification.onclick = () => {
+                window.focus();
+                window.location.hash = `#msg-${frame.seq}`;
+                notification.close();
+              };
+            }
+          }
+          if (frame.type === "msg") {
+            const nextBadge = nextMentionBadgeCount(
+              desktopMentionBadgeRef.current,
               frame,
               selfHandleRef.current,
               document.hidden,
-              optinRef.current && typeof Notification !== "undefined" && Notification.permission === "granted",
-            )
-          ) {
-            notifiedSeqRef.current.add(frame.seq);
-            const n = new Notification(tRef.current("Channel.notify.title", { channel: slug }), {
-              body: summarizeReplyPreview(frame.body),
-            });
-            n.onclick = () => {
-              window.focus();
-              window.location.hash = `#msg-${frame.seq}`;
-              n.close();
-            };
+            );
+            if (nextBadge !== desktopMentionBadgeRef.current) {
+              desktopMentionBadgeRef.current = nextBadge;
+              void setDesktopBadge(nextBadge);
+            }
           }
           // 被@页内 toast（聚焦态）：与上面的系统通知按 document.hidden 互斥，各自 seq 去重
           if (
@@ -1828,7 +1845,7 @@ export function ChannelPage({
   useEffect(() => {
     const el = streamRef.current;
     if (el !== null && stickBottom.current) el.scrollTop = el.scrollHeight;
-    if (stickBottom.current) sendSeen(lastSeq);
+    if (shouldMarkSeen(document.hidden, stickBottom.current)) sendSeen(lastSeq);
     // 贴底时收窄消息窗口：DOM 不挂几千条；被丢弃的最老页上翻会重新拉回
     if (stickBottom.current && state.messages.length > MESSAGE_CAP + PAGE_SIZE) {
       dispatch({ type: "trim", keep: MESSAGE_CAP });
@@ -1836,6 +1853,24 @@ export function ChannelPage({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastSeq]);
+
+  useEffect(() => {
+    const markVisible = () => {
+      if (document.hidden) return;
+      desktopMentionBadgeRef.current = 0;
+      void setDesktopBadge(0);
+      if (stickBottom.current) sendSeen(lastSeqRef.current);
+    };
+    document.addEventListener("visibilitychange", markVisible);
+    window.addEventListener("focus", markVisible);
+    markVisible();
+    return () => {
+      document.removeEventListener("visibilitychange", markVisible);
+      window.removeEventListener("focus", markVisible);
+      desktopMentionBadgeRef.current = 0;
+      void setDesktopBadge(0);
+    };
+  }, [sendSeen]);
 
   // prepend 老页后的 scroll anchoring：绘制前把 scrollTop 平移新增高度，视口纹丝不动
   const firstSeq = state.messages.length > 0 ? state.messages[0]!.seq : 0;

@@ -4,7 +4,7 @@ import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DesktopUpdaterState } from "../lib/desktopUpdater";
 import { DesktopUpdaterStrings } from "../i18n/strings/DesktopUpdater";
-import { DesktopUpdaterPanel, updateUpdaterDialogFocus } from "./DesktopUpdater";
+import { DesktopUpdaterPanel, handleDesktopUpdaterTrayCheck, updateUpdaterDialogFocus } from "./DesktopUpdater";
 
 const state = (overrides: Partial<DesktopUpdaterState>): DesktopUpdaterState => ({
   phase: "idle",
@@ -100,4 +100,15 @@ describe("desktop updater dialog focus", () => {
 
     expect(focused).toEqual(["dialog", "trigger"]);
   });
+});
+
+test("tray update action opens the updater and starts a manual check", () => {
+  const calls: string[] = [];
+  const controller = {
+    openPanel: () => calls.push("open"),
+    check: async (source: string) => { calls.push(`check:${source}`); },
+  } as unknown as import("../lib/desktopUpdater").DesktopUpdaterController;
+
+  handleDesktopUpdaterTrayCheck(controller);
+  expect(calls).toEqual(["open", "check:manual"]);
 });

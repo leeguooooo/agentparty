@@ -2,6 +2,7 @@
 import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChannelList } from "./components/ChannelList";
 import { CreateChannel } from "./components/CreateChannel";
+import { DesktopSettings } from "./components/DesktopSettings";
 import { DesktopUpdater } from "./components/DesktopUpdater";
 import { HandleSetup } from "./components/HandleSetup";
 import { TokenGate } from "./components/TokenGate";
@@ -494,6 +495,7 @@ export function App() {
             />
           </div>
         )}
+        <DesktopSettings />
         <DesktopUpdater />
         <LanguageSwitcher />
         {!isShareMode() && (

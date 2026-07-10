@@ -158,6 +158,68 @@
 .desktop-updater-actions .d-btn { min-height: 28px; padding: 3px 8px; font-size: 11px; }
 .desktop-updater-actions .d-btn:disabled { cursor: not-allowed; opacity: 0.5; }
 .desktop-updater-install { background: var(--d-yellow); color: var(--d-ink); }
+
+.desktop-settings { position: relative; display: inline-flex; }
+.desktop-settings-trigger {
+  width: 30px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 1.4px solid var(--t-faint);
+  border-radius: 0;
+  background: var(--t-panel);
+  color: var(--t-text);
+  cursor: pointer;
+}
+.desktop-settings-trigger:hover,
+.desktop-settings-trigger:focus-visible { border-color: var(--t-accent); outline: none; }
+.desktop-settings-trigger .ap-sprite { --ap-icon-size: 20px; }
+.desktop-settings-panel {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 7px);
+  right: 0;
+  width: min(340px, calc(100vw - 24px));
+  padding: 12px;
+  border: 1.6px solid var(--d-ink);
+  border-radius: 0;
+  background: var(--t-panel);
+  box-shadow: 3px 3px 0 var(--d-shadow);
+  color: var(--t-body);
+}
+.desktop-settings-panel header { margin-bottom: 10px; font-size: 12px; font-weight: 800; }
+.desktop-settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.desktop-settings-row strong,
+.desktop-settings-row small { display: block; }
+.desktop-settings-row strong { font-size: 12px; }
+.desktop-settings-row small { margin-top: 3px; color: var(--t-dim); font-size: 10px; line-height: 1.35; }
+.desktop-settings-switch {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  padding: 2px;
+  border: 1.4px solid var(--t-text);
+  border-radius: 11px;
+  background: var(--t-faint);
+  cursor: pointer;
+}
+.desktop-settings-switch span {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--t-text);
+  border-radius: 50%;
+  background: var(--t-panel);
+  transition: transform 120ms ease;
+}
+.desktop-settings-switch.is-on { background: var(--d-green); }
+.desktop-settings-switch.is-on span { transform: translateX(16px); }
+.desktop-settings-switch:disabled { cursor: wait; opacity: 0.55; }
+.desktop-settings-status,
+.desktop-settings-error { margin: 8px 0 0; font-size: 10px; }
+.desktop-settings-status { color: var(--t-dim); }
+.desktop-settings-error { color: var(--d-red); }
 .app-me {
   margin-left: auto;
   flex: 1 1 240px;

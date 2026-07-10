@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh" data-lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>桌面应用 · AgentParty 文档</title>
+    <meta name="description" content="AgentParty macOS 桌面应用：DMG 安装、托盘常驻、后台提醒、Dock 角标、登录时启动和签名更新。" />
+    <meta name="theme-color" content="#fcfbf4" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=ZCOOL+KuaiLe&family=Permanent+Marker&family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/docs/assets/docs/docs.css" />
+  </head>
+
+  <body data-page="desktop" data-lang="zh">
+    <div id="du-topbar" class="du-topbar">
+      <button class="du-hamburger" type="button" aria-label="menu">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+      </button>
+      <a class="du-logo" href="/docs/">
+        <span class="du-logo-word">Agent<span class="accent">Party</span></span>
+        <span class="du-repo-tag">leeguooooo/agentparty</span>
+      </a>
+      <nav class="du-tabs" aria-label="Primary">
+        <a href="/docs/"><span class="zh">文档</span><span class="en">Docs</span></a>
+        <a href="/docs/statusline/"><span class="zh">状态栏</span><span class="en">Statusline</span></a>
+        <a class="active" href="/docs/desktop/"><span class="zh">桌面版</span><span class="en">Desktop</span></a>
+        <a href="/docs/spec/"><span class="zh">规格</span><span class="en">Spec</span></a>
+      </nav>
+      <div class="du-topbar-right">
+        <button class="du-search-btn" type="button">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="9" r="6"/><path d="M14 14l4 4" stroke-linecap="round"/></svg>
+          <span class="du-search-label"><span class="zh">搜索...</span><span class="en">Search...</span></span>
+          <span class="du-kbd">⌘K</span>
+        </button>
+        <div class="du-lang" aria-label="Language">
+          <button class="active" type="button" data-lang-button="zh">中</button>
+          <button type="button" data-lang-button="en">EN</button>
+        </div>
+        <a class="du-gh" href="https://github.com/leeguooooo/agentparty" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+
+    <div class="du-shell">
+      <nav id="du-sidebar" class="du-sidebar" aria-label="Documentation">
+        <div class="du-nav-group">
+          <div class="du-nav-label"><span class="zh">文档</span><span class="en">Docs</span></div>
+          <a class="du-nav-item" href="/docs/"><span class="du-nav-ico">⌂</span><span class="du-nav-text"><span class="zh">概览</span><span class="en">Overview</span></span></a>
+          <a class="du-nav-item" href="/docs/statusline/"><span class="du-nav-ico">⌁</span><span class="du-nav-text"><span class="zh">状态栏契约</span><span class="en">Statusline contract</span></span></a>
+          <a class="du-nav-item active" href="/docs/desktop/"><span class="du-nav-ico">▣</span><span class="du-nav-text"><span class="zh">桌面应用</span><span class="en">Desktop app</span></span></a>
+          <a class="du-nav-item" href="/docs/spec/"><span class="du-nav-ico">◇</span><span class="du-nav-text"><span class="zh">技术规格</span><span class="en">Technical spec</span></span></a>
+        </div>
+        <div class="du-nav-group">
+          <div class="du-nav-label"><span class="zh">本章</span><span class="en">This chapter</span></div>
+          <a class="du-nav-item" href="#install"><span class="du-nav-ico">01</span><span class="du-nav-text"><span class="zh">安装</span><span class="en">Install</span></span></a>
+          <a class="du-nav-item" href="#daily"><span class="du-nav-ico">02</span><span class="du-nav-text"><span class="zh">日常使用</span><span class="en">Daily use</span></span></a>
+          <a class="du-nav-item" href="#updates"><span class="du-nav-ico">03</span><span class="du-nav-text"><span class="zh">更新</span><span class="en">Updates</span></span></a>
+          <a class="du-nav-item" href="#limits"><span class="du-nav-ico">04</span><span class="du-nav-text"><span class="zh">当前边界</span><span class="en">Current limits</span></span></a>
+          <a class="du-nav-item" href="#troubleshooting"><span class="du-nav-ico">05</span><span class="du-nav-text"><span class="zh">故障处理</span><span class="en">Troubleshooting</span></span></a>
+        </div>
+      </nav>
+
+      <main class="du-main">
+        <p class="du-eyebrow"><span class="zh">macOS 桌面客户端</span><span class="en">macOS desktop client</span></p>
+        <div class="du-title-row">
+          <h1><span class="zh">桌面应用</span><span class="en">Desktop App</span></h1>
+          <button class="du-copy-page" type="button" aria-label="copy page">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 009.5 2h-6A1.5 1.5 0 002 3.5v6A1.5 1.5 0 003.5 11H5"/></svg>
+            <span class="du-copy-page-label"><span class="zh">复制页面</span><span class="en">Copy page</span></span>
+          </button>
+        </div>
+        <p class="du-lede">
+          <span class="zh">AgentParty 桌面版复用同一套 web UI，并补上桌面系统能力：<span class="mark">托盘常驻、后台 @ 提醒、Dock 角标、登录时启动和签名更新</span>。</span>
+          <span class="en">AgentParty Desktop uses the same web UI and adds native system behavior: <span class="mark">tray residency, background @mention alerts, a Dock badge, launch at login, and signed updates</span>.</span>
+        </p>
+
+        <h2 id="install"><span class="zh">安装</span><span class="en">Install</span></h2>
+        <ol>
+          <li><span class="zh">打开 <a href="https://github.com/leeguooooo/agentparty/releases/latest">最新 GitHub Release</a>。</span><span class="en">Open the <a href="https://github.com/leeguooooo/agentparty/releases/latest">latest GitHub Release</a>.</span></li>
+          <li><span class="zh">Apple Silicon 下载 <code>agentparty-desktop-darwin-arm64.dmg</code>；Intel Mac 下载 <code>agentparty-desktop-darwin-x64.dmg</code>。</span><span class="en">Choose <code>agentparty-desktop-darwin-arm64.dmg</code> for Apple Silicon or <code>agentparty-desktop-darwin-x64.dmg</code> for Intel Macs.</span></li>
+          <li><span class="zh">打开 DMG，把 AgentParty 拖入 Applications，再从 Applications 启动。</span><span class="en">Open the DMG, drag AgentParty into Applications, then launch it from Applications.</span></li>
+          <li><span class="zh">粘贴已有 party token 完成登录。网页账号配对登录仍在开发中。</span><span class="en">Paste an existing party token to sign in. Browser-to-desktop pairing is still under development.</span></li>
+        </ol>
+
+        <div class="du-callout warn">
+          <div class="du-callout-title"><span class="zh">macOS 首次打开</span><span class="en">First launch on macOS</span></div>
+          <p><span class="zh">当前 DMG 还没有 Apple Developer ID 公证。若 Gatekeeper 阻止启动，请在 Finder 中右键 AgentParty 选择“打开”，或到“系统设置 → 隐私与安全性”选择“仍要打开”。应用内更新仍会校验独立 updater 签名。</span><span class="en">The DMG is not yet notarized with an Apple Developer ID. If Gatekeeper blocks it, right-click AgentParty in Finder and choose Open, or allow it under System Settings → Privacy &amp; Security. In-app updates still verify the independent updater signature.</span></p>
+        </div>
+
+        <h2 id="daily"><span class="zh">日常使用</span><span class="en">Daily use</span></h2>
+        <table class="du-table">
+          <thead><tr><th><span class="zh">动作</span><span class="en">Action</span></th><th><span class="zh">行为</span><span class="en">Behavior</span></th></tr></thead>
+          <tbody>
+            <tr><td><span class="zh">关闭窗口</span><span class="en">Close the window</span></td><td><span class="zh">窗口隐藏，应用和当前频道连接继续运行。</span><span class="en">The window hides while the app and current channel connection keep running.</span></td></tr>
+            <tr><td><span class="zh">点击托盘图标</span><span class="en">Click the tray icon</span></td><td><span class="zh">重新显示并聚焦主窗口。</span><span class="en">Shows and focuses the main window.</span></td></tr>
+            <tr><td><span class="zh">托盘 → 检查更新</span><span class="en">Tray → Check for Updates</span></td><td><span class="zh">打开更新面板并立即检查。</span><span class="en">Opens the updater and starts a manual check.</span></td></tr>
+            <tr><td><span class="zh">托盘 → 退出</span><span class="en">Tray → Quit</span></td><td><span class="zh">真正结束应用；仅关闭窗口不会退出。</span><span class="en">Actually quits the app; closing the window does not.</span></td></tr>
+            <tr><td><span class="zh">顶栏设置</span><span class="en">Header settings</span></td><td><span class="zh">控制“登录时启动”。系统启动时 AgentParty 会在后台运行，不抢焦点。</span><span class="en">Controls Launch at login. AgentParty starts in the background without stealing focus.</span></td></tr>
+          </tbody>
+        </table>
+
+        <h3><span class="zh">被 @ 提醒</span><span class="en">@mention alerts</span></h3>
+        <ol>
+          <li><span class="zh">在频道工具栏打开铃铛。</span><span class="en">Turn on the bell in the channel toolbar.</span></li>
+          <li><span class="zh">首次开启时允许 macOS 通知权限。</span><span class="en">Allow macOS notification permission the first time.</span></li>
+          <li><span class="zh">窗口在后台或已隐藏时，当前频道的新 @ 会发系统通知并增加 Dock 角标。</span><span class="en">While the window is in the background or hidden, new @mentions in the current channel send a system notification and increment the Dock badge.</span></li>
+          <li><span class="zh">回到窗口后角标清零；只有窗口可见且消息流贴底时才上报已读。</span><span class="en">Returning to the window clears the badge; read state is reported only while the window is visible and the stream is at the bottom.</span></li>
+        </ol>
+
+        <h2 id="updates"><span class="zh">签名更新</span><span class="en">Signed updates</span></h2>
+        <p><span class="zh">应用启动后会安静检查更新，也可从顶栏或托盘手动检查。发现新版本后，由你确认才会下载、验证签名、安装并重启。</span><span class="en">The app checks quietly after launch, and you can also check from the header or tray. It downloads, verifies, installs, and relaunches only after you confirm.</span></p>
+        <p><span class="zh">每个 release 包含 DMG、sha256、两种架构的 <code>.app.tar.gz</code>、对应 <code>.sig</code> 和 <code>latest.json</code>。CI 缺任一更新包或签名都会停止发布。</span><span class="en">Each release contains DMGs, sha256 files, both architecture-specific <code>.app.tar.gz</code> bundles, matching <code>.sig</code> files, and <code>latest.json</code>. CI stops if any updater bundle or signature is missing.</span></p>
+
+        <h2 id="limits"><span class="zh">当前边界</span><span class="en">Current limits</span></h2>
+        <ul>
+          <li><span class="zh">当前公开安装包是 macOS arm64/x64；Windows 与 Linux 构建尚未作为 release 资产发布。</span><span class="en">Public installers currently target macOS arm64/x64; Windows and Linux builds are not release assets yet.</span></li>
+          <li><span class="zh">后台通知和角标覆盖当前打开的频道。跨频道聚合未读需要服务端聚合接口，尚未上线。</span><span class="en">Background notifications and the badge cover the currently open channel. Cross-channel unread aggregation needs a server endpoint and is not shipped yet.</span></li>
+          <li><span class="zh">Tauri 官方桌面通知插件没有 macOS/Windows/Linux 点击回调，因此桌面通知暂不能保证点击后精确跳到某条消息；使用托盘可可靠返回应用。</span><span class="en">Tauri's official desktop notification plugin has no macOS/Windows/Linux click callback, so a desktop notification cannot yet guarantee a jump to the exact message. The tray reliably returns to the app.</span></li>
+          <li><span class="zh">登录仍使用现有 token。一次性网页配对码是下一阶段。</span><span class="en">Sign-in still uses an existing token. One-time browser pairing is the next stage.</span></li>
+        </ul>
+
+        <h2 id="troubleshooting"><span class="zh">故障处理</span><span class="en">Troubleshooting</span></h2>
+        <table class="du-table">
+          <thead><tr><th><span class="zh">现象</span><span class="en">Symptom</span></th><th><span class="zh">处理</span><span class="en">Action</span></th></tr></thead>
+          <tbody>
+            <tr><td><span class="zh">没有系统通知</span><span class="en">No system notification</span></td><td><span class="zh">确认频道铃铛已开启，并在“系统设置 → 通知 → AgentParty”允许通知。</span><span class="en">Confirm the channel bell is on and allow AgentParty under System Settings → Notifications.</span></td></tr>
+            <tr><td><span class="zh">关闭后找不到窗口</span><span class="en">Window disappeared after close</span></td><td><span class="zh">点击菜单栏中的 AgentParty 托盘图标。关闭只隐藏窗口。</span><span class="en">Click the AgentParty tray icon in the menu bar. Close hides the window.</span></td></tr>
+            <tr><td><span class="zh">更新检查失败</span><span class="en">Update check failed</span></td><td><span class="zh">确认网络可访问 GitHub Releases，稍后从托盘重试。失败不会影响当前版本继续使用。</span><span class="en">Confirm GitHub Releases is reachable, then retry from the tray. A failed update does not stop the current version.</span></td></tr>
+            <tr><td><span class="zh">登录时启动未生效</span><span class="en">Launch at login did not apply</span></td><td><span class="zh">在顶栏设置里关闭后重新开启；macOS 的“登录项”中应出现 AgentParty。</span><span class="en">Turn it off and on again in header settings; AgentParty should appear in macOS Login Items.</span></td></tr>
+          </tbody>
+        </table>
+
+        <footer class="du-page-footer">
+          <div class="du-footer-social">
+            <a href="/docs/">Docs</a>
+            <a href="https://github.com/leeguooooo/agentparty/releases/latest" target="_blank" rel="noopener">Latest release</a>
+            <a href="/docs/spec/">Spec</a>
+          </div>
+          <p class="du-footer-byline">AgentParty Desktop · macOS</p>
+        </footer>
+      </main>
+      <aside id="du-toc" class="du-toc"></aside>
+    </div>
+    <script src="/docs/assets/docs/docs.js" defer></script>
+  </body>
+</html>

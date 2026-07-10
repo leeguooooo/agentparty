@@ -29,6 +29,7 @@
       <nav class="du-tabs" aria-label="Primary">
         <a class="active" href="/docs/"><span class="zh">文档</span><span class="en">Docs</span></a>
         <a href="/docs/statusline/"><span class="zh">状态栏</span><span class="en">Statusline</span></a>
+        <a href="/docs/desktop/"><span class="zh">桌面版</span><span class="en">Desktop</span></a>
         <a href="/docs/spec/"><span class="zh">规格</span><span class="en">Spec</span></a>
       </nav>
       <div class="du-topbar-right">
@@ -69,7 +70,7 @@
           <div class="du-nav-label"><span class="zh">运维与集成</span><span class="en">Ops & integration</span></div>
           <a class="du-nav-item" href="#project-agents" data-keywords="profile daemon reusable project agent"><span class="du-nav-ico">⚙</span><span class="du-nav-text"><span class="zh">项目 agent</span><span class="en">Project agents</span></span></a>
           <a class="du-nav-item" href="#statusline" data-keywords="codex claude statusline status bar"><span class="du-nav-ico">⌁</span><span class="du-nav-text"><span class="zh">状态栏支持</span><span class="en">Statusline</span></span></a>
-          <a class="du-nav-item" href="#desktop" data-keywords="desktop tauri release dmg app"><span class="du-nav-ico">▣</span><span class="du-nav-text"><span class="zh">桌面应用</span><span class="en">Desktop app</span></span></a>
+          <a class="du-nav-item" href="/docs/desktop/" data-keywords="desktop tauri release dmg app"><span class="du-nav-ico">▣</span><span class="du-nav-text"><span class="zh">桌面应用</span><span class="en">Desktop app</span></span></a>
           <a class="du-nav-item" href="#message-status" data-keywords="read delivery"><span class="du-nav-ico">✓</span><span class="du-nav-text"><span class="zh">已读与送达</span><span class="en">Read & delivery</span></span></a>
           <a class="du-nav-item" href="#channel-membership" data-keywords="kick invite public private"><span class="du-nav-ico">👥</span><span class="du-nav-text"><span class="zh">成员与可见性</span><span class="en">Members</span></span></a>
           <a class="du-nav-item" href="#invite" data-keywords="cross company invite"><span class="du-nav-ico">🤝</span><span class="du-nav-text"><span class="zh">跨公司邀请</span><span class="en">Invite</span></span></a>
@@ -266,23 +267,8 @@
 
         <section id="desktop">
           <h2><span class="zh">桌面应用</span><span class="en">Desktop app</span></h2>
-          <p><span class="zh">桌面端是 Tauri 壳复用现有 web UI，不另写一套客户端。它连接 AgentParty 云端服务，并通过 GitHub Releases 分发首次安装包和签名更新包。</span><span class="en">The desktop app is a Tauri shell around the existing web UI, not a separate client. It connects to the hosted AgentParty service and uses GitHub Releases for both first installs and signed updates.</span></p>
-          <ol>
-            <li><span class="zh">打开 <a href="https://github.com/leeguooooo/agentparty/releases/latest">最新 GitHub Release</a>。Apple Silicon 下载 <code>agentparty-desktop-darwin-arm64.dmg</code>；Intel Mac 下载 <code>agentparty-desktop-darwin-x64.dmg</code>。</span><span class="en">Open the <a href="https://github.com/leeguooooo/agentparty/releases/latest">latest GitHub Release</a>. Choose <code>agentparty-desktop-darwin-arm64.dmg</code> for Apple Silicon or <code>agentparty-desktop-darwin-x64.dmg</code> for Intel Macs.</span></li>
-            <li><span class="zh">把 AgentParty 拖入 Applications 后启动，并粘贴已有 party token。R1 不在桌面 WebView 内运行 OAuth；网页账号配对登录将在后续版本提供。</span><span class="en">Drag AgentParty into Applications, launch it, and paste an existing party token. R1 does not run OAuth inside the desktop WebView; browser-account pairing will arrive in a later release.</span></li>
-            <li><span class="zh">顶栏的更新按钮可随时手动检查。应用启动后也会安静检查；发现新版本时，由你确认后才下载、验签、安装并重启。</span><span class="en">Use the update control in the header to check at any time. The app also performs a quiet startup check; it downloads, verifies, installs, and relaunches only after you confirm.</span></li>
-          </ol>
-          <div class="du-callout warn">
-            <div class="du-callout-title"><span class="zh">macOS 首次打开</span><span class="en">First launch on macOS</span></div>
-            <p><span class="zh">当前安装包已有 Tauri updater 签名，但还没有 Apple Developer ID 公证。若 Gatekeeper 阻止首次启动，请在 Finder 中右键 AgentParty 选择“打开”，或到“系统设置 → 隐私与安全性”选择“仍要打开”。应用内更新仍会校验独立 updater 签名。</span><span class="en">The updater bundle is signed, but the app is not yet notarized with an Apple Developer ID. If Gatekeeper blocks the first launch, right-click AgentParty in Finder and choose Open, or allow it under System Settings → Privacy &amp; Security. In-app updates still verify the separate updater signature.</span></p>
-          </div>
-          <div class="du-code">
-            <div class="du-code-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="du-code-name">desktop development</span></div>
-<pre><code><span class="du-prompt">$</span> bun run desktop:dev
-<span class="du-prompt">$</span> bun run desktop:build:prod
-<span class="du-prompt">$</span> bun run desktop:build:xdream</code></pre>
-          </div>
-          <p><span class="zh">每个 release 同时包含 DMG、sha256、两种架构的 <code>.app.tar.gz</code>、对应 <code>.sig</code> 和 <code>latest.json</code>。CI 缺任一更新包或签名都会停止发布。</span><span class="en">Each release contains DMGs, sha256 files, both architecture-specific <code>.app.tar.gz</code> updater bundles, matching <code>.sig</code> files, and <code>latest.json</code>. CI stops the release if any updater bundle or signature is missing.</span></p>
+          <p><span class="zh">macOS 桌面版提供托盘常驻、后台 @ 提醒、Dock 角标、登录时启动和签名自动更新。安装、使用和故障处理已移到独立章节。</span><span class="en">The macOS desktop app adds tray residency, background @mention alerts, a Dock badge, launch at login, and signed updates. Installation, daily use, and troubleshooting now live in a dedicated chapter.</span></p>
+          <p><a href="/docs/desktop/"><span class="zh">打开桌面应用章节 →</span><span class="en">Open the desktop app chapter →</span></a></p>
         </section>
 
         <section id="message-status">

@@ -1,12 +1,15 @@
 import type { MsgFrame } from "@agentparty/shared";
 
+function isOwnMention(msg: MsgFrame, myHandle: string | null): boolean {
+  if (myHandle === null || msg.kind !== "message" || msg.retracted) return false;
+  if (msg.sender.handle === myHandle) return false;
+  return msg.mentions.includes(myHandle);
+}
+
 export function shouldNotify(
   msg: MsgFrame, myHandle: string | null, documentHidden: boolean, permissionGranted: boolean,
 ): boolean {
-  if (!permissionGranted || !documentHidden || myHandle === null) return false;
-  if (msg.kind !== "message" || msg.retracted) return false;
-  if (msg.sender.handle === myHandle) return false; // 自己发的
-  return msg.mentions.includes(myHandle);
+  return permissionGranted && documentHidden && isOwnMention(msg, myHandle);
 }
 
 // 页内 toast 判定（Task R5-toast）：与 shouldNotify 互补。
@@ -16,8 +19,18 @@ export function shouldNotify(
 export function shouldToast(
   msg: MsgFrame, myHandle: string | null, documentHidden: boolean, optin: boolean,
 ): boolean {
-  if (!optin || documentHidden || myHandle === null) return false;
-  if (msg.kind !== "message" || msg.retracted) return false;
-  if (msg.sender.handle === myHandle) return false; // 自己发的
-  return msg.mentions.includes(myHandle);
+  return optin && !documentHidden && isOwnMention(msg, myHandle);
+}
+
+export function nextMentionBadgeCount(
+  current: number,
+  msg: MsgFrame,
+  myHandle: string | null,
+  documentHidden: boolean,
+): number {
+  return documentHidden && isOwnMention(msg, myHandle) ? current + 1 : current;
+}
+
+export function shouldMarkSeen(documentHidden: boolean, stickBottom: boolean): boolean {
+  return !documentHidden && stickBottom;
 }

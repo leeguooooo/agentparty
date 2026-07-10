@@ -5,6 +5,7 @@ import {
   type DesktopUpdaterController,
   type DesktopUpdaterState,
 } from "../lib/desktopUpdater";
+import { listenForDesktopUpdateChecks } from "../lib/desktopRuntime";
 import { useT } from "../i18n/useT";
 import type { TFunc } from "../i18n/useT";
 import "../i18n/strings/DesktopUpdater";
@@ -40,6 +41,11 @@ export function updateUpdaterDialogFocus(
 ) {
   if (panelOpen) dialog?.focus();
   else if (wasPanelOpen) trigger?.focus();
+}
+
+export function handleDesktopUpdaterTrayCheck(controller: DesktopUpdaterController): void {
+  controller.openPanel();
+  void controller.check("manual");
 }
 
 interface DesktopUpdaterPanelProps {
@@ -176,6 +182,23 @@ export function DesktopUpdater() {
       unsubscribe();
       controller.dispose();
       if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, [desktop]);
+
+  useEffect(() => {
+    if (!desktop) return;
+    let disposed = false;
+    let unlisten = () => {};
+    void listenForDesktopUpdateChecks(() => {
+      const controller = controllerRef.current;
+      if (controller !== null) handleDesktopUpdaterTrayCheck(controller);
+    }).then((nextUnlisten) => {
+      if (disposed) nextUnlisten();
+      else unlisten = nextUnlisten;
+    });
+    return () => {
+      disposed = true;
+      unlisten();
     };
   }, [desktop]);
 

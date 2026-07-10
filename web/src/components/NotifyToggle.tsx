@@ -3,6 +3,7 @@
 // 读/写 opt-in、申请浏览器通知权限、把结果上报给持有 optin state 的父组件（ChannelPage）。
 import { useState } from "react";
 import { useT } from "../i18n/useT";
+import { isDesktopRuntime, requestDesktopNotificationPermission } from "../lib/desktopRuntime";
 import "../i18n/strings/Channel";
 
 const OPTIN_KEY = "ap_notify_optin";
@@ -31,7 +32,8 @@ interface Props {
 export function NotifyToggle({ optin, onChange }: Props) {
   const t = useT();
   const [hint, setHint] = useState<string | null>(null);
-  const supported = typeof window !== "undefined" && "Notification" in window;
+  const desktop = isDesktopRuntime();
+  const supported = desktop || (typeof window !== "undefined" && "Notification" in window);
 
   const toggle = () => {
     setHint(null);
@@ -47,6 +49,12 @@ export function NotifyToggle({ optin, onChange }: Props) {
     // 额外能力：切走标签时的系统通知需要浏览器授权，best-effort 申请；拒绝/不支持不回滚 optin，只提示
     if (!supported) {
       setHint(t("Channel.notify.inAppOnly"));
+      return;
+    }
+    if (desktop) {
+      void requestDesktopNotificationPermission().then((permission) => {
+        if (permission !== "granted") setHint(t("Channel.notify.inAppOnly"));
+      });
       return;
     }
     if (Notification.permission === "granted") return;
