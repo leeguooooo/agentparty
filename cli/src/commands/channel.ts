@@ -7,6 +7,7 @@ import {
   archiveChannel,
   clearChannelRole,
   createChannel,
+  getLoopGuard,
   handleRestError,
   inviteProjectAgent,
   fetchChannelPerms,
@@ -67,6 +68,7 @@ const HELP = `usage: party channel create <slug> [--title t] [--temp] [--party] 
        party channel remove-agent <owner>/<handle> [slug]
        party channel gate reviewer|off [slug] [--policy sender|owner]
        party channel guard unlimited|off|<limit> [slug]
+       party channel guard status [slug] [--json]   read limit/streak/remaining before exit 4
        party channel workflow-guard off|<limit> [slug]
        party channel visibility <slug> public|private [--confirm]
        party channel members <slug>
@@ -339,9 +341,31 @@ export async function run(argv: string[]): Promise<number> {
       }
       case "guard": {
         const value = positionals[1];
+        // #174 读路径：熔断前读 limit/streak/remaining，与 set 语义共用 guard 子命令。
+        if (value === "status") {
+          const slug = resolveChannel(positionals[2]);
+          if (!slug) {
+            console.error("usage: party channel guard status [slug] [--json]");
+            return 1;
+          }
+          if (!isSlug(slug)) {
+            console.error("slug must match [a-z0-9][a-z0-9-]{0,63}");
+            return 1;
+          }
+          const state = await getLoopGuard(cfg.server, cfg.token, slug);
+          if (flags.json === true) {
+            console.log(JSON.stringify(state));
+          } else {
+            const onoff = state.enabled ? "on" : "off";
+            console.log(
+              `loop guard ${slug}: ${onoff} streak=${state.streak}/${state.limit} remaining=${state.remaining} resets_on=${state.resets_on}`,
+            );
+          }
+          return 0;
+        }
         const slug = resolveChannel(positionals[2]);
         if (!value || !slug) {
-          console.error("usage: party channel guard unlimited|off|<limit> [slug]");
+          console.error("usage: party channel guard status|unlimited|off|<limit> [slug]");
           return 1;
         }
         if (!isSlug(slug)) {

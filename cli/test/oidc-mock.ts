@@ -147,6 +147,10 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
         const filtered = handle ? invites.filter((i) => i.profile_handle === handle) : invites;
         return Response.json({ invites: filtered });
       }
+      if (req.method === "GET" && /^\/api\/channels\/[^/]+\/loop-guard$/.test(u.pathname)) {
+        // #174 loop guard 读路径 mock
+        return Response.json({ enabled: true, limit: 30, streak: 27, remaining: 3, resets_on: "human" });
+      }
       if (req.method === "POST" && /^\/api\/channels\/[^/]+\/project-agents$/.test(u.pathname)) {
         const slug = u.pathname.split("/")[3] ?? "dev";
         const b = rec.body as { owner_account?: string; handle?: string } | null;

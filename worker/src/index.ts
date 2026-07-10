@@ -3219,6 +3219,24 @@ app.get("/api/channels/:slug/presence", async (c) => {
   return fetchChannelDO(c.env, slug, new Request("https://do/internal/presence", { headers: { "x-partykit-room": slug } }));
 });
 
+app.get("/api/channels/:slug/loop-guard", async (c) => {
+  // #174 loop guard 读路径：熔断前就能读 limit/streak/remaining。与 presence 同样的 ACL 门。
+  // 传 channelHeaders 让 DO 用 D1 权威刷新 enabled/limit，再叠上它自己的 streak。
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  return fetchChannelDO(
+    c.env,
+    slug,
+    new Request("https://do/internal/guard", {
+      headers: { "x-partykit-room": slug, ...channelHeaders(channel, c.req.url) },
+    }),
+  );
+});
+
 app.get("/api/channels/:slug/identities", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);

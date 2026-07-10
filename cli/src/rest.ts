@@ -899,6 +899,21 @@ export async function setLoopGuard(
   })) as { enabled: boolean; limit: number | null };
 }
 
+export interface LoopGuardState {
+  enabled: boolean;
+  limit: number;
+  streak: number;
+  remaining: number;
+  resets_on: string;
+}
+
+// #174 loop guard 读路径：熔断前就能读到 limit/streak/remaining，agent 据此自我节流。
+export async function getLoopGuard(server: string, token: string, slug: string): Promise<LoopGuardState> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/loop-guard`, {
+    headers: bearerJson(token),
+  })) as LoopGuardState;
+}
+
 export async function setWorkflowGuard(
   server: string,
   token: string,

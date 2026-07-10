@@ -1714,6 +1714,12 @@ export class ChannelDO extends Server<Env> {
       // party who：完整 presence 快照（含 kind/wake/last_seen），供 CLI 分档展示谁在线/可唤醒
       return Response.json({ presence: this.presenceList() });
     }
+    if (url.pathname === "/internal/guard" && request.method === "GET") {
+      // party channel guard status（#174）：熔断前就能读到 limit/streak/remaining。
+      // 先按 header 刷新 config meta，保证 enabled/limit 与 D1 权威一致，streak 取 DO 自身状态。
+      this.cacheChannelMeta(request.headers, request.headers.get("x-ap-host"));
+      return Response.json(this.loopGuardState());
+    }
     if (url.pathname === "/internal/identities" && request.method === "GET") {
       const identities = new Map<string, { name: string; kind?: SenderKind; account?: string }>();
       const add = (name: unknown, kind: unknown, account: unknown) => {
@@ -3134,15 +3140,39 @@ export class ChannelDO extends Server<Env> {
     return `agent_count:${name}`;
   }
 
-  private globalLoopGuardMessage(): string | null {
-    if (this.getMeta("loop_guard_enabled") !== "1") return null;
+  // 熔断实际生效的阈值：显式配置优先，否则回落 normal/party 默认（便于手工修复旧 DO meta）。
+  private effectiveLoopGuardLimit(): number {
     const configured = Number(this.getMeta("loop_guard_limit") ?? "");
-    // 频道未显式配置 limit 时保留旧 normal/party 默认，便于手工修复旧 DO meta。
-    const guardLimit = Number.isInteger(configured) && configured > 0
+    return Number.isInteger(configured) && configured > 0
       ? Math.min(configured, 10_000)
       : this.getMeta("mode") === "party"
         ? LOOP_GUARD_PARTY_N
         : LOOP_GUARD_N;
+  }
+
+  // 熔断【之前】就可读的 guard 快照（#174）：limit/streak/remaining 与实际触发用同一套阈值口径，
+  // 让 agent 能自我节流，而不必先撞 exit 4 把频道锁死才知道 guard 存在。
+  private loopGuardState(): {
+    enabled: boolean;
+    limit: number;
+    streak: number;
+    remaining: number;
+    resets_on: "human";
+  } {
+    const limit = this.effectiveLoopGuardLimit();
+    const streak = this.agentStreak();
+    return {
+      enabled: this.getMeta("loop_guard_enabled") === "1",
+      limit,
+      streak,
+      remaining: Math.max(0, limit - streak),
+      resets_on: "human",
+    };
+  }
+
+  private globalLoopGuardMessage(): string | null {
+    if (this.getMeta("loop_guard_enabled") !== "1") return null;
+    const guardLimit = this.effectiveLoopGuardLimit();
     return this.agentStreak() >= guardLimit
       ? `${guardLimit} consecutive agent messages, waiting for a human`
       : null;
