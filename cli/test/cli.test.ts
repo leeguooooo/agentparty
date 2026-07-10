@@ -267,7 +267,8 @@ describe("cli subprocess", () => {
         method: "POST",
         path: "/api/channels/dev/messages",
         auth: "Bearer ap_tok",
-        body: { kind: "message", body: "hello mcp", mentions: ["bob"], reply_to: null },
+        // body 还带一个随机 idempotency_key（#98），故用 objectContaining 容忍它
+        body: expect.objectContaining({ kind: "message", body: "hello mcp", mentions: ["bob"], reply_to: null }),
       }));
 
       const created = await client.callTool({
@@ -400,7 +401,8 @@ describe("cli subprocess", () => {
       expect(seen).toContainEqual(expect.objectContaining({
         method: "POST",
         path: "/api/channels/dev/messages",
-        body: { kind: "status", state: "working", note: "started", mentions: [], scope: ["task:1"], context: expect.any(Object) },
+        // body 还带一个随机 idempotency_key（#98），故用 objectContaining 容忍它
+        body: expect.objectContaining({ kind: "status", state: "working", note: "started", mentions: [], scope: ["task:1"], context: expect.any(Object) }),
       }));
       expect(seen).toContainEqual(expect.objectContaining({
         method: "PATCH",

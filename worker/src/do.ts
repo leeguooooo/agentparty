@@ -2,6 +2,8 @@
 import {
   applyLiveConnection,
   BODY_LIMIT,
+  IDEMPOTENCY_KEY_MAX,
+  IDEMPOTENCY_WINDOW_MS,
   LOOP_GUARD_N,
   LOOP_GUARD_PARTY_N,
   MAX_WEBHOOKS_PER_CHANNEL,
@@ -88,7 +90,8 @@ interface WebhookDeliveryResult {
 }
 
 type SendOutcome =
-  | { ok: true; seq: number; frames: ServerFrame[] }
+  // deduped：命中幂等去重（#98）——seq/frames 来自原来那条已落库消息，调用方须跳过广播/唤醒等副作用
+  | { ok: true; seq: number; frames: ServerFrame[]; deduped?: boolean }
   | { ok: false; code: ErrorCode; message: string };
 type SendErrorOutcome = Extract<SendOutcome, { ok: false }>;
 
@@ -618,10 +621,18 @@ function sendRejectMessage(raw: unknown): string {
   return "invalid send payload";
 }
 
+// 幂等键（#98）：仅接受非空、长度受限的字符串；异常值静默丢弃（不因它拒收整条 send，向后兼容）。
+function parseIdempotencyKey(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  if (raw.length === 0 || raw.length > IDEMPOTENCY_KEY_MAX) return undefined;
+  return raw;
+}
+
 // rest body 与 ws send 帧共用的校验（rest 侧无 type 字段）
 function parseSendFrame(input: unknown): SendFrame | null {
   if (typeof input !== "object" || input === null) return null;
   const f = input as Record<string, unknown>;
+  const idempotencyKey = parseIdempotencyKey(f.idempotency_key);
   if (f.kind === "message") {
     if (typeof f.body !== "string") return null;
     const explicit = parseMentions(f.mentions);
@@ -650,6 +661,7 @@ function parseSendFrame(input: unknown): SendFrame | null {
       reply_to,
       ...(completionArtifact !== undefined ? { completion_artifact: completionArtifact } : {}),
       ...(completionArtifact !== undefined && replaces !== undefined ? { replaces } : {}),
+      ...(idempotencyKey !== undefined ? { idempotency_key: idempotencyKey } : {}),
     };
   }
   if (f.kind === "status") {
@@ -698,6 +710,7 @@ function parseSendFrame(input: unknown): SendFrame | null {
       ...(context !== undefined ? { context } : {}),
       ...(decision !== undefined ? { decision } : {}),
       ...(workflow !== undefined ? { workflow } : {}),
+      ...(idempotencyKey !== undefined ? { idempotency_key: idempotencyKey } : {}),
     };
   }
   return null;
@@ -859,6 +872,9 @@ export class ChannelDO extends Server<Env> {
       "ALTER TABLE messages ADD COLUMN sender_display_name TEXT",
       "ALTER TABLE messages ADD COLUMN sender_avatar_url TEXT",
       "ALTER TABLE messages ADD COLUMN sender_avatar_thumb TEXT",
+      // 幂等键（#98）：客户端每次发送带一个 ULID，服务端按 (sender_name, idempotency_key) 去重。
+      // 注：messages 表是 DO 内建 SQLite（ctx.storage.sql），不是 D1，故无需 worker/migrations 迁移文件。
+      "ALTER TABLE messages ADD COLUMN idempotency_key TEXT",
     ]) {
       try {
         sql.exec(ddl);
@@ -866,6 +882,8 @@ export class ChannelDO extends Server<Env> {
         // 列已存在
       }
     }
+    // 幂等去重查询走 (sender_name, idempotency_key)；NULL 键（老客户端/非幂等发送）不进有效查询路径。
+    sql.exec("CREATE INDEX IF NOT EXISTS idx_messages_idempotency ON messages(sender_name, idempotency_key)");
     sql.exec(`CREATE TABLE IF NOT EXISTS presence (
       name TEXT PRIMARY KEY,
       state TEXT NOT NULL,
@@ -1157,6 +1175,8 @@ export class ChannelDO extends Server<Env> {
       }
       // sent 先于广播到达发送方，客户端先推进游标再看到自己的回声
       this.sendFrame(connection, { type: "sent", seq: out.seq });
+      // 幂等去重命中（#98）：只回 sent（原 seq），不重复广播/唤醒。ws 发送目前不带 key，故常态为 false。
+      if (out.deduped) return;
       // 广播必须紧跟 INSERT，中间不能有任何 await（#114）：
       // 并发发送时 A 落库 seq=N 后若在这里等 D1，B 落库 N+1 先广播，watcher ack 了 N+1，
       // 后到的 N 就被客户端当作「已消费」永久丢弃（client.ts: seq <= cursor 静默丢），
@@ -2193,10 +2213,13 @@ export class ChannelDO extends Server<Env> {
           { status: ERROR_STATUS[out.code] },
         );
       }
-      // 同 ws 路径（#114）：先广播，再做与本条消息无关的连接清理
-      for (const f of out.frames) this.broadcastFrame(f);
-      await this.closeInactiveConnections();
-      await this.afterSend(out.frames[0] as MsgFrame);
+      // 幂等去重命中（#98）：首发时已广播/唤醒过，重发只回原 seq，绝不重复副作用
+      if (!out.deduped) {
+        // 同 ws 路径（#114）：先广播，再做与本条消息无关的连接清理
+        for (const f of out.frames) this.broadcastFrame(f);
+        await this.closeInactiveConnections();
+        await this.afterSend(out.frames[0] as MsgFrame);
+      }
       const sent = out.frames[0] as MsgFrame;
       return Response.json({
         seq: out.seq,
@@ -2388,6 +2411,23 @@ export class ChannelDO extends Server<Env> {
     if (!(await this.isTokenActive(identity.tokenHash))) {
       return { ok: false, code: "unauthorized", message: "invalid or revoked token" };
     }
+    // 幂等去重（#98）：必须在 rate/loop/workflow guard 与 INSERT 之前——重试是网络产物而非第二条消息，
+    // 不能重复消耗配额、不能重复触发熔断，更不能重复落库/重复唤醒。命中就原样返回首发那条的 seq。
+    // 窗口 IDEMPOTENCY_WINDOW_MS 内、同一 sender_name 的同一 key 才去重；DO 单线程 + 重试串行发生，
+    // SELECT→INSERT 之间无并发同键写入之虞。
+    if (frame.idempotency_key !== undefined) {
+      const priorRow = this.ctx.storage.sql
+        .exec(
+          "SELECT * FROM messages WHERE sender_name = ? AND idempotency_key = ? AND ts >= ? ORDER BY seq DESC LIMIT 1",
+          identity.name,
+          frame.idempotency_key,
+          Date.now() - IDEMPOTENCY_WINDOW_MS,
+        )
+        .toArray()[0];
+      if (priorRow !== undefined) {
+        return { ok: true, seq: Number(priorRow.seq), frames: [this.rowToFrame(priorRow)], deduped: true };
+      }
+    }
     const payload = frame.kind === "message" ? frame.body : frame.note;
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
@@ -2527,9 +2567,9 @@ export class ChannelDO extends Server<Env> {
          state, note, status_scope_json, status_summary_seq, status_blocked_reason, status_context_json,
          status_decision_json, status_workflow_json, message_workflow_json,
          sender_role, sender_role_source, completion_artifact_json, completion_review_state, completion_review_policy,
-         completion_review_replaces_seq, ts
+         completion_review_replaces_seq, idempotency_key, ts
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       seq,
       identity.name,
       identity.kind,
@@ -2560,6 +2600,7 @@ export class ChannelDO extends Server<Env> {
       msg.completion_review?.state ?? null,
       msg.completion_review?.policy ?? null,
       replacesSeq ?? null,
+      frame.idempotency_key ?? null,
       now,
     );
     let replacedUpdate: MessageUpdateFrame | undefined;

@@ -11,6 +11,13 @@ export const LOOP_GUARD_AGENT_N = 15;
 export const LOOP_GUARD_PARTY_N = 200;
 export const LOOP_GUARD_AGENT_PARTY_N = 50;
 export const RETAIN_N = 10_000;
+// 幂等键最大长度（#98）：ULID 是 26 字符，留足余量到 128 防滥用把 key 当附加 payload。
+export const IDEMPOTENCY_KEY_MAX = 128;
+// 幂等去重窗口（#98）：只在最近这段时间内的同键消息上去重。10 分钟足以覆盖
+// 客户端 30s 超时 + 重试 + 服务端 fetchChannelDO 的 DO-reset 重发，并留足时钟偏移余量；
+// 越界后同一 key 可被安全重用（实践中客户端每次发送都生成新 ULID，不会重用）。
+// 另有 RETAIN_N 条消息保留上限做二次兜底：更老的消息连同其 key 一起被裁剪。
+export const IDEMPOTENCY_WINDOW_MS = 10 * 60_000;
 export const PRESENCE_TIMEOUT_MS = 60_000;
 // temp 频道最后一条消息后闲置多久自动归档（spec §6）
 export const TEMP_IDLE_ARCHIVE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -400,6 +407,12 @@ export interface SendMessageFrame {
   reply_to: number | null;
   completion_artifact?: CompletionArtifact;
   replaces?: number;
+  /**
+   * 幂等键（#98）：客户端每次发送生成一个唯一键（ULID）。同一条逻辑消息的重试（客户端超时重发、
+   * 或服务端 fetchChannelDO 在 DO reset 后 clone 重发）携带同一键，服务端按 (sender, key) 去重，
+   * 返回原来那条的 seq，不再重复落库/重复唤醒。旧客户端不带 → 保持旧行为（不去重）。
+   */
+  idempotency_key?: string;
 }
 
 export interface SendStatusFrame {
@@ -408,6 +421,8 @@ export interface SendStatusFrame {
   state: StatusState;
   note: string;
   mentions?: string[];
+  /** 幂等键（#98）：同 SendMessageFrame，status 帧同样会重复落库 + 重复唤醒，故也支持去重。 */
+  idempotency_key?: string;
   scope?: string[];
   summary_seq?: number | null;
   blocked_reason?: string | null;

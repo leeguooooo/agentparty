@@ -1358,7 +1358,8 @@ describe("party status/history channel flag", () => {
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("completion seq=1");
     const req = reqsOf(mock!, "POST", "/api/channels/dev/messages")[0]!;
-    expect(req.body).toEqual({
+    // toMatchObject（非 toEqual）：body 还带一个随机 idempotency_key（#98）
+    expect(req.body).toMatchObject({
       kind: "message",
       body: "final synthesis",
       mentions: ["alice"],
@@ -1373,6 +1374,7 @@ describe("party status/history channel flag", () => {
         task_id: 12,
       },
     });
+    expect(typeof (req.body as { idempotency_key?: unknown }).idempotency_key).toBe("string");
   });
 
   test("complete sends --replaces for reworked completion", async () => {

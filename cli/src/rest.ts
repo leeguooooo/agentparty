@@ -1005,16 +1005,39 @@ export async function searchMessages(
 
 export type MessagePayload = Omit<SendMessageFrame, "type"> | Omit<SendStatusFrame, "type">;
 
+const ULID_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+// ULID（#98）：48-bit 毫秒时间戳 + 80-bit 随机，时间有序、无依赖。仅需唯一性即可满足幂等，
+// 时间有序还让服务端 (sender, key) 索引对最近消息更友好。crypto.getRandomValues 在 node/bun/浏览器均有。
+function newIdempotencyKey(): string {
+  let ts = Date.now();
+  const time: string[] = [];
+  for (let i = 0; i < 10; i += 1) {
+    time.unshift(ULID_CROCKFORD[ts % 32]!);
+    ts = Math.floor(ts / 32);
+  }
+  const rnd = new Uint8Array(16);
+  crypto.getRandomValues(rnd);
+  const rand: string[] = [];
+  for (let i = 0; i < 16; i += 1) rand.push(ULID_CROCKFORD[rnd[i]! % 32]!);
+  return time.join("") + rand.join("");
+}
+
 export async function postMessage(
   server: string,
   token: string,
   slug: string,
   payload: MessagePayload,
 ): Promise<{ seq: number; completion_review?: CompletionReview }> {
+  // 每次发送生成一个新的幂等键：调用方不必操心；重试（客户端超时重发 / 服务端 DO-reset clone 重发）
+  // 携带同一 body 即同一 key，服务端据此去重。调用方若已带 key（少见）则尊重之。
+  const body: MessagePayload = "idempotency_key" in payload && payload.idempotency_key !== undefined
+    ? payload
+    : { ...payload, idempotency_key: newIdempotencyKey() };
   return (await req(server, `/api/channels/${encodeURIComponent(slug)}/messages`, {
     method: "POST",
     headers: bearerJson(token),
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   })) as { seq: number; completion_review?: CompletionReview };
 }
 
