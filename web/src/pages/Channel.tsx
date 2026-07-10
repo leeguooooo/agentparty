@@ -2270,8 +2270,10 @@ export function ChannelPage({
     [state.messages, state.participants, state.presence, teamNow],
   );
   const hostBoard = useMemo(
-    () => buildHostBoard(slug, Object.values(state.presence), state.messages, teamNow, { loopGuardActive: state.loopGuard !== null }),
-    [slug, state.loopGuard, state.messages, state.presence, teamNow],
+    // #204 open_claims / conflicts / blockers 改由任务台账派生：把已加载的 tasks 一并喂进 buildHostBoard。
+    // 注：tasks 目前在打开任务面板时惰性加载，未打开时 board 的 task 派生段为空（详见 loadTaskLedger）。
+    () => buildHostBoard(slug, Object.values(state.presence), state.messages, tasks, teamNow, { loopGuardActive: state.loopGuard !== null }),
+    [slug, state.loopGuard, state.messages, state.presence, tasks, teamNow],
   );
   // @ 补全候选：participants ∪ presence，分档（在线/可唤醒/最近）。teamNow 30s 刷新驱动 stale 判定。
   const mentionOptions = useMemo(

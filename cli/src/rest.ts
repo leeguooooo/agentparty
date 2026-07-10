@@ -603,6 +603,8 @@ export async function createTask(
     parent_id?: number;
     anchor_seqs?: number[];
     workflow_id?: string;
+    scope?: string[];
+    blocked_reason?: string | null;
   },
 ): Promise<TaskRecord> {
   return (await req(server, `/api/channels/${encodeURIComponent(slug)}/tasks`, {
@@ -624,6 +626,8 @@ export async function updateTask(
     assignee?: { name: string; kind: TaskAssigneeKind } | null;
     priority?: number;
     labels?: string[];
+    scope?: string[];
+    blocked_reason?: string | null;
   },
 ): Promise<TaskRecord> {
   return (await req(server, `/api/channels/${encodeURIComponent(slug)}/tasks/${id}`, {

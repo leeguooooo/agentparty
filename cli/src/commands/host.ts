@@ -7,7 +7,7 @@ import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../
 import { resolveChannel } from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth } from "../oidc-cli";
-import { fetchMessages, fetchPresence, fetchRecentMessages, handleRestError } from "../rest";
+import { fetchMessages, fetchPresence, fetchRecentMessages, handleRestError, listTasks } from "../rest";
 import { isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 
 const HOST_FLAGS = ["channel", "since", "limit", "json"];
@@ -93,6 +93,11 @@ function printBoard(board: HostBoard, window: BoardWindow) {
     const takeover = decision.takeover_from === null ? "" : ` takeover=${decision.takeover_from}`;
     console.log(`- #${decision.seq} ${decision.owner} ${decision.kind}: ${decision.decision}${handoff}${takeover}`);
   }
+  // #204 legacy 段：没有对应 task 的历史 status claim。独立成段、不混进 open claims；给出转成 task 的命令。
+  console.log(`unlinked status claims (no task, legacy): ${board.unlinked_claims.length}`);
+  for (const claim of board.unlinked_claims) {
+    console.log(`- #${claim.seq} ${claim.owner} ${claim.state} scope=${scopeLabel(claim.scope)}  (no task; run: party task from ${claim.seq})`);
+  }
   console.log(`recommended actions: ${board.recommended_actions.length}`);
   for (const action of board.recommended_actions) {
     const human = action.requires_human ? " human" : "";
@@ -153,17 +158,19 @@ export async function run(argv: string[]): Promise<number> {
     // flag 是否存在才决定走向——没给 --since 就取最近窗口（tail），否则频道超过 limit 条后
     // last_seq 永久冻结在头部、loop guard blocker 永远看不到最新发言（见频道公告 rev347）。
     const sinceGiven = flags.since !== undefined;
-    const [presence, messages, headProbe] = await Promise.all([
+    const [presence, messages, headProbe, tasks] = await Promise.all([
       fetchPresence(cfg.server, cfg.token, channel),
       sinceGiven
         ? fetchMessages(cfg.server, cfg.token, channel, since ?? 0, resolvedLimit)
         : fetchRecentMessages(cfg.server, cfg.token, channel, resolvedLimit),
       // 独立 tail 探针拿频道真实 head：取尾窗口本身推不出「后面还有没有更新」，取头窗口更推不出。
       fetchRecentMessages(cfg.server, cfg.token, channel, 1),
+      // #204 open_claims / conflicts / blockers 改由任务台账派生，board 必须并行拉 tasks 一并喂进 buildHostBoard。
+      listTasks(cfg.server, cfg.token, channel, { limit: 500 }),
     ]);
     const head = headProbe.at(-1)?.seq ?? 0;
     const window = describeWindow(messages, head);
-    const board = buildHostBoard(channel, presence, messages);
+    const board = buildHostBoard(channel, presence, messages, tasks);
     if (flags.json === true) console.log(JSON.stringify(jsonFrame({ ...board, window } as unknown as Record<string, unknown>)));
     else printBoard(board, window);
     return 0;
