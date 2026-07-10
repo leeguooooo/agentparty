@@ -439,6 +439,13 @@ function parseCollaborationRole(input: unknown): CollaborationRole | undefined |
   return input as CollaborationRole;
 }
 
+// undefined = 调用方没传（用默认值）；null = 传了但非法（400）。同 parseCollaborationRole 的三态约定。
+function statusStateFrom(input: unknown): StatusState | undefined | null {
+  if (input === undefined || input === null) return undefined;
+  if (typeof input !== "string" || !STATUS_STATES.includes(input)) return null;
+  return input as StatusState;
+}
+
 function parseRoleSource(input: unknown): CollaborationRoleSource | undefined | null {
   if (input === undefined) return undefined;
   if (typeof input !== "string" || !ROLE_SOURCES.includes(input)) return null;
@@ -1252,7 +1259,7 @@ export class ChannelDO extends Server<Env> {
       }
       if (attempt > WEBHOOK_MAX_RETRIES) {
         this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
-        this.insertSystemStatus(`webhook ${webhookName} 连续投递失败已停用本条`, now);
+        this.insertSystemStatus(`webhook ${webhookName} 连续投递失败已停用本条`, now, false, { state: "blocked" });
         continue;
       }
       this.ctx.storage.sql.exec(
@@ -1416,7 +1423,7 @@ export class ChannelDO extends Server<Env> {
       if (delivery.ok) continue;
       const queued = Number(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM webhook_queue").one().n);
       if (queued >= MAX_WEBHOOK_QUEUE_ROWS) {
-        await this.insertSystemStatus("webhook retry queue is full; dropping failed delivery", now);
+        await this.insertSystemStatus("webhook retry queue is full; dropping failed delivery", now, false, { state: "blocked" });
         continue;
       }
       this.ctx.storage.sql.exec(
@@ -1572,7 +1579,9 @@ export class ChannelDO extends Server<Env> {
     options: { mentions?: string[]; workflow?: StatusWorkflow; broadcast?: boolean; state?: StatusState } = {},
   ): MsgFrame {
     const seq = this.lastSeq() + 1;
-    const state = options.state ?? "blocked";
+    // 默认 waiting 而非 blocked（#143）：信息类系统事件是常态、blocked 是例外，默认值失误的方向
+    // 必须是安全的。blocked 会让守 etiquette 的 agent 停手等人类，误报的代价远大于漏报。
+    const state = options.state ?? "waiting";
     const blockedReason = state === "blocked" ? note : null;
     const status: StatusEvent = {
       owner: "system",
@@ -1771,13 +1780,19 @@ export class ChannelDO extends Server<Env> {
       });
     }
     if (url.pathname === "/internal/system-status" && request.method === "POST") {
-      const body = (await request.json().catch(() => null)) as { note?: unknown; ts?: unknown } | null;
+      const body = (await request.json().catch(() => null)) as { note?: unknown; ts?: unknown; state?: unknown } | null;
       const note = typeof body?.note === "string" ? body.note : "";
       if (!note || note.length > 1000) {
         return Response.json({ error: { code: "bad_request", message: "valid note required" } }, { status: 400 });
       }
+      // state 由 worker 层显式指定（#143）：建 task / 改可见性 / squad 增删改这类信息事件是
+      // waiting，不能落成 blocked——etiquette 教 agent「blocked 就停手等人类」，打反了会瘫痪协作。
+      const state = statusStateFrom(body?.state);
+      if (state === null) {
+        return Response.json({ error: { code: "bad_request", message: "state must be working|waiting|blocked|done" } }, { status: 400 });
+      }
       const ts = typeof body?.ts === "number" && Number.isInteger(body.ts) ? body.ts : Date.now();
-      this.insertSystemStatus(note, ts);
+      this.insertSystemStatus(note, ts, false, state === undefined ? {} : { state });
       return Response.json({ ok: true });
     }
     if (url.pathname === "/internal/charter-rev" && request.method === "POST") {
@@ -2824,6 +2839,7 @@ export class ChannelDO extends Server<Env> {
         mentions,
         workflow: decision.workflow,
         broadcast: false,
+        state: "blocked",
       });
       this.pruneWorkflowGuardState();
       return guardFrame;
@@ -3084,7 +3100,7 @@ export class ChannelDO extends Server<Env> {
   private alertLoopGuard(message: string) {
     if (this.getMeta("loop_guard_alerted") !== null) return;
     this.setMeta("loop_guard_alerted", "1");
-    this.insertSystemStatus(`loop guard tripped: ${message}`, Date.now(), true);
+    this.insertSystemStatus(`loop guard tripped: ${message}`, Date.now(), true, { state: "blocked" });
   }
 
   private isArchived(): boolean {

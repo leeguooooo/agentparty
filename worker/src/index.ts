@@ -16,6 +16,7 @@ import type {
   TaskAssigneeKind,
   TaskRecord,
   TaskSummary,
+  StatusState,
   TaskState,
   TokenRole,
   WebhookFilter,
@@ -75,6 +76,12 @@ const COMPLETION_REVIEW_POLICIES: readonly string[] = ["sender", "owner"] satisf
 const COLLAB_ROLES: readonly string[] = ["host", "worker", "reviewer", "observer"] satisfies CollaborationRole[];
 const TASK_STATES: readonly string[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "done", "blocked"] satisfies TaskState[];
 const TASK_ASSIGNEE_KINDS: readonly string[] = ["agent", "human", "squad"] satisfies TaskAssigneeKind[];
+
+// TASK_STATES.includes() 不做类型收窄，用守卫保住 TaskState
+function isTaskState(input: unknown): input is TaskState {
+  return typeof input === "string" && TASK_STATES.includes(input);
+}
+
 const HUMAN_METADATA_POLICIES = ["owner", "moderators", "members"] as const;
 const AGENT_METADATA_POLICIES = ["off", "moderators", "members", "allowlist"] as const;
 
@@ -828,7 +835,7 @@ async function syncTaskCompletion(
     state === "needs_review" ? `task #${taskId} needs_review via completion #${seq}` :
     state === "done" ? `task #${taskId} done via completion #${seq}` :
     `task #${taskId} back to in_progress after rejected completion #${seq}`;
-  await insertSystemStatus(env, slug, note).catch(() => false);
+  await insertSystemStatus(env, slug, note, statusStateForTask(state)).catch(() => false);
 }
 
 // 铸/重铸 token 的落库逻辑（/api/tokens 与 /api/agents 共用）：
@@ -1121,17 +1128,35 @@ async function channelMessageStats(env: AppEnv, slug: string): Promise<{ message
   return (await res.json()) as { message_count: number; earliest_ts: number | null };
 }
 
-async function insertSystemStatus(env: AppEnv, slug: string, note: string, ts = Date.now()): Promise<boolean> {
+// state 必传（#143）：worker 层发的都是信息类事件，落成 blocked 会让守 etiquette 的 agent
+// 停手等人类。唯一真 blocked 的来源在 DO 内部（webhook 死信 / 队列满 / guard 熔断）。
+async function insertSystemStatus(
+  env: AppEnv,
+  slug: string,
+  note: string,
+  state: StatusState = "waiting",
+  ts = Date.now(),
+): Promise<boolean> {
   const res = await fetchChannelDO(
     env,
     slug,
     new Request("https://do/internal/system-status", {
       method: "POST",
-      body: JSON.stringify({ note, ts }),
+      body: JSON.stringify({ note, ts, state }),
       headers: { "content-type": "application/json", "x-partykit-room": slug },
     }),
   );
   return res.ok;
+}
+
+// task 状态 → 系统状态帧的 state。task 自己 blocked 时确实该报 blocked；done 报 done；
+// 其余（triage/backlog/assigned/in_progress/needs_review）都是推进中的信息事件 → waiting。
+// 入参放宽到 string（DB 行的 state 列是裸 string）：未知值兜底 waiting，与 insertSystemStatus
+// 的默认值同向——误判成 blocked 会让 agent 停手，误判成 waiting 只是少一条告警。
+function statusStateForTask(state: string): StatusState {
+  if (state === "blocked") return "blocked";
+  if (state === "done") return "done";
+  return "waiting";
 }
 
 async function recentNonMemberSpeakers(db: D1Database, env: AppEnv, slug: string, ownerAccount: string | null): Promise<string[]> {
@@ -3002,7 +3027,7 @@ app.put("/api/channels/:slug/visibility", async (c) => {
   await c.env.DB.prepare("UPDATE channels SET visibility = ? WHERE slug = ?")
     .bind(visibility, slug)
     .run();
-  const ok = await insertSystemStatus(c.env, slug, `visibility changed to ${visibility} by ${identity.name}`, now);
+  const ok = await insertSystemStatus(c.env, slug, `visibility changed to ${visibility} by ${identity.name}`, "waiting", now);
   if (!ok) return c.json(errorBody("unavailable", "visibility changed but audit status failed"), 503);
   const recentSpeakers =
     visibility === "private" ? await recentNonMemberSpeakers(c.env.DB, c.env, slug, channel.owner_account) : [];
@@ -3323,7 +3348,7 @@ app.post("/api/channels/:slug/squads", async (c) => {
     throw error;
   }
   const row = await loadSquadRow(c.env.DB, slug, name);
-  await insertSystemStatus(c.env, slug, `squad @${name} created`).catch(() => false);
+  await insertSystemStatus(c.env, slug, `squad @${name} created`, "waiting").catch(() => false);
   return c.json(squadRowToRecord(row!), 201);
 });
 
@@ -3375,7 +3400,7 @@ app.patch("/api/channels/:slug/squads/:name", async (c) => {
     .bind(title, description, leader, JSON.stringify(members), now, slug, name)
     .run();
   const row = await loadSquadRow(c.env.DB, slug, name);
-  await insertSystemStatus(c.env, slug, `squad @${name} updated`).catch(() => false);
+  await insertSystemStatus(c.env, slug, `squad @${name} updated`, "waiting").catch(() => false);
   return c.json(squadRowToRecord(row!));
 });
 
@@ -3400,7 +3425,7 @@ app.delete("/api/channels/:slug/squads/:name", async (c) => {
   await c.env.DB.prepare("DELETE FROM channel_squads WHERE channel_slug = ? AND name = ?")
     .bind(slug, name)
     .run();
-  await insertSystemStatus(c.env, slug, `squad @${name} deleted`).catch(() => false);
+  await insertSystemStatus(c.env, slug, `squad @${name} deleted`, "waiting").catch(() => false);
   return c.json({ ok: true, squad: squadRowToRecord(existing) });
 });
 
@@ -3567,7 +3592,7 @@ app.post("/api/channels/:slug/tasks", async (c) => {
     .run();
   const id = Number(result.meta.last_row_id);
   const row = await loadTaskRow(c.env.DB, slug, id);
-  await insertSystemStatus(c.env, slug, `task #${id} created: ${title}`).catch(() => false);
+  await insertSystemStatus(c.env, slug, `task #${id} created: ${title}`, "waiting").catch(() => false);
   return c.json(taskRowToRecord(row!), 201);
 });
 
@@ -3592,7 +3617,7 @@ app.patch("/api/channels/:slug/tasks/:id", async (c) => {
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body) return c.json(errorBody("bad_request", "json body required"), 400);
 
-  const state = body.state === undefined ? existing.state : typeof body.state === "string" && TASK_STATES.includes(body.state) ? body.state : null;
+  const state = body.state === undefined ? existing.state : isTaskState(body.state) ? body.state : null;
   if (state === null) {
     return c.json(errorBody("bad_request", "state must be triage|backlog|assigned|in_progress|needs_review|done|blocked"), 400);
   }
@@ -3643,7 +3668,7 @@ app.patch("/api/channels/:slug/tasks/:id", async (c) => {
     .bind(title, desc, state, nextAssigneeName, nextAssigneeKind, priority, JSON.stringify(labels), now, completedAt, slug, id)
     .run();
   const row = await loadTaskRow(c.env.DB, slug, id);
-  await insertSystemStatus(c.env, slug, `task #${id} ${state}`).catch(() => false);
+  await insertSystemStatus(c.env, slug, `task #${id} ${state}`, statusStateForTask(state)).catch(() => false);
   return c.json(taskRowToRecord(row!));
 });
 
