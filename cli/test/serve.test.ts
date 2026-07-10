@@ -537,9 +537,14 @@ describe("builtin runner", () => {
   test("builtin runner prompt includes CLI upgrade notice and asks the user before continuing", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
+    // prompt 里只有 context 文件路径（#120：argv 对同机任意用户可见，不放正文/charter）。
+    // 升级提示随 context 文件送达模型，趁 runner 还在跑时读出来断言。
+    let ctxFromFile: Record<string, unknown> = {};
     let prompt = "";
     const runProcess: RunnerProcess = async (args) => {
       prompt = String(args.at(-1));
+      const m = prompt.match(/(\/[^\s]*\.json)/);
+      if (m) ctxFromFile = JSON.parse(readFileSync(m[0], "utf8"));
       const out = args[args.indexOf("-o") + 1]!;
       writeFileSync(out, "I will ask first.\n");
       return { code: 0, stdout: `session id: ${uuid(7)}\n`, stderr: "" };
@@ -565,7 +570,9 @@ describe("builtin runner", () => {
       },
     });
 
-    const ctx = JSON.parse(prompt);
+    // argv 里只有路径，没有正文
+    expect(prompt).not.toContain("wake up");
+    const ctx = ctxFromFile as { cli_upgrade: { message: string } };
     expect(ctx.cli_upgrade).toMatchObject({
       installed_version: "0.2.73",
       action_required: "ask_user",

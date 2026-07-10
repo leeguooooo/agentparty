@@ -58,9 +58,21 @@ export class WakeBlockedError extends Error {
 // 放弃通告都发不出去（网络/loop guard 熔断）。此时既没送达也没宣告，继续跑就是静默丢 @。
 export const EXIT_WAKE_UNANNOUNCED = 1;
 
+/** 传给 builtin runner 的提示：只给路径，不给正文（#120）。 */
+function wakePrompt(contextFile: string): string {
+  return (
+    `你在 AgentParty 频道里被 @ 了。唤醒上下文是一个 JSON 文件：${contextFile}\n` +
+    `先读它（含 channel / seq / sender / body / mentions / charter / recent），再动手。\n` +
+    `${PROTOCOL_REMINDER}`
+  );
+}
+
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // 有界重放（#198）：同一条 seq 连续送达失败到顶就响亮放弃，既不无限重放也不静默丢弃
+// env 里保留的正文上限。完整正文走 stdin 与 context file。
+const AP_BODY_MAX = 4_000;
+
 const DEFAULT_MAX_WAKE_ATTEMPTS = 3;
 const DEFAULT_WAKE_RETRY_DELAY_MS = 500;
 
@@ -346,7 +358,10 @@ async function defaultRun(
       AP_SEQ: String(frame.seq),
       AP_SENDER: frame.sender.name,
       AP_OWNER: frame.sender.owner ?? "",
-      AP_BODY: body,
+      // env 也会被同一 unix 用户下的兄弟 agent 读到（`ps -E`），而「一机多 agent」是推荐拓扑。
+      // 完整正文走 stdin（不进 ps）与 AP_CONTEXT_FILE（0700）；env 里只留一个可读的摘要。
+      AP_BODY: body.length > AP_BODY_MAX ? body.slice(0, AP_BODY_MAX) : body,
+      AP_BODY_TRUNCATED: body.length > AP_BODY_MAX ? "1" : "0",
       AP_MENTIONS: frame.mentions.join(","),
       AP_SELF: ctx.self,
       AP_REPLY_TO: String(frame.seq),
@@ -749,7 +764,14 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
     const repoCwd = await ensureRepo(opts, env);
     const cwd = opts.cwd ?? repoCwd ?? opts.workdir;
     const contextFile = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null);
-    const prompt = readFileSync(contextFile, "utf8");
+    // 绝不把 context JSON 当 argv 传（#120）：argv 对同机任意用户可见（`ps -axww`），
+    // 一条私有频道消息的正文、charter、最近 20 条上下文就全泄漏了。
+    // 只传 0700 私有目录里的文件路径——protocol_reminder 本来就叫模型「先读本文件」。
+    //
+    // 顺带证伪 issue 里「大消息 E2BIG」那半：macOS 上 argv 单条到 ~2MB 才 E2BIG，
+    // 而最坏 context ≈ 230KB（BODY_LIMIT 100KB + CHARTER_LIMIT 16KB + recent 20×400B）。
+    // 当前限额下炸不了；真正当下就成立的是上面这条泄漏。
+    const prompt = wakePrompt(contextFile);
 
     // resume 非零退出**不能**再 cold-start 重跑（#206 门禁 P1②）：
     // 那次 resume 可能已经执行了模型、push 过、开过 PR，只是最后一步非零。
