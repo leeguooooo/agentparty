@@ -175,6 +175,10 @@ export interface TaskRecord {
   labels: string[];
   parent_id: number | null;
   anchor_seqs: number[];
+  /** 该任务声明占用的代码/文档作用域（#204）；conflicts 判定与派生 claim 的 scope 都来自这里 */
+  scope: string[];
+  /** state=blocked 时的结构化阻塞原因（#204）；其他状态为 null */
+  blocked_reason: string | null;
   completion_artifact: unknown | null;
   workflow_id: string | null;
   created_at: number;
@@ -576,8 +580,16 @@ export interface HostSummary {
 
 export interface ClaimSummary {
   seq: number;
+  /**
+   * claim 的新身份（#204）：任务台账派生的 claim = 对应 task 的 id；消息折叠派生的历史 claim（unlinked）无 task，为 null。
+   * owner+scope 拼出的 claimKey 不再是身份——同一 task 中途改 scope 仍是同一条 claim，不再裂成孤儿。
+   */
+  task_id: number | null;
   owner: string;
+  /** StatusState 口径的状态；task 派生时由 taskStateToStatusState(task.state) 映射得到 */
   state: StatusState;
+  /** 精确的任务台账状态（#204）；消息折叠派生的 claim 无对应 task 为 null，不丢失 assigned/in_progress/needs_review 的区分 */
+  task_state: TaskState | null;
   scope: string[];
   note: string | null;
   blocked_reason: string | null;
@@ -629,6 +641,8 @@ export interface HostBoard {
   blockers: ClaimSummary[];
   conflicts: ConflictSummary[];
   decisions: DecisionSummary[];
+  /** 历史消息里没有对应 task 的 status claim（#204 legacy 段）：按 seq 去重排序、附转换命令，不静默丢弃 */
+  unlinked_claims: ClaimSummary[];
   recommended_actions: RecommendedAction[];
 }
 
@@ -660,6 +674,25 @@ export function summarizeHosts(presence: PresenceEntry[], now: number): HostSumm
     });
 }
 
+// TaskState → StatusState 映射（#204）：host board 的 claim 用 StatusState 口径显示，而任务台账用 TaskState。
+// 活跃三态（assigned/in_progress/needs_review）视作 working，blocked/done 直通，triage/backlog 视作 waiting（待命/未开工）。
+// 精确 TaskState 另存于 claim.task_state，映射不丢信息。
+export function taskStateToStatusState(state: TaskState): StatusState {
+  switch (state) {
+    case "blocked":
+      return "blocked";
+    case "done":
+      return "done";
+    case "assigned":
+    case "in_progress":
+    case "needs_review":
+      return "working";
+    case "triage":
+    case "backlog":
+      return "waiting";
+  }
+}
+
 function claimKey(status: StatusEvent): string {
   return `${status.owner}\0${status.scope.join("\0")}`;
 }
@@ -667,8 +700,10 @@ function claimKey(status: StatusEvent): string {
 function claimFrom(seq: number, status: StatusEvent): ClaimSummary {
   return {
     seq,
+    task_id: null,
     owner: status.owner,
     state: status.state,
+    task_state: null,
     scope: status.scope,
     note: null,
     blocked_reason: status.blocked_reason,
@@ -868,16 +903,78 @@ export function recommendHostActions(
   return actions;
 }
 
+// #204：任务台账（channel_tasks）→ claim。claim 的身份 = task.id；owner = assignee（conflicts 按 assignee 判定），
+// 无 assignee 的任务（如无人认领的 blocked）回退 created_by 以保证 owner 非空。scope/blocked_reason 直接取自 task。
+function taskToClaim(task: TaskRecord): ClaimSummary {
+  return {
+    seq: task.id,
+    task_id: task.id,
+    owner: task.assignee?.name ?? task.created_by,
+    state: taskStateToStatusState(task.state),
+    task_state: task.state,
+    scope: task.scope,
+    note: task.blocked_reason,
+    blocked_reason: task.blocked_reason,
+    summary_seq: null,
+    updated_at: task.updated_at,
+    workflow: null,
+  };
+}
+
+// open_claims：活跃且有 assignee 的任务。claim 身份 = task id，故同一 task 改 scope 仍是同一条，不再裂成孤儿。
+const OPEN_CLAIM_STATES: readonly TaskState[] = ["assigned", "in_progress", "needs_review"];
+
+function openClaimsFromTasks(tasks: TaskRecord[]): ClaimSummary[] {
+  return tasks
+    .filter((task) => task.assignee !== null && OPEN_CLAIM_STATES.includes(task.state))
+    .map(taskToClaim)
+    .sort((a, b) => b.seq - a.seq);
+}
+
+function blockersFromTasks(tasks: TaskRecord[]): ClaimSummary[] {
+  return tasks
+    .filter((task) => task.state === "blocked")
+    .map(taskToClaim)
+    .sort((a, b) => b.seq - a.seq);
+}
+
+// unlinked（legacy）段（#204）：消息折叠出的 openClaims 里，没有任何 task 的 anchor_seqs 指向其 seq 的那些。
+// 「有对应 task」判定按 seq（anchor 命中），不用 owner+scope 拼 claimKey——这正是要修的影子台账根因：
+// 一个改过 scope 的 claim 用 claimKey 匹配会误判成「另一条」。去重与排序也按 seq（claim 的稳定标识），
+// 不用 claimKey：claimKey 会把同 owner+scope、不同 seq 的两条误并成一条、并按字符串序打乱顺序。
+function unlinkedClaimsFromMessages(messageOpenClaims: ClaimSummary[], tasks: TaskRecord[]): ClaimSummary[] {
+  const anchoredSeqs = new Set<number>();
+  for (const task of tasks) {
+    for (const seq of task.anchor_seqs) anchoredSeqs.add(seq);
+  }
+  const bySeq = new Map<number, ClaimSummary>();
+  for (const claim of messageOpenClaims) {
+    if (anchoredSeqs.has(claim.seq)) continue;
+    bySeq.set(claim.seq, claim);
+  }
+  return [...bySeq.values()].sort((a, b) => b.seq - a.seq);
+}
+
 export function buildHostBoard(
   channel: string,
   presence: PresenceEntry[],
   messages: MsgFrame[],
+  tasks: TaskRecord[] = [],
   now = Date.now(),
   options: HostBoardOptions = {},
 ): HostBoard {
-  const status = summarizeStatus(messages);
+  // decisions 仍从消息折叠来；open_claims / blockers / conflicts 改由任务台账派生（#204）。
+  const messageStatus = summarizeStatus(messages);
   const hosts = summarizeHosts(presence, now);
-  const conflicts = summarizeConflicts(status.openClaims);
+  const openClaims = openClaimsFromTasks(tasks);
+  const blockers = blockersFromTasks(tasks);
+  const conflicts = summarizeConflicts(openClaims);
+  const unlinkedClaims = unlinkedClaimsFromMessages(messageStatus.openClaims, tasks);
+  // recommendHostActions 的 loop-guard 检测靠 system status 消息里的 blocker（不是 task）；只喂 task blockers
+  // 会让 loop guard 永远看不到。故把消息里的 loop-guard system blocker 一并喂它；review-blockers 只对
+  // task blockers 生效（loop-guard blocker 的 owner=system 会被其 nonLoopBlockers 过滤掉）。
+  const loopGuardBlockers = messageStatus.blockers.filter(isLoopGuardBlocker);
+  const recommendBlockers = [...blockers, ...loopGuardBlockers];
   return {
     schema: "agentparty.v1",
     type: "host_board",
@@ -885,11 +982,12 @@ export function buildHostBoard(
     generated_at: now,
     last_seq: messages.at(-1)?.seq ?? 0,
     hosts,
-    open_claims: status.openClaims,
-    blockers: status.blockers,
+    open_claims: openClaims,
+    blockers,
     conflicts,
-    decisions: status.decisions,
-    recommended_actions: recommendHostActions(channel, hosts, status.blockers, conflicts, messages, options),
+    decisions: messageStatus.decisions,
+    unlinked_claims: unlinkedClaims,
+    recommended_actions: recommendHostActions(channel, hosts, recommendBlockers, conflicts, messages, options),
   };
 }
 
