@@ -12,6 +12,7 @@
     "deploy:prod": "node scripts/deploy-dual.mjs prod",
     "deploy:xdream": "node scripts/deploy-dual.mjs xdream",
     "deploy:dual": "node scripts/deploy-dual.mjs",
+    "verify:dual-deployment": "node scripts/verify-dual-deployment.mjs",
     "smoke:prod": "node scripts/smoke-prod.mjs",
     "verify:remote-schema": "node scripts/verify-remote-schema.mjs",
     "verify:test-runtime": "node scripts/verify-test-runtime.mjs",

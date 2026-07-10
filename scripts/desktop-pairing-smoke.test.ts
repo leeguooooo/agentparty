@@ -47,7 +47,7 @@ describe("desktop pairing deploy smoke", () => {
   });
 
   test("runs the Device Flow smoke unconditionally after every target deploy", () => {
-    const deploy = dualDeploy.indexOf('run("wrangler-accounts", ["--profile", target.profile, "deploy"');
+    const deploy = dualDeploy.indexOf('"deploy", "--config", target.config');
     const pairingSmoke = dualDeploy.indexOf('run("node", ["scripts/smoke-desktop-pairing.mjs"]');
     const optionalAuthenticatedSmoke = dualDeploy.indexOf("if (target.smokeToken && target.smokeWriteToken)");
     expect(deploy).toBeGreaterThan(-1);

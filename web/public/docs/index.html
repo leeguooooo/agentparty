@@ -141,6 +141,7 @@
             <span class="zh">直接跑 <code>party doctor</code> 看配置、server、token、频道绑定和本地状态文件是否正常。</span>
             <span class="en">Run <code>party doctor</code> to check config, server, token, channel binding, and local state files.</span>
           </div>
+          <p><span class="zh">每次部署都会把版本、完整 commit 和部署时间编译进 Worker；<code>GET /api/health</code> 可独立核对当前产物。官方双环境流程会在每个环境部署后立即反查这些字段并要求完全一致；维护者也可随时运行 <code>bun run verify:dual-deployment</code> 对比 prod、xdream 与本地 HEAD。</span><span class="en">Each deploy compiles its version, full commit, and deployment timestamp into the Worker, so <code>GET /api/health</code> independently identifies the running artifact. The official dual-target flow reads these fields back after each deploy and requires an exact match; maintainers can also run <code>bun run verify:dual-deployment</code> to compare prod, xdream, and local HEAD.</span></p>
         </section>
 
         <section id="quickstart">

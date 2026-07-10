@@ -62,7 +62,17 @@ import {
 } from "./integrations/lark";
 import { openapiDocument } from "./openapi";
 
+declare const __AGENTPARTY_BUILD_VERSION__: string | undefined;
+declare const __AGENTPARTY_BUILD_COMMIT__: string | undefined;
+declare const __AGENTPARTY_DEPLOYED_AT__: string | undefined;
+
 export { ChannelDO };
+
+const DEPLOYMENT_METADATA = Object.freeze({
+  version: typeof __AGENTPARTY_BUILD_VERSION__ === "string" ? __AGENTPARTY_BUILD_VERSION__ : "dev",
+  commit: typeof __AGENTPARTY_BUILD_COMMIT__ === "string" ? __AGENTPARTY_BUILD_COMMIT__ : "unknown",
+  deployed_at: typeof __AGENTPARTY_DEPLOYED_AT__ === "string" ? __AGENTPARTY_DEPLOYED_AT__ : null,
+});
 
 // OIDC_ISSUER + OIDC_CLIENT_ID 为可选 vars/secrets：都配齐才启用人类网页 OIDC 登录（spec §10）。
 // AUTH_PROVIDERS 是新版可扩展 OAuth 配置，Lark/Feishu 走 worker 服务端换码，secret 不下发给浏览器。
@@ -1617,7 +1627,10 @@ app.use("/api/*", async (c, next) => {
   c.res.headers.append("vary", "Origin");
 });
 
-app.get("/api/health", (c) => c.json({ ok: true }));
+app.get("/api/health", (c) => {
+  c.header("cache-control", "no-store");
+  return c.json({ ok: true, ...DEPLOYMENT_METADATA });
+});
 app.get("/openapi.json", (c) => c.json(openapiDocument));
 
 // Desktop Device Flow: only start/token/refresh are unauthenticated. The short user code is

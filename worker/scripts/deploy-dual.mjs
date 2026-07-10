@@ -1,5 +1,6 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { deploymentDefineArgs, verifyDeploymentMetadata } from "./deployment-metadata.mjs";
 
 function smokeBaseFromConfig(config) {
   const text = readFileSync(config, "utf8");
@@ -39,7 +40,16 @@ function run(cmd, args, options = {}) {
   }
 }
 
-function deployTarget(name) {
+const trackedChanges = execFileSync("git", ["status", "--porcelain", "--untracked-files=no"], { encoding: "utf8" }).trim();
+if (trackedChanges !== "") throw new Error("refusing to deploy tracked, uncommitted changes");
+
+const deploymentMetadata = {
+  version: JSON.parse(readFileSync("../desktop/package.json", "utf8")).version,
+  commit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+  deployed_at: new Date().toISOString(),
+};
+
+async function deployTarget(name) {
   const target = targets[name];
   if (!target) throw new Error(`unknown deploy target: ${name}`);
 
@@ -53,7 +63,13 @@ function deployTarget(name) {
       AGENTPARTY_WRANGLER_CONFIG: target.config,
     },
   });
-  run("wrangler-accounts", ["--profile", target.profile, "deploy", "--config", target.config], { env });
+  run("wrangler-accounts", [
+    "--profile", target.profile,
+    "deploy", "--config", target.config,
+    ...deploymentDefineArgs(deploymentMetadata),
+  ], { env });
+  await verifyDeploymentMetadata(target.smokeBase, deploymentMetadata);
+  console.error(`Verified ${name} deployment: ${deploymentMetadata.version} ${deploymentMetadata.commit}`);
   run("node", ["scripts/smoke-desktop-pairing.mjs"], {
     env: { ...env, AGENTPARTY_SMOKE_BASE: target.smokeBase },
   });
@@ -75,4 +91,4 @@ const requested = process.argv.slice(2);
 const names = requested.length > 0 ? requested : ["prod", "xdream"];
 
 run("bun", ["run", "build:web"]);
-for (const name of names) deployTarget(name);
+for (const name of names) await deployTarget(name);
