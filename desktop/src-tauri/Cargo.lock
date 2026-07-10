@@ -23,7 +23,9 @@ dependencies = [
 name = "agentparty-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "keyring",
+ "minisign-verify",
  "serde",
  "serde_json",
  "sha2",

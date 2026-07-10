@@ -307,6 +307,9 @@ pub fn run() {
 mod tests {
     use std::{cell::RefCell, collections::HashMap};
 
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use minisign_verify::{PublicKey, Signature};
+
     use super::{
         credential_account_for_origin, migrate_legacy_credential, parse_stored_credential,
         tray_action, CredentialBackend, ExitGuard, TrayAction, CREDENTIAL_ACCOUNT,
@@ -348,6 +351,37 @@ mod tests {
 
         guard.begin_quit();
         assert!(guard.is_quitting());
+    }
+
+    #[test]
+    fn configured_updater_key_verifies_the_v2_probe() {
+        const PROBE: &[u8] = b"AgentParty updater v2 key probe\n";
+        const PROBE_SIGNATURE_B64: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTaFhBUlJFam9nMURVUGRiTDRXRTVTUU44amViWVhJUGQvNVRxN09ZK01reFc3aldyZzNNeTk4WmZ3Z2J6Wkp1RmxyZUtKOG5BdHo4cmxXaWRYYzhpOGpKNTVDN3RNZ1FVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNjk5NTgwCWZpbGU6dG1wLjNpNHNNUHZQZU4KVSt6YnFHSk1pUEs3cnFCSUZ3MW53cDkrNVBGTHMxMWU4Z3hXM1dqVjE5Y3lrWCt5OE1MMWhzVlk0WVdZbjZUYXBqRk9vdlJSTTBwSHdpQkJWNWlzRFE9PQo=";
+
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid Tauri config");
+        let encoded_public_key = config["plugins"]["updater"]["pubkey"]
+            .as_str()
+            .expect("configured updater public key");
+        let public_key_text = String::from_utf8(
+            STANDARD
+                .decode(encoded_public_key)
+                .expect("base64-encoded updater public key"),
+        )
+        .expect("UTF-8 minisign public key");
+        let public_key = PublicKey::decode(&public_key_text).expect("parseable updater public key");
+
+        let signature_text = String::from_utf8(
+            STANDARD
+                .decode(PROBE_SIGNATURE_B64)
+                .expect("base64-encoded updater signature"),
+        )
+        .expect("UTF-8 minisign signature");
+        let signature = Signature::decode(&signature_text).expect("parseable updater signature");
+
+        public_key
+            .verify(PROBE, &signature, false)
+            .expect("v2 updater key verifies its probe signature");
     }
 
     #[test]
