@@ -11,6 +11,7 @@ import {
   loadAutostartSetting,
   shouldDismissDesktopSettings,
   type DesktopSettingsRuntime,
+  updateDesktopSettingsFocus,
 } from "./DesktopSettings";
 
 const translations: Record<string, string> = {
@@ -152,5 +153,17 @@ describe("desktop settings dismissal", () => {
     expect(isDesktopSettingsOutsideClick(root, outside)).toBe(true);
     expect(isDesktopSettingsOutsideClick(root, inside)).toBe(false);
     expect(isDesktopSettingsOutsideClick(null, outside)).toBe(false);
+  });
+
+  test("moves focus into the popover and restores it for keyboard dismissal", () => {
+    const calls: string[] = [];
+    const control = { focus: () => calls.push("control") };
+    const trigger = { focus: () => calls.push("trigger") };
+
+    updateDesktopSettingsFocus(true, false, false, control, trigger);
+    updateDesktopSettingsFocus(false, true, true, control, trigger);
+    updateDesktopSettingsFocus(false, true, false, control, trigger);
+
+    expect(calls).toEqual(["control", "trigger"]);
   });
 });

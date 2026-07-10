@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import {
   isAutostartEnabled,
   isDesktopRuntime,
@@ -47,15 +47,31 @@ export function isDesktopSettingsOutsideClick(
   return root !== null && !root.contains(target);
 }
 
+interface FocusTarget {
+  focus(): void;
+}
+
+export function updateDesktopSettingsFocus(
+  open: boolean,
+  wasOpen: boolean,
+  restoreFocus: boolean,
+  control: FocusTarget | null,
+  trigger: FocusTarget | null,
+): void {
+  if (open && !wasOpen) control?.focus();
+  else if (!open && wasOpen && restoreFocus) trigger?.focus();
+}
+
 interface PanelProps {
   enabled: boolean;
   pending: boolean;
   error: boolean;
   t: TFunc;
   onToggle(): void;
+  switchRef?: RefObject<HTMLButtonElement | null>;
 }
 
-export function DesktopSettingsPanel({ enabled, pending, error, t, onToggle }: PanelProps) {
+export function DesktopSettingsPanel({ enabled, pending, error, t, onToggle, switchRef }: PanelProps) {
   return (
     <section
       id="desktop-settings-panel"
@@ -70,6 +86,7 @@ export function DesktopSettingsPanel({ enabled, pending, error, t, onToggle }: P
           <small>{t("DesktopSettings.autostart.description")}</small>
         </span>
         <button
+          ref={switchRef}
           type="button"
           className={`desktop-settings-switch${enabled ? " is-on" : ""}`}
           role="switch"
@@ -99,6 +116,10 @@ export function DesktopSettings({ runtime = defaultRuntime }: Props) {
   const [pending, setPending] = useState(desktop);
   const [error, setError] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const switchRef = useRef<HTMLButtonElement | null>(null);
+  const wasOpenRef = useRef(false);
+  const restoreFocusRef = useRef(false);
 
   useEffect(() => {
     if (!desktop) return;
@@ -115,10 +136,14 @@ export function DesktopSettings({ runtime = defaultRuntime }: Props) {
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (shouldDismissDesktopSettings(event)) setOpen(false);
+      if (shouldDismissDesktopSettings(event)) {
+        restoreFocusRef.current = true;
+        setOpen(false);
+      }
     };
     const onPointerDown = (event: PointerEvent) => {
       if (event.target instanceof Node && isDesktopSettingsOutsideClick(rootRef.current, event.target)) {
+        restoreFocusRef.current = false;
         setOpen(false);
       }
     };
@@ -128,6 +153,18 @@ export function DesktopSettings({ runtime = defaultRuntime }: Props) {
       document.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("pointerdown", onPointerDown);
     };
+  }, [open]);
+
+  useLayoutEffect(() => {
+    updateDesktopSettingsFocus(
+      open,
+      wasOpenRef.current,
+      restoreFocusRef.current,
+      switchRef.current,
+      triggerRef.current,
+    );
+    wasOpenRef.current = open;
+    if (!open) restoreFocusRef.current = false;
   }, [open]);
 
   if (!desktop) return null;
@@ -147,13 +184,18 @@ export function DesktopSettings({ runtime = defaultRuntime }: Props) {
   return (
     <div className="desktop-settings" ref={rootRef}>
       <button
+        ref={triggerRef}
         type="button"
         className="desktop-settings-trigger"
         aria-label={t("DesktopSettings.control.label")}
         title={t("DesktopSettings.control.label")}
         aria-expanded={open}
+        aria-haspopup="dialog"
         aria-controls="desktop-settings-panel"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => setOpen((current) => {
+          restoreFocusRef.current = current;
+          return !current;
+        })}
       >
         <span className="ap-sprite ap-sprite--settings" aria-hidden="true" />
       </button>
@@ -164,6 +206,7 @@ export function DesktopSettings({ runtime = defaultRuntime }: Props) {
           error={error}
           t={t}
           onToggle={toggleAutostart}
+          switchRef={switchRef}
         />
       )}
     </div>
