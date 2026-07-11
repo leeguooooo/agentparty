@@ -63,7 +63,15 @@ export const ONCE_CODEX_ADVISORY =
 export const ONCE_REARM_ADVISORY =
   "note: --once is single-shot. Re-arm it after handling this wake, or use `party serve` for Codex/unknown harnesses.";
 
+/** Claude Code：后台任务退出即唤醒同一会话，watch --once 在它上面正常工作。 */
+export function isClaudeCodeEnv(env: Record<string, string | undefined> = process.env): boolean {
+  return env.CLAUDECODE !== undefined || Object.keys(env).some((key) => key.startsWith("CLAUDE_CODE_"));
+}
+
 export function isCodexRuntimeEnv(env: Record<string, string | undefined> = process.env): boolean {
+  // Claude Code 优先短路（#175）：它装 codex 插件/companion 时 env 里也会有 CODEX_* 变量，
+  // 但它的后台退出会唤醒——那条「Codex 不会唤醒你、改用 serve」的警告对它是反的。
+  if (isClaudeCodeEnv(env)) return false;
   return Object.keys(env).some((key) => key === "CODEX" || key.startsWith("CODEX_") || key.startsWith("OPENAI_CODEX"));
 }
 

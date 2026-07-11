@@ -709,7 +709,17 @@ describe("cli subprocess", () => {
       join(home, "config.json"),
       JSON.stringify({ server: server.url, token: "ap_tok" }),
     );
-    const r = await runCli(["watch", "dev", "--once", "--mentions-only", "--timeout", "1"], { CODEX_CI: "1" });
+    // 真正模拟 Codex 环境：剥掉测试宿主（可能是 Claude Code）的 harness 标记，否则
+    // 子进程继承 CLAUDECODE，isCodexRuntimeEnv 会短路（#175），警告就不打了。
+    const clearClaudeCode = Object.fromEntries(
+      Object.keys(process.env)
+        .filter((k) => k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_"))
+        .map((k) => [k, undefined as string | undefined]),
+    );
+    const r = await runCli(
+      ["watch", "dev", "--once", "--mentions-only", "--timeout", "1"],
+      { ...clearClaudeCode, CODEX_CI: "1" },
+    );
     expect(r.code).toBe(2);
     expect(r.stdout.trim()).toBe("TIMEOUT");
     expect(r.stderr).toContain("Codex CLI does not resume");
