@@ -155,7 +155,7 @@ function writeSeenCharterRev(slug: string, rev: number) {
   }
 }
 
-interface RoleDraft {
+export interface RoleDraft {
   role: CollaborationRole;
   responsibility: string;
 }
@@ -337,6 +337,46 @@ function selfReportedRoles(
   return roles;
 }
 
+interface UnassignedMember {
+  name: string;
+  display: string;
+  accountLabel: string;
+  owner: string | null;
+  kind: Sender["kind"];
+}
+
+// issue #169：分工面板此前只收录「已分配角色」（roles）+「self-report 过角色」
+// （presence role_source==="self"）的成员——已连接但从没声明过角色的 agent 会被
+// 整条跳过，界面上直接消失（"频道四个 agent 分工面板只有两个"）。这里把他们也
+// 收进名单，用「未分工」占位展示，而不是从 roster 里彻底丢失。
+// 名单来源取 presence（当前/最近连接过）∪ identities（channel 曾经见过的身份）
+// 的并集，与 PresenceBar 的 names 并集口径一致；已在 roles/selfRoles 里出现的
+// 名字（assigned 或 self）不重复收录。
+function unassignedMembers(
+  assignedRoles: ChannelRoleInfo[],
+  selfRoles: ChannelRoleInfo[],
+  presence: Record<string, PresenceEntry>,
+  identities: ChannelIdentity[],
+  t: TFunc,
+): UnassignedMember[] {
+  const known = new Set([...assignedRoles, ...selfRoles].map((role) => role.name));
+  const identityByName = new Map(identities.map((identity) => [identity.name, identity]));
+  const names = new Set([...Object.keys(presence), ...identities.map((identity) => identity.name)]);
+  const members: UnassignedMember[] = [];
+  for (const name of names) {
+    if (name === "system" || known.has(name)) continue;
+    const entry = presence[name];
+    const identity = identityByName.get(name);
+    const kind = entry?.kind ?? identity?.kind ?? "agent";
+    const account = entry?.account ?? identity?.account;
+    const display = identity?.display ?? name;
+    const accountLabel = account && account !== "" ? account : kind === "human" ? display : t("Channel.roles.unowned");
+    const owner = account && account !== display ? account : null;
+    members.push({ name, display, accountLabel, owner, kind });
+  }
+  return members;
+}
+
 function CharterBanner({
   charter,
   open,
@@ -422,24 +462,7 @@ function CharterBanner({
   );
 }
 
-function DivisionBoard({
-  canModerate,
-  slug,
-  roles,
-  roleDrafts,
-  roleError,
-  roleSaving,
-  roleName,
-  roleDraft,
-  identities,
-  presence,
-  onRoleDraft,
-  onNewRoleName,
-  onNewRoleDraft,
-  onSaveRole,
-  onDeleteRole,
-  forceOpen = false,
-}: {
+export interface DivisionBoardProps {
   canModerate: boolean;
   slug: string;
   roles: ChannelRoleInfo[];
@@ -456,7 +479,26 @@ function DivisionBoard({
   onSaveRole: (name: string, draft: RoleDraft) => void;
   onDeleteRole: (name: string) => void;
   forceOpen?: boolean;
-}) {
+}
+
+export function DivisionBoard({
+  canModerate,
+  slug,
+  roles,
+  roleDrafts,
+  roleError,
+  roleSaving,
+  roleName,
+  roleDraft,
+  identities,
+  presence,
+  onRoleDraft,
+  onNewRoleName,
+  onNewRoleDraft,
+  onSaveRole,
+  onDeleteRole,
+  forceOpen = false,
+}: DivisionBoardProps) {
   const t = useT();
   const [selfHintOpen, setSelfHintOpen] = useState(false);
   const [selfHintCopied, setSelfHintCopied] = useState(false);
@@ -478,14 +520,21 @@ function DivisionBoard({
   };
   const identityByName = new Map(identities.map((identity) => [identity.name, identity]));
   const selfRoles = selfReportedRoles(roles, presence, identities);
+  // issue #169：unassigned 也并入同一份 roleViews，保证 role-account-group 按
+  // accountLabel 分组、渲染时 roster 完整——但 header 上的「N 个分工」徽标只数
+  // 「已声明角色」（assigned + self），语义与 Channel.tools.roles 按钮上的
+  // structuredRoleCount 徽标保持一致，不把「未分工」的人也算进"分工数"里。
+  const unassigned = unassignedMembers(roles, selfRoles, presence, identities, t);
+  const declaredCount = roles.length + selfRoles.length;
   const roleViews = [
-    ...roles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "assigned" as const })),
-    ...selfRoles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "self" as const })),
+    ...roles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "assigned" as const, name: role.name })),
+    ...selfRoles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "self" as const, name: role.name })),
+    ...unassigned.map((member) => ({ ...member, role: null, source: "unassigned" as const })),
   ]
     .sort(
       (a, b) =>
         a.accountLabel.localeCompare(b.accountLabel) ||
-        a.role.role.localeCompare(b.role.role) ||
+        (a.role?.role ?? "\uffff").localeCompare(b.role?.role ?? "\uffff") ||
         a.display.localeCompare(b.display),
     );
   const groups: Array<{ accountLabel: string; roles: typeof roleViews }> = [];
@@ -495,7 +544,7 @@ function DivisionBoard({
     else groups.push({ accountLabel: view.accountLabel, roles: [view] });
   }
   const roleCounts = COLLAB_ROLES
-    .map((role) => ({ role, count: roleViews.filter((item) => item.role.role === role).length }))
+    .map((role) => ({ role, count: roleViews.filter((item) => item.role?.role === role).length }))
     .filter((item) => item.count > 0);
 
   return (
@@ -506,7 +555,7 @@ function DivisionBoard({
           <p className="t-mono">{t("Channel.roles.help")}</p>
         </div>
         <div className="role-board-summary">
-          <span className="t-mono role-board-count">{t("Channel.roles.count", { count: String(roleViews.length) })}</span>
+          <span className="t-mono role-board-count">{t("Channel.roles.count", { count: String(declaredCount) })}</span>
           {roleCounts.map((item) => (
             <span key={item.role} className="t-mono role-board-role-count">
               {roleCountLabel(item.role, item.count, t)}
@@ -550,24 +599,32 @@ function DivisionBoard({
                   </span>
                 </header>
                 <div className="role-list">
-                  {group.roles.map(({ role, display, owner, accountLabel, kind, source }) => {
-                    const draftForRole = roleDrafts[role.name] ?? roleDraftFrom(role);
+                  {group.roles.map(({ role, display, owner, accountLabel, kind, source, name }) => {
+                    // issue #169：role 为 null 代表「已连接/曾出现过，但从没声明过角色」的
+                    // 未分工成员——只读展示占位文案，不接可编辑的 role-select/input（那需要一个
+                    // 真实的 ChannelRoleInfo；moderator 要给他分工，走下面的「添加」新建行）。
+                    const draftForRole = role !== null ? roleDrafts[role.name] ?? roleDraftFrom(role) : null;
                     const title = [
-                      role.name !== display ? role.name : null,
+                      name !== display ? name : null,
                       t("Composer.owner", { account: accountLabel }),
                       t(`Composer.kind.${kind}`),
-                      t("Composer.role", { role: role.role }),
-                      role.responsibility ? t("Composer.responsibility", { responsibility: role.responsibility }) : null,
+                      role !== null ? t("Composer.role", { role: role.role }) : null,
+                      role?.responsibility ? t("Composer.responsibility", { responsibility: role.responsibility }) : null,
                     ].filter((part): part is string => part !== null).join("\n");
                     return (
-                      <div key={role.name} className="role-row">
+                      <div key={name} className="role-row">
                         <div className="role-person" title={title}>
                           <span className="role-person-name t-mono">{display}</span>
                           <span className={`role-kind role-kind--${kind}`}>{t(`Composer.kind.${kind}`)}</span>
                           {source === "self" && <span className="role-source t-mono">{t("Channel.roles.selfReported")}</span>}
+                          {source === "unassigned" && (
+                            <span className="role-source role-source--unassigned t-mono">{t("Channel.roles.unassigned")}</span>
+                          )}
                           {owner !== null && <span className="role-owner t-mono">{owner}</span>}
                         </div>
-                        {canModerate ? (
+                        {role === null || draftForRole === null ? (
+                          <span className="role-text role-text--unassigned">{t("Channel.roles.noRoleYet")}</span>
+                        ) : canModerate ? (
                           <>
                             <select
                               className="role-select t-mono"

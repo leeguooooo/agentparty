@@ -766,6 +766,12 @@
   border-color: var(--d-blue);
   background: var(--d-blue-soft);
 }
+/* issue #169：未分工占位——已连接但没声明角色的成员，视觉上与「自报」蓝拉开，避免误读成已有分工 */
+.role-source--unassigned {
+  color: var(--t-dim);
+  border-color: var(--t-faint);
+  background: var(--t-panel);
+}
 .role-select,
 .role-input,
 .role-name-input {
@@ -784,6 +790,9 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.role-text--unassigned {
+  font-style: italic;
 }
 
 /* ---- 新建频道 ---- */
