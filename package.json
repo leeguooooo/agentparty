@@ -3,7 +3,7 @@
   "license": "BUSL-1.1",
   "private": true,
   "scripts": {
-    "check:scripts": "sh -n install.sh && sh -n install-desktop.sh && bun scripts/check-migration-numbering.ts && bun test scripts/release-version.test.ts scripts/desktop-update-manifest.test.ts scripts/desktop-release-workflow.test.ts scripts/apple-signing-mode.test.ts scripts/configure-apple-release.test.ts scripts/prepare-desktop-sidecar.test.ts scripts/desktop-production-acceptance.test.ts scripts/desktop-pairing-smoke.test.ts scripts/install.test.ts scripts/check-aggregate.test.ts scripts/ci-paths-filter.test.ts scripts/check-migration-numbering.test.ts && bunx tsc --project scripts/tsconfig.json",
+    "check:scripts": "sh -n install.sh && sh -n install-desktop.sh && bun scripts/check-migration-numbering.ts && bun test scripts/release-version.test.ts scripts/desktop-update-manifest.test.ts scripts/desktop-release-workflow.test.ts scripts/apple-signing-mode.test.ts scripts/configure-apple-release.test.ts scripts/prepare-desktop-sidecar.test.ts scripts/desktop-production-acceptance.test.ts scripts/desktop-pairing-smoke.test.ts scripts/install.test.ts scripts/install-desktop.test.ts scripts/check-aggregate.test.ts scripts/ci-paths-filter.test.ts scripts/check-migration-numbering.test.ts && bunx tsc --project scripts/tsconfig.json",
     "check:cli": "cd cli && bun test && bunx tsc --noEmit",
     "check:shared": "cd shared && bunx tsc --noEmit",
     "check:web": "cd web && bun test && bunx tsc --noEmit && bunx vite build",

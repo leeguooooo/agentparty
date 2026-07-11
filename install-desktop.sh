@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# agentparty install-desktop.sh — macOS 桌面端一键安装器（#248）
+# agentparty install-desktop.sh — macOS production 桌面端安装器（#248）
 # 用法:
 #   curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install-desktop.sh | sh
 # 环境变量:
@@ -7,18 +7,15 @@
 #   AGENTPARTY_MIRROR        下载 base url，默认 github releases。GFW/内网兜底。
 #   AGENTPARTY_APP_DIR       安装目录，默认 /Applications（无写权时回落 $HOME/Applications）。
 #
-# 为什么需要这个脚本（#248）:
-#   当前 desktop 是「未公证 preview」——没有 Apple Developer ID 证书，.app 未做 Developer ID 签名。
-#   macOS Gatekeeper 会把「未签名、带 quarantine」的 app 当成损坏/来路不明，双击直接拒绝甚至运行时挪进废纸篓。
-#   本脚本用**不需要开发者账号**的两步让它可装可用:
-#     1) 去掉下载隔离标记 `xattr -dr com.apple.quarantine`
-#     2) ad-hoc 签名 `codesign --force --deep --sign -`（`-` = ad-hoc，免证书免账号）
-#   ad-hoc 签名后系统视其为「已签名、未公证」——不再自动 trash，可正常启动（不是 Developer ID 公证，
-#   但对自用/内测足够）。真正的公证仍需 Apple 开发者账号（见 #248 其余验收项）。
+# 本脚本只安装 Developer ID 签名并通过 Apple 公证的 production 产物。
+# preview、ad-hoc 签名、缺失公证票据或 Gatekeeper 拒绝的产物一律中止；不会移除 quarantine，
+# 也不会在用户机器上重签名应用。
 #
 # 安全:
 #   - 只装 macOS（Darwin）；其他平台直接拒绝。
-#   - sha256 强校验 .dmg（与 CI 产出的 .dmg.sha256 比对），失败即中止。
+#   - sha256 强校验 .dmg，并核对 CI 产出的签名状态元数据。
+#   - DMG 和 staging app 都通过 Developer ID、Gatekeeper 与 stapler 验证后才替换旧版本。
+#   - 替换失败时恢复原应用。
 #   - 下载失败有上限退避重试，不静默循环。
 set -eu
 
@@ -81,6 +78,9 @@ main() {
   need shasum || die "需要 shasum。"
   need hdiutil || die "需要 hdiutil（macOS 自带）。"
   need codesign || die "需要 codesign（装 Xcode Command Line Tools: xcode-select --install）。"
+  need spctl || die "需要 spctl（macOS 自带）。"
+  need xcrun || die "需要 xcrun（装 Xcode Command Line Tools: xcode-select --install）。"
+  need plutil || die "需要 plutil（macOS 自带）。"
 
   asset="$(detect_asset)"
   version="$(resolve_version)"
@@ -90,12 +90,26 @@ main() {
   tag="v$version"
   base="$MIRROR/$tag"
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"; [ -n "${mnt:-}" ] && hdiutil detach "$mnt" -quiet 2>/dev/null || true' EXIT
+  stage=""
+  backup=""
+  dst=""
+  cleanup() {
+    [ -n "${mnt:-}" ] && hdiutil detach "$mnt" -quiet 2>/dev/null || true
+    [ -n "$stage" ] && rm -rf "$stage"
+    if [ -n "$backup" ] && [ -d "$backup" ]; then
+      if [ -n "$dst" ] && [ ! -e "$dst" ]; then mv "$backup" "$dst" 2>/dev/null || true; else rm -rf "$backup"; fi
+    fi
+    rm -rf "$tmp"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' HUP INT TERM
 
   dmg="agentparty-desktop-${asset}.dmg"
+  status="agentparty-desktop-${asset}.signing-status.json"
   log "下载 $dmg …"
   fetch "$base/$dmg" "$tmp/$dmg" || die "下载 dmg 失败。"
   fetch "$base/$dmg.sha256" "$tmp/$dmg.sha256" || die "下载 sha256 失败。"
+  fetch "$base/$status" "$tmp/$status" || die "下载桌面签名状态失败。"
 
   # sha256 强校验（.sha256 首字段是 hash）
   want="$(awk '{print $1}' "$tmp/$dmg.sha256")"
@@ -103,6 +117,17 @@ main() {
   [ -n "$want" ] || die "sha256 文件为空。"
   [ "$want" = "$got" ] || die "sha256 不匹配（期望 $want，实得 $got）。已中止，未安装。"
   log "sha256 校验通过。"
+
+  notarized="$(plutil -extract notarized raw -o - "$tmp/$status" 2>/dev/null || true)"
+  distribution="$(plutil -extract distribution raw -o - "$tmp/$status" 2>/dev/null || true)"
+  auth="$(plutil -extract notarization_auth raw -o - "$tmp/$status" 2>/dev/null || true)"
+  [ "$notarized" = "true" ] || die "该版本不是 Apple 公证产物，拒绝安装 preview。"
+  [ "$distribution" = "production" ] || die "该版本未标记为 production，拒绝安装。"
+  case "$auth" in apple-id|api-key) ;; *) die "签名状态缺少合法 notarization 认证记录。" ;; esac
+
+  hdiutil verify "$tmp/$dmg" >/dev/null || die "DMG 结构校验失败。"
+  xcrun stapler validate "$tmp/$dmg" >/dev/null 2>&1 || die "DMG 缺少有效 Apple 公证票据。"
+  spctl --assess --type open --context context:primary-signature "$tmp/$dmg" >/dev/null 2>&1 || die "Gatekeeper 拒绝该 DMG。"
 
   # 挂载 dmg，取出 .app
   mnt="$(hdiutil attach "$tmp/$dmg" -nobrowse -readonly -mountrandom /tmp | awk '/\/Volumes\//{print $NF}' | tail -n1)"
@@ -117,7 +142,24 @@ main() {
     mkdir -p "$appdir"
     log "/Applications 无写权限，改装到 $appdir"
   fi
+  mkdir -p "$appdir" || die "无法创建安装目录 $appdir。"
   dst="$appdir/$APP_NAME"
+  stage="$appdir/.${APP_NAME}.new.$$"
+  backup="$appdir/.${APP_NAME}.backup.$$"
+  rm -rf "$stage" "$backup"
+  cp -R "$src" "$stage"
+
+  info="$stage/Contents/Info.plist"
+  installed_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info" 2>/dev/null || true)"
+  [ "$installed_version" = "$version" ] || die "app 版本不匹配（期望 $version，实际 ${installed_version:-unknown}）。"
+  [ -x "$stage/Contents/MacOS/party" ] || die "app 缺少可执行的内置 party sidecar。"
+  bundled_version="$("$stage/Contents/MacOS/party" --version 2>/dev/null || true)"
+  [ "$bundled_version" = "$version" ] || die "内置 party 版本不匹配。"
+  codesign --verify --deep --strict --verbose=2 "$stage" >/dev/null 2>&1 || die "Developer ID 签名校验失败。"
+  authority="$(codesign -dv --verbose=4 "$stage" 2>&1 || true)"
+  printf '%s\n' "$authority" | grep -q '^Authority=Developer ID Application:' || die "app 不是 Developer ID Application 签名。"
+  xcrun stapler validate "$stage" >/dev/null 2>&1 || die "app 缺少有效 Apple 公证票据。"
+  spctl --assess --type execute "$stage" >/dev/null 2>&1 || die "Gatekeeper 拒绝该 app。"
 
   # 若目标正在运行，先退出
   if pgrep -f "$appdir/$APP_NAME/Contents/MacOS/" >/dev/null 2>&1; then
@@ -127,21 +169,20 @@ main() {
   fi
 
   log "安装到 $dst …"
-  rm -rf "$dst"
-  cp -R "$src" "$dst"
   hdiutil detach "$mnt" -quiet 2>/dev/null || true
   mnt=""
-
-  # 免开发者账号的可用化（#248）：去隔离 + ad-hoc 签名，防 Gatekeeper 把未公证 app 当损坏/自动 trash
-  log "去除 quarantine 隔离标记…"
-  xattr -dr com.apple.quarantine "$dst" 2>/dev/null || true
-  log "ad-hoc 签名（免证书，防运行时被移入废纸篓）…"
-  codesign --force --deep --sign - "$dst" || die "ad-hoc 签名失败。"
-  codesign --verify --deep --strict "$dst" 2>/dev/null || log "警告：codesign --verify 未通过（ad-hoc 仍可运行，公证需 Apple 账号）。"
+  if [ -e "$dst" ]; then mv "$dst" "$backup" || die "无法备份现有应用。"; fi
+  if ! mv "$stage" "$dst"; then
+    [ -d "$backup" ] && mv "$backup" "$dst" 2>/dev/null || true
+    die "替换应用失败，已尝试恢复旧版本。"
+  fi
+  stage=""
+  rm -rf "$backup"
+  backup=""
 
   log "✅ 已安装：$dst"
   log "启动：open \"$dst\"    或在 Launchpad/访达里双击。"
-  log "注意：这是未公证 preview（ad-hoc 签名）。正式公证发布需 Apple 开发者账号（#248）。"
+  log "Developer ID、Apple 公证与 Gatekeeper 校验均已通过。"
 }
 
 main "$@"

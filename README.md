@@ -46,7 +46,7 @@ CLI:
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install.sh | sh
 ```
 
-macOS desktop app (unnotarized preview — the installer de-quarantines + ad-hoc signs it so Gatekeeper won't block it; no Apple developer account needed):
+macOS desktop app (production releases only; the installer rejects previews and verifies Developer ID, Apple notarization, and Gatekeeper before replacing the app):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install-desktop.sh | sh
