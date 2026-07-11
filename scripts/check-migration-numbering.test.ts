@@ -85,6 +85,30 @@ describe("analyzeMigrations (pure)", () => {
     const res = analyzeMigrations(["init.sql", "0001_a.sql"], []);
     expect(res.unnumbered).toEqual(["init.sql"]);
   });
+
+  test("a non-4-digit prefix is unnumbered (NNNN_ contract, not just any digits)", () => {
+    // #230 P2: `\d+` let 2- or 5-digit widths through; the contract is exactly NNNN_.
+    const res = analyzeMigrations(["25_bad_width.sql", "00250_too_wide.sql", "0026_ok.sql"], []);
+    expect(res.unnumbered).toEqual(["00250_too_wide.sql", "25_bad_width.sql"]);
+  });
+
+  test("renaming a grandfathered (applied) file across numbers is caught even with no new dup", () => {
+    // #230 P1: rename 0015_agent_profiles.sql -> 0099_agent_profiles.sql. Now no number
+    // collides (0015 keeps only guard_config, 0099 is unique), so the duplicate check is
+    // blind — but wrangler would re-run the renamed applied migration. missingGrandfathered
+    // catches it.
+    const renamed = GRANDFATHERED_DUPLICATES.filter((f) => f !== "0015_agent_profiles.sql").concat(
+      "0099_agent_profiles.sql",
+    );
+    const res = analyzeMigrations(renamed);
+    expect(res.forbidden).toEqual([]); // no NEW duplicate number
+    expect(res.missingGrandfathered).toEqual(["0015_agent_profiles.sql"]);
+  });
+
+  test("all grandfathered files present => missingGrandfathered empty", () => {
+    const res = analyzeMigrations([...GRANDFATHERED_DUPLICATES]);
+    expect(res.missingGrandfathered).toEqual([]);
+  });
 });
 
 describe("check-migration-numbering CLI", () => {
@@ -112,5 +136,24 @@ describe("check-migration-numbering CLI", () => {
     const r = run(["--dir", dir]);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("0015");
+  });
+
+  test("renaming an applied migration across numbers fails (no new dup, but re-run hazard)", () => {
+    // #230 P1 via CLI: the grandfather list is intact except 0015_agent_profiles.sql
+    // was renamed to a fresh unique number → no collision, but the guard must still fail.
+    const dir = makeDir(
+      GRANDFATHERED_DUPLICATES.filter((f) => f !== "0015_agent_profiles.sql").concat("0099_agent_profiles.sql"),
+    );
+    const r = run(["--dir", dir]);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("0015_agent_profiles.sql");
+  });
+
+  test("a 2-digit-width prefix fails the CLI (NNNN_ contract)", () => {
+    // #230 P2 via CLI
+    const dir = makeDir(["0001_a.sql", "25_bad_width.sql"]);
+    const r = run(["--dir", dir, "--allow", ""]);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("25_bad_width.sql");
   });
 });

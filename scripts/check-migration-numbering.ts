@@ -31,7 +31,10 @@ export const GRANDFATHERED_DUPLICATES: readonly string[] = [
   "0016_account_profiles_handle_nocase.sql",
 ];
 
-export const MIGRATION_RE = /^(\d+)_.*\.sql$/;
+// Exactly four digits: the documented contract is `NNNN_`. `\d+` would let
+// `25_bad_width.sql` or `00250_x.sql` slip through with a width that sorts
+// differently from the 4-digit files around it.
+export const MIGRATION_RE = /^(\d{4})_.*\.sql$/;
 
 export interface DuplicateGroup {
   number: number;
@@ -45,6 +48,15 @@ export interface AnalysisResult {
   forbidden: DuplicateGroup[];
   /** `.sql` files without a leading `NNNN_` migration prefix. */
   unnumbered: string[];
+  /**
+   * Grandfathered (already-applied) filenames that are no longer present in the
+   * directory. Renaming/removing an applied migration makes wrangler treat it as
+   * new and re-run it against production — so a missing grandfathered file fails
+   * the guard even though it produces no NEW duplicate number. This is the
+   * "rename an applied migration across numbers" bypass the duplicate check alone
+   * cannot see.
+   */
+  missingGrandfathered: string[];
 }
 
 export function analyzeMigrations(
@@ -52,6 +64,7 @@ export function analyzeMigrations(
   allowed: Iterable<string> = GRANDFATHERED_DUPLICATES,
 ): AnalysisResult {
   const allowSet = new Set(allowed);
+  const fileSet = new Set(filenames);
   const byNumber = new Map<number, string[]>();
   const unnumbered: string[] = [];
 
@@ -79,7 +92,9 @@ export function analyzeMigrations(
     if (!group.files.every((f) => allowSet.has(f))) forbidden.push(group);
   }
 
-  return { duplicates, forbidden, unnumbered: unnumbered.sort() };
+  const missingGrandfathered = [...allowSet].filter((f) => !fileSet.has(f)).sort();
+
+  return { duplicates, forbidden, unnumbered: unnumbered.sort(), missingGrandfathered };
 }
 
 interface CliOptions {
@@ -121,12 +136,12 @@ function main(): void {
     process.exit(2);
   }
 
-  const { duplicates, forbidden, unnumbered } = analyzeMigrations(
+  const { duplicates, forbidden, unnumbered, missingGrandfathered } = analyzeMigrations(
     entries,
     allowed,
   );
 
-  if (forbidden.length === 0 && unnumbered.length === 0) {
+  if (forbidden.length === 0 && unnumbered.length === 0 && missingGrandfathered.length === 0) {
     const note =
       duplicates.length > 0
         ? ` (${duplicates.length} grandfathered duplicate number(s) tolerated)`
@@ -146,6 +161,11 @@ function main(): void {
   }
   for (const name of unnumbered) {
     console.error(`  .sql without NNNN_ prefix: ${name}`);
+  }
+  for (const name of missingGrandfathered) {
+    console.error(
+      `  already-applied migration renamed/removed: ${name} — wrangler would re-run it against production`,
+    );
   }
   console.error(
     "\nEach migration number must be unique. Renumber the new migration to the " +
