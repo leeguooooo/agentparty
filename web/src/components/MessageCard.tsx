@@ -227,10 +227,15 @@ export function MessageCard({
       msg.status?.workflow?.step_id ? `workflow step: ${msg.status.workflow.step_id}` : null,
       msg.status?.workflow?.parent_summary_seq ? `parent summary: #${msg.status.workflow.parent_summary_seq}` : null,
     ].filter((part): part is string => part !== null && part !== "").join("\n");
+    // worker 常把同一句话既写进 note 又写进 blocked_reason，直接拼接会让时间线出现
+    // 「… · blocked …」的整句重复（issue #147）——受阻原因与 note 同文时去掉重复的那一份。
+    const noteTrimmed = msg.note?.trim() ?? "";
+    const blockedReason = msg.status?.blocked_reason ?? null;
+    const blockedIsDupOfNote = blockedReason !== null && blockedReason.trim() === noteTrimmed && noteTrimmed !== "";
     const statusBits = [
       msg.note,
       msg.status?.scope.length ? `scope ${msg.status.scope.join(", ")}` : null,
-      msg.status?.blocked_reason ? `blocked ${msg.status.blocked_reason}` : null,
+      blockedReason !== null && !blockedIsDupOfNote ? `blocked ${blockedReason}` : null,
       msg.status?.summary_seq !== null && msg.status?.summary_seq !== undefined ? `summary #${msg.status.summary_seq}` : null,
     ].filter((part): part is string => typeof part === "string" && part !== "");
     return (
