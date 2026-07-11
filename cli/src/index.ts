@@ -49,6 +49,7 @@ commands:
   invite    "<title>" [--slug s] [--temp] [--party] [--public] [--guest-name bob] [--owner label]   (ADMIN_SECRET env)
   webhook   add <channel> --name n --url URL --secret S [--filter mentions|status|needs-human|all] | remove <channel> --name n | list <channel>
   token     create --name n --role agent|human|readonly --owner label [--channel-scope slug] | revoke <name>   (ADMIN_SECRET env)
+  membership activate --account a | deactivate --account a   owner-only: mark an account member/free (#277)   (ADMIN_SECRET env)
 
 watch defaults to a 240s timeout. With --follow, it stays attached unless --timeout N is explicit.
 
@@ -136,6 +137,8 @@ export async function main(argv: string[]): Promise<number> {
       return (await import("./commands/webhook")).run(rest);
     case "token":
       return (await import("./commands/token")).run(rest);
+    case "membership":
+      return (await import("./commands/membership")).run(rest);
     case "doctor":
       return (await import("./commands/doctor")).run(rest);
     case "health":

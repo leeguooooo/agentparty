@@ -1,13 +1,17 @@
 // worker 入口 — rest 路由 + ws 升级转发
 import {
   CHARTER_LIMIT,
+  DEFAULT_MEMBERSHIP,
   LOOP_GUARD_N,
   LOOP_GUARD_PARTY_N,
+  normalizeTier,
   RESERVED_NAMES,
   ROLE_RESPONSIBILITY_LIMIT,
 } from "@agentparty/shared";
 import type {
   AgentLineage,
+  MembershipStatus,
+  MembershipTier,
   Attachment,
   CaptureKind,
   ChannelRoleAssignment,
@@ -1130,6 +1134,18 @@ const requireAdmin = createMiddleware<AppContext>(async (c, next) => {
   await next();
 });
 
+// 会员骨架（#277）：读账号的 free/member 状态。无 account_membership 行 => free（默认，含自部署/未申请）。
+// 这是账号维度分层的读侧真相来源；isMember（shared）判会员时喂它的返回值即可。
+async function loadMembership(db: D1Database, account: string | null | undefined): Promise<MembershipStatus> {
+  if (account == null) return DEFAULT_MEMBERSHIP;
+  const row = await db
+    .prepare("SELECT tier, member_since FROM account_membership WHERE account = ?")
+    .bind(account)
+    .first<{ tier: string; member_since: number | null }>();
+  if (!row) return DEFAULT_MEMBERSHIP;
+  return { tier: normalizeTier(row.tier), member_since: row.member_since ?? null };
+}
+
 const requireBearer = createMiddleware<AppContext>(async (c, next) => {
   if (!c.get("identity")) {
     const bearer = extractBearer(c.req.raw, {
@@ -1867,6 +1883,8 @@ app.get("/api/me", requireBearer, async (c) => {
     : (await c.env.DB.prepare("SELECT nickname FROM agent_nicknames WHERE name = ?")
         .bind(id.name)
         .first<{ nickname: string | null }>())?.nickname ?? null;
+  // 会员骨架（#277）：账号维度 free/member。无账号会话（legacy/readonly）也回落 free，让工具统一读这两个字段。
+  const membership = await loadMembership(c.env.DB, id.account);
   return c.json({
     name: id.name,
     email: id.email ?? null,
@@ -1881,6 +1899,8 @@ app.get("/api/me", requireBearer, async (c) => {
     avatar_thumb: profile?.avatar_thumb ?? null,
     provider: profile?.provider ?? null,
     tenant_key: profile?.tenant_key ?? null,
+    membership_tier: membership.tier,
+    member_since: membership.member_since,
     caps: {
       send: id.role !== "readonly",
       // scoped token 不得建频道（会逃出 scope）；readonly 也不行
@@ -1966,6 +1986,40 @@ app.put("/api/me/nickname", requireBearer, async (c) => {
     throw e;
   }
   return c.json({ nickname });
+});
+
+// 会员骨架 · owner 手动开通（#277）：owner/admin-only（requireAdmin，走 ADMIN_SECRET，跟铸 token 同一把钥匙）。
+// 申请走邮件（网页 mailto → leeguooooo@gmail.com），owner 收到后用这个端点把账号翻成 member。
+// tier=member 首次开通盖 member_since（重复开通保留最初时间，幂等）；tier=free 降级并清 member_since。
+// 本次不接支付、不 gate 任何功能——只把「谁是会员」落库，供将来的 feature-tier 清单消费。
+app.post("/api/admin/membership", requireAdmin, async (c) => {
+  const body = (await c.req.json().catch(() => null)) as { account?: unknown; tier?: unknown } | null;
+  const account = typeof body?.account === "string" ? body.account.trim() : "";
+  if (account === "") {
+    return c.json(errorBody("bad_request", "account required"), 400);
+  }
+  // 只认精确的 free/member；别的字符串（含大小写变体）一律 400，不静默当 free 吞掉。
+  if (body?.tier !== "free" && body?.tier !== "member") {
+    return c.json(errorBody("bad_request", "tier must be 'free' or 'member'"), 400);
+  }
+  const tier: MembershipTier = body.tier;
+  const now = Date.now();
+  const existing = await loadMembership(c.env.DB, account);
+  // member：首次开通盖 now，已是会员则保留最初 member_since（幂等，不重置开通时间）。free：清空。
+  const memberSince =
+    tier === "member"
+      ? existing.tier === "member" && existing.member_since != null
+        ? existing.member_since
+        : now
+      : null;
+  await c.env.DB.prepare(
+    `INSERT INTO account_membership (account, tier, member_since, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(account) DO UPDATE SET tier = excluded.tier, member_since = excluded.member_since, updated_at = excluded.updated_at`,
+  )
+    .bind(account, tier, memberSince, now)
+    .run();
+  return c.json({ account, tier, member_since: memberSince });
 });
 
 app.post("/api/tokens", requireAdmin, async (c) => {

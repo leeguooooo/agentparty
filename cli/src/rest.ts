@@ -238,6 +238,9 @@ export interface Identity {
   // 权限自省（whoami --caps）：旧 server 无这些字段（可选）
   channel_scope?: string | null;
   lineage?: AgentLineage | null;
+  // 会员骨架（#277）：旧 server 无这两个字段（可选）；缺失时按 free 处理（isMember 会兜底）。
+  membership_tier?: "free" | "member" | null;
+  member_since?: number | null;
   caps?: {
     send: boolean;
     create_channel: boolean;
@@ -438,6 +441,20 @@ export async function revokeToken(server: string, adminSecret: string, name: str
     method: "DELETE",
     headers: { "x-admin-secret": adminSecret },
   });
+}
+
+// 会员骨架（#277）：owner 手动把账号翻成 member/free。走 ADMIN_SECRET（与铸 token 同一把钥匙）。
+export async function setMembership(
+  server: string,
+  adminSecret: string,
+  account: string,
+  tier: "free" | "member",
+): Promise<{ account: string; tier: "free" | "member"; member_since: number | null }> {
+  return (await req(server, "/api/admin/membership", {
+    method: "POST",
+    headers: { "x-admin-secret": adminSecret, "content-type": "application/json" },
+    body: JSON.stringify({ account, tier }),
+  })) as { account: string; tier: "free" | "member"; member_since: number | null };
 }
 
 export async function listChannels(server: string, token: string): Promise<ChannelInfo[]> {

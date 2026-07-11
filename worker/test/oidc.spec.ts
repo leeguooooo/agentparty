@@ -237,6 +237,9 @@ describe("oidc end-to-end via SELF.fetch", () => {
       avatar_thumb: null,
       provider: null,
       tenant_key: null,
+      // 会员骨架（#277）：新账号默认 free，无 member_since
+      membership_tier: "free",
+      member_since: null,
       // OIDC 人类：非 readonly 能发/建频道；有 account 能自助铸 agent；无 scope；spawn 只给 scoped parent agent
       caps: { send: true, create_channel: true, mint_agents: true, spawn_children: false, scoped_to: null },
     });

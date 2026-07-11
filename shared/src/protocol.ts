@@ -33,6 +33,36 @@ export const RESERVED_NAMES: readonly string[] = ["system"];
 export const MAX_WEBHOOK_QUEUE_ROWS = 200;
 export const WEBHOOK_RETRY_BATCH_SIZE = 25;
 
+// ---- 会员分层（#277 骨架）----
+// 账号维度的 free/member 层：托管部署每月要成本，会员用于回收；自部署始终免费。
+// 本次只搭骨架——建库、开通路径、isMember 钩子；不定价、不接支付、不 gate 任何功能。
+export type MembershipTier = "free" | "member";
+
+export interface MembershipStatus {
+  tier: MembershipTier;
+  /** 开通为 member 的时刻（epoch ms）；free 或从未开通为 null。 */
+  member_since: number | null;
+}
+
+/** 无会员记录的账号（含自部署、未申请者）一律回落到此。 */
+export const DEFAULT_MEMBERSHIP: MembershipStatus = { tier: "free", member_since: null };
+
+/**
+ * 把任意来源的 tier 值收敛成合法枚举。只有精确的 "member" 才算会员，其余（含 null/垃圾值）都 free——
+ * 少一个未知字符串意外解锁付费能力的路子。
+ */
+export function normalizeTier(tier: unknown): MembershipTier {
+  return tier === "member" ? "member" : "free";
+}
+
+/**
+ * feature-gating 的唯一钩子：将来「免费 vs 会员」功能清单都只通过它判定，别处别再各自比字符串。
+ * 传入 /api/me 或 account_membership 行（或 null=无记录）。本次不 gate 任何功能。
+ */
+export function isMember(status: { tier?: string | null } | null | undefined): boolean {
+  return normalizeTier(status?.tier) === "member";
+}
+
 // cli 退出码
 export const EXIT_TIMEOUT = 2;
 export const EXIT_AUTH = 3;

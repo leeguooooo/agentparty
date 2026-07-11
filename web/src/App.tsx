@@ -1,4 +1,6 @@
 // 应用骨架：登录闸 → 头部 + 左侧频道列表 + 右侧（首页 | 频道页）
+import { isMember } from "@agentparty/shared";
+import { membershipApplyMailto, membershipStatusOf } from "./lib/membership";
 import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChannelList } from "./components/ChannelList";
 import { CreateChannel } from "./components/CreateChannel";
@@ -829,6 +831,29 @@ export function App() {
             {me.role !== me.kind && <span className="app-me-chip">{me.role}</span>}
             {me.owner !== null && me.owner !== me.name && (
               <span className="app-me-owner">owner: {me.owner}</span>
+            )}
+            {/* 会员骨架（#277）：账号 free/member 状态就近展示（不进 #273 全局设置面板，避免并行冲突）。 */}
+            {me.kind === "human" && (
+              isMember(membershipStatusOf(me)) ? (
+                <span
+                  className="app-me-chip app-me-chip--member"
+                  title={t("App.membership.memberTitle")}
+                >
+                  {t("App.membership.member")}
+                </span>
+              ) : (
+                <a
+                  className="app-me-membership-apply"
+                  href={membershipApplyMailto(
+                    me,
+                    t("App.membership.applySubject"),
+                    t("App.membership.applyBody"),
+                  )}
+                  title={t("App.membership.freeTitle")}
+                >
+                  {t("App.membership.apply")}
+                </a>
+              )
             )}
           </span>
         )}

@@ -335,6 +335,21 @@
 }
 .app-me-chip--human { background: var(--d-green-soft); }
 .app-me-chip--agent { background: var(--d-yellow); }
+/* 会员骨架（#277）：会员标章 + 免费账号的申请入口。 */
+.app-me-chip--member { background: var(--d-green-soft); color: var(--d-ink); }
+.app-me-membership-apply {
+  flex: none;
+  padding: 1px 5px;
+  border: 1.4px dashed var(--d-ink);
+  background: var(--bg);
+  color: var(--t-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-decoration: none;
+}
+.app-me-membership-apply:hover,
+.app-me-membership-apply:focus-visible { color: var(--d-ink); background: var(--d-yellow); }
 .app-me-owner {
   min-width: 0;
   overflow: hidden;
