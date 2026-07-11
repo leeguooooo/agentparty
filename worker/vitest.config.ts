@@ -2,9 +2,12 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineWorkersConfig, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
 
-export default defineWorkersConfig(async () => {
+// vitest 4 + vitest-pool-workers 0.18：defineWorkersConfig/test.poolOptions.workers 已被
+// cloudflareTest() Vite 插件取代（pool 选项进插件，普通 test 选项留在 test 块）。
+export default defineConfig(async () => {
   const workerDir = path.dirname(fileURLToPath(import.meta.url));
   const migrationsDir = path.join(workerDir, "migrations");
   const migrations = await readD1Migrations(migrationsDir);
@@ -36,6 +39,31 @@ export default defineWorkersConfig(async () => {
     }),
   );
   return {
+    plugins: [
+      cloudflareTest({
+        // 0.18 起 singleWorker/isolatedStorage 选项已移除（单 worker 是既定行为，
+        // 存储隔离不复存在——本仓测试一直用唯一 slug/name 而非隔离，行为不变）。
+        wrangler: { configPath: testWranglerConfig },
+        miniflare: {
+          bindings: {
+            ADMIN_SECRET: "test-admin-secret",
+            TEST_MIGRATIONS: migrations,
+            // 静态启用 OIDC，供 e2e 走 SELF.fetch 验证人类网页登录（未配 OIDC 的降级路径由单元测试覆盖）
+            OIDC_ISSUER: "https://oidc.test",
+            OIDC_CLIENT_ID: "ap-web",
+            AUTH_PROVIDERS: JSON.stringify([
+              { id: "lark-main", kind: "lark", client_id: "cli_test_lark" },
+            ]),
+            LARK_CLIENT_SECRET: "test-lark-secret",
+            DESKTOP_PAIRING_SECRET: "test-desktop-pairing-secret-at-least-32-bytes",
+            // #137：把每频道 WS 连接上限降到小值，测试才不用真开 200 条连接验证上限。
+            // 值必须 > 任何单个 it 对同一频道的并发连接数（现存最多 <6），并与
+            // account-channel-quota.spec.ts 的 TEST_CONN_CAP 保持一致。
+            MAX_CONNECTIONS_PER_CHANNEL: "10",
+          },
+        },
+      }),
+    ],
     test: {
       // 单 workerd 运行时串行跑全部 spec，满载时个别 WS 握手/DO 交互偶发超过默认 5000ms
       // （非代码 bug，隔离单跑 75ms；见 issue #43）。抬到 20s 消除随机挡发布的假超时。
@@ -51,32 +79,6 @@ export default defineWorkersConfig(async () => {
       // "worker/src/index.ts changed, invalidating this Durable Object" failures (#48).
       fileParallelism: false,
       setupFiles: ["./test/apply-migrations.ts"],
-      poolOptions: {
-        workers: {
-          singleWorker: true,
-          // ws 连接跨事件循环，隔离存储会与挂起的 ws 事件互踩；用唯一 slug/name 代替隔离
-          isolatedStorage: false,
-          wrangler: { configPath: testWranglerConfig },
-          miniflare: {
-            bindings: {
-              ADMIN_SECRET: "test-admin-secret",
-              TEST_MIGRATIONS: migrations,
-              // 静态启用 OIDC，供 e2e 走 SELF.fetch 验证人类网页登录（未配 OIDC 的降级路径由单元测试覆盖）
-              OIDC_ISSUER: "https://oidc.test",
-              OIDC_CLIENT_ID: "ap-web",
-              AUTH_PROVIDERS: JSON.stringify([
-                { id: "lark-main", kind: "lark", client_id: "cli_test_lark" },
-              ]),
-              LARK_CLIENT_SECRET: "test-lark-secret",
-              DESKTOP_PAIRING_SECRET: "test-desktop-pairing-secret-at-least-32-bytes",
-              // #137：把每频道 WS 连接上限降到小值，测试才不用真开 200 条连接验证上限。
-              // 值必须 > 任何单个 it 对同一频道的并发连接数（现存最多 <6），并与
-              // account-channel-quota.spec.ts 的 TEST_CONN_CAP 保持一致。
-              MAX_CONNECTIONS_PER_CHANNEL: "10",
-            },
-          },
-        },
-      },
     },
   };
 });

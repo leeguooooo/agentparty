@@ -1,4 +1,5 @@
-import { env, fetchMock } from "cloudflare:test";
+import { env } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canAccessChannel, type AclIdentity, type ChannelAcl } from "../src/acl";
 import { api, postMessage, seedToken, uniq } from "./helpers";

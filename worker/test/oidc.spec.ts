@@ -1,5 +1,6 @@
 // 人类网页 OIDC 登录（spec §10 双轨）：ap_ token 走 D1，OIDC access token（RS256 JWT）走 issuer/jwks.json 验签
-import { SELF, env, fetchMock } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { lookupToken, oidcConfigFromEnv } from "../src/auth";
 import { createChannel, uniq } from "./helpers";

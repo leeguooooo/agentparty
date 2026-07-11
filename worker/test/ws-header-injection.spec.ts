@@ -1,5 +1,6 @@
 import type { TokenIdentity } from "../src/auth";
-import { env, fetchMock, SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { handleHeader } from "../src/index";
 import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";

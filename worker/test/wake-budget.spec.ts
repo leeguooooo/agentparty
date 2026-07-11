@@ -2,7 +2,8 @@
 // LLM 订阅；协议此前无任何总量上限。这里给每个 agent 一个滚动窗口内的 wake 硬上限：窗口内
 // 已投 wake 达到 limit 后，再来的 @ 不再投 webhook（不烧订阅），落 wake_delivery_ledger 的
 // budget 行 + 频道内 system status 可观测；窗口滚动后自动恢复；不设预算 = 正常流（不限）。
-import { env, fetchMock, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
 import { api, createChannel, seedToken, uniq } from "./helpers";

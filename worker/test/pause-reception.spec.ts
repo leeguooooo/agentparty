@@ -1,7 +1,8 @@
 // issue #180：人可暂停某 agent 的接待（如 token 不够用了）。暂停期该 agent 被 @ 也不唤醒
 // （webhook 不投），但消息照进频道历史；到点由 DO alarm 自动恢复，也可手动恢复。非 moderator 不能暂停。
 import type { PresenceEntry } from "@agentparty/shared";
-import { env, fetchMock, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
 import { api, createChannel, seedToken, uniq } from "./helpers";

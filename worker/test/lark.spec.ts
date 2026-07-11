@@ -1,4 +1,5 @@
-import { SELF, env, fetchMock, runInDurableObject } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
 import {

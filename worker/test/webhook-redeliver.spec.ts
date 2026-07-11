@@ -1,5 +1,6 @@
 import { MAX_WEBHOOK_DEAD_LETTERS, WEBHOOK_MAX_RETRIES } from "@agentparty/shared";
-import { env, fetchMock, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
 import { api, createChannel, seedToken, uniq } from "./helpers";

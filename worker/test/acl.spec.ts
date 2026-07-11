@@ -1,7 +1,8 @@
 // 公开/私有频道访问控制（spec §3.2 矩阵 + §5 踢人）
 // 单元：canAccessChannel / isChannelModerator 全矩阵
 // 集成：WS 升级 / REST GET / REST POST 三处强制 + 踢人
-import { SELF, env, fetchMock } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
+import { fetchMock } from "./fetch-mock";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canAccessChannel, isChannelModerator, type AclIdentity, type ChannelAcl } from "../src/acl";
 import { ADMIN_HEADERS, api, seedToken, uniq, WsClient } from "./helpers";
