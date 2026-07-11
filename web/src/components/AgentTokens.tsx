@@ -66,6 +66,9 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
   const [busyName, setBusyName] = useState<string | null>(null);
   const [busyProfile, setBusyProfile] = useState<string | null>(null);
   const [creatingProfile, setCreatingProfile] = useState(false);
+  const [editingRules, setEditingRules] = useState<string | null>(null);
+  const [rulesDraft, setRulesDraft] = useState("");
+  const [savingRules, setSavingRules] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<CopyTarget | null>(null);
   const [revealed, setRevealed] = useState<Set<string>>(() => new Set());
@@ -221,6 +224,48 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
       else setError(t("AgentTokens.errProfileSave"));
     } finally {
       setCreatingProfile(false);
+    }
+  }
+
+  function startEditRules(profile: ProjectAgentProfile) {
+    setEditingRules(`${profile.owner_account}/${profile.handle}`);
+    setRulesDraft(profile.rules ?? "");
+    setError(null);
+  }
+
+  function cancelEditRules() {
+    setEditingRules(null);
+    setRulesDraft("");
+  }
+
+  // 编辑已有 profile 的规则：worker 没有独立的 PATCH，POST /api/agent-profiles 走 ON CONFLICT
+  // DO UPDATE 做 upsert，缺省字段会被写成 null——所以这里必须把整份 profile 的字段带回去，
+  // 只替换 rules，否则重存会把 repo/workdir 等抹掉。
+  async function saveProfileRules(profile: ProjectAgentProfile) {
+    const key = `${profile.owner_account}/${profile.handle}`;
+    setSavingRules(key);
+    setError(null);
+    try {
+      await createProjectAgentProfile(token, {
+        handle: profile.handle,
+        runner: profile.runner,
+        ...(profile.repo_url === null ? {} : { repo_url: profile.repo_url }),
+        ...(profile.workdir === null ? {} : { workdir: profile.workdir }),
+        base_branch: profile.base_branch,
+        worktree_strategy: profile.worktree_strategy,
+        invitable_by: profile.invitable_by,
+        rules: rulesDraft.trim(),
+      });
+      setEditingRules(null);
+      setRulesDraft("");
+      await refresh();
+    } catch (err) {
+      if (err instanceof AuthError) onAuthFailed(err.message);
+      else if (err instanceof ForbiddenError) setError(t("AgentTokens.errProfileForbidden"));
+      else if (err instanceof ValidationError) setError(t("AgentTokens.errProfileInvalid"));
+      else setError(t("AgentTokens.errProfileSave"));
+    } finally {
+      setSavingRules(null);
     }
   }
 
@@ -393,6 +438,7 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
               <ul className="agenttokens-list agenttokens-profile-list">
                 {profiles.map((profile) => {
                   const key = `${profile.owner_account}/${profile.handle}`;
+                  const isEditing = editingRules === key;
                   return (
                     <li key={key} className="agenttokens-item">
                       <div className="agenttokens-main">
@@ -401,9 +447,51 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
                           {profile.runner} · {profile.base_branch} · {profile.worktree_strategy}
                         </span>
                       </div>
-                      <button type="button" className="d-btn" disabled={busyProfile === key} onClick={() => inviteProfile(profile)}>
-                        {busyProfile === key ? t("AgentTokens.invitingProfile") : t("AgentTokens.inviteProfile")}
-                      </button>
+                      {isEditing ? (
+                        <div className="agenttokens-rules-edit-wrap">
+                          <textarea
+                            className="agenttokens-input agenttokens-input--wide agenttokens-rules-edit"
+                            value={rulesDraft}
+                            onChange={(event) => setRulesDraft(event.target.value)}
+                            placeholder={t("AgentTokens.profileRules")}
+                            aria-label={t("AgentTokens.rulesLabel")}
+                          />
+                          <div className="agenttokens-actions">
+                            <button
+                              type="button"
+                              className="d-btn agenttokens-save-rules"
+                              disabled={savingRules === key}
+                              onClick={() => saveProfileRules(profile)}
+                            >
+                              {savingRules === key ? t("AgentTokens.savingRules") : t("AgentTokens.saveRules")}
+                            </button>
+                            <button
+                              type="button"
+                              className="d-btn agenttokens-cancel-rules"
+                              disabled={savingRules === key}
+                              onClick={cancelEditRules}
+                            >
+                              {t("AgentTokens.cancelRules")}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          {profile.rules !== null && profile.rules !== "" ? (
+                            <pre className="agenttokens-rules" aria-label={t("AgentTokens.rulesLabel")}>{profile.rules}</pre>
+                          ) : (
+                            <span className="agenttokens-rules-empty">{t("AgentTokens.noRules")}</span>
+                          )}
+                          <div className="agenttokens-actions">
+                            <button type="button" className="d-btn agenttokens-edit-rules" onClick={() => startEditRules(profile)}>
+                              {t("AgentTokens.editRules")}
+                            </button>
+                            <button type="button" className="d-btn" disabled={busyProfile === key} onClick={() => inviteProfile(profile)}>
+                              {busyProfile === key ? t("AgentTokens.invitingProfile") : t("AgentTokens.inviteProfile")}
+                            </button>
+                          </div>
+                        </>
+                      )}
                     </li>
                   );
                 })}

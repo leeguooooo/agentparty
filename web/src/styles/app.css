@@ -2715,6 +2715,35 @@
 .agenttokens-profile-list .agenttokens-main {
   min-width: 0;
 }
+.agenttokens-profile-list .agenttokens-rules,
+.agenttokens-profile-list .agenttokens-rules-empty,
+.agenttokens-profile-list .agenttokens-rules-edit-wrap {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+.agenttokens-profile-list .agenttokens-actions {
+  justify-self: end;
+}
+.agenttokens-rules {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border: 1.4px solid var(--t-faint);
+  background: var(--t-surface, transparent);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow: auto;
+}
+.agenttokens-rules-empty {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--t-dim);
+}
+.agenttokens-rules-edit {
+  min-height: 72px;
+  resize: vertical;
+}
 .archive-channel-btn {
   border-color: var(--d-red);
   color: var(--d-red);
