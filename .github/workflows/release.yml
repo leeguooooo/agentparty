@@ -318,7 +318,7 @@ jobs:
 
       # party-*.tar.gz* 一把捞 tar.gz / .sha256 / .sig（.sig 未签名时缺省，glob 不报错）
       - name: upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: party-*.tar.gz*
@@ -629,7 +629,7 @@ jobs:
             "$NOTARIZED" "$distribution" "$UPDATER_KEY_MODE" "$NOTARIZATION_AUTH" > "agentparty-desktop-${ASSET}.signing-status.json"
 
       - name: upload desktop artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-${{ matrix.asset }}
           path: agentparty-desktop-*
