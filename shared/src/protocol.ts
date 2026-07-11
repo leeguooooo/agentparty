@@ -38,6 +38,18 @@ export const MAX_WEBHOOK_DEAD_LETTERS = 200;
 // 单次 redeliver 最多重投多少条死信，避免一个端点的巨量积压一次性打满 subrequest 配额。
 export const WEBHOOK_REDELIVER_BATCH_SIZE = 50;
 
+// ---- 每账号频道配额 + 创建限速 + 每频道连接上限（#137 成本模型与滥用防护）----
+// 每个频道背后是一个 Durable Object + 一行 D1；此前 POST /api/channels 无任何配额，
+// 任一带账号的 ap_ token 持有者可无限造 DO/D1 行（面向跨公司外部 agent 发 token 的产品，
+// 这是真实账单攻击面）。下面给「拥有该频道的账号」两道闸：owned 总量硬上限 + 滚动窗口创建限速。
+// 缺省对单团队足够宽松（正常协作不可能撞上），只挡量级异常的滥用。legacy 无账号 token 不受限（fail-open）。
+export const MAX_CHANNELS_PER_ACCOUNT = 100; // 单账号可拥有（owner_account）的频道总数上限（含归档，堵 create→archive→create 绕过）
+export const CHANNEL_CREATE_WINDOW_MS = 60 * 60_000; // 创建限速滚动窗口：1 小时
+export const MAX_CHANNEL_CREATES_PER_WINDOW = 20; // 单账号每窗口最多新建频道数
+// 每频道并发 WS 连接上限：DO 无上限时单频道可被灌爆连接（每连接吃内存 + presence 扇出）。
+// 缺省 200 远超任何真实多公司 party 的在场规模；worker env 可覆盖以便运维调参 / 测试用小值。
+export const MAX_CONNECTIONS_PER_CHANNEL = 200;
+
 // ---- per-agent wake 预算/配额（#108）----
 // 每个 @ 触发一次完整 runner run，会烧目标 agent 的 LLM 订阅/tokens；协议此前无任何总量上限
 // （README 宣称的「capacity routing」无落地）。这里给每个 agent 一个滚动窗口内的 wake 硬上限：
@@ -320,6 +332,8 @@ export type ErrorCode =
   | "loop_guard"
   | "workflow_guard"
   | "archived"
+  | "quota_exceeded"
+  | "channel_full"
   | "not_found";
 
 export type RestErrorCode = ErrorCode | "conflict" | "unavailable" | "forbidden";

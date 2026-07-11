@@ -1,9 +1,12 @@
 // worker 入口 — rest 路由 + ws 升级转发
 import {
+  CHANNEL_CREATE_WINDOW_MS,
   CHARTER_LIMIT,
   DEFAULT_MEMBERSHIP,
   LOOP_GUARD_N,
   LOOP_GUARD_PARTY_N,
+  MAX_CHANNELS_PER_ACCOUNT,
+  MAX_CHANNEL_CREATES_PER_WINDOW,
   normalizeTier,
   RESERVED_NAMES,
   ROLE_RESPONSIBILITY_LIMIT,
@@ -2925,6 +2928,38 @@ app.post("/api/channels", async (c) => {
   }
   const now = Date.now();
   const creator = c.get("identity");
+  // #137 成本滥用：每频道 = 一个 DO + 一行 D1。带账号的 token 受两道闸约束——
+  //   owned 总量硬上限（quota_exceeded/403）+ 滚动窗口创建限速（rate_limited/429）。
+  // owned 计数含归档频道（archived_at 不为 null 也占 DO/D1），堵 create→archive→create 绕过。
+  // legacy 无账号 token（account == null）不计入、不受限（fail-open，与建表处 owner_account=null 的过渡口径一致）。
+  if (creator.account != null) {
+    const windowStart = now - CHANNEL_CREATE_WINDOW_MS;
+    const counts = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END), 0) AS recent
+         FROM channels
+        WHERE owner_account = ?2`,
+    )
+      .bind(windowStart, creator.account)
+      .first<{ total: number; recent: number }>();
+    const total = Number(counts?.total ?? 0);
+    const recent = Number(counts?.recent ?? 0);
+    if (total >= MAX_CHANNELS_PER_ACCOUNT) {
+      return c.json(
+        errorBody("quota_exceeded", `account channel quota reached (max ${MAX_CHANNELS_PER_ACCOUNT} channels per account)`),
+        403,
+      );
+    }
+    if (recent >= MAX_CHANNEL_CREATES_PER_WINDOW) {
+      return c.json(
+        errorBody(
+          "rate_limited",
+          `too many channels created recently (max ${MAX_CHANNEL_CREATES_PER_WINDOW} per hour)`,
+        ),
+        429,
+      );
+    }
+  }
   try {
     await c.env.DB.prepare(
       "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, owner_account, created_at, loop_guard_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",

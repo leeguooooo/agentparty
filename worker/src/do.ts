@@ -18,6 +18,7 @@ import {
   DECISION_OPTIONS_MAX,
   DECISION_OPTION_LIMIT,
   DECISION_REASON_LIMIT,
+  MAX_CONNECTIONS_PER_CHANNEL,
   PRESENCE_TIMEOUT_MS,
   RATE_LIMIT_PER_MIN,
   RETAIN_N,
@@ -132,6 +133,8 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   loop_guard: 409,
   workflow_guard: 409,
   archived: 410,
+  quota_exceeded: 403,
+  channel_full: 429,
   not_found: 404,
 };
 
@@ -1329,6 +1332,14 @@ export class ChannelDO extends Server<Env> {
     );
   }
 
+  // #137：每频道连接上限缺省取 MAX_CONNECTIONS_PER_CHANNEL；worker env 可覆盖以便运维调参
+  // 或测试用小值（避免为验证上限真开 200 条 WS）。非法/缺省值回退到常量。
+  private maxConnectionsPerChannel(): number {
+    const raw = (this.env as { MAX_CONNECTIONS_PER_CHANNEL?: unknown }).MAX_CONNECTIONS_PER_CHANNEL;
+    const n = typeof raw === "string" ? Number(raw) : typeof raw === "number" ? raw : NaN;
+    return Number.isInteger(n) && n > 0 ? n : MAX_CONNECTIONS_PER_CHANNEL;
+  }
+
   async onConnect(connection: Connection<ConnState>, ctx: ConnectionContext) {
     const h = ctx.request.headers;
     const state: ConnState = {
@@ -1353,6 +1364,23 @@ export class ChannelDO extends Server<Env> {
     if (state.archived || this.isArchived()) {
       this.sendFrame(connection, { type: "error", code: "archived", message: "channel is archived" });
       connection.close(1008, "archived");
+      return;
+    }
+    // #137 每频道 WS 连接上限：DO 无上限时单频道可被灌爆连接（每连接吃内存 + presence 扇出）。
+    // getConnections 在 onConnect 时已含刚接入的这条，按 id 排除自己后计数「其它存活连接」，
+    // 达上限即拒绝这条（第 N+1 条），前 N 条照常。镜像 archived 的 error 帧 + 1008 关闭。
+    const connCap = this.maxConnectionsPerChannel();
+    let otherConns = 0;
+    for (const other of this.getConnections<ConnState>()) {
+      if (other.id !== connection.id) otherConns++;
+    }
+    if (otherConns >= connCap) {
+      this.sendFrame(connection, {
+        type: "error",
+        code: "channel_full",
+        message: `channel connection limit reached (max ${connCap})`,
+      });
+      connection.close(1008, "channel_full");
       return;
     }
     const loopGuard = state.kind === "agent" ? this.loopGuardMessage(state.name) : this.globalLoopGuardMessage();
