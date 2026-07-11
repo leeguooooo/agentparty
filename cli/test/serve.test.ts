@@ -154,6 +154,80 @@ describe("runServe", () => {
     expect(posts.indexOf(working!)).toBeLessThan(posts.indexOf(idle!));
   });
 
+  // 每任务进度/心跳（#228，扩 #103 busy）：run() 阻塞串行循环数分钟时，靠 setInterval 侧信道
+  // 周期性发 presence-only 的 heartbeat 帧（不落 history），频道/本机都能看到「正在处理 seq=X、活到 T」。
+  test("task heartbeat: while a wake runs, serve emits advancing heartbeats with current_task, then clears on completion", async () => {
+    const beats: Array<{ current_task: number | null; task_started_at: number | null; heartbeat_at: number | null }> = [];
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "heartbeat") {
+        beats.push(frame as unknown as (typeof beats)[number]);
+        return;
+      }
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "long task", { mentions: ["me"] })), 10);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 250);
+    });
+    let tick = 0;
+    const o = opts({
+      server: server.url,
+      heartbeatIntervalMs: 8,
+      now: () => (tick += 1000),
+      // 自定义（注入）runner：阻塞 ~70ms 模拟长任务；#228 的重点就是让自定义 runner 也被看见。
+      runCommand: async () => {
+        await new Promise((r) => setTimeout(r, 70));
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+
+    const active = beats.filter((b) => b.current_task === 1);
+    // 立刻一拍 started + 至少一拍间隔心跳
+    expect(active.length, "must emit a started beat plus periodic heartbeats while the task runs").toBeGreaterThanOrEqual(2);
+    // heartbeat_at 严格递增 —— 证明心跳真的在推进（不是发同一个时间戳）
+    for (let i = 1; i < active.length; i++) {
+      expect(active[i]!.heartbeat_at!).toBeGreaterThan(active[i - 1]!.heartbeat_at!);
+      expect(active[i]!.task_started_at).toBe(active[0]!.task_started_at);
+    }
+    // 收尾清除：一条 current_task=null，且在所有活跃心跳之后
+    const clears = beats.filter((b) => b.current_task === null);
+    expect(clears.length, "must clear the running task once it finishes").toBeGreaterThanOrEqual(1);
+    expect(beats.lastIndexOf(active[active.length - 1]!)).toBeLessThan(beats.indexOf(clears[0]!));
+  });
+
+  // 本机操作者可见性（#228）：health.json 盖上正在处理的 seq，任务结束清回 null。
+  test("task heartbeat: stamps current_task into the local health file and clears it on completion", async () => {
+    const { readHealthCache } = await import("../src/health-cache");
+    const prevHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = tempDir("ap-hb-home-");
+    try {
+      let seenDuringRun: number | null = null;
+      server = startMockServer((frame, sock) => {
+        if (frame.type === "hello") {
+          sock.send(welcomeFrame(0, "me"));
+          setTimeout(() => sock.send(msgFrame(1, "long task", { mentions: ["me"] })), 10);
+          setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 200);
+        }
+      });
+      const o = opts({
+        server: server.url,
+        heartbeatIntervalMs: 8,
+        runCommand: async () => {
+          await new Promise((r) => setTimeout(r, 60));
+          // 任务执行到一半时，health.json 应该已经写上 current_task=1
+          seenDuringRun = readHealthCache()?.current_task ?? null;
+        },
+      });
+
+      expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+      expect(seenDuringRun as number | null, "health.json must show the running task while it executes").toBe(1);
+      expect(readHealthCache()?.current_task, "health.json must clear the task once it finishes").toBeNull();
+    } finally {
+      if (prevHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = prevHome;
+    }
+  });
+
   test("reports a non-zero runner exit instead of silently swallowing it", async () => {
     const s = closeAfterOneMention();
     // 每次失败都打印，并带上「第几次/共几次」——有界重试的进度必须可见（#198）

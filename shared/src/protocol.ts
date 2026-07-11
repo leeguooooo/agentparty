@@ -375,6 +375,20 @@ export interface PresenceEntry {
   busy?: boolean;
   /** 排在当前 wake 身后、尚未处理的 wake 数（issue #103）。仅 state != offline 且 >0 时下发。 */
   queue_depth?: number;
+  /**
+   * 当前正在处理的那条 wake 的触发 seq（reply_to / @ 的 seq）（issue #228，扩 #103 busy）。
+   * serve 处理一条长任务期间用轻量、presence-only 的 heartbeat 帧刷这三个字段：正在处理哪条、何时开始、
+   * 最近一次心跳。用途：who/web 区分「还在干、活到 T」与「卡死」——busy 只说「在忙」，这里说「在忙哪一条、活没活」。
+   * 仅 state != offline 且有活跃任务时下发；任务结束由 heartbeat(current_task=null) 清除。旧客户端忽略。
+   */
+  current_task?: number;
+  /** 当前任务的 run() 开始时刻（epoch ms）（issue #228）。与 current_task 同生共死。 */
+  task_started_at?: number;
+  /**
+   * 最近一次心跳时刻（epoch ms）（issue #228）。serve 周期性推进它；消费方据 now-heartbeat_at 判新鲜度：
+   * 心跳还在推进 = 活着，长时间不动 = 卡死。不参与可达性/租约判定。
+   */
+  heartbeat_at?: number;
 }
 
 export interface ChannelRoleAssignment {
@@ -555,7 +569,23 @@ export interface SeenFrame {
   seq: number;
 }
 
-export type ClientFrame = HelloFrame | SendFrame | PingFrame | SeenFrame;
+/**
+ * 每任务进度/心跳（issue #228，扩 #103 busy）。serve 处理一条长 wake 期间，周期性发这条**轻量、
+ * presence-only** 的帧：只更新发送者 presence 上的 current_task/task_started_at/heartbeat_at，
+ * **不落 history**（不刷屏，是 ledger 而非聊天）。任务结束发一条 current_task=null 的清除帧。
+ * 三个字段要么全是非负整数（正在处理），要么全是 null（清除）。脏值被服务端静默丢弃、不断流。
+ */
+export interface HeartbeatFrame {
+  type: "heartbeat";
+  /** 正在处理的 wake 的触发 seq；null = 任务结束、清除。 */
+  current_task: number | null;
+  /** 当前任务 run() 的开始时刻（epoch ms）；随 current_task 一起清空。 */
+  task_started_at: number | null;
+  /** 本次心跳时刻（epoch ms），周期性推进；随 current_task 一起清空。 */
+  heartbeat_at: number | null;
+}
+
+export type ClientFrame = HelloFrame | SendFrame | PingFrame | SeenFrame | HeartbeatFrame;
 
 // ---- 服务端 → 客户端帧 ----
 

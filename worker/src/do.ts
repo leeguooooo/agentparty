@@ -902,6 +902,29 @@ function parseSendFrame(input: unknown): SendFrame | null {
   return null;
 }
 
+export interface ParsedTaskHeartbeat {
+  current_task: number | null;
+  task_started_at: number | null;
+  heartbeat_at: number | null;
+}
+
+// 每任务心跳帧校验（#228）：三字段要么全是非负整数（活跃任务），要么各自 null（清除）。
+// 混入负数/浮点/非数字 → 返回 null（整帧丢弃）。缺字段按 undefined→拒收，避免半截状态写脏 presence。
+function parseHeartbeatFrame(input: unknown): ParsedTaskHeartbeat | null {
+  if (typeof input !== "object" || input === null) return null;
+  const f = input as Record<string, unknown>;
+  const field = (v: unknown): number | null | undefined => {
+    if (v === null) return null;
+    if (typeof v === "number" && Number.isInteger(v) && v >= 0) return Math.min(v, Number.MAX_SAFE_INTEGER);
+    return undefined; // 非法
+  };
+  const current = field(f.current_task);
+  const started = field(f.task_started_at);
+  const heartbeat = field(f.heartbeat_at);
+  if (current === undefined || started === undefined || heartbeat === undefined) return null;
+  return { current_task: current, task_started_at: started, heartbeat_at: heartbeat };
+}
+
 async function hmacSha256Hex(secret: string, body: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -1135,6 +1158,11 @@ export class ChannelDO extends Server<Env> {
       // busy + 队列深度（#103）：serve 串行处理长任务时自报「忙 + N 待处理」，供 who/reach/web 展示。
       "ALTER TABLE presence ADD COLUMN busy INTEGER",
       "ALTER TABLE presence ADD COLUMN queue_depth INTEGER",
+      // 每任务进度/心跳（#228，扩 #103）：正在处理哪条 wake（触发 seq）、何时开始、最近心跳。
+      // 由 presence-only 的 heartbeat 帧刷（不落 history）；任务结束/离线时清空。供 who/web 判「活着 vs 卡死」。
+      "ALTER TABLE presence ADD COLUMN current_task INTEGER",
+      "ALTER TABLE presence ADD COLUMN task_started_at INTEGER",
+      "ALTER TABLE presence ADD COLUMN heartbeat_at INTEGER",
     ]) {
       try {
         sql.exec(ddl);
@@ -1410,6 +1438,13 @@ export class ChannelDO extends Server<Env> {
         const cursor = this.recordSeen(st.name, st.kind, seq);
         if (cursor !== null) this.broadcastFrame({ type: "read_cursor", ...cursor });
       }
+      return;
+    }
+    if (frame.type === "heartbeat") {
+      // 每任务进度/心跳（#228）：presence-only，不落 history、不占发送速率、不炸连接。
+      // 脏值（负数/非整数/字段不齐）静默丢弃——心跳是自动流量，宁可漏一拍也别断流。
+      const hb = parseHeartbeatFrame(frame);
+      if (hb !== null) this.applyTaskHeartbeat(st.name, hb);
       return;
     }
     if (frame.type === "send") {
@@ -1763,8 +1798,11 @@ export class ChannelDO extends Server<Env> {
 
   private markOffline(name: string, ts: number) {
     this.ctx.storage.sql.exec(
+      // 离线时清掉每任务心跳（#228）：否则一次硬崩后再上线（发个 status 但不带心跳），旧的 current_task
+      // 会借尸还魂显示成「还在处理」。心跳字段与「活着」正交，离线即无任务，直接清空最干净。
       `INSERT INTO presence (name, state, note, updated_at) VALUES (?, 'offline', NULL, ?)
-       ON CONFLICT(name) DO UPDATE SET state = 'offline', updated_at = excluded.updated_at`,
+       ON CONFLICT(name) DO UPDATE SET state = 'offline', updated_at = excluded.updated_at,
+         current_task = NULL, task_started_at = NULL, heartbeat_at = NULL`,
       name,
       ts,
     );
@@ -1780,6 +1818,23 @@ export class ChannelDO extends Server<Env> {
       name,
       ts,
       clientVersion,
+    );
+    const entry = this.presenceFor(name);
+    if (entry) this.broadcastFrame({ type: "presence", ...entry });
+  }
+
+  // 每任务进度/心跳（#228）：只更新 presence 上的 current_task/task_started_at/heartbeat_at 三列，
+  // 不碰 state/note/busy、不落 history（presence-only，不刷屏）。仅当已有这行 presence 时才更新+广播；
+  // 从没发过 presence（连 status 都没发）就无从附着，直接忽略。current_task=null 即清除（任务结束）。
+  private applyTaskHeartbeat(name: string, hb: ParsedTaskHeartbeat) {
+    const exists = this.ctx.storage.sql.exec("SELECT 1 FROM presence WHERE name = ? LIMIT 1", name).toArray().length > 0;
+    if (!exists) return;
+    this.ctx.storage.sql.exec(
+      `UPDATE presence SET current_task = ?, task_started_at = ?, heartbeat_at = ? WHERE name = ?`,
+      hb.current_task,
+      hb.task_started_at,
+      hb.heartbeat_at,
+      name,
     );
     const entry = this.presenceFor(name);
     if (entry) this.broadcastFrame({ type: "presence", ...entry });
@@ -4279,7 +4334,8 @@ export class ChannelDO extends Server<Env> {
                 account, handle, display_name, avatar_url, avatar_thumb, client_version,
                 state, note, updated_at, status_scope_json, status_summary_seq, status_blocked_reason,
                 status_context_json, status_decision_json, status_workflow_json, role, role_source, residency, wake_kind, wake_verified_at,
-                context_json, lineage_json, paused_at, paused_resume_at, busy, queue_depth`;
+                context_json, lineage_json, paused_at, paused_resume_at, busy, queue_depth,
+                current_task, task_started_at, heartbeat_at`;
 
   private presenceList(): PresenceEntry[] {
     const liveCounts = this.liveConnectionCounts();
@@ -4362,6 +4418,15 @@ export class ChannelDO extends Server<Env> {
       // 缺省即「不忙、无积压」，旧客户端与旧行没这两列时 Number(undefined/null)=0/NaN，天然回退。
       ...(state !== "offline" && Number(r.busy) === 1 ? { busy: true } : {}),
       ...(state !== "offline" && Number(r.queue_depth) > 0 ? { queue_depth: Number(r.queue_depth) } : {}),
+      // 每任务进度/心跳（#228）：仅在有活跃任务（current_task 非空）且 state != offline 时下发这一组。
+      // 三者同生共死：只要 current_task 在，就一并带出 started/heartbeat，供消费方算新鲜度。
+      ...(state !== "offline" && r.current_task !== null && r.current_task !== undefined
+        ? {
+            current_task: Number(r.current_task),
+            ...(r.task_started_at === null || r.task_started_at === undefined ? {} : { task_started_at: Number(r.task_started_at) }),
+            ...(r.heartbeat_at === null || r.heartbeat_at === undefined ? {} : { heartbeat_at: Number(r.heartbeat_at) }),
+          }
+        : {}),
     };
   }
 

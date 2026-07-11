@@ -3,7 +3,7 @@ import type { PresenceEntry, Sender } from "@agentparty/shared";
 import { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
-import { buildGroups, busyLabel, countLiveGroups, ownerKey, pauseResumeAt, PresenceBar, type Item } from "./PresenceBar";
+import { buildGroups, busyLabel, countLiveGroups, ownerKey, pauseResumeAt, PresenceBar, taskLabel, type Item } from "./PresenceBar";
 
 function item(over: Partial<Item> = {}): Item {
   return {
@@ -213,6 +213,18 @@ describe("busy indicator + queue depth (#103)", () => {
     expect(busyLabel(it({ busy: true, queueDepth: null }))).toBe("⏳ busy");
     expect(busyLabel(it({ busy: true, queueDepth: 4 }))).toBe("⏳ busy · 4 queued");
     expect(busyLabel(it({ busy: false }))).toBeNull();
+  });
+
+  // 每任务进度/心跳（#228）：比 busy 更细——标明正在处理哪条 wake + 心跳新鲜度。
+  test("taskLabel: 有任务+心跳 / 有任务无心跳 / 无任务三态", () => {
+    const now = 100_000;
+    const it = (over: Partial<Item>) =>
+      ({ name: "a", busy: false, queueDepth: null, currentTask: null, heartbeatAt: null, ...over }) as Item;
+    // 新鲜心跳（<45s）显示 "now" = 还活着；很旧则显示 "2m"/"1h" = 大概率卡死。
+    expect(taskLabel(it({ currentTask: 510, heartbeatAt: now - 5_000 }), now)).toBe("▶ #510 · ♥ now");
+    expect(taskLabel(it({ currentTask: 510, heartbeatAt: now - 120_000 }), now)).toBe("▶ #510 · ♥ 2m");
+    expect(taskLabel(it({ currentTask: 7 }), now)).toBe("▶ #7");
+    expect(taskLabel(it({ currentTask: null }), now)).toBeNull();
   });
 
   test("busy 项渲染琥珀徽章 + 顶部「N busy」汇总", () => {

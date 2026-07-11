@@ -19,6 +19,11 @@ export const PresenceBarStrings: LocaleDict = {
     "PresenceBar.pausedChipUntil": "⏸ paused · resumes {time}",
     "PresenceBar.pausedManual": "Paused — won't be woken by @-mentions until resumed manually",
     "PresenceBar.pausedUntil": "Paused — won't be woken by @-mentions; auto-resumes {time}",
+    // 每任务进度/心跳（#228）
+    "PresenceBar.taskChip": "▶ #{seq}",
+    "PresenceBar.taskChipBeat": "▶ #{seq} · ♥ {age}",
+    "PresenceBar.taskTitle": "running the wake from #{seq}",
+    "PresenceBar.taskTitleBeat": "running the wake from #{seq} — last heartbeat {age} (still alive; a stale heartbeat means stuck)",
   },
   zh: {
     "PresenceBar.kickTitle": "踢出 {name}",
@@ -38,6 +43,11 @@ export const PresenceBarStrings: LocaleDict = {
     "PresenceBar.pausedChipUntil": "⏸ 已暂停 · {time} 恢复",
     "PresenceBar.pausedManual": "已暂停接待——被 @ 也不唤醒，需手动恢复",
     "PresenceBar.pausedUntil": "已暂停接待——被 @ 也不唤醒；将于 {time} 自动恢复",
+    // 每任务进度/心跳（#228）
+    "PresenceBar.taskChip": "▶ #{seq}",
+    "PresenceBar.taskChipBeat": "▶ #{seq} · ♥ {age}",
+    "PresenceBar.taskTitle": "正在处理 #{seq} 的唤醒",
+    "PresenceBar.taskTitleBeat": "正在处理 #{seq} 的唤醒——最近心跳 {age}（还活着；心跳很旧多半卡死了）",
   },
 };
 

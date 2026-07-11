@@ -84,6 +84,9 @@ const AP_BODY_MAX = 4_000;
 
 const DEFAULT_MAX_WAKE_ATTEMPTS = 3;
 const DEFAULT_WAKE_RETRY_DELAY_MS = 500;
+// 每任务心跳节奏（#228）：任务运行期间每隔这么久刷一次「还活着、正在处理 seq=X」。
+// 15s 足够让频道/本机在几分钟的长任务里持续看到新鲜度，又远比逐 tick 便宜（presence-only，不落 history）。
+const DEFAULT_TASK_HEARTBEAT_MS = 15_000;
 // 普通频道 loop guard 是 30；必须远低于它，避免放弃通告先把频道熔断、随后静默丢消息。
 const MAX_CONSECUTIVE_WAKE_ABANDONS = 3;
 const BLOCKED_ERROR_MAX = 300;
@@ -392,6 +395,10 @@ export interface ServeOptions {
   upgradeDeps?: UpgradeDeps; // 测试注入版本读取/re-exec
   out?: (line: string) => void;
   statusline?: boolean;
+  /** 每任务心跳间隔（#228）。默认 DEFAULT_TASK_HEARTBEAT_MS；测试注入更短值。 */
+  heartbeatIntervalMs?: number;
+  /** 时钟注入（#228）：任务开始时刻与每次心跳时刻走它，便于测试断言心跳在推进。默认 Date.now。 */
+  now?: () => number;
 }
 
 // serve 一挂上就把 presence 标成可唤醒：residency=supervised + wake.kind=serve。
@@ -1637,33 +1644,67 @@ export async function runServe(o: ServeOptions): Promise<number> {
         // 本帧正在处理，故只数它 seq 之后、够格触发唤醒的缓冲帧。
         const queueDepth = pendingWakeDepth(conn.pendingFrames(), self, o.mentionsOnly === true, frame.seq);
         if (reportsBusy) busyReported = true;
-        for (let attempt = priorAttempts + 1; attempt <= maxAttempts && retriable; attempt++) {
+        // 每任务进度/心跳（#228，扩 #103 busy）：run() 会把这条串行循环阻塞数分钟——期间频道与本机都看不到
+        // 「具体这条任务在跑、活着」。用一个 setInterval 侧信道在 run() 执行期间周期性刷新（阻塞的循环靠定时器
+        // 心跳），每拍做两件事：① 本机 health.json 盖上 current_task/heartbeat_at（供 party health/watchdog）；
+        // ② 一条 presence-only 的 heartbeat 帧发给 DO（供 who/web），**不落 history、不刷屏**。任务结束（成功或
+        // 放弃）在 finally 里清定时器 + 发一条 current_task=null 的清除帧——绝不留「假在跑」的僵状态。
+        const nowFn = o.now ?? (() => Date.now());
+        const taskStartedAt = nowFn();
+        const heartbeatIntervalMs = o.heartbeatIntervalMs ?? DEFAULT_TASK_HEARTBEAT_MS;
+        const emitTaskBeat = (active: boolean, at: number) => {
+          const fields = active
+            ? { current_task: frame.seq, task_started_at: taskStartedAt, heartbeat_at: at }
+            : { current_task: null, task_started_at: null, heartbeat_at: null };
           try {
-            const cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps);
-            await run(frame, {
-              cmd: o.cmd,
-              channel: o.channel,
-              self,
-              contextDir,
-              recent: recent.slice(),
-              charter,
-              projectAgent: o.projectAgent ?? null,
-              cliUpgrade,
-              queueDepth,
-            });
-            delivered = true;
-            break;
-          } catch (e) {
-            lastError = e instanceof Error ? e.message : String(e);
-            // 抛错不等于「模型没跑过」。只有 runner 明确声明可重试（spawn 都没成功）才重试；
-            // 否则重跑会重复模型与外部副作用（git push / 开 PR）。见门禁 P1③。
-            retriable = e instanceof WakeBlockedError ? e.retriable : false;
-            if (!retriable) lastError += " (not retriable: model may have run)";
-            out(`  命令失败 (${attempt}/${maxAttempts}): ${lastError}`);
-            // 先落盘再重试：此刻进程崩掉，重启后不会把已经烧掉的次数忘干净
-            setStuck({ seq: frame.seq, attempts: attempt, last_error: lastError });
-            if (retriable && attempt < maxAttempts && retryDelayMs > 0) await delay(retryDelayMs);
+            writeHealthCache({ channel: o.channel, ...fields });
+          } catch {
+            /* 本机 health 落盘失败不影响唤醒 */
           }
+          try {
+            conn.send({ type: "heartbeat", ...fields });
+          } catch {
+            /* WS 未就绪就漏一拍：本机 health 仍新鲜，且下一拍/清除会补 */
+          }
+        };
+        // t=0 立刻发一拍「started」：不必等第一个间隔，频道/本机马上就能看到「已开始处理 seq=X」。
+        emitTaskBeat(true, taskStartedAt);
+        const taskBeat: ReturnType<typeof setInterval> = setInterval(() => emitTaskBeat(true, nowFn()), heartbeatIntervalMs);
+        if (typeof taskBeat.unref === "function") taskBeat.unref();
+        try {
+          for (let attempt = priorAttempts + 1; attempt <= maxAttempts && retriable; attempt++) {
+            try {
+              const cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps);
+              await run(frame, {
+                cmd: o.cmd,
+                channel: o.channel,
+                self,
+                contextDir,
+                recent: recent.slice(),
+                charter,
+                projectAgent: o.projectAgent ?? null,
+                cliUpgrade,
+                queueDepth,
+              });
+              delivered = true;
+              break;
+            } catch (e) {
+              lastError = e instanceof Error ? e.message : String(e);
+              // 抛错不等于「模型没跑过」。只有 runner 明确声明可重试（spawn 都没成功）才重试；
+              // 否则重跑会重复模型与外部副作用（git push / 开 PR）。见门禁 P1③。
+              retriable = e instanceof WakeBlockedError ? e.retriable : false;
+              if (!retriable) lastError += " (not retriable: model may have run)";
+              out(`  命令失败 (${attempt}/${maxAttempts}): ${lastError}`);
+              // 先落盘再重试：此刻进程崩掉，重启后不会把已经烧掉的次数忘干净
+              setStuck({ seq: frame.seq, attempts: attempt, last_error: lastError });
+              if (retriable && attempt < maxAttempts && retryDelayMs > 0) await delay(retryDelayMs);
+            }
+          }
+        } finally {
+          // 任务收尾：无论送达、放弃还是抛异常穿透，都停心跳并清除本机+频道的「正在处理」状态。
+          // 若身后还有排队的 wake，下一条自己的 started 拍会把 current_task 覆盖成新 seq。
+          clearInterval(taskBeat);
+          emitTaskBeat(false, nowFn());
         }
         if (delivered) {
           // 一条真正送达的 wake 证明 runner 恢复了；此前连续失败不再代表当前健康状态。

@@ -35,6 +35,9 @@ export interface HealthReport {
   last_frame_at?: number | null;
   last_error?: string | null;
   connected_since?: number | null;
+  current_task?: number | null;
+  task_started_at?: number | null;
+  heartbeat_at?: number | null;
   updated_at?: number;
 }
 
@@ -87,6 +90,7 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
 
+  const now = Date.now();
   const ageS = report.age_ms === null || report.age_ms === undefined ? null : Math.round(report.age_ms / 1000);
   console.log(`pid:             ${report.pid}`);
   console.log(`channel:         ${report.channel}`);
@@ -95,6 +99,21 @@ export async function run(argv: string[]): Promise<number> {
   console.log(`reconnect_count: ${report.reconnect_count}`);
   console.log(`last_frame_at:   ${report.last_frame_at === null ? "(never)" : `${new Date(report.last_frame_at!).toISOString()} (${ageS}s ago)`}`);
   console.log(`last_error:      ${report.last_error ?? "(none)"}`);
+  // 每任务进度/心跳（#228）：本机操作者一眼看到「正在跑 seq=X 的任务、心跳 Ns 前」，
+  // 不必去 launchd/tmux 后台文件里翻 ▶ 和 runner log。空闲则不打印这行。
+  if (report.current_task !== null && report.current_task !== undefined) {
+    const hbAgeS =
+      report.heartbeat_at === null || report.heartbeat_at === undefined
+        ? null
+        : Math.round((now - report.heartbeat_at) / 1000);
+    const runS =
+      report.task_started_at === null || report.task_started_at === undefined
+        ? null
+        : Math.round((now - report.task_started_at) / 1000);
+    const hb = hbAgeS === null ? "(no heartbeat)" : `heartbeat ${hbAgeS}s ago`;
+    const ran = runS === null ? "" : `, running ${runS}s`;
+    console.log(`current_task:    seq=${report.current_task} (${hb}${ran})`);
+  }
 
   if (channel !== undefined && report.channel !== channel) {
     console.log(`→ health stale for #${channel}: record belongs to #${report.channel}`);

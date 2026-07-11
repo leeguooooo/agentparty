@@ -1523,6 +1523,12 @@
   font-size: 9px;
   padding: 0 4px;
 }
+/* 每任务进度/心跳（#228）：与 busy 的琥珀区分——蓝色表达「正在处理具体这条 wake、心跳新鲜」。 */
+.presence-task {
+  border-color: var(--d-blue);
+  background: var(--d-blue-soft);
+  color: var(--d-blue);
+}
 .presence-wake--off {
   border-color: var(--t-faint);
   color: var(--t-dim);

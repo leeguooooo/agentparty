@@ -36,6 +36,9 @@ describe("health cache contract", () => {
       reconnect_count: 0,
       last_error: null,
       connected_since: null,
+      current_task: null,
+      task_started_at: null,
+      heartbeat_at: null,
       updated_at: 1234,
     });
     expect(statSync(healthCachePath(cwd)).mode & 0o777).toBe(0o600);

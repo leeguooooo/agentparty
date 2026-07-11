@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PresenceEntry } from "@agentparty/shared";
-import { busyNote, classify, identityNote, terminalIdentityText } from "../src/commands/who";
+import { busyNote, classify, identityNote, taskNote, terminalIdentityText } from "../src/commands/who";
 
 const NOW = 1_000_000_000;
 
@@ -239,5 +239,25 @@ describe("who busy + queue depth (#103)", () => {
       " · ⏳ busy · 4 queued",
     );
     expect(busyNote({ name: "a", kind: "agent", tier: "online", age_ms: 0 })).toBe("");
+  });
+
+  test("taskNote 渲染：正在处理的 seq + 心跳新鲜度（#228）", () => {
+    const now = 100_000;
+    // 有 current_task + 心跳：显示 ▶ seq 与心跳年龄
+    expect(taskNote({ name: "a", kind: "agent", tier: "online", age_ms: 0, current_task: 510, heartbeat_at: now - 8_000 }, now)).toBe(
+      " · ▶ seq 510 · ♥ 8s",
+    );
+    // 无心跳时间戳：如实标 (none)，不伪造新鲜
+    expect(taskNote({ name: "a", kind: "agent", tier: "online", age_ms: 0, current_task: 7 }, now)).toBe(" · ▶ seq 7 · ♥ (none)");
+    // 无活跃任务：空
+    expect(taskNote({ name: "a", kind: "agent", tier: "online", age_ms: 0 }, now)).toBe("");
+  });
+
+  test("classify 带出 current_task/task_started_at/heartbeat_at；离线不带（#228）", () => {
+    const online = classify(p({ name: "bot", current_task: 42, task_started_at: 1000, heartbeat_at: 2000 }), NOW);
+    expect(online).toMatchObject({ current_task: 42, task_started_at: 1000, heartbeat_at: 2000 });
+    // 离线 presence 服务端本就不下发这些字段；即便脏数据混进来，classify 也不该把它当成「正在处理」。
+    const offline = classify(p({ name: "bot", state: "offline", wake: { kind: "serve" } }), NOW);
+    expect(offline?.current_task).toBeUndefined();
   });
 });

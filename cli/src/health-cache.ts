@@ -23,6 +23,15 @@ export interface HealthCache {
   last_error: string | null;
   /** 当前这次连上是从什么时候开始的；重连后刷新，断开时清空。 */
   connected_since: number | null;
+  /**
+   * 每任务进度/心跳（#228）：serve 正在处理哪条 wake（触发 seq）。空闲时 null。
+   * 本机操作者用它（配合 party health）看到「正在跑 seq=X 的任务」，不必去后台文件里翻 runner log。
+   */
+  current_task: number | null;
+  /** 当前任务的 run() 开始时刻（epoch ms）（#228）。与 current_task 同生共死。 */
+  task_started_at: number | null;
+  /** 最近一次任务心跳时刻（epoch ms）（#228）。周期性推进；与 last_frame_at（连接新鲜度）正交——它是「任务还在跑」。 */
+  heartbeat_at: number | null;
   updated_at: number;
 }
 
@@ -59,6 +68,9 @@ export function writeHealthCache(patch: HealthPatch, cwd: string = process.cwd()
     reconnect_count: pick(patch, "reconnect_count", prev?.reconnect_count ?? 0),
     last_error: pick(patch, "last_error", prev?.last_error ?? null),
     connected_since: pick(patch, "connected_since", prev?.connected_since ?? null),
+    current_task: pick(patch, "current_task", prev?.current_task ?? null),
+    task_started_at: pick(patch, "task_started_at", prev?.task_started_at ?? null),
+    heartbeat_at: pick(patch, "heartbeat_at", prev?.heartbeat_at ?? null),
     updated_at: now,
   };
 
