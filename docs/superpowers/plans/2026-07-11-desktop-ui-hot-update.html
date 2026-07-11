@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>桌面 UI 热更新实施计划</title>
+<style>
+:root{--fg:#202020;--muted:#666;--accent:#2456d6;--border:#d8d8d3;--soft:#f5f6f8}*{box-sizing:border-box}body{max-width:980px;margin:auto;padding:32px 24px 72px;color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}header{border-bottom:3px solid var(--accent)}h1{font-size:27px}h2{margin-top:32px;font-size:20px}h3{font-size:16px}code{background:var(--soft);padding:1px 4px}table{width:100%;border-collapse:collapse}th,td{border:1px solid var(--border);padding:8px;text-align:left;vertical-align:top}th{background:var(--soft)}li{margin:6px 0}.done{color:#18733c}.gate{color:#9a3412}</style>
+</head>
+<body>
+<header><h1>桌面 UI 热更新实施计划</h1><p>目标：官方签名 UI 独立发布，本地验签加载，启动失败自动回滚。</p></header>
+<main>
+<section><h2>全局约束</h2><ul><li>私有部署不能成为代码签名方。</li><li><code>ui_abi=1</code>；首版最低壳版本 <code>0.2.94</code>。</li><li>所有 archive 路径、大小、文件数、哈希和签名必须在解包前后校验。</li><li>内置 UI 始终可启动；更新失败不能阻塞登录和频道。</li></ul></section>
+<section><h2>文件与责任</h2><table>
+<tr><th>范围</th><th>文件</th><th>产出</th></tr>
+<tr><td>发布</td><td><code>scripts/desktop-ui-release.ts</code>、测试、<code>.github/workflows/desktop-ui-release.yml</code></td><td>确定性 archive、manifest、签名和固定 release channel。</td></tr>
+<tr><td>原生核心</td><td><code>desktop/src-tauri/src/ui_update.rs</code></td><td>模型、兼容性、安全解包、状态机、原子切换。</td></tr>
+<tr><td>原生接线</td><td><code>desktop/src-tauri/src/lib.rs</code>、<code>tauri.conf.json</code></td><td>固定 endpoint、后台检查、custom protocol、ready command。</td></tr>
+<tr><td>Web</td><td><code>web/src/lib/desktopUi.ts</code>、测试、<code>App.tsx</code></td><td>读取注入 build identity，首屏稳定后回报 ready。</td></tr>
+<tr><td>恢复</td><td>Rust 状态机测试 + 桌面 smoke</td><td>pending 两次失败回退 previous，再失败使用 bundled。</td></tr>
+</table></section>
+<section><h2>执行顺序</h2>
+<h3>1. 发布通道</h3><ol><li>先写 manifest、非法元数据、确定性 archive 和 workflow 契约测试，并确认失败。</li><li>实现构建脚本；输出 versioned asset 与签名输入。</li><li>新增 main 分支 Web 变更触发的 workflow，使用 release environment 的 v2 signing secret。</li><li>运行脚本测试、TypeScript 和 workflow 静态测试。</li></ol>
+<h3>2. 原生可测试核心</h3><ol><li>先写兼容性、路径穿越、symlink、超限、哈希错误和状态迁移测试。</li><li>实现纯 Rust manifest 与 cache API，不接网络和 WebView。</li><li>用临时目录验证 staging、atomic rename、current/previous 和清理策略。</li><li>运行 <code>cargo test</code> 与 <code>cargo clippy -- -D warnings</code>。</li></ol>
+<h3>3. Web ready 握手</h3><ol><li>先写浏览器 no-op、合法注入值、重复调用 single-flight 与错误吞吐测试。</li><li>实现 <code>reportDesktopUiReady()</code>，只在 Tauri 且 build identity 完整时 invoke。</li><li>在 App 身份恢复和首屏初始化完成后调用；不等待返回，不阻塞 UI。</li><li>运行 Web 全量测试、类型检查和生产构建。</li></ol>
+<h3>4. 原生接线</h3><ol><li>注册固定官方 endpoint 和 custom protocol，协议只读 current 或 bundled。</li><li>下载 manifest/signature/archive，调用已测试核心后切换 pending。</li><li>注册 ready command；超时/下次启动按状态机回退。</li><li>保留 <code>frontendDist</code> 作为 bundled 救援页。</li></ol>
+<h3>5. 端到端门禁</h3><ol><li>发布测试 UI build，不提高客户端版本。</li><li>已安装应用更新 UI 并回报 build_id；切换私有服务器仍正常登录。</li><li>用损坏签名、路径穿越 archive、ABI 2 manifest 和 crash build 验证拒绝/回退。</li><li>通过后更新桌面文档，并把 UI build identity 显示到统一设置面板。</li></ol>
+</section>
+<section><h2>完成标准</h2><p class="gate">只有独立 UI 发布、真实桌面加载、恶意包拒绝、自动回滚和 bundled 救援五项都有证据，才算完成。Developer ID 公证仍是客户端二进制发布的独立门禁。</p></section>
+</main>
+</body>
+</html>

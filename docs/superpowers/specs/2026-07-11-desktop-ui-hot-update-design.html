@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentParty 桌面 UI 热更新设计</title>
+<style>
+:root { --fg:#1b1b1b; --muted:#666; --accent:#b42318; --border:#d7d7d2; --soft:#f6f6f3; --code:#efefeb; }
+* { box-sizing:border-box; }
+body { max-width:980px; margin:auto; padding:32px 24px 80px; color:var(--fg); font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+header { border-bottom:3px solid var(--accent); padding-bottom:18px; }
+h1 { margin:0 0 6px; font-size:28px; } h2 { margin-top:34px; font-size:20px; } h3 { font-size:16px; }
+.meta,.muted { color:var(--muted); } aside { margin:18px 0; padding:12px 16px; border-left:4px solid var(--accent); background:var(--soft); }
+table { width:100%; border-collapse:collapse; margin:14px 0; } th,td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; } th { background:var(--soft); }
+code,pre { font-family:"SFMono-Regular",Consolas,monospace; } code { background:var(--code); padding:1px 4px; } pre { overflow:auto; padding:14px; background:var(--code); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentParty 桌面 UI 热更新设计</h1>
+  <p class="meta">日期：2026-07-11 · 状态：实施中 · 适用：macOS、Windows、Linux 桌面壳</p>
+</header>
+<main>
+<section>
+  <h2>目标</h2>
+  <p>React、CSS、文案等 UI 变更独立发布，不再要求每次生成 DMG/NSIS/AppImage。Rust、Tauri 权限、sidecar、系统插件和 UI ABI 变化仍走客户端版本发布。</p>
+  <aside><strong>信任边界：</strong>桌面壳只执行 AgentParty 官方签名的 UI 包。私有部署只提供 API 和认证配置，不能向本机下发可调用 Tauri IPC 的代码。</aside>
+</section>
+<section>
+  <h2>为什么不能直接加载远程站点</h2>
+  <table>
+    <tr><th>方案</th><th>问题</th><th>结论</th></tr>
+    <tr><td>WebView 直接打开部署 URL</td><td>远端页面一旦被篡改，可调用 Keychain、更新器、本机 agent、通知和文件打开等 IPC。</td><td>拒绝</td></tr>
+    <tr><td>私有服务器下发自己的 UI</td><td>把每个私有部署都提升成桌面代码签名方，无法统一撤销和审计。</td><td>首版不支持</td></tr>
+    <tr><td>官方签名 UI 包 + 本地协议</td><td>可验签、缓存、回滚，并维持 Tauri 本地 origin 与 IPC 权限控制。</td><td>采用</td></tr>
+  </table>
+</section>
+<section>
+  <h2>发布契约</h2>
+  <pre><code>{
+  "schema": 1,
+  "channel": "stable",
+  "build_id": "&lt;git sha&gt;",
+  "published_at": "2026-07-11T12:00:00Z",
+  "ui_abi": 1,
+  "min_shell_version": "0.2.94",
+  "asset": { "url": ".../agentparty-ui-&lt;sha&gt;.tar.gz", "sha256": "...", "size": 123456 }
+}</code></pre>
+  <p><code>desktop-ui-latest.json</code> 与 archive 分别签名。客户端固定访问官方 HTTPS endpoint，拒绝未知 schema、错误 channel、ABI 不匹配、壳版本过低、时间倒退、哈希或签名错误。</p>
+</section>
+<section>
+  <h2>本地存储与启动</h2>
+  <table>
+    <tr><th>目录/状态</th><th>责任</th></tr>
+    <tr><td><code>ui/bundled</code></td><td>随应用携带的救援 UI，永不删除。</td></tr>
+    <tr><td><code>ui/builds/&lt;build_id&gt;</code></td><td>验签并安全解包后的不可变 UI。</td></tr>
+    <tr><td><code>ui/state.json</code></td><td>记录 current、previous、pending、最高已接受发布时间和失败次数。</td></tr>
+    <tr><td><code>agentparty-ui://localhost/</code></td><td>只从 current 目录读取静态文件；规范化路径并禁止目录穿越。</td></tr>
+  </table>
+  <p>下载先进入 staging；通过大小、文件数、路径、哈希、签名与兼容性校验后原子 rename。新包先标记 <code>pending</code>，React 完成初始化后调用 <code>desktop_ui_ready(build_id, ui_abi)</code>。连续两次未 ready 时回退 previous；previous 也失败则使用 bundled。</p>
+</section>
+<section>
+  <h2>更新时机</h2>
+  <p>应用启动后延迟检查，前台每 6 小时最多检查一次，并提供手动检查。下载完成后仅重载 WebView，不重启原生进程。正在编辑消息、执行配对或本机 agent 操作时延迟重载；强制安全撤回可在下次启动生效。</p>
+</section>
+<section>
+  <h2>客户端版本边界</h2>
+  <table>
+    <tr><th>可热更新</th><th>必须发客户端</th></tr>
+    <tr><td>React 页面、CSS、i18n、静态图片、仅调用既有 IPC 的交互</td><td>Rust/Tauri、权限、capabilities、sidecar、协议处理器、签名公钥、UI ABI、窗口/托盘原生行为</td></tr>
+  </table>
+</section>
+<section>
+  <h2>验收</h2>
+  <ol>
+    <li>发布一个只改 UI 的提交，GitHub 生成签名 UI 包但不生成新 DMG。</li>
+    <li>已安装桌面版发现并加载新 build_id，设置和登录状态保留。</li>
+    <li>断网、签名损坏、archive 路径穿越、ABI 不匹配均保留当前 UI。</li>
+    <li>注入启动崩溃后自动回退 previous；删除缓存后仍能启动 bundled。</li>
+    <li>切换官方与私有 API origin 时使用同一份官方签名 UI。</li>
+  </ol>
+</section>
+</main>
+</body>
+</html>

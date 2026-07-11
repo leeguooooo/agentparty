@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChannelList } from "./components/ChannelList";
 import { CreateChannel } from "./components/CreateChannel";
 import { DesktopSettings } from "./components/DesktopSettings";
+import { reportDesktopUiReady } from "./lib/desktopUi";
 import { DesktopDownloadLink } from "./components/DesktopDownloadLink";
 import { DesktopInvitePaste } from "./components/DesktopInvitePaste";
 import { DesktopPairingGate } from "./components/DesktopPairingGate";
@@ -98,6 +99,10 @@ function meTitle(me: MeInfo): string {
 }
 
 export function App() {
+  useEffect(() => {
+    void reportDesktopUiReady();
+  }, []);
+
   const t = useT();
   const [path, navigate, replace] = useRoute();
   const desktop = useRef(isDesktopRuntime()).current;
