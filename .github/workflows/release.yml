@@ -28,7 +28,7 @@ jobs:
     outputs:
       cli_only: ${{ github.event_name == 'pull_request' && steps.filter.outputs.cli == 'true' && steps.filter.outputs.non_cli == 'false' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -56,7 +56,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - run: bun run check:cli
 
@@ -74,7 +74,7 @@ jobs:
       matrix:
         ws: [web, shared, scripts]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - run: bun run check:${{ matrix.ws }}
 
@@ -94,7 +94,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - name: verify test runtime
         working-directory: worker
@@ -112,7 +112,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - working-directory: worker
         run: bunx tsc --noEmit
@@ -129,7 +129,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - name: bun audit
         run: |
@@ -157,7 +157,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
       - name: verify release version contract
         env:
@@ -237,7 +237,7 @@ jobs:
             asset: windows-x64
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -345,7 +345,7 @@ jobs:
             asset: darwin-arm64
             rust_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -646,7 +646,7 @@ jobs:
     permissions:
       contents: write # 建/改 Release、上传 assets
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
