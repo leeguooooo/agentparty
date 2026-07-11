@@ -291,8 +291,11 @@
   .desktop-agent-fields label:first-child { grid-column: 1 / -1; }
 }
 .app-me {
+  /* #275 Head 优化：margin-left:auto 把身份簇推到右组开头，但原来 flex:1 1 240px 会让它
+     撑满到 560px/50vw，内容左对齐后「token …」就浮在顶栏正中、和右边的昵称/语言/退出拉开一大段空白。
+     改为不 grow（flex:0 1 auto），身份簇紧凑地和昵称/语言/退出聚成一个右组，只在左右组之间留一个间隔。 */
   margin-left: auto;
-  flex: 1 1 240px;
+  flex: 0 1 auto;
   display: flex;
   align-items: center;
   gap: 6px;
