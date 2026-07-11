@@ -1,0 +1,21 @@
+# 复用的 workspace setup：pin bun + 缓存 bun 全局 install cache + frozen install。
+# 每个并行 check job 都装全 workspace（根 lockfile 保证 workspace:* 依赖可解析），
+# 缓存命中时 install 只需秒级。
+name: bun install
+description: Set up bun and install all workspace dependencies with a warm cache.
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: "1.3.14"
+    - name: cache bun install
+      uses: actions/cache@v4
+      with:
+        path: ~/.bun/install/cache
+        key: bun-install-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+        restore-keys: |
+          bun-install-${{ runner.os }}-
+    - name: install deps
+      shell: bash
+      run: bun install --frozen-lockfile

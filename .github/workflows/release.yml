@@ -38,27 +38,57 @@ jobs:
             non_cli:
               - '!cli/**'
 
-  # ── #9 pre-merge / release gate：必须覆盖测试文件 tsc ─────────────
-  # 唯一的 required 门禁，名字保持 "full check"（分支保护不用改）。
-  # #247：纯 CLI 的 PR 只跑 check:cli（秒级），否则跑全量 check（行为不变）。
-  check:
-    name: full check
+  # ── #9 pre-merge / release gate：每个 workspace 独立并行跑，墙上时间=最慢单个 ──
+  # 5 个 workspace（cli/worker/web/shared/scripts）互不依赖（worker vitest 用隔离的
+  # 空 assets 目录，不再需要 web/dist），原来一个 job 串行跑 `bun run check` 要 ~6min，
+  # 拆并行后 ≈ 最慢那个 job。
+  # 复用的 setup 步骤（checkout+bun+install cache+install）由 composite action 提供。
+  #
+  # 快路径（#247）：纯 CLI 的 PR 只有 check-cli 真跑；worker/web/shared/scripts 靠
+  # `if: cli_only != 'true'` 跳过。fail-safe 方向不变——cli_only 只在 changes job 里
+  # 按「PR + cli 变更 + 无任何非 cli 变更」判定，配错只多跑绝不漏测；tag/main push
+  # 非 PR，cli_only 恒 false，5 个 workspace 全跑。
+
+  # cli 在两条路径下都要跑，所以无条件执行。
+  check-cli:
     needs: changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - run: bun run check:cli
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.14"
+  # worker/web/shared/scripts：非纯 CLI（或非 PR）才跑，纯 CLI 快路径下 skip。
+  check-rest:
+    name: check ${{ matrix.ws }}
+    needs: changes
+    if: needs.changes.outputs.cli_only != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ws: [worker, web, shared, scripts]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - run: bun run check:${{ matrix.ws }}
 
-      - name: install deps
-        run: bun install --frozen-lockfile
-
+  # 发布版本契约：只在 tag 上校验 tag == cli/desktop package.json 版本。
+  # 非 tag 时 skip（聚合门禁把 skipped 当通过）。
+  version-contract:
+    needs: changes
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
       - name: verify release version contract
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -69,19 +99,37 @@ jobs:
             exit 1
           fi
 
-      # #247：纯 CLI 改动走 check:cli 快路径；其余一律全量。
-      # 快路径只由 changes.cli_only 决定，而它 fail-safe 偏向全量——判断在 changes job，
-      # 这里只是执行。tag/main push（非 PR）永远走全量。
-      - name: run check (cli-only fast path or full)
+  # 唯一的 required 门禁，名字保持 "full check"（分支保护映射的就是它，不用改设置）。
+  # if: always() → 无论上游成功/跳过/失败都跑；任一 workspace job 结论为 failure/cancelled
+  # 则本 job 失败，skipped（快路径跳过的）与 success 都算通过。build/desktop 仍 needs: check。
+  check:
+    name: full check
+    needs:
+      - check-cli
+      - check-rest
+      - version-contract
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: aggregate workspace check results
+        env:
+          R_CLI: ${{ needs.check-cli.result }}
+          R_REST: ${{ needs.check-rest.result }}
+          R_VERSION: ${{ needs.version-contract.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.changes.outputs.cli_only }}" = "true" ]; then
-            echo "#247: 纯 CLI 改动 → 只跑 check:cli（快路径）"
-            bun run check:cli
-          else
-            echo "#247: 非纯 CLI（或非 PR）→ 全量 check"
-            bun run check
-          fi
+          echo "cli=$R_CLI rest=$R_REST version=$R_VERSION"
+          fail=0
+          for r in "$R_CLI" "$R_REST" "$R_VERSION"; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::required check job did not pass: result=$r"; fail=1 ;;
+            esac
+          done
+          [ "$fail" = "0" ] || exit 1
+          echo "full check ✅"
 
   # ── 交叉编译 + 打包 + 构建溯源 ──────────────────────────────
   build:
