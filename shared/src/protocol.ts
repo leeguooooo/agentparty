@@ -376,6 +376,13 @@ export interface PresenceEntry {
   /** 排在当前 wake 身后、尚未处理的 wake 数（issue #103）。仅 state != offline 且 >0 时下发。 */
   queue_depth?: number;
   /**
+   * 同名多机 serve 里，除持租者外仍挂着、处于 standby 的 serve 连接数（issue #99）。DO 从活连接里的
+   * serve 租约候选权威判定：候选数 N ≥ 2 时下发 N-1（有几台在待命顶替），否则省略。用途：who / web
+   * 一眼看出「这个 name 有重复 serve，但只有 1 台在真正跑 runner」——把过去只能靠 connection_count x2
+   * 猜测的重复执行风险，明确成「已被租约互斥、其余在 standby」。旧客户端忽略。
+   */
+  serve_standbys?: number;
+  /**
    * 当前正在处理的那条 wake 的触发 seq（reply_to / @ 的 seq）（issue #228，扩 #103 busy）。
    * serve 处理一条长任务期间用轻量、presence-only 的 heartbeat 帧刷这三个字段：正在处理哪条、何时开始、
    * 最近一次心跳。用途：who/web 区分「还在干、活到 T」与「卡死」——busy 只说「在忙」，这里说「在忙哪一条、活没活」。
@@ -621,7 +628,15 @@ export interface HeartbeatFrame {
   heartbeat_at: number | null;
 }
 
-export type ClientFrame = HelloFrame | SendFrame | PingFrame | SeenFrame | HeartbeatFrame;
+// 同名 serve 跨机租约（#99）：一个 serve 连接声明「我是这个 name 的 serve runner，想当唯一在跑的那个」。
+// 服务端据此在同名的多条 serve 连接里选出唯一持租者，并回 ServeLeaseFrame 告知各连接是否持租。
+// 只有 serve 型 supervisor 发它；watch / webhook / 人类连接都不发。op 目前恒为 "claim"（断连即隐式释放）。
+export interface ServeLeaseClaimFrame {
+  type: "serve_lease";
+  op: "claim";
+}
+
+export type ClientFrame = HelloFrame | SendFrame | PingFrame | SeenFrame | HeartbeatFrame | ServeLeaseClaimFrame;
 
 // ---- 服务端 → 客户端帧 ----
 
@@ -1258,6 +1273,17 @@ export interface PongFrame {
   type: "pong";
 }
 
+// 同名 serve 跨机租约（#99）：服务端告诉某条 serve 连接它此刻是否持租。
+// held=true 的那条才跑 runner；held=false 的转入 standby（被 @ 也不跑，消息仍进历史、游标照推进）。
+// 持租者断连 / 心跳超时（presence 60s 扫描）后，服务端把租约转给下一条 standby 并补发 held=true。
+export interface ServeLeaseFrame {
+  type: "serve_lease";
+  /** 本连接所属身份 name。 */
+  name: string;
+  /** 本连接此刻是否持有该 name 的 serve 租约（唯一在跑的那个）。 */
+  held: boolean;
+}
+
 export type ServerFrame =
   | WelcomeFrame
   | ParticipantsFrame
@@ -1267,4 +1293,5 @@ export type ServerFrame =
   | PresenceFrame
   | ReadCursorFrame
   | ErrorFrame
-  | PongFrame;
+  | PongFrame
+  | ServeLeaseFrame;

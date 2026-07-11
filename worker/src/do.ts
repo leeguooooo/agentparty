@@ -85,6 +85,13 @@ interface ConnState {
   collabRoleSource?: CollaborationRoleSource;
   archived: boolean;
   lastSeen: number;
+  // 同名 serve 跨机租约（#99）：本连接是否 claim 过 serve 租约（是一条 serve runner）。
+  serveCandidate?: boolean;
+  // claim 时分配的单调序号（meta 计数器）。同名多条候选里最小序号者持租——序号在首次 claim 定死、
+  // 重连/重复 claim 不变，故持租者掉线后由"次早"顶上，重连的原持租者拿到更大序号、不抢回（软租约）。
+  serveClaimSeq?: number;
+  // 上次已通告给本连接的持租状态，用于去重：只在 held 变化时才补发 serve_lease 帧。
+  serveLeaseHeld?: boolean;
 }
 
 interface Identity {
@@ -1464,6 +1471,16 @@ export class ChannelDO extends Server<Env> {
       if (hb !== null) this.applyTaskHeartbeat(st.name, hb);
       return;
     }
+    if (frame.type === "serve_lease" && frame.op === "claim") {
+      // 同名 serve 跨机租约（#99）：本连接声明它是一条 serve runner，想当唯一在跑的那个。
+      // 首次 claim 定死一个单调序号（重复 claim 不改，避免重连者用更小序号抢回租约）；随后在同名候选里
+      // 选最小序号者持租，回 serve_lease 告知各连接是否持租。断连/心跳超时由 onClose/scanPresence 触发改选。
+      if (!st.serveCandidate) {
+        st = connection.setState({ ...st, serveCandidate: true, serveClaimSeq: this.nextServeClaimSeq() }) ?? st;
+      }
+      this.reconcileServeLease(st.name);
+      return;
+    }
     if (frame.type === "send") {
       if (st.archived || this.isArchived()) {
         this.sendFrame(connection, { type: "error", code: "archived", message: "channel is archived" });
@@ -1515,6 +1532,9 @@ export class ChannelDO extends Server<Env> {
   onClose(connection: Connection<ConnState>) {
     const st = connection.state;
     if (!st || !st.name || st.archived) return;
+    // 同名 serve 跨机租约（#99）：持租者/候选断连 → 重选，让下一条 standby 顶上（补发 held=true）。
+    // 排除正在关闭的这条（getConnections 可能仍返回它）。非 serve 连接不触发。
+    if (st.serveCandidate) this.reconcileServeLease(st.name, connection.id);
     for (const other of this.getConnections<ConnState>()) {
       if (other.id !== connection.id && other.state?.name === st.name) {
         this.broadcastFrame({ type: "participants", participants: this.participants() });
@@ -1552,8 +1572,11 @@ export class ChannelDO extends Server<Env> {
       if (now - last >= PRESENCE_TIMEOUT_MS) stale.push(connection);
       else live++;
     }
+    // 同名 serve 跨机租约（#99）：心跳超时的持租者，其连接在这里被关；关掉后要重选租约让 standby 顶上。
+    const staleServeNames = new Set<string>();
     for (const connection of stale) {
       const name = connection.state?.name;
+      if (connection.state?.serveCandidate && name) staleServeNames.add(name);
       connection.close(1001, "heartbeat timeout");
       if (!name) continue;
       // getConnections 只回 open 的连接，刚 close 的不算
@@ -1566,6 +1589,8 @@ export class ChannelDO extends Server<Env> {
       }
       if (gone) this.markOffline(name, now);
     }
+    // 已 close 的陈旧连接不在 getConnections 里，直接重选：存活的候选里最早的顶上、补发 held=true。
+    for (const name of staleServeNames) this.reconcileServeLease(name);
     if (stale.length > 0) {
       this.broadcastFrame({ type: "participants", participants: this.participants() });
     }
@@ -4405,6 +4430,60 @@ export class ChannelDO extends Server<Env> {
     return counts;
   }
 
+  // ---- 同名 serve 跨机租约（issue #99）----
+  // 同机单实例锁（CLI src/instance-lock.ts，#237）只挡本机；跨机器两台 serve 各连一条 WS，广播把每条 @
+  // 发给同名所有连接 → 都跑完整 runner、双份副作用。这里在服务端做互斥：同名 serve 连接各自 claim，只有
+  // claim 最早（序号最小）的那条持租、跑 runner；其余转 standby。持租者断连/心跳超时后自动让下一条顶上。
+
+  // claim 时从单调计数器取一个序号：越早 claim 越小。序号首次 claim 后定死，故持租者掉线由"次早"顶替、
+  // 重连的原持租者拿到更大序号不抢回（软租约）。计数器落 meta，DO hibernate 也不丢。
+  private nextServeClaimSeq(): number {
+    const next = (Number(this.getMeta("serve_claim_seq") ?? "0") || 0) + 1;
+    this.setMeta("serve_claim_seq", String(next));
+    return next;
+  }
+
+  // 同名的活 serve 候选连接，按 claim 序号升序（并列用 connection.id 兜底稳定）。excludeId 供 onClose 用：
+  // 正在关闭的连接 getConnections 可能仍返回，但它已不该参与选举。
+  private serveLeaseCandidates(name: string, excludeId?: string): Connection<ConnState>[] {
+    const list: Connection<ConnState>[] = [];
+    for (const c of this.getConnections<ConnState>()) {
+      if (c.id === excludeId) continue;
+      const st = c.state;
+      if (st?.serveCandidate && st.name === name) list.push(c);
+    }
+    list.sort((a, b) => {
+      const sa = a.state?.serveClaimSeq ?? Number.MAX_SAFE_INTEGER;
+      const sb = b.state?.serveClaimSeq ?? Number.MAX_SAFE_INTEGER;
+      return sa !== sb ? sa - sb : a.id.localeCompare(b.id);
+    });
+    return list;
+  }
+
+  // 选出唯一持租者（序号最小），给每条候选连接补发它此刻是否持租——只在 held 相对上次变化时才发（去重）。
+  private reconcileServeLease(name: string, excludeId?: string) {
+    const candidates = this.serveLeaseCandidates(name, excludeId);
+    const holderId = candidates[0]?.id;
+    for (const c of candidates) {
+      const st = c.state;
+      if (!st) continue;
+      const held = c.id === holderId;
+      if (st.serveLeaseHeld === held) continue;
+      c.setState({ ...st, serveLeaseHeld: held });
+      this.sendFrame(c, { type: "serve_lease", name, held });
+    }
+  }
+
+  // 每个 name 的 serve 候选连接数（含持租者）。用于 presence 暴露 standby 数（候选数 - 1）。
+  private serveCandidateCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const c of this.getConnections<ConnState>()) {
+      const st = c.state;
+      if (st?.serveCandidate && st.name) counts.set(st.name, (counts.get(st.name) ?? 0) + 1);
+    }
+    return counts;
+  }
+
   private getMeta(key: string): string | null {
     const rows = this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray();
     return rows.length > 0 ? String(rows[0]!.value) : null;
@@ -4446,27 +4525,37 @@ export class ChannelDO extends Server<Env> {
 
   private presenceList(): PresenceEntry[] {
     const liveCounts = this.liveConnectionCounts();
+    const serveCounts = this.serveCandidateCounts();
     return this.ctx.storage.sql
       .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence ORDER BY name`)
       .toArray()
-      .map((r) => this.withLivePresence(this.presenceRowToEntry(r), liveCounts));
+      .map((r) => this.withLivePresence(this.presenceRowToEntry(r), liveCounts, serveCounts));
   }
 
   private presenceFor(name: string): PresenceEntry | null {
     const liveCounts = this.liveConnectionCounts();
+    const serveCounts = this.serveCandidateCounts();
     const rows = this.ctx.storage.sql
       .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence WHERE name = ?`, name)
       .toArray();
-    return rows.length > 0 ? this.withLivePresence(this.presenceRowToEntry(rows[0]!), liveCounts) : null;
+    return rows.length > 0 ? this.withLivePresence(this.presenceRowToEntry(rows[0]!), liveCounts, serveCounts) : null;
   }
 
   // issue #97：presence 序列化时用「当前有无活 WS 连接」在读侧修正可达性/离线，再叠加重复连接计数。
   // 有活连接 → applyLiveConnection 打 live=true、offline 提升为 waiting（不改写 ts/last_seen，故 host 租约
   // 判定完全不受影响，详见 shared 注释）；无活连接 → 原样返回。connection_count 语义照旧（仅 >1 时下发）。
-  private withLivePresence(entry: PresenceEntry, liveCounts: Map<string, number>): PresenceEntry {
+  private withLivePresence(
+    entry: PresenceEntry,
+    liveCounts: Map<string, number>,
+    serveCounts?: Map<string, number>,
+  ): PresenceEntry {
     const count = liveCounts.get(entry.name) ?? 0;
     const live = applyLiveConnection(entry, count > 0);
-    return count > 1 ? { ...live, connection_count: count } : live;
+    const withCount = count > 1 ? { ...live, connection_count: count } : live;
+    // 同名 serve standby 数（#99）：serve 候选连接数 - 1 持租者。>0 才下发（有几台在待命顶替），让 who/web
+    // 一眼看出"重复 serve 但已被租约互斥、只有 1 台在跑"，而不是只能靠 connection_count x2 猜。
+    const standbys = (serveCounts?.get(entry.name) ?? 0) - 1;
+    return standbys > 0 ? { ...withCount, serve_standbys: standbys } : withCount;
   }
 
   private presenceRowToEntry(r: Record<string, unknown>): PresenceEntry {

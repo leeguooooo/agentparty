@@ -1498,6 +1498,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
   // 人为暂停接待（#180）：服务端对 webhook 已抑制，但 serve 是本地 supervisor、消息照样广播给它。
   // 收到自己的 paused presence 帧就自我抑制唤醒——被 @ 也不触发 runner，直到收到恢复帧。消息仍进历史。
   let selfPaused = false;
+  // 同名 serve 跨机租约（#99）：同机单实例锁（上文）只挡本机；跨机器两台 serve 各连一条 WS，服务端广播
+  // 把每条 @ 发给同名所有连接 → 两台都跑完整 runner。修复：挂上后向服务端 claim 租约，只有持租的那台跑
+  // runner。hasLease 默认 true（老服务端不认租约、从不下发 serve_lease → 保持旧行为不回归）；收到
+  // held=false 转 standby（被 @ 也不跑，消息仍进历史、游标照推进），held=true（持租/顶替）恢复响应。
+  let hasLease = true;
+  let leaseKnown = false; // 是否至少收到过一次 serve_lease（用于只在真 standby 时打印提示）
   let charter: ChannelCharter | null = o.charter ?? null;
   const refreshCharter = async (reason: string, expectedRev?: number) => {
     if (!o.fetchCharter) return;
@@ -1533,6 +1539,10 @@ export async function runServe(o: ServeOptions): Promise<number> {
       writeHealthCache({ channel: o.channel, last_frame_at: Date.now() });
       if (frame.type === "welcome") {
         self = frame.self;
+        // 挂上/重连即向服务端 claim serve 租约（#99）。best-effort：ws 此刻是 OPEN，claim 会送出；
+        // 服务端在同名多条 serve 里选唯一持租者并回 serve_lease。老服务端不认识它、直接忽略（hasLease
+        // 默认 true → 旧行为）。重连每次 welcome 都重新 claim（连接换了，租约候选身份也换了）。
+        conn.send({ type: "serve_lease", op: "claim" });
         // 连上时若自己已被暂停接待（#180），从 welcome 的 presence 快照里认出来——重连也不误唤醒。
         const mine = frame.presence?.find((p) => p.name === self);
         selfPaused = mine?.paused === true;
@@ -1605,6 +1615,24 @@ export async function runServe(o: ServeOptions): Promise<number> {
           );
         }
       }
+      // 同名 serve 跨机租约（#99）：服务端在同名多条 serve 连接里选唯一持租者，用这帧告诉本连接是否持租。
+      // 只有持租的那台跑 runner；held=false 转 standby（下方 qualifies 拦住 runner），持租者掉线后服务端
+      // 补发 held=true 让 standby 顶上。跨进程互斥点在服务端——本地只是遵从它的裁决。
+      if (frame.type === "serve_lease" && frame.name === self) {
+        const next = frame.held === true;
+        if (!leaseKnown || next !== hasLease) {
+          hasLease = next;
+          out(
+            hasLease
+              ? leaseKnown
+                ? "serve: 取得 serve 租约——本台顶替，开始响应 @（同名另一台已让出/掉线）。"
+                : "serve: 持有 serve 租约——本台负责跑 runner。"
+              : "serve: 未持有 serve 租约（同名另一台 serve 在跑）——本台转 standby：被 @ 也不跑 runner，消息仍进历史；持租者掉线后自动顶替。",
+          );
+        }
+        leaseKnown = true;
+        continue;
+      }
       if (frame.type !== "msg") continue;
       const fromSelf = frame.sender.name === self;
       // fresh = 游标之上的新消息。历史修订快照会穿透去重被重放（seq 早已消费过），
@@ -1629,7 +1657,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
       if (wouldWake && selfPaused) {
         out(`⏸ 暂停中，跳过唤醒（消息仍在历史）: ${formatMsg(frame)}`);
       }
-      const qualifies = wouldWake && !selfPaused;
+      // 未持租（#99）：同名另一台 serve 在跑，本台是 standby——被 @ 也不跑 runner，但消息照进 recent/历史、
+      // 游标照推进（下方 ack），与暂停接待同路径。持租者掉线后收到 held=true 再从新消息开始响应。
+      if (wouldWake && !selfPaused && !hasLease) {
+        out(`▷ standby（未持有 serve 租约），跳过唤醒（消息仍在历史）: ${formatMsg(frame)}`);
+      }
+      const qualifies = wouldWake && !selfPaused && hasLease;
       if (qualifies) {
         out(`▶ ${formatMsg(frame)}`);
         // 串行：本条命令跑完再消费下一帧（新帧此间缓冲在 FrameQueue），避免并发唤起互相抢
