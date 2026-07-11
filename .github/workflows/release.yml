@@ -312,7 +312,7 @@ jobs:
 
       # 保留 attest-build-provenance 作为额外溯源层（gh attestation verify 可增强验证）
       - name: attest provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.pkg.outputs.pkg }}
 
