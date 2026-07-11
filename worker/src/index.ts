@@ -1758,8 +1758,13 @@ app.use("/api/*", async (c, next) => {
   }
   await next();
   // 建言信号：始终告知下限；已知过时才打 too-old 标（unknown/legacy 不打，避免误伤本就不带头的浏览器等）。
-  c.res.headers.set(MIN_CLIENT_VERSION_HEADER, minVersion);
-  if (verdict.status === "too_old") c.res.headers.set(CLIENT_TOO_OLD_HEADER, "1");
+  // 建言头是尽力而为——某些响应（流式/已终结）的 headers 不可变，绝不能因加建言头而把请求崩成 500。
+  try {
+    c.res.headers.set(MIN_CLIENT_VERSION_HEADER, minVersion);
+    if (verdict.status === "too_old") c.res.headers.set(CLIENT_TOO_OLD_HEADER, "1");
+  } catch {
+    // 不可变响应头：跳过建言头，不影响正文
+  }
 });
 
 app.get("/api/health", (c) => {
