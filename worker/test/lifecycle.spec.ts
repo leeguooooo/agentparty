@@ -1,7 +1,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
-import { ADMIN_HEADERS, api, createChannel, postMessage, seedToken, WsClient } from "./helpers";
+import { ADMIN_HEADERS, api, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
 
 async function errorCode(res: Response): Promise<string> {
   const body = (await res.json()) as { error: { code: string } };
@@ -125,6 +125,33 @@ describe("channel lifecycle endpoints", () => {
       .run();
 
     const revoked = await SELF.fetch(`http://ap.test/api/tokens/${name}`, {
+      method: "DELETE",
+      headers: ADMIN_HEADERS,
+    });
+    expect(revoked.status).toBe(200);
+    const err = await ws.nextOfType("error");
+    expect(err.code).toBe("unauthorized");
+    ws.close();
+  });
+
+  it("revocation still kicks a socket in a public channel the token neither owns nor is a member of (#200)", async () => {
+    // #200 收窄的安全关键路径：public 频道对任何 token 开放（acl.ts），一个既非房主也非成员的
+    // token 也能连进来。收窄若只看 owner_account/channel_members 会漏踢它 → 撤销的 token 还连着。
+    const ownerTok = await seedToken("agent", uniq("pubowner"), { owner: "pubowner@x.com" });
+    const slug = uniq("pubch");
+    const created = await SELF.fetch("http://ap.test/api/channels", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ownerTok.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ slug, kind: "standing", visibility: "public" }),
+    });
+    expect(created.status).toBe(201);
+
+    // 另一个账号的 token，不是房主、不是成员，靠 public 连进来
+    const intruder = await seedToken("agent", uniq("intruder"), { owner: "intruder@x.com" });
+    const ws = await WsClient.open(slug, intruder.token);
+    await ws.nextOfType("welcome");
+
+    const revoked = await SELF.fetch(`http://ap.test/api/tokens/${intruder.name}`, {
       method: "DELETE",
       headers: ADMIN_HEADERS,
     });

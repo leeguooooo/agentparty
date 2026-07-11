@@ -2447,10 +2447,10 @@ app.delete("/api/tokens/:name", requireAdmin, async (c) => {
     `UPDATE tokens
         SET revoked_at = ?
       WHERE name = ? AND revoked_at IS NULL
-      RETURNING channel_scope`,
+      RETURNING channel_scope, owner`,
   )
     .bind(Date.now(), name)
-    .first<{ channel_scope: string | null }>();
+    .first<{ channel_scope: string | null; owner: string | null }>();
   if (revoked === null) {
     return c.json(errorBody("not_found", "no active token with that name"), 404);
   }
@@ -2460,8 +2460,25 @@ app.delete("/api/tokens/:name", requireAdmin, async (c) => {
     resource: `token/${name}`,
     channel: revoked.channel_scope,
   });
-  // 吊销即时生效：踢掉所有未归档频道里该 name 的存活 ws（spec §12）
-  const { results } = await c.env.DB.prepare("SELECT slug FROM channels").all<{ slug: string }>();
+  // 吊销即时生效：踢掉该 name 的存活 ws（spec §12）。#200：只踢该 token **可能持连接**的频道，
+  // 而不是唤醒整个部署的每一个 DO（O(全部频道)、冷启动、149 频道时光扇出 8.3s、还是 #185 CI flaky 主因）。
+  // 收窄按 token 类型（严格是「该 token 能访问的频道」的超集，即实际连接的超集，绝不漏踢）：
+  //   - channel_scope 有值：scoped/guest token 只在那一个频道有效（acl.ts canAccessChannel）→ 只踢它。
+  //   - 账号级 token：覆盖 canAccessChannel/canAccessLoadedChannel 的全部访问路径：
+  //       public（对任何 token 开放，不能只看 channel_members）∪ 自己创建的（created_by=name，
+  //       兜住 owner 为空的 token）∪ 账号房主（owner_account=account）∪ 成员（channel_members）
+  //       ∪ 被邀请的 project-agent（channel_agent_invites，按 name=profile_handle）。
+  const scopedSlugs = revoked.channel_scope
+    ? await c.env.DB.prepare("SELECT slug FROM channels WHERE slug = ?").bind(revoked.channel_scope).all<{ slug: string }>()
+    : await c.env.DB.prepare(
+        `SELECT slug FROM channels
+          WHERE visibility = 'public'
+             OR created_by = ?2
+             OR (?1 IS NOT NULL AND owner_account = ?1)
+             OR (?1 IS NOT NULL AND slug IN (SELECT channel_slug FROM channel_members WHERE account = ?1))
+             OR slug IN (SELECT channel_slug FROM channel_agent_invites WHERE profile_handle = ?2 AND revoked_at IS NULL)`,
+      ).bind(revoked.owner, name).all<{ slug: string }>();
+  const { results } = scopedSlugs;
   await Promise.all(
     results.map(async ({ slug }) => {
       try {
