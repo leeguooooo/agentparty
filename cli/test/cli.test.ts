@@ -657,6 +657,20 @@ describe("cli subprocess", () => {
     expect(r.stderr).toContain("no config");
   });
 
+  test("watch help documents explicit --latest and --since cursor choices", async () => {
+    const r = await runCli(["watch", "--help"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("--latest");
+    expect(r.stdout).toContain("--since seq");
+  });
+
+  test("watch rejects --latest with --since before auth or network access", async () => {
+    const r = await runCli(["watch", "dev", "--latest", "--since", "4"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--latest and --since are mutually exclusive");
+    expect(r.stderr).not.toContain("no config");
+  });
+
   test("watch timeout exits 2 and prints TIMEOUT", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") sock.send(welcomeFrame(0));
@@ -743,7 +757,7 @@ describe("cli subprocess", () => {
     );
     const r = await runCli(["watch", "dev", "--once", "--mentions-only", "--timeout", "2"], { CODEX_CI: undefined });
     expect(r.code).toBe(0);
-    expect(r.stdout.trim()).toBe("[1] bob(human): @me wake");
+    expect(r.stdout.split("\n")[0]).toBe("[1] bob(human): @me wake");
     expect(r.stderr).toContain("--once is single-shot");
     expect(r.stdout).not.toContain("--once is single-shot");
   }, 15_000);

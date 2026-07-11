@@ -1,5 +1,5 @@
 // party watch — 补拉错过消息，阻塞等新消息
-import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_LOOP_GUARD, EXIT_STREAM_ENDED, EXIT_TIMEOUT } from "@agentparty/shared";
+import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_LOOP_GUARD, EXIT_STREAM_ENDED, EXIT_TIMEOUT, type MsgFrame } from "@agentparty/shared";
 import { dirname } from "node:path";
 import { acquireInstanceLock } from "../instance-lock";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
@@ -7,7 +7,8 @@ import { connect } from "../client";
 import { loadCursor, loadRevCursor, resolveChannel, saveCursor, saveRevCursor, statePath } from "../config";
 import { resolveAuth } from "../oidc-cli";
 import { formatMsg } from "../format";
-import { MAX_TIMEOUT_SEC, isSlug, parsePositiveIntFlag } from "../validation";
+import { fetchMe, fetchMessages, fetchRecentMessages, handleRestError } from "../rest";
+import { MAX_TIMEOUT_SEC, isSlug, parseNonNegativeIntFlag, parsePositiveIntFlag } from "../validation";
 import { jsonFrame, nowTs } from "../json";
 import {
   clearStatuslineListener,
@@ -18,8 +19,10 @@ import {
   writeStatuslineCache,
 } from "../statusline-cache";
 
-const WATCH_FLAGS = ["channel", "timeout", "follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple"];
-const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow|--once] [--json] [--allow-multiple]
+const WATCH_FLAGS = ["channel", "timeout", "follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest", "since"];
+const WATCH_SKIP_PAGE_SIZE = 1000;
+const WATCH_SKIP_SCAN_LIMIT = 10_000;
+const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow|--once] [--latest|--since seq] [--json] [--allow-multiple]
 
 Watch a channel for new messages. By default this waits up to 240 seconds.
 With --follow, it stays attached unless --timeout N is explicit.
@@ -44,6 +47,8 @@ Options:
   --exclude-self    explicitly skip this agent's own messages (default)
   --follow          keep watching after the first matching message
   --once            exit 0 right after the first matching message
+  --latest          explicitly skip backlog, attach at the current channel head
+  --since seq       explicitly start after seq (mutually exclusive with --latest)
   --json            emit structured NDJSON frames`;
 
 // --follow 的假在线陷阱（issue #55/#60）：watcher 打印了 mention、presence 也新鲜，但多数
@@ -88,6 +93,7 @@ export interface WatchOptions {
   mentionsOnly: boolean;
   once?: boolean; // 第一条匹配消息后立即退出 0（harness 后台任务的唤醒信号）
   json?: boolean; // 输出 NDJSON 帧而非人类格式，供 supervisor/工具消费
+  skippedMentionSeqs?: number[]; // 显式 --latest/--since 快进时跳过的 @，随 once wake 交给 agent
   onCursor?: (cursor: number) => void;
   onRevCursor?: (revCursor: number) => void;
   out?: (line: string) => void;
@@ -102,6 +108,62 @@ export interface WatchOptions {
 export function resolveWatchTimeoutSec(timeout: number | undefined, indefinite: boolean): number {
   if (typeof timeout === "number") return timeout;
   return indefinite ? 0 : 240;
+}
+
+interface ExplicitWatchCursor {
+  cursor: number;
+  skippedMessages: number;
+  skippedMentionSeqs: number[];
+}
+
+async function resolveExplicitWatchCursor(
+  server: string,
+  token: string,
+  channel: string,
+  localCursor: number,
+  requestedSince: number | undefined,
+): Promise<ExplicitWatchCursor> {
+  const [identity, tail] = await Promise.all([
+    fetchMe(server, token),
+    fetchRecentMessages(server, token, channel, 1),
+  ]);
+  const head = tail.at(-1)?.seq ?? 0;
+  // Sample head first. The subsequent forward scan is then complete through that
+  // head; messages created later remain above the attach cursor and arrive on WS.
+  const cursor = Math.min(requestedSince ?? head, head);
+  const skipped: MsgFrame[] = [];
+  let scanCursor = localCursor;
+  while (scanCursor < cursor && skipped.length < WATCH_SKIP_SCAN_LIMIT) {
+    const page = await fetchMessages(
+      server,
+      token,
+      channel,
+      scanCursor,
+      Math.min(WATCH_SKIP_PAGE_SIZE, WATCH_SKIP_SCAN_LIMIT - skipped.length),
+    );
+    if (page.length === 0) break;
+    const throughCursor = page.filter((msg) => msg.seq <= cursor);
+    skipped.push(...throughCursor);
+    const pageLast = page.at(-1)?.seq ?? scanCursor;
+    if (pageLast <= scanCursor) break;
+    scanCursor = pageLast;
+    if (pageLast >= cursor) break;
+  }
+  const firstSkipped = skipped.at(0)?.seq;
+  const exactFromLocalCursor = firstSkipped === undefined || firstSkipped === localCursor + 1;
+  const scanComplete = cursor <= localCursor || scanCursor >= cursor;
+  if (!exactFromLocalCursor || !scanComplete) {
+    throw new Error(
+      `refusing to skip more than ${WATCH_SKIP_SCAN_LIMIT} retained messages without an exact mention scan; use --since in smaller steps`,
+    );
+  }
+  return {
+    cursor,
+    skippedMessages: skipped.length,
+    skippedMentionSeqs: skipped
+      .filter((msg) => msg.sender.name !== identity.name && msg.mentions.includes(identity.name))
+      .map((msg) => msg.seq),
+  };
 }
 
 export async function runWatch(o: WatchOptions): Promise<number> {
@@ -183,15 +245,29 @@ export async function runWatch(o: WatchOptions): Promise<number> {
       }
       const msg = frame.type === "message_update" ? frame.message : frame;
       if (msg.type !== "msg" && msg.type !== "status") continue;
+      lastSeq = Math.max(lastSeq, msg.seq);
       const fromSelf = msg.sender.name === self;
       const qualifies = !fromSelf && (!o.mentionsOnly || msg.mentions.includes(self));
-      if (qualifies) {
-        out(o.json ? JSON.stringify(jsonFrame(frame as unknown as Record<string, unknown>)) : formatMsg(msg));
-        printed++;
-      }
       // fresh = 游标之上的新消息。重放的历史修订快照（seq 早已消费过）会穿透去重进来
       // ——它们可以照常打印（展示编辑是 feature），但绝不能算「唤醒」（曾把 --once 假唤醒）
       const fresh = msg.seq > conn.cursor;
+      if (qualifies) {
+        if (o.json && o.once && fresh) {
+          out(
+            JSON.stringify(
+              jsonFrame({
+                ...(frame as unknown as Record<string, unknown>),
+                channel_last_seq: lastSeq,
+                lag: Math.max(0, lastSeq - msg.seq),
+                skipped_mention_seqs: o.skippedMentionSeqs ?? [],
+              }),
+            ),
+          );
+        } else {
+          out(o.json ? JSON.stringify(jsonFrame(frame as unknown as Record<string, unknown>)) : formatMsg(msg));
+        }
+        printed++;
+      }
       // 打印（或有意跳过）之后才推进游标，退出时入队未消费的消息留给下次补拉
       if (msg.seq > 0) conn.ack(msg.seq);
       if (o.statusline === true) {
@@ -214,10 +290,15 @@ export async function runWatch(o: WatchOptions): Promise<number> {
       if (o.once && qualifies && fresh) {
         onceDone = true;
         const behind = Math.max(0, lastSeq - msg.seq);
-        if (behind > 0) {
+        if (!o.json && behind > 0) {
           out(
             `watch: 唤醒于 seq=${msg.seq}（最旧的未读 @），落后 ${behind} 条，head=${lastSeq}。` +
+              ` channel_last_seq=${lastSeq} lag=${behind} skipped_mention_seqs=${JSON.stringify(o.skippedMentionSeqs ?? [])}.` +
               ` 这不是最新消息——补上下文：party history ${o.channel} --since ${msg.seq}`,
+          );
+        } else if (!o.json) {
+          out(
+            `watch: channel_last_seq=${lastSeq} lag=0 skipped_mention_seqs=${JSON.stringify(o.skippedMentionSeqs ?? [])}`,
           );
         }
         break;
@@ -259,9 +340,22 @@ export async function run(argv: string[]): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple"] });
+  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest"] });
   if (flags.follow === true && flags.once === true) {
     console.error("--follow and --once are mutually exclusive: follow keeps watching, once exits after the first match");
+    return 1;
+  }
+  if (flags.latest === true && flags.since !== undefined) {
+    console.error("--latest and --since are mutually exclusive");
+    return 1;
+  }
+  if (flags.since === true) {
+    console.error("--since requires a value");
+    return 1;
+  }
+  const explicitSince = parseNonNegativeIntFlag(str(flags.since), "since");
+  if (typeof explicitSince === "string") {
+    console.error(explicitSince);
     return 1;
   }
   const cfg = await resolveAuth();
@@ -274,7 +368,7 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["channel", "timeout"]);
+  const flagError = valueFlagError(flags, ["channel", "timeout", "since"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -295,17 +389,54 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (flags.follow === true) console.error(FOLLOW_WAKE_ADVISORY);
   if (flags.once === true && isCodexRuntimeEnv()) console.error(ONCE_CODEX_ADVISORY);
+  const localCursor = loadCursor(channel);
+  let since = explicitSince ?? localCursor;
+  let skippedMentionSeqs: number[] = [];
+  if (flags.latest === true || (explicitSince !== undefined && explicitSince > localCursor)) {
+    try {
+      const selection = await resolveExplicitWatchCursor(
+        cfg.server,
+        cfg.token,
+        channel,
+        localCursor,
+        flags.latest === true ? undefined : explicitSince,
+      );
+      since = selection.cursor;
+      skippedMentionSeqs = selection.skippedMentionSeqs;
+      saveCursor(channel, since);
+      const attached = {
+        type: "watch_attached",
+        channel,
+        attached_at_seq: since,
+        skipped_messages: selection.skippedMessages,
+        skipped_mentions: skippedMentionSeqs.length,
+        skipped_mention_seqs: skippedMentionSeqs,
+      };
+      console.log(
+        flags.json === true
+          ? JSON.stringify(jsonFrame(attached))
+          : `watch: attached_at_seq=${since} skipped_messages=${selection.skippedMessages} skipped_mentions=${skippedMentionSeqs.length} skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}`,
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("refusing to skip more than")) {
+        console.error(`error: ${e.message}`);
+        return 1;
+      }
+      return handleRestError(e);
+    }
+  }
   const code = await runWatch({
     server: cfg.server,
     token: cfg.token,
     channel,
-    since: loadCursor(channel),
+    since,
     sinceRev: loadRevCursor(channel),
     timeoutSec: resolveWatchTimeoutSec(timeout, flags.follow === true || flags.once === true),
     follow: flags.follow === true,
     once: flags.once === true,
     mentionsOnly: flags["mentions-only"] === true,
     json: flags.json === true,
+    skippedMentionSeqs,
     onCursor: (c) => saveCursor(channel, c),
     onRevCursor: (r) => saveRevCursor(channel, r),
     statusline: true,

@@ -301,7 +301,7 @@ describe("runWatch", () => {
     expect(await runWatch(o)).toBe(0);
     // 在 seq=4 到达前就退出（退出即 harness 的唤醒信号）
     expect(Date.now() - started).toBeLessThan(180);
-    expect(o.lines).toEqual(["[3] bob(agent): wake"]);
+    expect(o.lines).toEqual(["[3] bob(agent): wake", "watch: channel_last_seq=3 lag=0 skipped_mention_seqs=[]"]);
     // 游标推进过匹配消息，下次待命从 seq=3 之后继续
     expect(cursors).toEqual([1, 2, 3]);
   });
@@ -321,7 +321,7 @@ describe("runWatch", () => {
     expect(await runWatch(o)).toBe(0);
     // 断线前没消费任何消息 → 重连仍从 since=0 开始
     expect(server.hellos).toEqual([0, 0]);
-    expect(o.lines).toEqual(["[1] bob(agent): wake"]);
+    expect(o.lines).toEqual(["[1] bob(agent): wake", "watch: channel_last_seq=1 lag=0 skipped_mention_seqs=[]"]);
   });
 
   test("--once stream ending without a match exits EXIT_STREAM_ENDED, not silent 0", async () => {
@@ -350,7 +350,11 @@ describe("runWatch", () => {
     const o = opts({ server: server.url, once: true, timeoutSec: 5, since: 5 });
     expect(await runWatch(o)).toBe(0);
     // 旧修订照常展示，但完成 --once 的是 fresh 消息
-    expect(o.lines).toEqual(["[1] bob(agent) {edited}: ancient but edited", "[6] bob(agent): fresh wake"]);
+    expect(o.lines).toEqual([
+      "[1] bob(agent) {edited}: ancient but edited",
+      "[6] bob(agent): fresh wake",
+      "watch: channel_last_seq=6 lag=0 skipped_mention_seqs=[]",
+    ]);
   });
 
   test("--once with only replayed revisions never completes (times out)", async () => {
