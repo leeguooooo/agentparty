@@ -1964,8 +1964,10 @@ export class ChannelDO extends Server<Env> {
     if (host) this.setMeta("host", host);
   }
 
-  // 消息落库广播之后的副作用：webhook 投递 + temp 归档计时续排
+  // 消息落库广播之后的副作用：serve/watch 唤醒审计 + webhook 投递 + temp 归档计时续排
   private async afterSend(msg: MsgFrame) {
+    // #107：serve/watch 目标的 @ 广播即落 ledger（同步 SQL，不烧订阅、不发网络）——补齐它们缺失的服务端唤醒审计。
+    this.recordServeWatchWakes(msg);
     // 首投移出发送关键路径：坏/慢端点不再让每条消息阻塞 N×10s 才返回 seq（DoS 频道）
     this.ctx.waitUntil(this.dispatchWebhooks(msg));
     if (this.getMeta("ckind") === "temp" && !this.isArchived()) {
@@ -2134,6 +2136,52 @@ export class ChannelDO extends Server<Env> {
     );
   }
 
+  // #107：某 name 当前登记的 wake 层（presence.wake_kind）。无 presence / 未登记 = null。
+  private wakeKindFor(name: string): WakeKind | null {
+    const row = this.ctx.storage.sql.exec("SELECT wake_kind FROM presence WHERE name = ?", name).toArray()[0];
+    const raw = row?.wake_kind;
+    return typeof raw === "string" ? (raw as WakeKind) : null;
+  }
+
+  // #107：serve/watch 的唤醒也进服务端 ledger。webhook 由服务端主动 POST、天然可审计；serve/watch 是
+  // 拉模型——agent 自己的 loop 读广播、匹配 mentions.includes(self)，服务端从不"投递"给它们。故服务端能
+  // 诚实记录的唯一事实是：这条 @ 被广播了，且被 @ 的目标是一个已登记 serve/watch 的可唤醒 agent。记为
+  // result='broadcast'（已广播给拉客户端，**不是**"已确认消费"）。之后该 agent resume 且引用了这条 @
+  // （复用 #191 的 @->resume 观测，见 linkWakeResume）才升级为 result='consumed'。绝不因为"广播了"就声称
+  // 唤醒成功——broadcast 与 consumed 泾渭分明。adapter_kind 记 'serve'/'watch'，webhook 唤醒仍是 'webhook'。
+  private recordServeWatchWakes(msg: MsgFrame) {
+    if (msg.mentions.length === 0) return;
+    const now = Date.now();
+    const seen = new Set<string>();
+    for (const name of msg.mentions) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const kind = this.wakeKindFor(name);
+      if (kind !== "serve" && kind !== "watch") continue;
+      // #180：被人为暂停接待的目标，webhook 一律不投；serve/watch 同理不落"已广播唤醒"行，
+      // 让"存在一条 broadcast 行" == "服务端确实把这条 @ 推给了未被抑制的可唤醒拉客户端"。
+      if (this.isPresencePaused(name)) continue;
+      // 极端情形（resume 竟先于本行落库）下也别把已闭环的唤醒错记成未消费。
+      const resume = this.findExistingWakeResume(name, msg.seq);
+      const consumed = resume.ackSeq !== null || resume.resumeSeq !== null;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO wake_delivery_ledger (
+           mention_seq, target_name, webhook_name, adapter_kind, attempt,
+           result, http_status, error, attempted_at, ack_seq, resume_seq
+         )
+         VALUES (?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?)`,
+        msg.seq,
+        name,
+        name, // webhook_name NOT NULL：serve/watch 无 webhook，回填 target 名，审计读列时 adapter_kind 已足够区分
+        kind,
+        consumed ? "consumed" : "broadcast",
+        now,
+        resume.ackSeq,
+        resume.resumeSeq,
+      );
+    }
+  }
+
   // #108 per-agent wake 预算配置：未设 = null = 不限（正常流）。limit 存 meta，window 缺省 1 小时。
   private wakeBudgetConfig(name: string): { limit: number; windowMs: number } | null {
     const raw = this.getMeta(`wake_budget_limit:${name}`);
@@ -2153,8 +2201,10 @@ export class ChannelDO extends Server<Env> {
     return Number(
       this.ctx.storage.sql
         .exec(
+          // #107：wake 预算只计 webhook 唤醒（"烧订阅"的那一类）；serve/watch 的 broadcast/consumed 行是拉模型
+          // 的审计记录、不消耗 webhook 预算，故用 adapter_kind='webhook' 把它们排除在预算之外。
           `SELECT COUNT(*) AS n FROM wake_delivery_ledger
-            WHERE target_name = ? AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
+            WHERE target_name = ? AND adapter_kind = 'webhook' AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
           name,
           windowStart,
         )
@@ -2230,7 +2280,7 @@ export class ChannelDO extends Server<Env> {
     const oldest = this.ctx.storage.sql
       .exec(
         `SELECT MIN(attempted_at) AS t FROM wake_delivery_ledger
-          WHERE target_name = ? AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
+          WHERE target_name = ? AND adapter_kind = 'webhook' AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
         name,
         windowStart,
       )
@@ -3730,8 +3780,11 @@ export class ChannelDO extends Server<Env> {
   private linkWakeResume(targetName: string, msg: MsgFrame, now: number) {
     if (msg.reply_to !== null) {
       this.ctx.storage.sql.exec(
+        // #107：serve/watch 的 broadcast 行在观测到 @->resume 时升级为 consumed（webhook 行 result 不动，
+        // 仍是 ok/failed/budget）——"已广播"与"已确认消费"至此分明。
         `UPDATE wake_delivery_ledger
-            SET ack_seq = COALESCE(ack_seq, ?)
+            SET ack_seq = COALESCE(ack_seq, ?),
+                result = CASE WHEN adapter_kind IN ('serve', 'watch') THEN 'consumed' ELSE result END
           WHERE mention_seq = ? AND target_name = ?`,
         msg.seq,
         msg.reply_to,
@@ -3743,8 +3796,10 @@ export class ChannelDO extends Server<Env> {
     const summarySeq = msg.status?.summary_seq ?? null;
     if (summarySeq !== null) {
       this.ctx.storage.sql.exec(
+        // #107：同上，status 帧的 summary_seq 指向的 @ 若命中 serve/watch broadcast 行，同样升级为 consumed。
         `UPDATE wake_delivery_ledger
-            SET resume_seq = COALESCE(resume_seq, ?)
+            SET resume_seq = COALESCE(resume_seq, ?),
+                result = CASE WHEN adapter_kind IN ('serve', 'watch') THEN 'consumed' ELSE result END
           WHERE mention_seq = ? AND target_name = ?`,
         msg.seq,
         summarySeq,
