@@ -24,6 +24,10 @@ import {
   WEBHOOK_RETRY_BATCH_SIZE,
   WEBHOOK_RETRY_DELAYS_MS,
   WEBHOOK_TIMEOUT_MS,
+  WAKE_BUDGET_DEFAULT_WINDOW_MS,
+  WAKE_BUDGET_MAX_LIMIT,
+  WAKE_BUDGET_MAX_WINDOW_MS,
+  WAKE_BUDGET_MIN_WINDOW_MS,
   type AgentLineage,
   type Attachment,
   type ErrorCode,
@@ -1925,9 +1929,22 @@ export class ChannelDO extends Server<Env> {
       (h) => this.shouldDeliverWebhook(h.filter, h.name, msg) && !this.isPresencePaused(h.name),
     );
     if (targets.length === 0) return;
+    // #108 per-agent wake 预算：在真正投递（烧订阅）之前判每个目标是否已超窗口内 wake 硬上限。
+    // 超额者不投 webhook（这是「webhook not fired」的强制点），落 wake_delivery_ledger 的 budget
+    // 行做归属审计（哪条 mention_seq、谁被 @），并按窗口去重地在频道内 system status 通告一次可观测。
+    const firing: WebhookRow[] = [];
+    for (const hook of targets) {
+      if (this.isOverWakeBudget(hook.name, now)) {
+        this.recordWakeWithheld(msg.seq, hook.name, now);
+        this.alertWakeBudget(hook.name, now);
+      } else {
+        firing.push(hook);
+      }
+    }
+    if (firing.length === 0) return;
     // 并行投递：一个慢/坏端点不再拖累其余 hook（首投已由 afterSend 的 waitUntil 移出发送关键路径）
     const results = await Promise.all(
-      targets.map(async (hook) => ({
+      firing.map(async (hook) => ({
         hook,
         delivery: await this.deliverWebhook(hook.url, hook.secret, payload),
       })),
@@ -2043,6 +2060,118 @@ export class ChannelDO extends Server<Env> {
       resume.ackSeq,
       resume.resumeSeq,
     );
+  }
+
+  // #108 per-agent wake 预算配置：未设 = null = 不限（正常流）。limit 存 meta，window 缺省 1 小时。
+  private wakeBudgetConfig(name: string): { limit: number; windowMs: number } | null {
+    const raw = this.getMeta(`wake_budget_limit:${name}`);
+    if (raw === null) return null;
+    const limit = Number(raw);
+    if (!Number.isInteger(limit) || limit <= 0) return null;
+    const rawWindow = Number(this.getMeta(`wake_budget_window:${name}`) ?? "");
+    const windowMs =
+      Number.isInteger(rawWindow) && rawWindow >= WAKE_BUDGET_MIN_WINDOW_MS ? rawWindow : WAKE_BUDGET_DEFAULT_WINDOW_MS;
+    return { limit, windowMs };
+  }
+
+  // 滚动窗口内已消耗的 wake 数：ledger 里该 target 的首投行（attempt=1，排除 budget 抑制标记与重试行）。
+  // 一条首投 = 一次「唤醒该 agent 的 runner」，正是要计的烧订阅事件；重试（attempt>1）是同一 wake 的
+  // 再投，不重复计；budget 行是被抑制的、从未真投，不消耗预算。
+  private wakeCountInWindow(name: string, windowStart: number): number {
+    return Number(
+      this.ctx.storage.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM wake_delivery_ledger
+            WHERE target_name = ? AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
+          name,
+          windowStart,
+        )
+        .one().n,
+    );
+  }
+
+  // 该目标此刻是否已超 wake 预算（true = 应抑制，不投 webhook）。未设预算 = 永不超。
+  private isOverWakeBudget(name: string, now: number): boolean {
+    const cfg = this.wakeBudgetConfig(name);
+    if (cfg === null) return false;
+    return this.wakeCountInWindow(name, now - cfg.windowMs) >= cfg.limit;
+  }
+
+  // 超预算而被抑制的 wake：落一条 result='budget' 的 ledger 行做审计——归属到具体 mention_seq / 目标，
+  // http_status=null（从未真投），error 记下预算参数。计数查询用 result!='budget' 把它排除在消耗之外。
+  private recordWakeWithheld(mentionSeq: number, name: string, now: number) {
+    const cfg = this.wakeBudgetConfig(name);
+    const resume = this.findExistingWakeResume(name, mentionSeq);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO wake_delivery_ledger (
+         mention_seq, target_name, webhook_name, adapter_kind, attempt,
+         result, http_status, error, attempted_at, ack_seq, resume_seq
+       )
+       VALUES (?, ?, ?, 'webhook', 1, 'budget', NULL, ?, ?, ?, ?)`,
+      mentionSeq,
+      name,
+      name,
+      cfg === null
+        ? "wake budget exceeded"
+        : `wake budget exceeded: ${cfg.limit} wakes / ${cfg.windowMs}ms`,
+      now,
+      resume.ackSeq,
+      resume.resumeSeq,
+    );
+  }
+
+  // 频道内可观测：预算用尽时通告一条 system status。按窗口去重（一个窗口内只播一次），避免
+  // 高频 @ 把频道刷屏。用 waiting 而非 blocked——这是节流不是熔断，blocked 会让守 etiquette 的 agent 停手。
+  private alertWakeBudget(name: string, now: number) {
+    const cfg = this.wakeBudgetConfig(name);
+    if (cfg === null) return;
+    const key = `wake_budget_alerted:${name}`;
+    const last = Number(this.getMeta(key) ?? "");
+    if (Number.isInteger(last) && now - last < cfg.windowMs) return;
+    this.setMeta(key, String(now));
+    const windowMin = Math.max(1, Math.round(cfg.windowMs / 60_000));
+    this.insertSystemStatus(
+      `wake budget for ${name} exhausted: ${cfg.limit} wakes per ${windowMin}m — further @-mentions are withheld until the window rolls`,
+      now,
+      false,
+      { state: "waiting" },
+    );
+  }
+
+  // 预算快照（inspect 用）：含窗口内已用 used / remaining / 最早那次 wake 老化出窗后的恢复时刻。
+  private wakeBudgetState(name: string): {
+    name: string;
+    enabled: boolean;
+    limit: number | null;
+    window_ms: number | null;
+    used: number;
+    remaining: number | null;
+    window_resets_at: number | null;
+  } {
+    const cfg = this.wakeBudgetConfig(name);
+    if (cfg === null) {
+      return { name, enabled: false, limit: null, window_ms: null, used: 0, remaining: null, window_resets_at: null };
+    }
+    const now = Date.now();
+    const windowStart = now - cfg.windowMs;
+    const used = this.wakeCountInWindow(name, windowStart);
+    const oldest = this.ctx.storage.sql
+      .exec(
+        `SELECT MIN(attempted_at) AS t FROM wake_delivery_ledger
+          WHERE target_name = ? AND attempt = 1 AND result != 'budget' AND attempted_at >= ?`,
+        name,
+        windowStart,
+      )
+      .one().t;
+    return {
+      name,
+      enabled: true,
+      limit: cfg.limit,
+      window_ms: cfg.windowMs,
+      used,
+      remaining: Math.max(0, cfg.limit - used),
+      window_resets_at: oldest === null || oldest === undefined ? null : Number(oldest) + cfg.windowMs,
+    };
   }
 
   private findExistingWakeResume(targetName: string, mentionSeq: number): { ackSeq: number | null; resumeSeq: number | null } {
@@ -3076,6 +3205,50 @@ export class ChannelDO extends Server<Env> {
       }
       this.resumePresence(name, now);
       return Response.json({ ok: true, paused: false });
+    }
+    // #108 per-agent wake 预算 set/inspect。授权在 worker 侧已判（agent-for-self / moderator），do 只落状态。
+    const wakeBudgetMatch = url.pathname.match(/^\/internal\/wake-budget\/([^/]+)$/);
+    if (wakeBudgetMatch) {
+      const name = decodeURIComponent(wakeBudgetMatch[1] ?? "");
+      if (!name) {
+        return Response.json({ error: { code: "bad_request", message: "name required" } }, { status: 400 });
+      }
+      if (request.method === "GET") {
+        return Response.json(this.wakeBudgetState(name));
+      }
+      if (request.method === "PUT") {
+        const body = (await request.json().catch(() => null)) as
+          | { enabled?: unknown; limit?: unknown; window_ms?: unknown }
+          | null;
+        // enabled 显式 false = 清除预算（回到不限）；缺省视为设置。
+        if (body?.enabled === false) {
+          this.deleteMeta(`wake_budget_limit:${name}`);
+          this.deleteMeta(`wake_budget_window:${name}`);
+          this.deleteMeta(`wake_budget_alerted:${name}`);
+          return Response.json(this.wakeBudgetState(name));
+        }
+        const limit = Number(body?.limit);
+        if (!Number.isInteger(limit) || limit <= 0) {
+          return Response.json(
+            { error: { code: "bad_request", message: "limit must be a positive integer" } },
+            { status: 400 },
+          );
+        }
+        const rawWindow =
+          body?.window_ms === undefined || body?.window_ms === null
+            ? WAKE_BUDGET_DEFAULT_WINDOW_MS
+            : Number(body.window_ms);
+        if (!Number.isInteger(rawWindow) || rawWindow < WAKE_BUDGET_MIN_WINDOW_MS) {
+          return Response.json(
+            { error: { code: "bad_request", message: `window_ms must be an integer >= ${WAKE_BUDGET_MIN_WINDOW_MS}` } },
+            { status: 400 },
+          );
+        }
+        this.setMeta(`wake_budget_limit:${name}`, String(Math.min(limit, WAKE_BUDGET_MAX_LIMIT)));
+        this.setMeta(`wake_budget_window:${name}`, String(Math.min(rawWindow, WAKE_BUDGET_MAX_WINDOW_MS)));
+        this.deleteMeta(`wake_budget_alerted:${name}`); // 改配置即清抑制标记，新配置下可重新告警
+        return Response.json(this.wakeBudgetState(name));
+      }
     }
     return new Response("not found", { status: 404 });
   }

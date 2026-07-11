@@ -977,6 +977,42 @@ export async function getLoopGuard(server: string, token: string, slug: string):
   })) as LoopGuardState;
 }
 
+// #108 per-agent wake 预算：窗口内 wake 硬上限，超额 @ 不再投 webhook（不烧订阅）。
+export interface WakeBudgetState {
+  name: string;
+  enabled: boolean;
+  limit: number | null;
+  window_ms: number | null;
+  used: number;
+  remaining: number | null;
+  window_resets_at: number | null;
+}
+
+export async function getWakeBudget(
+  server: string,
+  token: string,
+  slug: string,
+  name: string,
+): Promise<WakeBudgetState> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/wake-budget/${encodeURIComponent(name)}`, {
+    headers: bearerJson(token),
+  })) as WakeBudgetState;
+}
+
+export async function setWakeBudget(
+  server: string,
+  token: string,
+  slug: string,
+  name: string,
+  body: { enabled: boolean; limit?: number; window_ms?: number },
+): Promise<WakeBudgetState> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/wake-budget/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as WakeBudgetState;
+}
+
 export async function setWorkflowGuard(
   server: string,
   token: string,

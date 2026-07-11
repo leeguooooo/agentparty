@@ -38,6 +38,16 @@ export const MAX_WEBHOOK_DEAD_LETTERS = 200;
 // 单次 redeliver 最多重投多少条死信，避免一个端点的巨量积压一次性打满 subrequest 配额。
 export const WEBHOOK_REDELIVER_BATCH_SIZE = 50;
 
+// ---- per-agent wake 预算/配额（#108）----
+// 每个 @ 触发一次完整 runner run，会烧目标 agent 的 LLM 订阅/tokens；协议此前无任何总量上限
+// （README 宣称的「capacity routing」无落地）。这里给每个 agent 一个滚动窗口内的 wake 硬上限：
+// 窗口内已投 wake 数达到 limit 后，再来的 @ 不再投 webhook（不烧订阅），落 wake_delivery_ledger
+// 的 budget 行 + 频道内 system status 可观测。缺省不设 = 不限（正常流，零影响）。
+export const WAKE_BUDGET_DEFAULT_WINDOW_MS = 60 * 60_000; // 未显式指定窗口时默认 1 小时
+export const WAKE_BUDGET_MIN_WINDOW_MS = 1_000; // 窗口下限 1s，防除零/病态极短窗口
+export const WAKE_BUDGET_MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 窗口上限 30 天
+export const WAKE_BUDGET_MAX_LIMIT = 100_000; // limit 硬上限，防把预算当计数器滥用
+
 // ---- 会员分层（#277 骨架）----
 // 账号维度的 free/member 层：托管部署每月要成本，会员用于回收；自部署始终免费。
 // 本次只搭骨架——建库、开通路径、isMember 钩子；不定价、不接支付、不 gate 任何功能。

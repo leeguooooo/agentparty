@@ -30,6 +30,7 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
   const tokenCalls: Record<string, string>[] = [];
   const profiles: Record<string, unknown>[] = [];
   const invites: Record<string, unknown>[] = [];
+  const wakeBudgets = new Map<string, { limit: number; window_ms: number }>();
   let base = "";
 
   const server = Bun.serve({
@@ -150,6 +151,32 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
       if (req.method === "GET" && /^\/api\/channels\/[^/]+\/loop-guard$/.test(u.pathname)) {
         // #174 loop guard 读路径 mock
         return Response.json({ enabled: true, limit: 30, streak: 27, remaining: 3, resets_on: "human" });
+      }
+      // #108 per-agent wake 预算 set/inspect mock（内存态）
+      const wbMatch = u.pathname.match(/^\/api\/channels\/[^/]+\/wake-budget\/([^/]+)$/);
+      if (wbMatch) {
+        const name = decodeURIComponent(wbMatch[1] ?? "");
+        if (req.method === "PUT") {
+          const b = rec.body as { enabled?: boolean; limit?: number; window_ms?: number } | null;
+          if (b?.enabled === false) {
+            wakeBudgets.delete(name);
+          } else {
+            wakeBudgets.set(name, { limit: b?.limit ?? 0, window_ms: b?.window_ms ?? 3_600_000 });
+          }
+        }
+        const cfg = wakeBudgets.get(name);
+        if (!cfg) {
+          return Response.json({ name, enabled: false, limit: null, window_ms: null, used: 0, remaining: null, window_resets_at: null });
+        }
+        return Response.json({
+          name,
+          enabled: true,
+          limit: cfg.limit,
+          window_ms: cfg.window_ms,
+          used: 0,
+          remaining: cfg.limit,
+          window_resets_at: null,
+        });
       }
       if (req.method === "POST" && /^\/api\/channels\/[^/]+\/project-agents$/.test(u.pathname)) {
         const slug = u.pathname.split("/")[3] ?? "dev";

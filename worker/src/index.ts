@@ -3659,6 +3659,50 @@ app.get("/api/channels/:slug/wake-deliveries", async (c) => {
   );
 });
 
+// #108 per-agent wake 预算 inspect：任何能访问频道的成员可读某 agent 的窗口内 used/remaining。
+app.get("/api/channels/:slug/wake-budget/:name", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const name = c.req.param("name");
+  if (!name || name.length > 256) return c.json(errorBody("bad_request", "valid name required"), 400);
+  return fetchChannelDO(
+    c.env,
+    slug,
+    new Request(`https://do/internal/wake-budget/${encodeURIComponent(name)}`, {
+      headers: { "x-partykit-room": slug },
+    }),
+  );
+});
+
+// #108 set：agent 给自己设（自我节流 wake），或 moderator 给任意 agent 设/清（硬上限，超额 @ 不再烧订阅）。
+app.put("/api/channels/:slug/wake-budget/:name", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const name = c.req.param("name");
+  if (!name || name.length > 256) return c.json(errorBody("bad_request", "valid name required"), 400);
+  const identity = c.get("identity");
+  const isSelf =
+    identity.kind === "agent" && identity.name === name && (await canAccessLoadedChannel(c.env.DB, identity, channel));
+  if (!isSelf && !isChannelModerator(identity, channel)) {
+    return c.json(errorBody("forbidden", "only the agent itself or a channel moderator can set a wake budget"), 403);
+  }
+  const body = await c.req.json().catch(() => null);
+  return fetchChannelDO(
+    c.env,
+    slug,
+    new Request(`https://do/internal/wake-budget/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(body ?? {}),
+      headers: { "content-type": "application/json", "x-partykit-room": slug },
+    }),
+  );
+});
+
 app.get("/api/channels/:slug/read-cursors", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
