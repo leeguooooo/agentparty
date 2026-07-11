@@ -60,7 +60,8 @@ jobs:
       - uses: ./.github/actions/bun-install
       - run: bun run check:cli
 
-  # worker/web/shared/scripts：非纯 CLI（或非 PR）才跑，纯 CLI 快路径下 skip。
+  # web/shared/scripts：非纯 CLI（或非 PR）才跑，纯 CLI 快路径下 skip。
+  # worker 因为一个 workerd 串行跑 43 个 spec 太慢（~6min），单独拆分片 job，见下。
   check-rest:
     name: check ${{ matrix.ws }}
     needs: changes
@@ -71,11 +72,50 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ws: [worker, web, shared, scripts]
+        ws: [web, shared, scripts]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bun-install
       - run: bun run check:${{ matrix.ws }}
+
+  # worker 测试：43 个 spec 在单 workerd 里串行要 ~6min，是唯一长杆。
+  # 用 vitest --shard 按文件切成 6 片并行——每片是独立 runner 上的全新 workerd，
+  # 跨片没有同一 job 内的 DO thrash（fileParallelism:false/singleWorker 只约束单 job 内）。
+  # 墙上时间 ≈ 最重那一片，而非全部串行之和。
+  check-worker:
+    name: check worker (shard ${{ matrix.shard }}/6)
+    needs: changes
+    if: needs.changes.outputs.cli_only != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - name: verify test runtime
+        working-directory: worker
+        run: bun run verify:test-runtime
+      - name: vitest shard ${{ matrix.shard }}/6
+        working-directory: worker
+        run: bunx vitest run --shard=${{ matrix.shard }}/6
+
+  # worker tsc 只跑一次，放并行独立 job（不放进分片，避免每片重复 typecheck）。
+  check-worker-types:
+    name: check worker (types)
+    needs: changes
+    if: needs.changes.outputs.cli_only != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - working-directory: worker
+        run: bunx tsc --noEmit
 
   # 发布版本契约：只在 tag 上校验 tag == cli/desktop package.json 版本。
   # 非 tag 时 skip（聚合门禁把 skipped 当通过）。
@@ -107,6 +147,8 @@ jobs:
     needs:
       - check-cli
       - check-rest
+      - check-worker
+      - check-worker-types
       - version-contract
     if: always()
     runs-on: ubuntu-latest
@@ -117,12 +159,14 @@ jobs:
         env:
           R_CLI: ${{ needs.check-cli.result }}
           R_REST: ${{ needs.check-rest.result }}
+          R_WORKER: ${{ needs.check-worker.result }}
+          R_WORKER_TYPES: ${{ needs.check-worker-types.result }}
           R_VERSION: ${{ needs.version-contract.result }}
         run: |
           set -euo pipefail
-          echo "cli=$R_CLI rest=$R_REST version=$R_VERSION"
+          echo "cli=$R_CLI rest=$R_REST worker=$R_WORKER worker-types=$R_WORKER_TYPES version=$R_VERSION"
           fail=0
-          for r in "$R_CLI" "$R_REST" "$R_VERSION"; do
+          for r in "$R_CLI" "$R_REST" "$R_WORKER" "$R_WORKER_TYPES" "$R_VERSION"; do
             case "$r" in
               success|skipped) ;;
               *) echo "::error::required check job did not pass: result=$r"; fail=1 ;;

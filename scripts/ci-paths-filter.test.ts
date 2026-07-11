@@ -30,13 +30,21 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
     expect(yml).toContain("'!cli/**'");
   });
 
-  test("5 个 workspace 各自 check:* 都在 workflow 里（漏配某个 = 漏测该 workspace）", () => {
+  test("cli + web/shared/scripts 各自 check:* 都在 workflow 里（漏配某个 = 漏测该 workspace）", () => {
     expect(yml).toContain("bun run check:cli");
-    // worker/web/shared/scripts 走 matrix：bun run check:${{ matrix.ws }}
+    // web/shared/scripts 走 matrix：bun run check:${{ matrix.ws }}
     expect(yml).toContain("bun run check:${{ matrix.ws }}");
-    for (const ws of ["worker", "web", "shared", "scripts"]) {
-      expect(yml).toContain(ws);
-    }
+    expect(yml).toContain("ws: [web, shared, scripts]");
+  });
+
+  test("worker 测试按文件分片并行（vitest --shard），且 typecheck 单跑不漏", () => {
+    // worker 是唯一长杆，拆 6 片；每片跑 vitest 的一个分片，tsc 单独一 job。
+    expect(yml).toContain("bunx vitest run --shard=${{ matrix.shard }}/6");
+    expect(yml).toContain("shard: [1, 2, 3, 4, 5, 6]");
+    // worker 的 tsc 仍在（放独立 check-worker-types job，不进分片）
+    expect(yml).toMatch(/check-worker-types:[\s\S]*?bunx tsc --noEmit/);
+    // worker vitest 前的 runtime 预检仍在
+    expect(yml).toContain("bun run verify:test-runtime");
   });
 
   test("非 cli 的 workspace 靠 cli_only 跳过（快路径下只有 check-cli 真跑）", () => {
@@ -47,9 +55,9 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
     expect(yml).toMatch(/check-cli:\s*\n\s*needs: changes\s*\n\s*runs-on:/);
   });
 
-  test('聚合 "full check" needs 全部 workspace job，且 if: always()（上游跳过/失败都要能裁决）', () => {
+  test('聚合 "full check" needs 全部 workspace job（含 worker 分片与 types），且 if: always()', () => {
     expect(yml).toMatch(/check:\s*\n\s*name: full check/);
-    for (const dep of ["check-cli", "check-rest", "version-contract"]) {
+    for (const dep of ["check-cli", "check-rest", "check-worker", "check-worker-types", "version-contract"]) {
       expect(yml).toContain(`- ${dep}`);
     }
     expect(yml).toContain("if: always()");
