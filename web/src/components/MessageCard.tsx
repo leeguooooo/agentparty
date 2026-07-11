@@ -273,27 +273,15 @@ export function MessageCard({
       <div id={`msg-${msg.seq}`} className="msg-status" data-state={msg.state ?? undefined} style={hueStyle}>
         <span title={statusFullDetail !== "" ? statusFullDetail : undefined}>
           <span className="msg-sender" title={senderTitle}>{senderLabel}</span>
-          {owner !== null && (
-            <span className="t-mono msg-owner" title={`owner: ${owner}`}>
+          {(owner !== null ||
+            lineageLabel !== null ||
+            statusContextBits.length > 0 ||
+            statusWorkflowBits.length > 0) && (
+            <span className="t-mono msg-context-more" aria-hidden="true">
               {" "}
-              · {owner}
+              ⋯
             </span>
           )}{" "}
-          {lineageLabel !== null && (
-            <span className="t-mono msg-lineage" title={senderTitle}>
-              {lineageLabel}
-            </span>
-          )}{" "}
-          {statusContextBits.map((bit) => (
-            <span key={bit} className="t-mono msg-context" title={statusTitle}>
-              {bit}
-            </span>
-          ))}{" "}
-          {statusWorkflowBits.map((bit) => (
-            <span key={bit} className="t-mono msg-context" title={statusTitle}>
-              {bit}
-            </span>
-          ))}{" "}
           → {msg.state}
           {statusBits.length > 0 ? ` · ${statusBits.join(" · ")}` : ""} · {fmtTime(msg.ts)}
         </span>

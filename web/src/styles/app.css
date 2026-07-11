@@ -2498,6 +2498,13 @@
   vertical-align: -1px;
   white-space: nowrap;
 }
+/* #280 收尾：状态行不再把 owner/lineage/wt/ws/cfg/fp 平铺在行内（issue「公告过长」），
+   只留一个暗色 ⋯ 提示「还有上下文」——完整内容挂在这一行的原生 title 上，悬停即见。 */
+.msg-context-more {
+  color: var(--t-faint);
+  cursor: default;
+  font-size: 11px;
+}
 .msg-mention { color: var(--t-accent); }
 .msg-reply { color: var(--t-dim); }
 /* 引用预览块：真·引用取代裸 ↩#N —— 左竖条 + 淡底，点了跳到原消息并短暂高亮。
