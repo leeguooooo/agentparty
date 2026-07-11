@@ -77,15 +77,17 @@ describe("collectAttachments", () => {
       _server: string,
       _token: string,
       slug: string,
-      file: { name: string },
+      filename: string,
+      _bytes: Uint8Array,
+      _contentType: string,
     ): Promise<Attachment> => {
-      seen.push(file.name);
+      seen.push(filename);
       return {
-        key: `${slug}/uuid/${file.name}`,
-        filename: file.name,
+        key: `${slug}/uuid/${filename}`,
+        filename,
         content_type: "image/png",
         size: 8,
-        url: `/api/channels/${slug}/attachments/uuid/${file.name}`,
+        url: `/api/channels/${slug}/attachments/uuid/${filename}`,
       };
     };
     const sources = await resolveAttachments([png]);

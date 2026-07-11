@@ -101,7 +101,7 @@ export async function collectAttachments(
 ): Promise<Attachment[]> {
   const refs: Attachment[] = [];
   for (const src of sources) {
-    refs.push(await upload(server, token, slug, { name: src.filename, type: src.contentType, bytes: src.bytes }));
+    refs.push(await upload(server, token, slug, src.filename, src.bytes, src.contentType));
   }
   return refs;
 }
