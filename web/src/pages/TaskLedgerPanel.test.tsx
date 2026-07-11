@@ -246,3 +246,25 @@ describe("TaskLedgerPanel assignee datalist (#271)", () => {
     expect(datalist.findAllByType("option")).toHaveLength(0);
   });
 });
+
+// #271(d)：展开/收起切换宽度 class。
+describe("TaskLedgerPanel expanded view (#271)", () => {
+  test("toggle flips the --expanded class and the button label", async () => {
+    const r = render("en", baseProps());
+    const section = r.root.find((n) => n.props["aria-label"] === "channel tasks");
+    expect(section.props.className).toBe("task-ledger-panel");
+
+    const toggle = findByAria(r, "Toggle task panel width");
+    expect(toggle.props["aria-pressed"]).toBe(false);
+    await act(async () => { toggle.props.onClick(); });
+
+    expect(r.root.find((n) => n.props["aria-label"] === "channel tasks").props.className)
+      .toBe("task-ledger-panel task-ledger-panel--expanded");
+    expect(findByAria(r, "Toggle task panel width").props["aria-pressed"]).toBe(true);
+    expect(allText(r)).toContain("Collapse");
+
+    await act(async () => { findByAria(r, "Toggle task panel width").props.onClick(); });
+    expect(r.root.find((n) => n.props["aria-label"] === "channel tasks").props.className)
+      .toBe("task-ledger-panel");
+  });
+});

@@ -3377,6 +3377,11 @@
   align-items: center;
   gap: 6px;
 }
+/* #271(d)：任务面板展开态——外层弹层卡片跟随内容加宽、拉高 */
+.channel-panel-card:has(.task-ledger-panel--expanded) {
+  width: calc(100vw - 28px);
+  max-height: calc(100vh - 28px);
+}
 .task-filter-select {
   max-width: 160px;
   padding: 2px 4px;

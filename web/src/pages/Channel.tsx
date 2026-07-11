@@ -1354,6 +1354,8 @@ export function TaskLedgerPanel({
   const [newDesc, setNewDesc] = useState("");
   // #271(a)：按受理人筛选看板。"all" 全量，"__unassigned__" 只看未指派。
   const [assigneeFilter, setAssigneeFilter] = useState("all");
+  // #271(d)：展开放大——CSS class 切宽度，外层 channel-panel-card 用 :has() 跟随。
+  const [expandedView, setExpandedView] = useState(false);
   const counts = tasks.reduce<Record<string, number>>((acc, task) => {
     acc[task.state] = (acc[task.state] ?? 0) + 1;
     return acc;
@@ -1466,7 +1468,10 @@ export function TaskLedgerPanel({
     );
   };
   return (
-    <section className="task-ledger-panel" aria-label={t("Channel.tasks.panelAria")}>
+    <section
+      className={"task-ledger-panel" + (expandedView ? " task-ledger-panel--expanded" : "")}
+      aria-label={t("Channel.tasks.panelAria")}
+    >
       {/* #271(b)：所有任务卡的指派输入共用同一份候选（参照 channel-role-targets 的写法） */}
       <datalist id="task-assignee-targets">
         {identities.map((identity) => (
@@ -1504,6 +1509,15 @@ export function TaskLedgerPanel({
           )}
           <button className="d-btn" type="button" disabled={loading} onClick={onRefresh}>
             {loading ? t("Channel.tasks.refreshing") : t("Channel.tasks.refresh")}
+          </button>
+          <button
+            className="d-btn task-expand-btn"
+            type="button"
+            aria-label={t("Channel.tasks.expandAria")}
+            aria-pressed={expandedView}
+            onClick={() => setExpandedView((open) => !open)}
+          >
+            {expandedView ? t("Channel.tasks.collapse") : t("Channel.tasks.expand")}
           </button>
         </div>
       </header>
