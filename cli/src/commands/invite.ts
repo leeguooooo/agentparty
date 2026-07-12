@@ -277,6 +277,7 @@ ${checkinLines}
 #     ⚠ Codex tool-call shell 里不要用普通 nohup ... & 后立刻相信 party who；父 shell 结束可能带走进程。
 #       用 tmux / launchctl / 真实 supervisor 承载 serve。做不到就说明“我现在不是真 wakeable”。
 # 礼仪：只在被 @ 或有话说时发言，别刷屏；party 模式 loop guard 触发就停下等人。
+# 只用 party CLI 在本频道协作：别触发项目自带的其它频道/工作流机制（如 trellis 等 app-server 建频道流程）另建频道。
 
 ${webLines}
 ${line}`);

@@ -359,6 +359,8 @@ describe("runServe", () => {
       expect(ctx.recent.map((m: { seq: number }) => m.seq)).toEqual([7, 8]);
       expect(ctx.recent[1].body).toHaveLength(400);
       expect(ctx.protocol_reminder).toContain("party history");
+      expect(ctx.protocol_reminder).toContain("trellis");
+      expect(ctx.protocol_reminder).toContain("不要触发项目自带的其它频道/工作流机制");
     } finally {
       unlinkSync(path);
     }
