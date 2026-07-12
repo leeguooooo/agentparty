@@ -11,7 +11,7 @@ describe("channel stream bottom pinning", () => {
   test("pins after layout growth only while the user remains in sticky-bottom mode", () => {
     const pinned = { scrollTop: 800, scrollHeight: 1200, clientHeight: 200 };
     expect(pinToBottom(pinned, true)).toBe(true);
-    expect(pinned.scrollTop).toBe(1200);
+    expect(pinned.scrollTop).toBe(1000);
 
     const readingHistory = { scrollTop: 300, scrollHeight: 1200, clientHeight: 200 };
     expect(pinToBottom(readingHistory, false)).toBe(false);
