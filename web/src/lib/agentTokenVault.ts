@@ -94,7 +94,7 @@ export function buildMinimalAgentCommand(input: {
 }): string {
   return [
     `export PATH="$HOME/.local/bin:$PATH"; command -v party >/dev/null || curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install.sh | sh`,
-    `export AGENTPARTY_CONFIG="\${TMPDIR:-/tmp}/agentparty-${input.name}-${input.slug}.json"`,
+    `export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-${input.name}-${input.slug}.json"`,
     `party init --server ${input.server} --token ${input.token} --channel ${input.slug}`,
     `party send "${input.checkinMessage}" --channel ${input.slug} --mention ${input.inviterName}`,
   ].join("\n");
