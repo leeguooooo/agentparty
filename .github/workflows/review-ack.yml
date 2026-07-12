@@ -52,7 +52,11 @@ jobs:
             exit 1
           fi
           echo "PR #$PR head SHA=$SHA"
-          BOTS='github-actions|github-actions\[bot\]|qodo|pr-agent|coderabbit|dependabot'
+          # 注意：这串会内嵌进 jq 的 test() 字符串字面量，不能含 jq 非法转义。
+          # 原来的 `github-actions\[bot\]` 里 `\[`/`\]` 在 jq 字符串里是非法转义序列，会让**整条 jq 解析失败**，
+          # 配合下面的 `|| echo 0` 使 REVIEWS/ACK_COMMENTS 恒为 0 → 所有 PR 的 review-ack 恒 fail，全员合并被卡。
+          # `github-actions` 本就子串命中 `github-actions[bot]`，那个 `[bot]` 分支冗余，直接删掉即修复。
+          BOTS='github-actions|qodo|pr-agent|coderabbit|dependabot'
           # 采纳 pr-agent 建议：API 失败时按 0 计（fail-safe——查不到就当无 ack、保持红，绝不误放行）
           REVIEWS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
             --jq "[.[] | select((.user.login | test(\"$BOTS\"; \"i\")) | not) | select(.state != \"PENDING\" and .state != \"DISMISSED\")] | length" 2>/dev/null || echo 0)
