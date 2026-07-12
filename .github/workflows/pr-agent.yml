@@ -1,7 +1,9 @@
-# PR Agent（qwen-max，非阻塞）——自动 review + 代码建议，随时可挂不拦合并。
+# PR Agent（qwen-max）——软阻断自动 review。
+# 「软阻断」= pr_agent 是 required check，合并前必须等它跑完 → 端点通时 review 评论已贴在 PR 上，
+# 合并者一定看得到；端点挂时 pr-agent 产不出评论、但本 job 照样绿（continue-on-error），绝不卡死所有 PR。
 # 模型走自建 OpenAI 兼容端点 ai.leeguoo.com；key/base 存 GitHub Secret，不进代码。
 # 同仓库分支 PR 才拿得到 secret；fork PR 无 secret 会自动 no-op（安全，不用 pull_request_target）。
-name: PR Agent (qwen · non-blocking)
+name: PR Agent (qwen · soft-gate)
 
 on:
   pull_request:
@@ -25,13 +27,13 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 8   # 端点慢/挂最多等 8 分钟就放行，不长时间卡 PR
     steps:
-      - name: PR Agent (qwen-max via ai.leeguoo.com)
-        continue-on-error: true   # 端点/模型随时会挂——绝不因此让 PR 变红或阻断合并
+      - name: PR Agent review (qwen-max via ai.leeguoo.com)
+        id: review
+        continue-on-error: true   # 端点/模型随时会挂——挂了本 step 失败但 job 仍绿，PR 不卡死
         uses: docker://pragent/pr-agent:0.39.0-github_action
         env:
-          # LLM：自建 OpenAI 兼容端点 + qwen-max（litellm 需 openai/ 前缀路由）
           OPENAI_KEY: ${{ secrets.PR_AGENT_OPENAI_KEY }}
           OPENAI__API_BASE: ${{ secrets.PR_AGENT_OPENAI_API_BASE }}
           CONFIG__MODEL: "openai/qwen-max"
@@ -39,8 +41,15 @@ jobs:
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: "32000"
           CONFIG__RESPONSE_LANGUAGE: "zh-cn"
           CONFIG__PUBLISH_OUTPUT_PROGRESS: "false"
-          # 只自动跑 review + 代码建议；描述我们自己写得够详，关掉省 token
           GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
           GITHUB_ACTION_CONFIG__AUTO_IMPROVE: "true"
           GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "false"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Gate summary（软阻断：合并前必须等本 check 跑完、读 review）
+        run: |
+          if [ "${{ steps.review.outcome }}" = "success" ]; then
+            echo "✅ pr-agent review 已产出并贴到 PR——合并前请先读它、处理真问题。"
+          else
+            echo "::warning::pr-agent review 未产出（端点不可达/超时）——本次无评论，按设计不阻断合并。"
+          fi
+          exit 0   # 无论端点通不通，本 job 都绿：required check 只强制「等 review 有机会产出」，不因端点宕机堵 PR
