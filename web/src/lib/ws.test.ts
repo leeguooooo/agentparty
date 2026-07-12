@@ -4,6 +4,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { HelloFrame, ServerFrame } from "@agentparty/shared";
 import { ChannelSocket } from "./ws";
 
+const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+const originalWebSocket = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+
 // 最小 WebSocket 桩：记录 send 出去的帧，暴露 open/close/deliver 供测试驱动生命周期。
 class FakeSocket {
   static instances: FakeSocket[] = [];
@@ -61,12 +65,13 @@ function flushTimers() {
 beforeEach(() => {
   FakeSocket.reset();
   pendingTimers = [];
-  (globalThis as unknown as { WebSocket: typeof FakeSocket }).WebSocket = FakeSocket;
-  (globalThis as unknown as { location: { protocol: string; host: string } }).location = {
-    protocol: "http:",
-    host: "localhost",
-  };
-  (globalThis as unknown as { window: unknown }).window = {
+  Object.defineProperty(globalThis, "WebSocket", { configurable: true, writable: true, value: FakeSocket });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    writable: true,
+    value: { protocol: "http:", host: "localhost" },
+  });
+  Object.defineProperty(globalThis, "window", { configurable: true, writable: true, value: {
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: (fn: () => void) => {
@@ -74,13 +79,18 @@ beforeEach(() => {
       return pendingTimers.length;
     },
     clearTimeout: () => {},
-  };
+  } });
 });
 
 afterEach(() => {
-  Reflect.deleteProperty(globalThis, "WebSocket");
-  Reflect.deleteProperty(globalThis, "window");
-  Reflect.deleteProperty(globalThis, "location");
+  for (const [key, descriptor] of [
+    ["WebSocket", originalWebSocket],
+    ["window", originalWindow],
+    ["location", originalLocation],
+  ] as const) {
+    if (descriptor === undefined) Reflect.deleteProperty(globalThis, key);
+    else Object.defineProperty(globalThis, key, descriptor);
+  }
 });
 
 function noopHandlers() {
