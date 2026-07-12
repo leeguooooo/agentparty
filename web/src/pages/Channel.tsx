@@ -15,6 +15,7 @@ import { MessageCard } from "../components/MessageCard";
 import { MentionToast, type MentionToastItem } from "../components/MentionToast";
 import { NotifyToggle, readNotifyOptin } from "../components/NotifyToggle";
 import { PresenceBar } from "../components/PresenceBar";
+import { OrgTree } from "../components/OrgTree";
 import { OrgTreePreview } from "../components/OrgTreePreview";
 import {
   archiveChannel,
@@ -3092,6 +3093,26 @@ export function ChannelPage({
       .finally(() => setRoleSaving(null));
   }, [channelRoles, roleSaving, slug, token, t]);
 
+  // #370 组织树：就地设置某成员向谁汇报（reportsTo=null 清空）。沿用现有角色/职责，只改 reports_to。
+  const setReportsTo = useCallback((name: string, reportsTo: string | null) => {
+    if (roleSaving !== null) return;
+    const current = channelRoles.find((role) => role.name === name);
+    if (current === undefined) return;
+    setRoleSaving(name);
+    setRoleError(null);
+    setChannelRole(token, slug, name, current.role, current.responsibility ?? "", reportsTo)
+      .then((saved) => {
+        setChannelRoles((roles) => [...roles.filter((role) => role.name !== saved.name), { ...current, ...saved }]);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
+        else if (err instanceof ForbiddenError) setRoleError(t("Channel.roles.forbidden"));
+        else if (err instanceof ValidationError) setRoleError(t("Channel.roles.invalid"));
+        else setRoleError(t("Channel.roles.saveFailed"));
+      })
+      .finally(() => setRoleSaving(null));
+  }, [channelRoles, roleSaving, slug, token, t]);
+
   const clearRole = useCallback((name: string) => {
     if (roleSaving !== null) return;
     const ok = window.confirm(t("Channel.roles.clearConfirm", { name }));
@@ -3711,6 +3732,19 @@ export function ChannelPage({
               onSave={saveCharter}
               onRetry={() => void loadCharter()}
             />
+          )}
+          {activePanel === "roles" && (
+            <div className="org-tree-section">
+              <div className="org-tree-head">{t("OrgTree.heading")}</div>
+              <OrgTree
+                roles={channelRoles}
+                presence={Object.values(state.presence)}
+                canModerate={canModerate}
+                onSetReportsTo={setReportsTo}
+                busyName={roleSaving}
+                onOpenDetail={setOpenAgentDetail}
+              />
+            </div>
           )}
           {activePanel === "roles" && (
             <DivisionBoard

@@ -607,11 +607,15 @@ export async function setChannelRole(
   name: string,
   role: CollaborationRole,
   responsibility: string,
+  // #370：向谁汇报（可跨 owner）。undefined=不改；null=清空（顶层）；否则 agent 名。
+  reportsTo?: string | null,
 ): Promise<ChannelRoleInfo> {
+  const body: Record<string, unknown> = { role, responsibility };
+  if (reportsTo !== undefined) body.reports_to = reportsTo;
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/roles/${encodeURIComponent(name)}`, {
     method: "PUT",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ role, responsibility }),
+    body: JSON.stringify(body),
   });
   if (res.status === 401) throw new AuthError("invalid or revoked token");
   if (res.status === 403) throw new ForbiddenError("forbidden");

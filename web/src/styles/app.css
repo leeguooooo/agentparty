@@ -5898,3 +5898,41 @@
     min-height: 36px;
   }
 }
+
+/* #370 组织架构树（办公软件式管理层级，按 reports_to） */
+.org-tree-section { margin: 0 4px 8px; }
+.org-tree-head { font-size: 12px; font-weight: 700; color: var(--t-muted); padding: 4px 2px; }
+.org-tree, .org-children { list-style: none; margin: 0; padding: 0; }
+.org-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 4px;
+}
+.org-row:hover { background: var(--t-panel2); }
+.org-status { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.org-status--online { background: #2ecc71; }
+.org-status--wakeable { background: #f4c430; }
+.org-status--offline { background: var(--t-faint); }
+.org-name {
+  border: none; background: none; cursor: pointer; padding: 0;
+  color: var(--fg, inherit); font-weight: 600; font-size: 13px;
+}
+.org-name:hover { text-decoration: underline; }
+.org-role {
+  font-size: 10px; padding: 0 5px; border-radius: 0; border: 1px solid var(--t-faint);
+  color: var(--t-dim); text-transform: uppercase; letter-spacing: 0.03em;
+}
+.org-role--host { color: var(--t-accent); border-color: var(--t-accent); }
+.org-owner-badge {
+  font-size: 10px; padding: 0 5px; border-radius: 8px;
+  background: var(--d-yellow, #f4e5b8); color: var(--fg, #6b5900);
+}
+.org-status-text { font-size: 10px; color: var(--t-dim); }
+.org-status-text--online { color: #2ecc71; }
+.org-reports-select {
+  margin-left: auto; font-size: 11px; max-width: 160px;
+  background: var(--t-panel2); color: var(--fg, inherit); border: 1px solid var(--t-faint);
+}
+.org-empty { color: var(--t-dim); font-size: 12px; padding: 6px 4px; }
