@@ -845,7 +845,7 @@ export function DivisionBoard({
   );
 }
 
-function ChannelPanelModal({
+export function ChannelPanelModal({
   title,
   subtitle,
   onClose,
@@ -1062,6 +1062,144 @@ function SearchHitCard({ hit, onJump }: { hit: SearchHit; onJump: (seq: number) 
       </header>
       <p className="search-hit-snippet">{hit.snippet === "" ? t("Channel.empty.content") : hit.snippet}</p>
     </article>
+  );
+}
+
+export interface ChannelSearchPanelProps {
+  search: string;
+  query: string;
+  searchFrom: string;
+  searchSince: string;
+  searchLimit: string;
+  senderListId: string;
+  knownSenders: string[];
+  searchLoading: boolean;
+  searchHits: SearchHit[];
+  visibleSearchHits: SearchHit[];
+  agentFilterActive: boolean;
+  searchInputError: string | null;
+  searchError: string | null;
+  onSearch(value: string): void;
+  onSearchFrom(value: string): void;
+  onSearchSince(value: string): void;
+  onSearchLimit(value: string): void;
+  onClose(): void;
+  onJump(seq: number): void;
+}
+
+export function ChannelSearchPanel({
+  search,
+  query,
+  searchFrom,
+  searchSince,
+  searchLimit,
+  senderListId,
+  knownSenders,
+  searchLoading,
+  searchHits,
+  visibleSearchHits,
+  agentFilterActive,
+  searchInputError,
+  searchError,
+  onSearch,
+  onSearchFrom,
+  onSearchSince,
+  onSearchLimit,
+  onClose,
+  onJump,
+}: ChannelSearchPanelProps) {
+  const t = useT();
+  const selectHit = (seq: number) => {
+    onClose();
+    onJump(seq);
+  };
+
+  return (
+    <div className="chan-search-panel">
+      <div className="chan-search-row">
+        <input
+          className="t-mono chan-search"
+          type="search"
+          value={search}
+          spellCheck={false}
+          onChange={(event) => onSearch(event.target.value)}
+          placeholder={t("Channel.search.placeholder")}
+          aria-label={t("Channel.search.aria")}
+          autoFocus
+        />
+        {query !== "" && (
+          <span className="t-mono chan-search-count" role="status" aria-live="polite">
+            {searchLoading
+              ? t("Channel.search.searching")
+              : agentFilterActive
+                ? t("Channel.search.hitsFiltered", { visible: visibleSearchHits.length, total: searchHits.length })
+                : t("Channel.search.hits", { count: searchHits.length })}
+          </span>
+        )}
+      </div>
+      {query !== "" && (
+        <div className="chan-search-filters">
+          <input
+            className="t-mono chan-filter-input"
+            value={searchFrom}
+            spellCheck={false}
+            list={senderListId}
+            onChange={(event) => onSearchFrom(event.target.value)}
+            placeholder={t("Channel.search.fromPlaceholder")}
+            aria-label={t("Channel.search.fromAria")}
+          />
+          <datalist id={senderListId}>
+            {knownSenders.map((name) => (
+              <option key={name} value={name} />
+            ))}
+          </datalist>
+          <input
+            className="t-mono chan-filter-input"
+            type="number"
+            min={0}
+            step={1}
+            value={searchSince}
+            onChange={(event) => onSearchSince(event.target.value)}
+            placeholder={t("Channel.search.sincePlaceholder")}
+            aria-label={t("Channel.search.sinceAria")}
+          />
+          <input
+            className="t-mono chan-filter-input chan-filter-input--short"
+            type="number"
+            min={1}
+            max={1000}
+            step={1}
+            value={searchLimit}
+            onChange={(event) => onSearchLimit(event.target.value)}
+            placeholder={t("Channel.search.limitPlaceholder")}
+            aria-label={t("Channel.search.limitAria")}
+          />
+        </div>
+      )}
+      {searchInputError !== null && (
+        <p className="banner banner--yellow" role="alert">
+          {searchInputError}
+        </p>
+      )}
+      {searchError !== null && searchInputError === null && (
+        <p className="banner banner--red" role="alert">
+          {searchError}
+        </p>
+      )}
+      {query !== "" && visibleSearchHits.map((hit) => (
+        <SearchHitCard key={hit.seq} hit={hit} onJump={selectHit} />
+      ))}
+      {query !== "" && !searchLoading && searchHits.length === 0 && searchInputError === null && searchError === null && (
+        <p className="d-empty" role="status" aria-live="polite">
+          {t("Channel.search.noMatch", { query: search.trim() })}
+        </p>
+      )}
+      {query !== "" && !searchLoading && searchHits.length > 0 && visibleSearchHits.length === 0 && (
+        <p className="d-empty" role="status" aria-live="polite">
+          {t("Channel.empty.searchFiltered")}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -3288,68 +3426,27 @@ export function ChannelPage({
   );
 
   const searchContent = (
-    <div className="chan-search-panel">
-      <div className="chan-search-row">
-        <input
-          className="t-mono chan-search"
-          type="search"
-          value={search}
-          spellCheck={false}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder={t("Channel.search.placeholder")}
-          aria-label={t("Channel.search.aria")}
-          autoFocus
-        />
-        {q !== "" && (
-          <span className="t-mono chan-search-count">
-            {searchLoading
-              ? t("Channel.search.searching")
-              : agentFilterActive
-                ? t("Channel.search.hitsFiltered", { visible: visibleSearchHits.length, total: searchHits.length })
-                : t("Channel.search.hits", { count: searchHits.length })}
-          </span>
-        )}
-      </div>
-      {q !== "" && (
-        <div className="chan-search-filters">
-          <input
-            className="t-mono chan-filter-input"
-            value={searchFrom}
-            spellCheck={false}
-            list={senderListId}
-            onChange={(e) => setSearchFrom(e.target.value)}
-            placeholder={t("Channel.search.fromPlaceholder")}
-            aria-label={t("Channel.search.fromAria")}
-          />
-          <datalist id={senderListId}>
-            {knownSenders.map((name) => (
-              <option key={name} value={name} />
-            ))}
-          </datalist>
-          <input
-            className="t-mono chan-filter-input"
-            type="number"
-            min={0}
-            step={1}
-            value={searchSince}
-            onChange={(e) => setSearchSince(e.target.value)}
-            placeholder={t("Channel.search.sincePlaceholder")}
-            aria-label={t("Channel.search.sinceAria")}
-          />
-          <input
-            className="t-mono chan-filter-input chan-filter-input--short"
-            type="number"
-            min={1}
-            max={1000}
-            step={1}
-            value={searchLimit}
-            onChange={(e) => setSearchLimit(e.target.value)}
-            placeholder={t("Channel.search.limitPlaceholder")}
-            aria-label={t("Channel.search.limitAria")}
-          />
-        </div>
-      )}
-    </div>
+    <ChannelSearchPanel
+      search={search}
+      query={q}
+      searchFrom={searchFrom}
+      searchSince={searchSince}
+      searchLimit={searchLimit}
+      senderListId={senderListId}
+      knownSenders={knownSenders}
+      searchLoading={searchLoading}
+      searchHits={searchHits}
+      visibleSearchHits={visibleSearchHits}
+      agentFilterActive={agentFilterActive}
+      searchInputError={searchInputError}
+      searchError={searchError}
+      onSearch={setSearch}
+      onSearchFrom={setSearchFrom}
+      onSearchSince={setSearchSince}
+      onSearchLimit={setSearchLimit}
+      onClose={() => setActivePanel(null)}
+      onJump={jumpToSearchHit}
+    />
   );
 
   return (
@@ -3657,8 +3754,7 @@ export function ChannelPage({
             ))}
           </div>
         )}
-        {q === ""
-          ? visibleTimeline.map((item) =>
+        {visibleTimeline.map((item) =>
               item.type === "message" ? (
                 <MessageCard
                   key={item.message.seq}
@@ -3715,9 +3811,8 @@ export function ChannelPage({
                   onEditSave={saveEdit}
                 />
               ),
-            )
-          : visibleSearchHits.map((hit) => <SearchHitCard key={hit.seq} hit={hit} onJump={jumpToSearchHit} />)}
-        {bootstrapped && state.messages.length === 0 && q === "" && (
+            )}
+        {bootstrapped && state.messages.length === 0 && (
           <div className="stream-empty" role="status" aria-live="polite">
             <p className="stream-empty-lead">{t("Channel.empty.partyWatch", { slug })}</p>
             <p className="stream-empty-lead">{t("Channel.empty.noMessagesHint")}</p>
@@ -3729,32 +3824,12 @@ export function ChannelPage({
             )}
           </div>
         )}
-        {state.messages.length > 0 && q === "" && visibleMessages.length === 0 && (
+        {state.messages.length > 0 && visibleMessages.length === 0 && (
           <p className="d-empty" role="status" aria-live="polite">
             {completionOnly ? t("Channel.empty.completionsFiltered") : t("Channel.empty.messagesFiltered")}
           </p>
         )}
-        {q !== "" && !searchLoading && searchHits.length === 0 && searchInputError === null && searchError === null && (
-          <p className="d-empty" role="status" aria-live="polite">
-            {t("Channel.search.noMatch", { query: search.trim() })}
-          </p>
-        )}
-        {q !== "" && !searchLoading && searchHits.length > 0 && visibleSearchHits.length === 0 && (
-          <p className="d-empty" role="status" aria-live="polite">
-            {t("Channel.empty.searchFiltered")}
-          </p>
-        )}
       </div>
-      {searchInputError !== null && (
-        <p className="banner banner--yellow" role="alert">
-          {searchInputError}
-        </p>
-      )}
-      {searchError !== null && searchInputError === null && (
-        <p className="banner banner--red" role="alert">
-          {searchError}
-        </p>
-      )}
       {state.archived && (
         <p className="banner banner--gray" role="status" aria-live="polite">
           {t("Channel.banner.archived")}

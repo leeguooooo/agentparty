@@ -28,7 +28,7 @@ describe("Channel loading and recovery surfaces (#344 #345 #346 #354)", () => {
   test("shows a skeleton before bootstrap and the actionable empty state only afterwards", () => {
     expect(channelSource).toContain('!bootstrapped && q === ""');
     expect(channelSource).toContain('className="stream-skeleton"');
-    expect(channelSource).toContain('bootstrapped && state.messages.length === 0 && q === ""');
+    expect(channelSource).toContain("bootstrapped && state.messages.length === 0");
     expect(channelSource).toContain('t("Channel.empty.noMessagesHint")');
     expect(styles).toContain(".msg-card--skeleton");
   });
