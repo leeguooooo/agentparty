@@ -1,0 +1,54 @@
+# 合并前必须「读了 review」的强制闸——对所有人生效，不靠任何人记忆。
+# 机制：这是 required check，只有当 PR 上出现一条 review 结论（ack）时才变绿、才允许合并。
+# ack = 任意非机器人身份 提交了 PR review（approve/comment/request-changes），
+#   或 留了一条以 `review-ack:` / `合并前已读` 开头的评论。
+# 不依赖任何 LLM 端点：即便 pr-agent 端点挂了、无自动 review，人也必须自己看过并写下结论才能合。
+# 空 ack 也拦不住恶意糊弄，但把「留结论」变成仓库强制的可核查动作，而非记忆里的自觉。
+name: Review Ack Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: review-ack-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false   # required check 不能被取消（取消=红=卡合并）
+
+jobs:
+  review-ack:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检查 PR 是否已有「读过 review」的结论（ack）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          BOTS='github-actions|github-actions\[bot\]|qodo|pr-agent|coderabbit|dependabot'
+          # ① 正式 PR review（approve / comment / changes_requested），非机器人
+          REVIEWS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+            --jq "[.[] | select((.user.login | test(\"$BOTS\"; \"i\")) | not) | select(.state != \"PENDING\")] | length")
+          # ② 评论里的显式 ack（review-ack: / 合并前已读 / 合并者 review 结论），非机器人
+          ACK_COMMENTS=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "[.[] | select((.user.login | test(\"$BOTS\"; \"i\")) | not) | select(.body | test(\"review-ack:|合并前已读|合并者 review 结论\"; \"i\"))] | length")
+          echo "非机器人 PR reviews: $REVIEWS · ack 评论: $ACK_COMMENTS"
+          if [ "$REVIEWS" -gt 0 ] || [ "$ACK_COMMENTS" -gt 0 ]; then
+            echo "✅ 已有 review 结论——合并者看过了。"
+            exit 0
+          fi
+          echo "::error::合并前必须先读 review 并留结论：在 PR 上提交一次 review，或评论一条以 'review-ack:' 开头的合并结论（说清 pr-agent/CodeRabbit 的 review 有无真问题、误报、是否采纳）。这是对所有人生效的强制闸，不是自觉。"
+          exit 1
