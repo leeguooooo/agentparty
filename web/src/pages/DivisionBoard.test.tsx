@@ -26,6 +26,11 @@ let renderer: ReactTestRenderer | null = null;
 
 const noop = () => {};
 
+// #150 自动同步用 800ms 去抖的 setTimeout；测试等它触发。留足余量避免 CI 抖动。
+const AUTO_SYNC_DEBOUNCE_MS = 800;
+const wait = (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); });
+const flushAutoSync = () => wait(AUTO_SYNC_DEBOUNCE_MS + 250);
+
 function presenceEntry(overrides: Partial<PresenceEntry> & { name: string }): PresenceEntry {
   return {
     state: "working",
@@ -287,6 +292,98 @@ describe("DivisionBoard sync-to-charter (#150)", () => {
     render(baseProps({ canModerate: false }));
     const btn = renderer!.root.findAll((n) => n.props.className === "d-btn role-sync-charter-btn");
     expect(btn.length).toBe(0);
+  });
+});
+
+// issue #150（缺口）：头号诉求是「分工/角色变化即自动同步到公告」，此前只有手动按钮。
+// 这里测自动同步 effect：分工变化去抖后自动落盘、非 moderator 静默跳过、内容一致时
+// 幂等不重复写。手动按钮保留为兜底（上一组已覆盖），默认自动。
+describe("DivisionBoard auto-sync-to-charter (#150)", () => {
+  const hostRole = {
+    name: "leo-claude", role: "host" as const, responsibility: "统筹", assigned_by: "leo",
+    assigned_at: 1, kind: "agent" as const, account: "leo", display: "leo-claude",
+  };
+
+  test("moderator auto-syncs declared roles into the charter with no button click", async () => {
+    let synced: string | null = null;
+    render(
+      baseProps({
+        canModerate: true,
+        charterText: "# Team charter\n\nBe kind to each other.",
+        roles: [hostRole],
+        presence: { "leo-claude": presenceEntry({ name: "leo-claude", account: "leo" }) },
+        onSyncToCharter: (text: string) => { synced = text; },
+      }),
+    );
+    // 没有任何点击——纯靠 effect + 去抖触发。
+    await flushAutoSync();
+    expect(synced).not.toBeNull();
+    expect(synced as unknown as string).toContain("leo-claude");
+    expect(synced as unknown as string).toContain("Be kind to each other.");
+  });
+
+  test("non-moderators never auto-write the charter (silent skip, no failing 403 write)", async () => {
+    let synced: string | null = null;
+    render(
+      baseProps({
+        canModerate: false,
+        charterText: "# Team charter",
+        roles: [hostRole],
+        presence: { "leo-claude": presenceEntry({ name: "leo-claude", account: "leo" }) },
+        onSyncToCharter: (text: string) => { synced = text; },
+      }),
+    );
+    await flushAutoSync();
+    expect(synced).toBeNull();
+  });
+
+  test("does not auto-write out of nothing when there is no division and no existing section", async () => {
+    let synced: string | null = null;
+    render(
+      baseProps({
+        canModerate: true,
+        charterText: "# Team charter\n\nBe kind.",
+        roles: [],
+        presence: {},
+        onSyncToCharter: (text: string) => { synced = text; },
+      }),
+    );
+    await flushAutoSync();
+    expect(synced).toBeNull();
+  });
+
+  test("idempotent: no second auto-write once the charter already holds the up-to-date section", async () => {
+    // 第一阶段：空底稿 + 分工，自动写出合并结果。
+    let synced: string | null = null;
+    render(
+      baseProps({
+        canModerate: true,
+        charterText: "# Team charter\n\nBe kind.",
+        roles: [hostRole],
+        presence: { "leo-claude": presenceEntry({ name: "leo-claude", account: "leo" }) },
+        onSyncToCharter: (text: string) => { synced = text; },
+      }),
+    );
+    await flushAutoSync();
+    const firstWrite = synced;
+    expect(firstWrite).not.toBeNull();
+    act(() => renderer!.unmount());
+    renderer = null;
+
+    // 第二阶段：把「已同步好的公告」作为底稿重新渲染，同一份分工——合并结果与现状一致，
+    // 不应再触发任何写入（幂等，防重复堆叠 / 防自我循环）。
+    let secondWrite: string | null = null;
+    render(
+      baseProps({
+        canModerate: true,
+        charterText: firstWrite as unknown as string,
+        roles: [hostRole],
+        presence: { "leo-claude": presenceEntry({ name: "leo-claude", account: "leo" }) },
+        onSyncToCharter: (text: string) => { secondWrite = text; },
+      }),
+    );
+    await flushAutoSync();
+    expect(secondWrite).toBeNull();
   });
 });
 

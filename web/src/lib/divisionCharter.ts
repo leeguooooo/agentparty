@@ -39,6 +39,13 @@ export function formatDivisionSection(roles: DivisionCharterRole[], labels: Divi
   return `${START_MARKER}\n### ${labels.heading}\n${body}\n${END_MARKER}`;
 }
 
+// #150 自动同步：判断公告里是否已经有「自动分工区块」（marker 存在）。用来区分
+// 「本来就没有分工、也不该无中生有写空区块」和「区块曾经写过、现在分工清零需要更新」
+// 两种情况——前者自动同步应静默跳过，后者应把区块刷新为空。
+export function charterHasDivisionSection(charterText: string): boolean {
+  return charterText.includes(START_MARKER);
+}
+
 export function mergeDivisionIntoCharter(charterText: string, section: string): string {
   const markerRe = new RegExp(`${escapeForRegExp(START_MARKER)}[\\s\\S]*?${escapeForRegExp(END_MARKER)}`);
   if (markerRe.test(charterText)) {

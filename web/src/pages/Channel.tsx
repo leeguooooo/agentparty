@@ -62,7 +62,7 @@ import { buildReceipts, type MentionReceipt } from "../lib/wakeReceipt";
 import { completionMessages } from "../lib/completions";
 import { catchupKey, summarizeCatchup, type CatchupDigest } from "../lib/digest";
 import { buildOrgTree, type OrgMemberInput } from "../lib/orgTree";
-import { formatDivisionSection, mergeDivisionIntoCharter, type DivisionCharterRole } from "../lib/divisionCharter";
+import { charterHasDivisionSection, formatDivisionSection, mergeDivisionIntoCharter, type DivisionCharterRole } from "../lib/divisionCharter";
 import {
   clearDeliveredMentionNotifications,
   isDesktopRuntime,
@@ -641,22 +641,56 @@ export function DivisionBoard({
     .filter((item) => item.count > 0);
 
   // issue #150\uff1a\u62ff\u5f53\u524d\u5df2\u58f0\u660e\u5206\u5de5\uff08assigned + self\uff0c\u4e0d\u542b\u672a\u5206\u5de5\u5360\u4f4d\uff09\u62fc\u6210 markdown
-  // \u5c0f\u8282\uff0c\u5408\u5e76\u8fdb\u73b0\u6709\u516c\u544a\u6587\u672c\uff0c\u4ea4\u7ed9\u4e0a\u5c42\u843d\u76d8\u3002
-  const syncDivisionToCharter = () => {
-    const declared: DivisionCharterRole[] = roleViews
-      .filter((view): view is typeof view & { role: NonNullable<typeof view.role> } => view.role !== null)
-      .map((view) => ({
-        display: view.display,
-        accountLabel: view.accountLabel,
-        role: view.role.role,
-        responsibility: view.role.responsibility,
-      }));
-    const section = formatDivisionSection(declared, {
+  // \u5c0f\u8282\uff0c\u5408\u5e76\u8fdb\u73b0\u6709\u516c\u544a\u6587\u672c\u3002\u7eaf\u8ba1\u7b97\u653e\u5728\u6e32\u67d3\u671f\uff0c\u624b\u52a8\u6309\u94ae\u548c\u4e0b\u9762\u7684\u81ea\u52a8\u540c\u6b65 effect
+  // \u5171\u7528\u540c\u4e00\u4efd\u5408\u5e76\u7ed3\u679c nextCharterText\u2014\u2014\u4fdd\u8bc1\u300c\u624b\u70b9\u300d\u548c\u300c\u81ea\u52a8\u300d\u5199\u8fdb\u53bb\u7684\u6587\u672c\u4e00\u6a21\u4e00\u6837\u3002
+  const declared: DivisionCharterRole[] = roleViews
+    .filter((view): view is typeof view & { role: NonNullable<typeof view.role> } => view.role !== null)
+    .map((view) => ({
+      display: view.display,
+      accountLabel: view.accountLabel,
+      role: view.role.role,
+      responsibility: view.role.responsibility,
+    }));
+  const currentCharterText = charterText ?? "";
+  const nextCharterText = mergeDivisionIntoCharter(
+    currentCharterText,
+    formatDivisionSection(declared, {
       heading: t("Channel.roles.syncHeading"),
       empty: t("Channel.roles.syncEmpty"),
-    });
-    onSyncToCharter(mergeDivisionIntoCharter(charterText ?? "", section));
+    }),
+  );
+  const syncDivisionToCharter = () => {
+    onSyncToCharter(nextCharterText);
   };
+
+  // issue #150\uff1a\u5934\u53f7\u8bc9\u6c42\u662f\u300c\u5206\u5de5\u53d8\u5316\u5373\u81ea\u52a8\u540c\u6b65\u5230\u516c\u544a\u300d\uff0c\u624b\u52a8\u6309\u94ae\u53ea\u505a\u515c\u5e95\u3002\u8fd9\u91cc\u76d1\u542c
+  // \u5408\u5e76\u7ed3\u679c\u7684\u53d8\u5316\uff0c\u53bb\u6296\u540e\u81ea\u52a8\u843d\u76d8\u3002\u5e42\u7b49/\u65ad\u73af\u9760 mergeDivisionIntoCharter\u2014\u2014\u5199\u8fdb\u53bb\u540e
+  // charterText \u4f1a\u53d8\u5f97\u4e0e\u5408\u5e76\u7ed3\u679c\u4e00\u81f4\uff0ceffect \u518d\u8dd1\u5c31 no-op\uff0c\u4e0d\u4f1a\u81ea\u6211\u5faa\u73af\u3002\u5b88\u536b\uff1a
+  //   - \u975e moderator \u9759\u9ed8\u8df3\u8fc7\uff08\u81ea\u52a8\u5199\u8def\u5f84\u4ecd\u8d70 moderator-only \u7684 setChannelCharter\uff0c
+  //     \u666e\u901a agent \u89e6\u53d1\u53ea\u4f1a 403\uff0c\u4e0d\u5982\u4e0d\u5199\u2014\u2014\u670d\u52a1\u7aef\u81ea\u52a8\u5199\u8005\u662f\u66f4\u5927\u6539\u52a8\uff0c\u7559 follow-up\uff09\uff1b
+  //   - \u5199\u5165\u5728\u9014\uff08syncingCharter\uff0c\u5373\u4e0a\u5c42 charterSaving\uff09\u65f6\u4e0d\u53e0\u5199\uff0c\u590d\u7528\u73b0\u6709\u5e76\u53d1\u5b88\u536b\uff1b
+  //   - \u53ea\u5728\u5408\u5e76\u7ed3\u679c\u4e0e\u5f53\u524d\u516c\u544a\u5b9e\u9645\u4e0d\u540c\u624d\u5199\uff08\u5e42\u7b49\uff0c\u9632\u91cd\u590d\u5806\u53e0\uff09\uff1b
+  //   - \u672c\u6765\u6ca1\u6709\u5206\u5de5\u3001\u516c\u544a\u91cc\u4e5f\u6ca1\u6709\u65e2\u5b58\u5206\u5de5\u533a\u5757\u65f6\u4e0d\u65e0\u4e2d\u751f\u6709\u5199\u7a7a\u533a\u5757\u2014\u2014\u90a3\u79cd\u300c\u663e\u5f0f\u7269\u5316
+  //     \u7a7a\u533a\u5757\u300d\u7684\u52a8\u4f5c\u7559\u7ed9\u624b\u52a8\u6309\u94ae\uff1b\u533a\u5757\u66fe\u5199\u8fc7\u3001\u5206\u5de5\u6e05\u96f6\u65f6\u4ecd\u4f1a\u81ea\u52a8\u5237\u65b0\u4e3a\u7a7a\uff1b
+  //   - lastAutoSyncedRef \u8bb0\u4f4f\u4e0a\u4e00\u6b21\u81ea\u52a8\u5199\u8fc7\u7684\u6587\u672c\uff0c\u4e07\u4e00\u670d\u52a1\u7aef\u56de\u5b58\u65f6\u505a\u4e86\u89c4\u8303\u5316
+  //     \uff08charterText \u4e0e\u6211\u4eec\u53d1\u51fa\u7684\u7565\u6709\u51fa\u5165\uff09\u4e5f\u4e0d\u4f1a\u6bcf\u4e2a\u53bb\u6296\u5468\u671f\u91cd\u590d\u5199\u3001\u6296\u6210\u6b7b\u5faa\u73af\u3002
+  const onSyncRef = useRef(onSyncToCharter);
+  onSyncRef.current = onSyncToCharter;
+  const lastAutoSyncedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!canModerate) return;
+    if (syncingCharter) return;
+    if (declared.length === 0 && !charterHasDivisionSection(currentCharterText)) return;
+    if (nextCharterText === currentCharterText) return;
+    if (nextCharterText === lastAutoSyncedRef.current) return;
+    const timer = setTimeout(() => {
+      lastAutoSyncedRef.current = nextCharterText;
+      onSyncRef.current(nextCharterText);
+    }, 800);
+    return () => clearTimeout(timer);
+    // declared.length \u8986\u76d6\u300c\u5206\u5de5\u6570\u91cf\u53d8\u5316\u300d\uff1bnextCharterText \u8986\u76d6\u300c\u5206\u5de5\u5185\u5bb9/\u516c\u544a\u5e95\u7a3f\u53d8\u5316\u300d\u3002
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nextCharterText, currentCharterText, canModerate, syncingCharter, declared.length]);
 
   return (
     <details className="role-board" aria-label={t("Channel.roles.label")} open={forceOpen ? true : undefined}>
