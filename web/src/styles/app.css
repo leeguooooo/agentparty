@@ -1073,6 +1073,12 @@
   color: var(--d-red);
   border-color: var(--d-red);
 }
+/* #168 跨级汇报的黄色软提示（「尽量避免」，非硬错误，故用黄色而非红色，与 external 区分） */
+.org-report--skip {
+  color: var(--t-accent);
+  border-color: var(--d-yellow);
+  cursor: help;
+}
 .org-unassigned {
   margin-top: 10px;
   padding-top: 8px;

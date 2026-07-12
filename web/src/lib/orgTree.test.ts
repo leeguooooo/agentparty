@@ -121,6 +121,71 @@ describe("buildOrgTree", () => {
     expect(tree.unassigned).toHaveLength(0);
   });
 
+  test("assigns tree depth from each structural root", () => {
+    const tree = buildOrgTree([
+      member("lead", { role: "host" }),
+      member("mid", { role: "worker", reportsTo: "lead" }),
+      member("ic", { role: "worker", reportsTo: "mid" }),
+    ]);
+    const lead = tree.roots[0]!;
+    expect(lead.depth).toBe(0);
+    expect(findNode(tree.roots, "mid")!.depth).toBe(1);
+    expect(findNode(tree.roots, "ic")!.depth).toBe(2);
+  });
+
+  test("#168 direct report to its immediate manager is NOT flagged skip-level", () => {
+    // proper chain: ic → mid → lead. ic reports to its direct manager, mid.
+    const tree = buildOrgTree([
+      member("lead", { role: "host" }),
+      member("mid", { role: "worker", reportsTo: "lead" }),
+      member("ic", { role: "worker", reportsTo: "mid" }),
+    ]);
+    for (const node of allNodes(tree.roots)) {
+      expect(node.skipLevel, `${node.name} should not be skip-level`).toBe(false);
+    }
+  });
+
+  test("#168 leaf reporting to the lead over an existing manager layer is skip-level", () => {
+    // lead has a real management layer (mid → ic_real). ic_skip attaches straight to lead,
+    // bypassing that layer → skip-level. The manager (mid) and the proper report (ic_real) are not.
+    const tree = buildOrgTree([
+      member("lead", { role: "host" }),
+      member("mid", { role: "worker", reportsTo: "lead" }),
+      member("ic_real", { role: "worker", reportsTo: "mid" }),
+      member("ic_skip", { role: "worker", reportsTo: "lead" }),
+    ]);
+    expect(findNode(tree.roots, "ic_skip")!.skipLevel).toBe(true);
+    expect(findNode(tree.roots, "ic_real")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "mid")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "lead")!.skipLevel).toBe(false);
+  });
+
+  test("#168 a flat team with no manager layer is not skip-level", () => {
+    // lead has two leaf reports and no sub-manager → reporting straight to lead is fine.
+    const tree = buildOrgTree([
+      member("lead", { role: "host" }),
+      member("a", { role: "worker", reportsTo: "lead" }),
+      member("b", { role: "worker", reportsTo: "lead" }),
+    ]);
+    expect(findNode(tree.roots, "a")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "b")!.skipLevel).toBe(false);
+  });
+
+  test("#168 a sub-manager reporting high alongside another manager is not flagged (only leaf ICs)", () => {
+    // both dir-a and dir-b report to lead; each has its own report. Neither is a leaf → not flagged.
+    const tree = buildOrgTree([
+      member("lead", { role: "host" }),
+      member("dir-a", { role: "worker", reportsTo: "lead" }),
+      member("ic-a", { role: "worker", reportsTo: "dir-a" }),
+      member("dir-b", { role: "worker", reportsTo: "lead" }),
+      member("ic-b", { role: "worker", reportsTo: "dir-b" }),
+    ]);
+    expect(findNode(tree.roots, "dir-a")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "dir-b")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "ic-a")!.skipLevel).toBe(false);
+    expect(findNode(tree.roots, "ic-b")!.skipLevel).toBe(false);
+  });
+
   test("empty input yields an empty tree", () => {
     const tree = buildOrgTree([]);
     expect(tree.roots).toHaveLength(0);

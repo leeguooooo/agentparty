@@ -35,6 +35,14 @@ export interface OrgTreeNode {
   reportsToExternal: boolean;
   /** 是否频道主负责人（role=host） */
   isLead: boolean;
+  /** 该节点在汇报树里的深度（结构根 = 0，逐级 +1）。#168 跨级判定基于此 */
+  depth: number;
+  /**
+   * #168「尽量避免跨级汇报」：本节点为叶子 IC（自己没有下属）、非主负责人，但其汇报对象
+   * 下面已经存在一层中层管理者（另有一个同级兄弟带着自己的下属）——也就是它越过了这层
+   * 管理者、直接汇报给了更高的上级。与 reportsToExternal（跨频道/外部）是两码事。
+   */
+  skipLevel: boolean;
   children: OrgTreeNode[];
 }
 
@@ -94,14 +102,22 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
   // visited 是环保护的核心：DFS 时绝不重复进入同一个节点，
   // 因此哪怕数据里出现 b→c→b 这样的环，回边也只会被跳过而不会无限递归。
   const visited = new Set<string>();
-  const build = (name: string): OrgTreeNode => {
+  const build = (name: string, depth: number): OrgTreeNode => {
     visited.add(name);
     const member = byName.get(name)!;
     const reportsToExternal =
       member.reportsTo !== null && member.reportsTo !== name && !byName.has(member.reportsTo);
     const children = sortNames(childrenNames.get(name) ?? [])
       .filter((child) => !visited.has(child))
-      .map(build);
+      .map((child) => build(child, depth + 1));
+    // #168 跨级检测：本节点（作为某些孩子的汇报对象）下面是否已经存在一层中层管理者，
+    // 即有没有一个带下属的孩子。若有，则那些「自己没下属」的叶子孩子就是越级直报到本节点。
+    const hasManagerChild = children.some((child) => child.children.length > 0);
+    if (hasManagerChild) {
+      for (const child of children) {
+        if (child.children.length === 0 && !child.isLead) child.skipLevel = true;
+      }
+    }
     return {
       name: member.name,
       display: member.display,
@@ -112,6 +128,8 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
       reportsTo: member.reportsTo,
       reportsToExternal,
       isLead: isLeadMember(member),
+      depth,
+      skipLevel: false,
       children,
     };
   };
@@ -122,11 +140,11 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
   );
   const rootNodes: OrgTreeNode[] = [];
   for (const name of structuralRoots) {
-    if (!visited.has(name)) rootNodes.push(build(name));
+    if (!visited.has(name)) rootNodes.push(build(name, 0));
   }
   // 残留的环成员（从任何结构根都到不了）——每个当作独立根重建，visited 保证环被打断
   for (const member of uniqueMembers) {
-    if (!visited.has(member.name)) rootNodes.push(build(member.name));
+    if (!visited.has(member.name)) rootNodes.push(build(member.name, 0));
   }
 
   // 分堆：主负责人 或 「有下属」的节点进组织树；其余叶子散兵进 unassigned

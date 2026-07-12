@@ -33,6 +33,14 @@ function OrgNodeRow({ node, t, interactive }: { node: OrgTreeNode; t: TFunc; int
               : t("Channel.roles.reportsTo", { parent: node.reportsTo })}
           </span>
         )}
+        {node.skipLevel && node.reportsTo !== null && (
+          <span
+            className="org-report org-report--skip t-mono"
+            title={t("Channel.roles.skipLevelHint", { parent: node.reportsTo })}
+          >
+            {t("Channel.roles.skipLevel", { parent: node.reportsTo })}
+          </span>
+        )}
         {interactive?.canModerate && (
           <select
             className="org-report-select"
