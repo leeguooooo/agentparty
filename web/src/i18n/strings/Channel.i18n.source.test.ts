@@ -161,12 +161,14 @@ describe("Channel i18n source guard (#350)", () => {
     expect(source).toContain('t("Channel.conn.closed")');
   });
 
-  test("keeps resolved channel banners translated and adds the Agents affordance", () => {
+  test("keeps resolved channel banners translated and surfaces the online-agents affordance in the merged Team panel", () => {
     for (const key of ["Channel.banner.archived", "Channel.banner.readonly", "Channel.guard.banner"] as const) {
       expect(source).toContain(`t("${key}")`);
       expect(ChannelStrings.zh[key]).not.toBe(ChannelStrings.en[key]);
     }
-    expect(source).toContain('className="ap-sprite ap-sprite--agent"');
+    // #370 方案A：Agent 面板并入「团队」——在线数从独立 Agent 按钮移到团队按钮的 onlineBadge。
+    expect(source).toContain('t("Channel.tools.team")');
+    expect(source).toContain("Channel.team.onlineBadge");
     expect(source).toContain("onlineAgentCount");
   });
 

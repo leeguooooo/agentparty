@@ -5944,3 +5944,7 @@
   border-radius: 4px;
   margin: 4px 0;
 }
+
+/* #370 团队面板：分工/Agent状态/协调 三区分隔 */
+.team-section { margin-top: 12px; border-top: 1px solid var(--t-faint); padding-top: 8px; }
+.team-section-head { font-size: 12px; font-weight: 700; color: var(--t-muted); margin: 0 0 6px; }

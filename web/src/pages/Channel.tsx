@@ -185,7 +185,7 @@ export interface RoleDraft {
   responsibility: string;
 }
 
-type ChannelPanel = "charter" | "roles" | "coordination" | "tasks" | "agents" | "search" | "settings";
+type ChannelPanel = "charter" | "team" | "tasks" | "search" | "settings";
 type AdminSurface = "agentJoin" | "agentTokens" | "joinLink";
 const TASK_BOARD_STATES: readonly TaskState[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "blocked", "done"];
 
@@ -2968,7 +2968,7 @@ export function ChannelPage({
       writeSeenCharterRev(slug, charter.charter_rev);
       setSeenCharterRev(charter.charter_rev);
     }
-    if (panel === "tasks" || panel === "agents") void loadTaskLedger();
+    if (panel === "tasks" || panel === "team") void loadTaskLedger();
     setActivePanel(panel);
   }, [charter, loadTaskLedger, slug]);
 
@@ -3644,14 +3644,12 @@ export function ChannelPage({
             {charter !== null && <span className="t-mono chan-tool-badge">{t("Channel.charter.rev", { rev: charter.charter_rev })}</span>}
             {charterUpdated && <span className="t-mono chan-tool-badge chan-tool-badge--hot">{t("Channel.tools.updated")}</span>}
           </button>
-          <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("roles")}>
+          {/* #370 方案A：分工/协调/Agent 合成单一「团队」入口——组织架构、分工、在线状态、协调一处看 */}
+          <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("team")}>
             <span className="ap-sprite ap-sprite--division" aria-hidden="true" />
-            <span>{t("Channel.tools.roles")}</span>
+            <span>{t("Channel.tools.team")}</span>
             <span className="t-mono chan-tool-badge">{structuredRoleCount}</span>
-          </button>
-          <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("coordination")}>
-            <span className="ap-sprite ap-sprite--coordination" aria-hidden="true" />
-            <span>{t("Channel.tools.coordination")}</span>
+            <span className="t-mono chan-tool-badge">{t("Channel.team.onlineBadge", { count: String(onlineAgentCount) })}</span>
             {(agentFilterActive || completionOnly) && (
               <span className="t-mono chan-tool-badge chan-tool-badge--hot">{t("Channel.tools.active")}</span>
             )}
@@ -3660,11 +3658,6 @@ export function ChannelPage({
             <span className="ap-sprite ap-sprite--tasks" aria-hidden="true" />
             <span>{t("Channel.tasks.title")}</span>
             <span className="t-mono chan-tool-badge">{taskOpenCount}</span>
-          </button>
-          <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("agents")}>
-            <span className="ap-sprite ap-sprite--agent" aria-hidden="true" />
-            <span>{t("Channel.agents.title")}</span>
-            <span className="t-mono chan-tool-badge">{onlineAgentCount}</span>
           </button>
           {(taskOpenCount > 0 || taskReviewCount > 0 || taskBlockedCount > 0 || taskMineCount > 0) && (
             <div className="task-strip-summary" aria-label={t("Channel.tasks.summaryAria")}>
@@ -3757,18 +3750,15 @@ export function ChannelPage({
         <ChannelPanelModal
           title={
             activePanel === "charter" ? t("Channel.tools.charter") :
-            activePanel === "roles" ? t("Channel.tools.roles") :
-            activePanel === "coordination" ? t("Channel.tools.coordination") :
+            activePanel === "team" ? t("Channel.tools.team") :
             activePanel === "tasks" ? t("Channel.tasks.title") :
-            activePanel === "agents" ? t("Channel.agents.title") :
             activePanel === "settings" ? t("Channel.tools.settings") :
             t("Channel.tools.search")
           }
           subtitle={
             activePanel === "charter" && charter !== null ? t("Channel.charter.rev", { rev: charter.charter_rev }) :
-            activePanel === "roles" ? t("Channel.roles.count", { count: String(structuredRoleCount) }) :
+            activePanel === "team" ? t("Channel.team.subtitle", { roles: String(structuredRoleCount), online: String(onlineAgentCount) }) :
             activePanel === "tasks" ? t("Channel.tasks.subtitle", { open: taskOpenCount, review: taskReviewCount, blocked: taskBlockedCount }) :
-            activePanel === "agents" ? t("Channel.agents.subtitle") :
             activePanel === "settings" ? (localLoopGuardEnabled ? t("Channel.settings.enabled") : t("Channel.settings.unlimited")) :
             activePanel === "search" && q !== "" ? t("Channel.search.hits", { count: searchHits.length }) :
             undefined
@@ -3794,34 +3784,45 @@ export function ChannelPage({
               onRetry={() => void loadCharter()}
             />
           )}
-          {activePanel === "roles" && (
-            <DivisionBoard
-              canModerate={canModerate}
-              slug={slug}
-              roles={channelRoles}
-              roleDrafts={roleDrafts}
-              roleError={roleError}
-              roleSaving={roleSaving}
-              roleName={newRoleName}
-              roleDraft={newRoleDraft}
-              identities={channelIdentities}
-              presence={state.presence}
-              forceOpen
-              onRoleDraft={updateRoleDraft}
-              onNewRoleName={setNewRoleName}
-              onNewRoleDraft={setNewRoleDraft}
-              onSaveRole={saveRole}
-              onSetReportsTo={setReportsTo}
-              onDeleteRole={clearRole}
-              charterText={charter?.charter ?? null}
-              onSyncToCharter={syncDivisionToCharter}
-              syncingCharter={charterSaving}
-              canManageAgentRules={canMintAgent && accountKey !== null}
-              onOpenAgentRules={openAgentRulesFromDivision}
-              onOpenAgentDetail={setOpenAgentDetail}
-            />
+          {activePanel === "team" && (
+            // #370 方案A：分工 + Agent 状态板 + 协调 三块合成单一「团队」面板。组织架构树在
+            // DivisionBoard 顶部（OrgTreePreview）。分区标题让大信息量仍可扫读。
+            <>
+              <DivisionBoard
+                canModerate={canModerate}
+                slug={slug}
+                roles={channelRoles}
+                roleDrafts={roleDrafts}
+                roleError={roleError}
+                roleSaving={roleSaving}
+                roleName={newRoleName}
+                roleDraft={newRoleDraft}
+                identities={channelIdentities}
+                presence={state.presence}
+                forceOpen
+                onRoleDraft={updateRoleDraft}
+                onNewRoleName={setNewRoleName}
+                onNewRoleDraft={setNewRoleDraft}
+                onSaveRole={saveRole}
+                onSetReportsTo={setReportsTo}
+                onDeleteRole={clearRole}
+                charterText={charter?.charter ?? null}
+                onSyncToCharter={syncDivisionToCharter}
+                syncingCharter={charterSaving}
+                canManageAgentRules={canMintAgent && accountKey !== null}
+                onOpenAgentRules={openAgentRulesFromDivision}
+                onOpenAgentDetail={setOpenAgentDetail}
+              />
+              <section className="team-section">
+                <h3 className="team-section-head">{t("Channel.agents.title")}</h3>
+                <AgentBoardPanel presence={Object.values(state.presence)} tasks={tasks} />
+              </section>
+              <section className="team-section">
+                <h3 className="team-section-head">{t("Channel.tools.coordination")}</h3>
+                {coordinationContent}
+              </section>
+            </>
           )}
-          {activePanel === "coordination" && coordinationContent}
           {activePanel === "tasks" && (
             <TaskLedgerPanel
               tasks={tasks}
@@ -3840,9 +3841,6 @@ export function ChannelPage({
               identities={channelIdentities}
               onUploadAttachment={canWrite ? (file) => uploadAttachment(token, slug, file) : undefined}
             />
-          )}
-          {activePanel === "agents" && (
-            <AgentBoardPanel presence={Object.values(state.presence)} tasks={tasks} />
           )}
           {activePanel === "settings" && (
             <GuardSettingsPanel
