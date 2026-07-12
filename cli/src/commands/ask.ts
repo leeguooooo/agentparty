@@ -1,7 +1,10 @@
 // party ask — send + watch 语法糖，agent 主循环用
+import { EXIT_TIMEOUT } from "@agentparty/shared";
 import { parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { loadCursor, loadRevCursor, saveCursor, saveRevCursor } from "../config";
 import { resolveAuth } from "../oidc-cli";
+import { busyTimeoutHint } from "../reach";
+import { fetchPresence } from "../rest";
 import { MAX_TIMEOUT_SEC, parsePositiveIntFlag } from "../validation";
 import { doSend, resolveSendInput, sendSpec } from "./send";
 import { runWatch } from "./watch";
@@ -40,7 +43,7 @@ export async function run(argv: string[]): Promise<number> {
 
   // 游标从自己刚发的 seq 起，自己的消息不会被当成回复
   const since = Math.max(result.seq, loadCursor(input.channel));
-  return runWatch({
+  const code = await runWatch({
     server: cfg.server,
     token: cfg.token,
     channel: input.channel,
@@ -53,4 +56,17 @@ export async function run(argv: string[]): Promise<number> {
     onRevCursor: (r) => saveRevCursor(input.channel, r),
     statusline: true,
   });
+  // 超时富提示（#103）：runWatch 已吐裸 TIMEOUT 到 stdout，看不出对方是「忙」还是「失联」。
+  // 若被 @ 的目标此刻仍标 busy（serve 正串行处理），在 stderr 补一行——别把超时误判成掉线反复 @。
+  // 锦上添花：presence 拉取失败不改变退出码，保持原 TIMEOUT 行为。
+  if (code === EXIT_TIMEOUT && input.mentions.length > 0) {
+    try {
+      const presence = await fetchPresence(cfg.server, cfg.token, input.channel);
+      const hint = busyTimeoutHint(input.mentions, presence, Date.now());
+      if (hint !== null) console.error(hint);
+    } catch {
+      /* presence 不可达：静默，裸 TIMEOUT 已足够 */
+    }
+  }
+  return code;
 }

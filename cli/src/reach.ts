@@ -62,3 +62,14 @@ export function formatReach(r: Reachability): string {
 export function formatReachLine(rs: Reachability[]): string {
   return "→ " + rs.map(formatReach).join("  ·  ");
 }
+
+// ask 超时提示（#103）：party ask 委托 watch，超时只吐裸 TIMEOUT，看不出对方是「忙」还是「失联」。
+// 用 reachOf 查被 @ 的目标此刻是否仍标 busy（serve 正串行处理一条 wake）：若有，返回一行富提示，
+// 让调用方把超时当「忙、回复慢」而非「离线」，别反复 @ 堆重复唤醒。无 busy 目标返回 null，
+// 调用方保持原裸 TIMEOUT 行为（查不到就不无中生有）。
+export function busyTimeoutHint(mentions: string[], presence: PresenceEntry[], now: number): string | null {
+  const busy = mentions.map((m) => reachOf(m, presence, now)).filter((r) => r.busy === true);
+  if (busy.length === 0) return null;
+  const parts = busy.map((r) => `@${r.name} 忙碌中${r.queueDepth !== undefined ? `, ${r.queueDepth} 排队` : ""}`);
+  return `TIMEOUT — ${parts.join("; ")}; 稍后再试, 勿重复 @（对方在忙, 不是失联）`;
+}

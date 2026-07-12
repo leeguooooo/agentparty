@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { applyLiveConnection, type PresenceEntry } from "@agentparty/shared";
-import { formatReach, formatReachLine, reachOf } from "../src/reach";
+import { busyTimeoutHint, formatReach, formatReachLine, reachOf } from "../src/reach";
 
 const NOW = 1_000_000_000;
 
@@ -110,6 +110,56 @@ describe("busy surfacing (#103)", () => {
     expect(formatReach({ name: "b", reach: "wakeable", wake: "serve", busy: true, queueDepth: 1 })).toBe(
       "@b ◐ wakeable(serve) · busy, 1 queued",
     );
+  });
+});
+
+// ask 超时富提示（#103）：ask 委托 watch，超时只吐裸 TIMEOUT，看不出对方是「忙」还是「失联」。
+// 若被 @ 的目标此刻仍标 busy，busyTimeoutHint 返回一行忙碌提示；否则 null（保持裸 TIMEOUT）。
+describe("busyTimeoutHint (#103)", () => {
+  test("目标 busy 带队列 → 富提示含忙碌 + 排队数", () => {
+    const presence = [p({ name: "bot", busy: true, queue_depth: 3 })];
+    expect(busyTimeoutHint(["bot"], presence, NOW)).toBe(
+      "TIMEOUT — @bot 忙碌中, 3 排队; 稍后再试, 勿重复 @（对方在忙, 不是失联）",
+    );
+  });
+
+  test("目标 busy 无队列 → 只报忙碌，不带排队数", () => {
+    const presence = [p({ name: "bot", busy: true })];
+    expect(busyTimeoutHint(["bot"], presence, NOW)).toBe(
+      "TIMEOUT — @bot 忙碌中; 稍后再试, 勿重复 @（对方在忙, 不是失联）",
+    );
+  });
+
+  test("wakeable serve + busy 同样出提示（可达即有意义）", () => {
+    const presence = [p({ name: "bot", state: "offline", wake: { kind: "serve" }, busy: true, queue_depth: 1 })];
+    expect(busyTimeoutHint(["bot"], presence, NOW)).toBe(
+      "TIMEOUT — @bot 忙碌中, 1 排队; 稍后再试, 勿重复 @（对方在忙, 不是失联）",
+    );
+  });
+
+  test("多个目标只列出 busy 的那些", () => {
+    const presence = [
+      p({ name: "a", busy: true, queue_depth: 2 }),
+      p({ name: "b" }), // 在线不忙
+    ];
+    expect(busyTimeoutHint(["a", "b"], presence, NOW)).toBe(
+      "TIMEOUT — @a 忙碌中, 2 排队; 稍后再试, 勿重复 @（对方在忙, 不是失联）",
+    );
+  });
+
+  test("多个目标都 busy → 分号连接", () => {
+    const presence = [p({ name: "a", busy: true, queue_depth: 2 }), p({ name: "b", busy: true })];
+    expect(busyTimeoutHint(["a", "b"], presence, NOW)).toBe(
+      "TIMEOUT — @a 忙碌中, 2 排队; @b 忙碌中; 稍后再试, 勿重复 @（对方在忙, 不是失联）",
+    );
+  });
+
+  test("无 busy 目标 → null（保持裸 TIMEOUT）", () => {
+    expect(busyTimeoutHint(["a"], [p({ name: "a" })], NOW)).toBeNull();
+  });
+
+  test("目标离线（查不到）→ null，不无中生有", () => {
+    expect(busyTimeoutHint(["ghost"], [], NOW)).toBeNull();
   });
 });
 
