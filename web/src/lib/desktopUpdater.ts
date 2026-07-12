@@ -2,7 +2,8 @@ export const LAST_SUCCESSFUL_CHECK_KEY = "ap_desktop_updater_last_success";
 export const LAST_UPDATER_DIAGNOSTIC_KEY = "ap_desktop_updater_diagnostic";
 
 const AUTO_CHECK_DELAY_MS = 8_000;
-const AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const AUTO_CHECK_RETRY_MS = 60 * 60 * 1000;
 const CHECK_TIMEOUT_MS = 30_000;
 const VERSION_LOOKUP_TIMEOUT_MS = 2_000;
 const MAX_RELEASE_NOTES_LENGTH = 2_000;
@@ -130,6 +131,21 @@ export function shouldAutoCheck(storage: StorageAdapter, now: number): boolean {
     return !Number.isFinite(timestamp) || age >= AUTO_CHECK_INTERVAL_MS;
   } catch {
     return true;
+  }
+}
+
+function autoCheckDelay(storage: StorageAdapter, now: number): number {
+  try {
+    const raw = storage.getItem(LAST_SUCCESSFUL_CHECK_KEY);
+    if (raw === null) return AUTO_CHECK_DELAY_MS;
+    const timestamp = Number(raw);
+    if (!Number.isFinite(timestamp)) return AUTO_CHECK_DELAY_MS;
+    const age = now - timestamp;
+    if (age < 0) return AUTO_CHECK_INTERVAL_MS;
+    if (age >= AUTO_CHECK_INTERVAL_MS) return AUTO_CHECK_DELAY_MS;
+    return Math.max(AUTO_CHECK_DELAY_MS, AUTO_CHECK_INTERVAL_MS - age);
+  } catch {
+    return AUTO_CHECK_DELAY_MS;
   }
 }
 
@@ -393,13 +409,26 @@ export function createDesktopUpdaterController(options: ControllerOptions): Desk
     start() {
       if (disposed || started) return;
       started = true;
-      const scheduleAutoCheck = () => {
-        if (disposed || !shouldAutoCheck(options.storage, options.clock.now())) return;
+      const scheduleAutoCheck = (delayOverride?: number) => {
+        if (disposed) return;
+        if (startupTimer !== undefined) timer.clearTimeout(startupTimer);
+        const delay = delayOverride ?? autoCheckDelay(options.storage, options.clock.now());
         startupTimer = timer.setTimeout(() => {
           startupTimer = undefined;
-          if (disposed || !shouldAutoCheck(options.storage, options.clock.now())) return;
-          void controller.check("auto");
-        }, AUTO_CHECK_DELAY_MS);
+          if (disposed) return;
+          if (!shouldAutoCheck(options.storage, options.clock.now())) {
+            scheduleAutoCheck();
+            return;
+          }
+          void controller.check("auto").finally(() => {
+            if (disposed) return;
+            scheduleAutoCheck(
+              state.phase === "error" && state.failureStage === "check"
+                ? AUTO_CHECK_RETRY_MS
+                : AUTO_CHECK_INTERVAL_MS,
+            );
+          });
+        }, delay);
       };
       const pending = readPendingUpdateReceipt(options.storage);
       if (pending === null) {
@@ -496,6 +525,7 @@ export function createDesktopUpdaterController(options: ControllerOptions): Desk
           }
           patch({
             phase: "available",
+            panelOpen: true,
             currentVersion: update.currentVersion,
             nextVersion: update.nextVersion,
             notes: boundReleaseNotes(update.notes),

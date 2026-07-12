@@ -215,10 +215,10 @@ describe("desktop updater auto-check", () => {
     });
   });
 
-  test("skips checks recorded within the previous 24 hours", () => {
+  test("skips checks recorded within the previous 6 hours", () => {
     const now = 30 * HOUR;
-    const recent = memoryStorage({ [LAST_SUCCESSFUL_CHECK_KEY]: String(now - 23 * HOUR) });
-    const stale = memoryStorage({ [LAST_SUCCESSFUL_CHECK_KEY]: String(now - 24 * HOUR) });
+    const recent = memoryStorage({ [LAST_SUCCESSFUL_CHECK_KEY]: String(now - 5 * HOUR) });
+    const stale = memoryStorage({ [LAST_SUCCESSFUL_CHECK_KEY]: String(now - 6 * HOUR) });
 
     expect(shouldAutoCheck(recent, now)).toBe(false);
     expect(shouldAutoCheck(stale, now)).toBe(true);
@@ -234,12 +234,11 @@ describe("desktop updater auto-check", () => {
 
   test("runs once after an 8 second startup delay when the gate is open", async () => {
     let checkCalls = 0;
-    let scheduled: (() => void) | undefined;
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
     const timer: TimerAdapter = {
       setTimeout(callback, delayMs) {
-        expect(delayMs).toBe(8_000);
-        scheduled = callback;
-        return 1;
+        scheduled.push({ callback, delayMs });
+        return scheduled.length;
       },
       clearTimeout() {},
     };
@@ -252,12 +251,12 @@ describe("desktop updater auto-check", () => {
 
     controller.start();
     expect(checkCalls).toBe(0);
-    scheduled?.();
-    await Promise.resolve();
-    await Promise.resolve();
+    scheduled.find(({ delayMs }) => delayMs === 8_000)?.callback();
+    for (let attempt = 0; attempt < 8; attempt += 1) await Promise.resolve();
 
     expect(checkCalls).toBe(1);
     expect(controller.getState().panelOpen).toBe(false);
+    expect(scheduled.some(({ delayMs }) => delayMs === 6 * HOUR)).toBe(true);
   });
 
   test("does not open the panel for automatic no-update checks", async () => {
@@ -272,7 +271,7 @@ describe("desktop updater auto-check", () => {
     expect(controller.getState()).toMatchObject({ phase: "up-to-date", panelOpen: false, error: null });
   });
 
-  test("rechecks the 24 hour gate when the delayed callback runs", async () => {
+  test("rechecks the 6 hour gate when the delayed callback runs", async () => {
     let now = 50 * HOUR;
     let checkCalls = 0;
     const storage = memoryStorage();
@@ -432,6 +431,23 @@ describe("desktop updater checks", () => {
       nextVersion: "0.2.83",
       notes: "Fixes update panel",
       panelOpen: true,
+    });
+  });
+
+  test("automatically opens the update panel when a background check finds a new version", async () => {
+    const controller = createDesktopUpdaterController({
+      adapter: adapter({ check: async () => candidate() }),
+      clock: { now: () => 1 },
+      storage: memoryStorage(),
+    });
+
+    await controller.check("auto");
+
+    expect(controller.getState()).toMatchObject({
+      phase: "available",
+      panelOpen: true,
+      currentVersion: "0.2.82",
+      nextVersion: "0.2.83",
     });
   });
 
