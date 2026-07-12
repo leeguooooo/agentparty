@@ -5562,7 +5562,7 @@ app.get("/api/channels/:slug/identity/:name/data", async (c) => {
   return fetchChannelDO(
     c.env,
     slug,
-    new Request(`https://do/internal/identity/${encodeURIComponent(name)}/data`, {
+    new Request(`https://do/internal/identity/${encodeURIComponent(name)}/data${new URL(c.req.url).search}`, {
       headers: { "x-partykit-room": slug },
     }),
   );
@@ -5588,11 +5588,21 @@ app.delete("/api/channels/:slug/identity/:name/data", async (c) => {
     slug,
     new Request(`https://do/internal/identity/${encodeURIComponent(name)}/data`, {
       method: "DELETE",
-      headers: { "x-partykit-room": slug },
+      headers: {
+        "x-partykit-room": slug,
+        "x-ap-name": identity.name,
+        "x-ap-kind": identity.kind,
+        "x-ap-role": identity.role,
+        "x-ap-token-hash": identity.hash,
+      },
     }),
   );
   if (res.ok) {
-    const summary = (await res.clone().json().catch(() => null)) as Record<string, unknown> | null;
+    const summary = (await res.clone().json().catch(() => null)) as (Record<string, unknown> & { attachment_keys?: unknown }) | null;
+    const attachmentKeys = Array.isArray(summary?.attachment_keys)
+      ? summary.attachment_keys.filter((key): key is string => typeof key === "string" && key.startsWith(`${slug}/`))
+      : [];
+    await Promise.all(attachmentKeys.map((key) => c.env.ATTACHMENTS.delete(key)));
     await bestEffortRecordManagementAudit(c.env.DB, {
       actor: managementAuditActor(identity),
       action: "channel.identity.erase",

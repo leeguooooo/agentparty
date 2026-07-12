@@ -28,6 +28,10 @@ Options:
   --yes         confirm the (irreversible) erase without prompting
   --json        (export) print the raw JSON dump`;
 
+function terminalSafe(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+}
+
 export async function run(argv: string[]): Promise<number> {
   if (isHelpArg(argv, { allowHelpPositional: true })) {
     console.log(HELP);
@@ -70,25 +74,19 @@ export async function run(argv: string[]): Promise<number> {
   }
 
   try {
+    const shownName = terminalSafe(name);
     if (sub === "export") {
       const data = await exportIdentityData(cfg.server, cfg.token, channel, name);
       if (flags.json === true) {
         console.log(JSON.stringify(data, null, 2));
         return 0;
       }
-      const d = data as {
-        messages?: unknown[];
-        audit?: unknown[];
-        wake_deliveries?: unknown[];
-        read_cursor?: unknown;
-        presence?: unknown[];
-      };
-      console.log(`data for ${name} in ${channel}:`);
-      console.log(`  messages:        ${(d.messages ?? []).length}`);
-      console.log(`  audit rows:      ${(d.audit ?? []).length}`);
-      console.log(`  wake deliveries: ${(d.wake_deliveries ?? []).length}`);
-      console.log(`  read cursor:     ${d.read_cursor ? "yes" : "none"}`);
-      console.log(`  presence rows:   ${(d.presence ?? []).length}`);
+      console.log(`data for ${shownName} in ${channel}:`);
+      console.log(`  messages:        ${data.messages.length}`);
+      console.log(`  audit rows:      ${data.audit.length}`);
+      console.log(`  wake deliveries: ${data.wake_deliveries.length}`);
+      console.log(`  read cursor:     ${data.read_cursor ? "yes" : "none"}`);
+      console.log(`  presence rows:   ${data.presence.length}`);
       console.log("re-run with --json for the full dump");
       return 0;
     }
@@ -96,13 +94,13 @@ export async function run(argv: string[]): Promise<number> {
     if (flags.yes !== true) {
       console.error(
         `refusing to erase without confirmation.\n` +
-          `  this PHYSICALLY deletes ${name}'s identifiable data in ${channel} and scrubs its message bodies to [erased].\n` +
-          `  re-run with --yes to proceed: party gdpr erase ${name} ${channel} --yes`,
+          `  this PHYSICALLY deletes ${shownName}'s identifiable data in ${channel} and scrubs its message bodies to [erased].\n` +
+          `  re-run with --yes to proceed: party gdpr erase -- ${shownName} ${channel} --yes`,
       );
       return 1;
     }
     const summary = await eraseIdentityData(cfg.server, cfg.token, channel, name);
-    console.log(`erased ${name} from ${channel}:`);
+    console.log(`erased ${shownName} from ${channel}:`);
     console.log(`  messages scrubbed:    ${summary.messages_scrubbed}`);
     console.log(`  audit rows deleted:   ${summary.audit_deleted}`);
     console.log(`  wake ledger deleted:  ${summary.wake_ledger_deleted}`);

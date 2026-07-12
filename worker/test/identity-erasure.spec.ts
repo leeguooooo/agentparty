@@ -8,7 +8,13 @@ import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 interface ExportShape {
   name: string;
-  messages: { seq: number; body: string }[];
+  messages: {
+    seq: number;
+    body: string;
+    sender: { name: string; owner?: string; handle?: string; display_name?: string; avatar_url?: string };
+    attachments?: unknown[];
+    rev_seq?: number;
+  }[];
   audit: { target_seq: number; action: string; actor: { name: string } }[];
   wake_deliveries: { target_name: string }[];
   read_cursor: { name: string } | null;
@@ -55,18 +61,20 @@ async function seedIdentityRows(slug: string, name: string): Promise<void> {
 
 describe("gdpr identity erasure + export (#421)", () => {
   it("exports an identity's data and then hard-erases it (moderator only)", async () => {
-    const { slug, owner, writer } = await fixture();
+    const { slug, owner, writer, other } = await fixture();
 
     // 造可归因数据：两条消息 + 一次编辑（产生 message_audit 行，actor = writer）。
     const first = await postMessage(slug, writer.token, "first body");
     const firstSeq = ((await first.json()) as { seq: number }).seq;
     await postMessage(slug, writer.token, "second body");
+    await postMessage(slug, other.token, "other body");
     const edited = await api(`/api/channels/${slug}/messages/${firstSeq}/edit`, writer.token, {
       method: "POST",
       body: JSON.stringify({ body: "edited body" }),
     });
     expect(edited.status).toBe(200);
     await seedIdentityRows(slug, writer.name);
+    await seedIdentityRows(slug, other.name);
 
     // 导出（moderator）：能看到全部维度。
     const exportRes = await api(`/api/channels/${slug}/identity/${encodeURIComponent(writer.name)}/data`, owner.token);
@@ -102,11 +110,23 @@ describe("gdpr identity erasure + export (#421)", () => {
     const after = (await (
       await api(`/api/channels/${slug}/identity/${encodeURIComponent(writer.name)}/data`, owner.token)
     ).json()) as ExportShape;
+    expect(after.messages.length).toBe(2);
     expect(after.messages.every((m) => m.body === "[erased]")).toBe(true);
+    expect(after.messages.every((m) => m.sender.name === writer.name)).toBe(true);
+    expect(after.messages.every((m) => m.sender.owner === undefined && m.sender.handle === undefined)).toBe(true);
+    expect(after.messages.every((m) => m.sender.display_name === undefined && m.sender.avatar_url === undefined)).toBe(true);
+    expect(after.messages.every((m) => m.attachments === undefined)).toBe(true);
+    expect(after.messages.every((m) => typeof m.rev_seq === "number")).toBe(true);
     expect(after.audit.length).toBe(0);
     expect(after.wake_deliveries.length).toBe(0);
     expect(after.read_cursor).toBeNull();
     expect(after.presence.length).toBe(0);
+
+    const otherAfter = (await (
+      await api(`/api/channels/${slug}/identity/${encodeURIComponent(other.name)}/data`, owner.token)
+    ).json()) as ExportShape;
+    expect(otherAfter.messages.some((m) => m.body === "other body")).toBe(true);
+    expect(otherAfter.presence.length).toBe(1);
 
     // 频道历史里也不再有原文。
     const history = await api(`/api/channels/${slug}/messages?since=0`, owner.token);
@@ -117,7 +137,7 @@ describe("gdpr identity erasure + export (#421)", () => {
   });
 
   it("rejects export and erase from a non-moderator", async () => {
-    const { slug, writer, other } = await fixture();
+    const { slug, owner, writer, other } = await fixture();
     await postMessage(slug, writer.token, "sensitive");
 
     const exportDenied = await api(
@@ -134,8 +154,9 @@ describe("gdpr identity erasure + export (#421)", () => {
     expect(eraseDenied.status).toBe(403);
 
     // 拒绝后原文仍在，未被误删。
-    const stillThere = await api(`/api/channels/${slug}/identity/${encodeURIComponent(writer.name)}/data`, writer.token);
-    // writer 自己也不是 moderator，同样 403（导出含 PII，只给房主/ap_）。
-    expect(stillThere.status).toBe(403);
+    const stillThere = await api(`/api/channels/${slug}/identity/${encodeURIComponent(writer.name)}/data`, owner.token);
+    expect(stillThere.status).toBe(200);
+    const stillThereData = (await stillThere.json()) as ExportShape;
+    expect(stillThereData.messages.some((m) => m.body === "sensitive")).toBe(true);
   });
 });

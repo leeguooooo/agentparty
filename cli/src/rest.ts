@@ -13,6 +13,8 @@ import {
   type CompletionReview,
   type CompletionReviewPolicy,
   type DecisionMode,
+  type IdentityEraseSummary,
+  type IdentityExportData,
   EXIT_ARCHIVED,
   EXIT_AUTH,
   EXIT_LOOP_GUARD,
@@ -1308,16 +1310,6 @@ export async function resumeAgent(server: string, token: string, slug: string, n
 
 // GDPR 按身份数据擦除（#421）。物理删除该身份在频道 message_audit/wake 账本/读游标/presence 的可识别行，
 // 并把其消息正文 + 归属 PII 抹成 [erased]。返回各表命中数。仅频道 moderator（房主 / ap_ token）可调。
-export interface IdentityEraseSummary {
-  name: string;
-  erased_at: number;
-  messages_scrubbed: number;
-  audit_deleted: number;
-  wake_ledger_deleted: number;
-  read_cursors_deleted: number;
-  presence_deleted: number;
-}
-
 export async function eraseIdentityData(
   server: string,
   token: string,
@@ -1336,10 +1328,29 @@ export async function exportIdentityData(
   token: string,
   slug: string,
   name: string,
-): Promise<unknown> {
-  return await req(server, `/api/channels/${encodeURIComponent(slug)}/identity/${encodeURIComponent(name)}/data`, {
-    headers: bearerJson(token),
-  });
+): Promise<IdentityExportData> {
+  const merged: IdentityExportData = {
+    name, exported_at: Date.now(), messages: [], audit: [], wake_deliveries: [],
+    read_cursor: null, presence: [], next: { messages: 0, audit: 0, wake_deliveries: 0 },
+  };
+  while (merged.next.messages !== null || merged.next.audit !== null || merged.next.wake_deliveries !== null) {
+    const query = new URLSearchParams({
+      message_after: String(merged.next.messages ?? -1),
+      audit_after: String(merged.next.audit ?? -1),
+      wake_after: String(merged.next.wake_deliveries ?? -1),
+    });
+    const page = (await req(server,
+      `/api/channels/${encodeURIComponent(slug)}/identity/${encodeURIComponent(name)}/data?${query}`,
+      { headers: bearerJson(token) })) as IdentityExportData;
+    merged.exported_at = page.exported_at;
+    merged.messages.push(...page.messages);
+    merged.audit.push(...page.audit);
+    merged.wake_deliveries.push(...page.wake_deliveries);
+    merged.read_cursor ??= page.read_cursor;
+    if (merged.presence.length === 0) merged.presence = page.presence;
+    merged.next = page.next;
+  }
+  return merged;
 }
 
 // rest 错误 → 契约退出码

@@ -14,7 +14,7 @@ let errs: string[];
 const origLog = console.log;
 const origErr = console.error;
 
-const IDENTITY_RE = /^\/api\/channels\/([^/]+)\/identity\/([^/]+)\/data$/;
+const IDENTITY_RE = /^\/api\/channels\/([^/]+)\/identity\/([^/?]+)\/data(?:\?.*)?$/;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ap-gdpr-"));
@@ -45,6 +45,7 @@ beforeEach(() => {
       wake_deliveries: [{ target_name: "bot" }],
       read_cursor: { name: "bot" },
       presence: [{ name: "bot" }],
+      next: { messages: null, audit: null, wake_deliveries: null },
     });
   });
   writeConfig({ server: restMock.url, token: "ap_mod" });
@@ -95,6 +96,18 @@ describe("party gdpr", () => {
     const parsed = JSON.parse(logs.join("\n")) as { name: string; messages: unknown[] };
     expect(parsed.name).toBe("bot");
     expect(parsed.messages.length).toBe(2);
+  });
+
+  test("sanitizes control characters in terminal output", async () => {
+    const code = await gdprRun(["erase", "bot\u001b[31m", "--yes"]);
+    expect(code).toBe(0);
+    expect(logs.join("\n")).not.toContain("\u001b");
+  });
+
+  test("accepts a dash-prefixed identity after the option terminator", async () => {
+    const code = await gdprRun(["erase", "--yes", "--", "-bot"]);
+    expect(code).toBe(0);
+    expect(restMock!.requests.some((r) => r.path.includes("identity/-bot/data"))).toBe(true);
   });
 
   test("rejects an unknown subcommand", async () => {

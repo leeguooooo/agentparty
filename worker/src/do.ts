@@ -50,6 +50,8 @@ import {
   type DecisionState,
   type HostDecision,
   type HostDecisionKind,
+  type IdentityEraseSummary,
+  type IdentityExportData,
   type MsgFrame,
   type MessageUpdateFrame,
   type PresenceEntry,
@@ -3334,12 +3336,24 @@ export class ChannelDO extends Server<Env> {
     if (identityDataMatch && request.method === "GET") {
       // 只读导出：该身份在本频道可归因的全部数据（消息 + 审计 + wake 账本 + 读游标 + presence）。
       const name = decodeURIComponent(identityDataMatch[1]!);
-      return Response.json(this.exportIdentityData(name));
+      const cursor = (key: string): number => {
+        const value = Number(url.searchParams.get(key) ?? "0");
+        return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+      };
+      return Response.json(this.exportIdentityData(name, {
+        messages: cursor("message_after"), audit: cursor("audit_after"), wake_deliveries: cursor("wake_after"),
+      }));
     }
     if (identityDataMatch && request.method === "DELETE") {
       // 硬擦除：物理删除该身份在本频道的可识别数据，并把其发过的消息正文/归属 PII 抹成 [erased]。
       const name = decodeURIComponent(identityDataMatch[1]!);
-      return Response.json(this.eraseIdentityData(name));
+      const actor: Identity = {
+        name: request.headers.get("x-ap-name") ?? "system",
+        kind: request.headers.get("x-ap-kind") === "agent" ? "agent" : "human",
+        role: (request.headers.get("x-ap-role") ?? "host") as TokenRole,
+        tokenHash: request.headers.get("x-ap-token-hash") ?? "",
+      };
+      return Response.json(this.eraseIdentityData(name, actor));
     }
     if (url.pathname === "/internal/messages" && request.method === "POST") {
       this.cacheChannelMeta(request.headers, request.headers.get("x-ap-host"));
@@ -4490,51 +4504,31 @@ export class ChannelDO extends Server<Env> {
 
   // GDPR 只读导出（#421）：该身份在本频道可归因的全部数据，供数据可携 / 出境审查。不改任何状态。
   // 复用 rowToFrame / presenceFor / readCursors，与现有观测端点同口径，不另造字段。
-  private exportIdentityData(name: string): {
-    name: string;
-    exported_at: number;
-    messages: MsgFrame[];
-    audit: {
-      target_seq: number;
-      action: string;
-      actor: { name: string; kind: string };
-      old_body: string | null;
-      new_body: string | null;
-      original_byte_length: number | null;
-      created_at: number;
-    }[];
-    wake_deliveries: {
-      mention_seq: number;
-      target_name: string;
-      webhook_name: string;
-      adapter_kind: string;
-      attempt: number;
-      result: string;
-      http_status: number | null;
-      error: string | null;
-      attempted_at: number;
-      ack_seq: number | null;
-      resume_seq: number | null;
-    }[];
-    read_cursor: ReadCursor | null;
-    presence: PresenceEntry[];
-  } {
+  private exportIdentityData(
+    name: string,
+    after: { messages: number; audit: number; wake_deliveries: number },
+  ): IdentityExportData {
     const sql = this.ctx.storage.sql;
-    const messages = sql
-      .exec("SELECT * FROM messages WHERE sender_name = ? ORDER BY seq", name)
-      .toArray()
+    const pageSize = 200;
+    const messageRows = sql
+      .exec("SELECT * FROM messages WHERE sender_name = ? AND seq > ? ORDER BY seq LIMIT ?", name, after.messages, pageSize + 1)
+      .toArray();
+    const messages = messageRows.slice(0, pageSize)
       .map((r) => this.rowToFrame(r));
     // 审计：该身份作为 actor 的行 + 其发的消息被审计过的行（target_seq 命中）。撤回后正文已 NULL。
-    const audit = sql
+    const auditRows = sql
       .exec(
-        `SELECT target_seq, action, actor_name, actor_kind, old_body, new_body, original_byte_length, created_at
+        `SELECT id, target_seq, action, actor_name, actor_kind, old_body, new_body, original_byte_length, created_at
            FROM message_audit
-          WHERE actor_name = ? OR target_seq IN (SELECT seq FROM messages WHERE sender_name = ?)
-          ORDER BY id`,
+          WHERE id > ? AND (actor_name = ? OR target_seq IN (SELECT seq FROM messages WHERE sender_name = ?))
+          ORDER BY id LIMIT ?`,
+        after.audit,
         name,
         name,
+        pageSize + 1,
       )
-      .toArray()
+      .toArray();
+    const audit = auditRows.slice(0, pageSize)
       .map((r) => ({
         target_seq: Number(r.target_seq),
         action: String(r.action),
@@ -4545,14 +4539,17 @@ export class ChannelDO extends Server<Env> {
           r.original_byte_length === null || r.original_byte_length === undefined ? null : Number(r.original_byte_length),
         created_at: Number(r.created_at),
       }));
-    const wake_deliveries = sql
+    const wakeRows = sql
       .exec(
-        `SELECT mention_seq, target_name, webhook_name, adapter_kind, attempt,
+        `SELECT id, mention_seq, target_name, webhook_name, adapter_kind, attempt,
                 result, http_status, error, attempted_at, ack_seq, resume_seq
-           FROM wake_delivery_ledger WHERE target_name = ? ORDER BY id`,
+           FROM wake_delivery_ledger WHERE target_name = ? AND id > ? ORDER BY id LIMIT ?`,
         name,
+        after.wake_deliveries,
+        pageSize + 1,
       )
-      .toArray()
+      .toArray();
+    const wake_deliveries = wakeRows.slice(0, pageSize)
       .map((r) => ({
         mention_seq: Number(r.mention_seq),
         target_name: String(r.target_name),
@@ -4576,6 +4573,11 @@ export class ChannelDO extends Server<Env> {
       wake_deliveries,
       read_cursor: cursor,
       presence: presenceEntry === null ? [] : [presenceEntry],
+      next: {
+        messages: messageRows.length > pageSize ? Number(messageRows[pageSize - 1]!.seq) : null,
+        audit: auditRows.length > pageSize ? Number(auditRows[pageSize - 1]!.id) : null,
+        wake_deliveries: wakeRows.length > pageSize ? Number(wakeRows[pageSize - 1]!.id) : null,
+      },
     };
   }
 
@@ -4584,30 +4586,35 @@ export class ChannelDO extends Server<Env> {
   // JSON payload）抹成 [erased]——#196 撤回清洗只覆盖已撤回的消息，这里补齐「按身份彻底擦除」的口子。
   // 单事务原子提交；返回各表命中数供 worker 落审计 + CLI 回显。sender_name 作为墓碑保留（频道内昵称，
   // 非原始 PII；账号级 owner 已抹），线程/回复链不悬空；跨频道 / D1 token 维度擦除留 follow-up。
-  private eraseIdentityData(name: string): {
-    name: string;
-    erased_at: number;
-    messages_scrubbed: number;
-    audit_deleted: number;
-    wake_ledger_deleted: number;
-    read_cursors_deleted: number;
-    presence_deleted: number;
-  } {
+  private eraseIdentityData(name: string, actor: Identity): IdentityEraseSummary {
     const sql = this.ctx.storage.sql;
     const countOne = (query: string, ...args: (string | number)[]): number =>
       Number(sql.exec(query, ...args).one().n ?? 0);
     let messages_scrubbed = 0;
     let audit_deleted = 0;
     let wake_ledger_deleted = 0;
+    let webhook_payloads_deleted = 0;
     let read_cursors_deleted = 0;
     let presence_deleted = 0;
+    const attachmentKeys: string[] = [];
+    const updatedSeqs: number[] = [];
     this.ctx.storage.transactionSync(() => {
+      const affected = sql.exec(
+        "SELECT seq, attachments_json FROM messages WHERE sender_name = ? AND body != '[erased]' ORDER BY seq",
+        name,
+      ).toArray();
+      for (const row of affected) {
+        updatedSeqs.push(Number(row.seq));
+        for (const attachment of parseStoredAttachments(row.attachments_json) ?? []) attachmentKeys.push(attachment.key);
+      }
       messages_scrubbed = countOne(
         "SELECT COUNT(*) AS n FROM messages WHERE sender_name = ? AND body != '[erased]'",
         name,
       );
       // 正文 + 归属 PII 一并抹除。列集对齐 #196 撤回清洗，另加 sender_owner/handle/头像/血缘/decision。
-      sql.exec(
+      for (const seq of updatedSeqs) {
+        const revSeq = this.nextRevSeq();
+        sql.exec(
         `UPDATE messages
             SET body = '[erased]', mentions_json = '[]', original_body = NULL,
                 state = NULL, note = NULL,
@@ -4619,10 +4626,13 @@ export class ChannelDO extends Server<Env> {
                 decision_request_json = NULL, decision_resolution_json = NULL, decision_response_json = NULL,
                 sender_owner = NULL, sender_lineage_json = NULL, sender_role = NULL, sender_role_source = NULL,
                 sender_handle = NULL, sender_display_name = NULL, sender_avatar_url = NULL, sender_avatar_thumb = NULL,
-                attachments_json = NULL, edited_by = NULL, retracted_by = NULL, idempotency_key = NULL
-          WHERE sender_name = ? AND body != '[erased]'`,
-        name,
+                attachments_json = NULL, edited_by = NULL, retracted_by = NULL, idempotency_key = NULL,
+                rev_seq = ?
+          WHERE seq = ?`,
+        revSeq,
+        seq,
       );
+      }
       audit_deleted = countOne(
         `SELECT COUNT(*) AS n FROM message_audit
           WHERE actor_name = ? OR target_seq IN (SELECT seq FROM messages WHERE sender_name = ?)`,
@@ -4637,12 +4647,29 @@ export class ChannelDO extends Server<Env> {
       );
       wake_ledger_deleted = countOne("SELECT COUNT(*) AS n FROM wake_delivery_ledger WHERE target_name = ?", name);
       sql.exec("DELETE FROM wake_delivery_ledger WHERE target_name = ?", name);
+      webhook_payloads_deleted = countOne(
+        `SELECT (SELECT COUNT(*) FROM webhook_queue WHERE json_extract(payload, '$.sender.name') = ?) +
+                (SELECT COUNT(*) FROM webhook_dead_letters WHERE json_extract(payload, '$.sender.name') = ?) AS n`,
+        name,
+        name,
+      );
+      sql.exec("DELETE FROM webhook_queue WHERE json_extract(payload, '$.sender.name') = ?", name);
+      sql.exec("DELETE FROM webhook_dead_letters WHERE json_extract(payload, '$.sender.name') = ?", name);
       read_cursors_deleted = countOne("SELECT COUNT(*) AS n FROM read_cursor WHERE name = ?", name);
       sql.exec("DELETE FROM read_cursor WHERE name = ?", name);
       presence_deleted = countOne("SELECT COUNT(*) AS n FROM presence WHERE name = ?", name);
       sql.exec("DELETE FROM presence WHERE name = ?", name);
     });
-    return { name, erased_at: Date.now(), messages_scrubbed, audit_deleted, wake_ledger_deleted, read_cursors_deleted, presence_deleted };
+    const erasedAt = Date.now();
+    for (const seq of updatedSeqs) {
+      const row = sql.exec("SELECT * FROM messages WHERE seq = ?", seq).toArray()[0];
+      if (row) this.broadcastFrame(this.messageUpdate("edit", actor, this.rowToFrame(row), erasedAt));
+    }
+    return {
+      name, erased_at: erasedAt, messages_scrubbed, audit_deleted, wake_ledger_deleted,
+      webhook_payloads_deleted, read_cursors_deleted, presence_deleted,
+      attachment_keys: [...new Set(attachmentKeys)],
+    };
   }
 
   // seen 帧：把某身份的已读游标前移到 seq（只前移；旧 seq 幂等忽略）。前移了返回新游标（供广播），
