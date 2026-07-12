@@ -46,6 +46,30 @@ describe("runWatch", () => {
     expect(o.lines).toEqual(["[1] bob(agent): line one\n    line two", "[2] bob(agent): second"]);
   });
 
+  test("prints attachment-only messages instead of an empty body (#362)", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send(welcomeFrame(1));
+        sock.send(
+          msgFrame(1, "", {
+            attachments: [{
+              key: "dev/uuid/photo.jpg",
+              filename: "photo.jpg",
+              content_type: "image/jpeg",
+              size: 2048,
+              url: "/api/channels/dev/attachments/uuid/photo.jpg",
+            }],
+          }),
+        );
+      }
+    });
+    const o = opts({ server: server.url });
+    expect(await runWatch(o)).toBe(0);
+    expect(o.lines).toEqual([
+      "[1] bob(agent): [attachment: photo.jpg · image/jpeg · 2048 bytes · auth GET /api/channels/dev/attachments/uuid/photo.jpg]",
+    ]);
+  });
+
   test("blocks until a live message arrives, then exits 0", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {

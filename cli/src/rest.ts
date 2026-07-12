@@ -1204,6 +1204,36 @@ export async function uploadAttachment(
   })) as Attachment;
 }
 
+/** Download through the worker's authenticated route without leaking credentials to another origin/channel. */
+export async function downloadAttachment(
+  server: string,
+  token: string,
+  slug: string,
+  attachment: Attachment,
+): Promise<Uint8Array> {
+  const base = new URL(server.replace(/\/+$/, "") + "/");
+  const expectedPrefix = `/api/channels/${encodeURIComponent(slug)}/attachments/`;
+  if (!attachment.url.startsWith(expectedPrefix)) throw new Error(`attachment URL is outside channel ${slug}`);
+  const url = new URL(attachment.url, base);
+  if (url.origin !== base.origin || !url.pathname.startsWith(expectedPrefix) || url.search !== "" || url.hash !== "") {
+    throw new Error(`attachment URL is outside channel ${slug}`);
+  }
+  const headers = new Headers({ authorization: `Bearer ${token}` });
+  headers.set("x-ap-client-version", pkg.version);
+  const res = await fetch(url, { headers, redirect: "error", signal: AbortSignal.timeout(REQ_TIMEOUT_MS) });
+  if (!res.ok) {
+    const raw = await res.text();
+    let body: unknown = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      // Older deployments may return plain-text attachment errors.
+    }
+    throw extractError(res.status, body, raw);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 export async function archiveChannel(server: string, token: string, slug: string): Promise<void> {
   await req(server, `/api/channels/${encodeURIComponent(slug)}/archive`, {
     method: "POST",

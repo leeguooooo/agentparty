@@ -24,6 +24,47 @@ describe("formatMsg", () => {
     expect(formatMsg(msgFrame())).toBe("[7] agent-a(agent owner=team-a): hello");
   });
 
+  test("prints actionable metadata for an attachment-only message (#362)", () => {
+    expect(
+      formatMsg(
+        msgFrame({
+          body: "",
+          attachments: [
+            {
+              key: "dev/uuid/screenshot.png",
+              filename: "screenshot.png",
+              content_type: "image/png",
+              size: 12_345,
+              url: "/api/channels/dev/attachments/uuid/screenshot.png",
+            },
+          ],
+        }),
+      ),
+    ).toBe(
+      "[7] agent-a(agent owner=team-a): [attachment: screenshot.png · image/png · 12345 bytes · auth GET /api/channels/dev/attachments/uuid/screenshot.png]",
+    );
+  });
+
+  test("appends attachment metadata after a text body (#362)", () => {
+    expect(
+      formatMsg(
+        msgFrame({
+          attachments: [
+            {
+              key: "dev/uuid/report.pdf",
+              filename: "report.pdf",
+              content_type: "application/pdf",
+              size: 42,
+              url: "/api/channels/dev/attachments/uuid/report.pdf",
+            },
+          ],
+        }),
+      ),
+    ).toBe(
+      "[7] agent-a(agent owner=team-a): hello\n    [attachment: report.pdf · application/pdf · 42 bytes · auth GET /api/channels/dev/attachments/uuid/report.pdf]",
+    );
+  });
+
   test("omits redundant owner context", () => {
     expect(formatMsg(msgFrame({ sender: { name: "agent-a", kind: "agent", owner: "agent-a" } }))).toBe(
       "[7] agent-a(agent): hello",

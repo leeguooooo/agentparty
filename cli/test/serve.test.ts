@@ -122,6 +122,71 @@ describe("runServe", () => {
     expect(cursors).toEqual([1]);
   });
 
+  test("downloads attachment-only wakes into the private context directory (#362)", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "", {
+        mentions: ["me"],
+        attachments: [{
+          key: "dev/uuid/screenshot.png",
+          filename: "screenshot.png",
+          content_type: "image/png",
+          size: 4,
+          url: "/api/channels/dev/attachments/uuid/screenshot.png",
+        }],
+      })), 20);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 60);
+    });
+    const downloaded: Array<{ server: string; token: string; channel: string; url: string }> = [];
+    const captured: { context?: Record<string, unknown>; localBytes?: Buffer; localMode?: number } = {};
+    const o = opts({
+      server: server.url,
+      downloadAttachment: async (base, token, channel, attachment) => {
+        downloaded.push({ server: base, token, channel, url: attachment.url });
+        return new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+      },
+      runCommand: async (frame, ctx) => {
+        const file = writeContextFile(
+          ctx.contextDir,
+          frame,
+          ctx.channel,
+          ctx.self,
+          ctx.recent,
+          null,
+          null,
+          null,
+          ctx.attachments,
+        );
+        captured.context = JSON.parse(readFileSync(file, "utf8"));
+        const localPath = (captured.context as { attachments: Array<{ local_path: string }> }).attachments[0]!.local_path;
+        captured.localBytes = readFileSync(localPath);
+        captured.localMode = lstatSync(localPath).mode & 0o777;
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(downloaded).toEqual([{
+      server: server.url,
+      token: "ap_tok",
+      channel: "dev",
+      url: "/api/channels/dev/attachments/uuid/screenshot.png",
+    }]);
+    expect(captured.context).toMatchObject({
+      body: "",
+      attachments: [{
+        filename: "screenshot.png",
+        content_type: "image/png",
+        size: 4,
+        url: `${server.url}/api/channels/dev/attachments/uuid/screenshot.png`,
+        auth: "Bearer token required",
+        local_path: expect.stringContaining("screenshot.png"),
+      }],
+    });
+    expect(captured.localBytes).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    expect(captured.localMode).toBe(0o600);
+  });
+
   // busy + 队列深度（#103）：serve 串行处理长任务时不再假装可即时响应。
   test("busy lifecycle: builtin runner marks busy on the working frame, then serve clears it when idle", async () => {
     const s = closeAfterOneMention();

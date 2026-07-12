@@ -1,7 +1,7 @@
 // party serve — 常驻监听频道，每条 @你 的消息触发一次本地命令，把「跑完就停的 session agent」
 // 用外部 supervisor 唤醒（wake GOAL 的 session 型那半；有入站 URL 的 runtime 走 webhook）。
 // 复用 client.connect 的自动重连帧流，真正常驻；命令串行执行（一条处理完再下一条，不并发抢跑）。
-import { BODY_LIMIT, EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, EXIT_UPGRADED, type MsgFrame, type ServerFrame } from "@agentparty/shared";
+import { BODY_LIMIT, EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, EXIT_UPGRADED, type Attachment, type MsgFrame, type ServerFrame } from "@agentparty/shared";
 import { maybeReexecUpgrade, upgradeNotice, type CliUpgradeNotice, type UpgradeDeps } from "../upgrade";
 import {
   appendFileSync,
@@ -33,7 +33,7 @@ import {
   unreadFromCursor,
   writeStatuslineCache,
 } from "../statusline-cache";
-import { ensureProjectAgentChannelRuntime, fetchChannelCharter, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
+import { downloadAttachment, ensureProjectAgentChannelRuntime, fetchChannelCharter, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
 import { isName, isSlug } from "../validation";
 import { buildContext } from "./status";
 
@@ -219,6 +219,19 @@ export interface ProjectAgentRunContext {
   runner_workdir: string;
 }
 
+export interface WakeContextAttachment extends Attachment {
+  /** Absolute worker route. It still requires the current AgentParty bearer token. */
+  url: string;
+  auth: "Bearer token required";
+  /** Private copy prepared by serve, or null when download failed/not attempted. */
+  local_path: string | null;
+  download_error?: string;
+}
+
+function attachmentContextMetadata(attachment: Attachment): WakeContextAttachment {
+  return { ...attachment, auth: "Bearer token required", local_path: null };
+}
+
 // 把一条 @mention 的完整上下文落成 JSON 文件，命令拿路径读——避开 env/stdin 的 shell quoting/注入，
 // 也让 runner 能一次拿全 channel/seq/sender/body/reply_to/recent/protocol_reminder（评审建议）。
 // recent = 触发消息之前、serve 在线期间看到的最近频道消息（含自己/未 @ 的闲聊，正文截断），
@@ -231,6 +244,7 @@ function buildWakeContext(
   charter: ChannelCharter | null = null,
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
+  attachments?: WakeContextAttachment[],
 ) {
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
   return {
@@ -240,6 +254,7 @@ function buildWakeContext(
     owner: frame.sender.owner ?? null,
     kind: frame.kind,
     body,
+    attachments: attachments ?? frame.attachments?.map(attachmentContextMetadata) ?? [],
     mentions: frame.mentions,
     reply_to: frame.seq, // 回这条就 --reply-to 它
     self,
@@ -252,6 +267,7 @@ function buildWakeContext(
       sender: m.sender.name,
       kind: m.kind,
       body: (m.kind === "message" ? m.body : (m.note ?? "")).slice(0, RECENT_BODY_MAX),
+      attachments: m.attachments?.map(attachmentContextMetadata) ?? [],
       ts: m.ts,
     })),
     protocol_reminder: PROTOCOL_REMINDER,
@@ -279,13 +295,14 @@ export function writeContextFile(
   charter: ChannelCharter | null = null,
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
+  attachments?: WakeContextAttachment[],
 ): string {
   // dir 是本 serve 实例私有的（createWakeContextDir）。文件名只需 seq：同一次唤醒重复写得到
   // 同一路径（幂等），而不同实例——不同身份 / 不同 server / 不同 profile——各在各的目录里。
   const path = join(dir, `${frame.seq}.json`);
   writeFileSync(
     path,
-    JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade), null, 2) + "\n",
+    JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments), null, 2) + "\n",
     { mode: 0o600 },
   );
   return path;
@@ -367,6 +384,8 @@ export interface ServeOptions {
   maxWakeAttempts?: number;
   wakeRetryDelayMs?: number;
   post?: typeof postMessage;
+  /** 入站附件下载注入点；默认走当前 server 的鉴权 REST 路径。 */
+  downloadAttachment?: typeof downloadAttachment;
   // 测试注入点：默认用 sh -c 起子进程
   runCommand?: (
     frame: MsgFrame,
@@ -380,6 +399,7 @@ export interface ServeOptions {
       charter?: ChannelCharter | null;
       projectAgent?: ProjectAgentRunContext | null;
       cliUpgrade?: CliUpgradeNotice | null;
+      attachments?: WakeContextAttachment[];
       /** 排在当前 wake 身后、尚未处理的 wake 数（#103）；runner 随 working 帧上报 busy+此值。 */
       queueDepth?: number;
     },
@@ -431,12 +451,13 @@ async function defaultRun(
     charter?: ChannelCharter | null;
     projectAgent?: ProjectAgentRunContext | null;
     cliUpgrade?: CliUpgradeNotice | null;
+    attachments?: WakeContextAttachment[];
     /** 排在当前 wake 身后、尚未处理的 wake 数（#103）。 */
     queueDepth?: number;
   },
 ): Promise<void> {
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
-  const file = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null);
+  const file = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments);
   const cmd = ctx.cmd.includes("{file}") ? ctx.cmd.replaceAll("{file}", file) : ctx.cmd;
   const proc = Bun.spawn(["sh", "-c", cmd], {
     stdin: new TextEncoder().encode(body),
@@ -526,6 +547,41 @@ function guessAttachmentContentType(filename: string): string {
 function safeAttachmentFilename(name: string): string {
   const cleaned = name.replace(/[/\\\x00-\x1f\x7f]/g, "_").slice(0, 255);
   return cleaned.length > 0 ? cleaned : "attachment";
+}
+
+async function materializeWakeAttachments(
+  server: string,
+  token: string,
+  channel: string,
+  frame: MsgFrame,
+  contextDir: string,
+  download: typeof downloadAttachment,
+): Promise<WakeContextAttachment[]> {
+  const attachments = frame.attachments ?? [];
+  if (attachments.length === 0) return [];
+  const dir = join(contextDir, `${frame.seq}-attachments`);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return Promise.all(attachments.map(async (attachment, index) => {
+    const metadata = attachmentContextMetadata(attachment);
+    try {
+      const bytes = await download(server, token, channel, attachment);
+      if (bytes.byteLength !== attachment.size) {
+        throw new Error(`attachment size mismatch: expected ${attachment.size}, received ${bytes.byteLength}`);
+      }
+      const localPath = join(dir, `${index + 1}-${safeAttachmentFilename(attachment.filename)}`);
+      writeFileSync(localPath, bytes, { mode: 0o600 });
+      return {
+        ...metadata,
+        url: new URL(attachment.url, server.replace(/\/+$/, "") + "/").toString(),
+        local_path: localPath,
+      };
+    } catch (error) {
+      return {
+        ...metadata,
+        download_error: sanitizeBlockedError(error instanceof Error ? error.message : String(error)),
+      };
+    }
+  }));
 }
 
 function stripAttachLines(text: string): string {
@@ -697,8 +753,9 @@ function sdkPrompt(
   charter: ChannelCharter | null,
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
+  attachments?: WakeContextAttachment[],
 ): string {
-  return JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade), null, 2) + "\n";
+  return JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments), null, 2) + "\n";
 }
 
 function sdkThreadId(thread: ThreadLike): string | null {
@@ -908,6 +965,7 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
       charter?: ChannelCharter | null;
       projectAgent?: ProjectAgentRunContext | null;
       cliUpgrade?: CliUpgradeNotice | null;
+      attachments?: WakeContextAttachment[];
       /** 排在当前 wake 身后、尚未处理的 wake 数（#103）。 */
       queueDepth?: number;
     },
@@ -930,7 +988,7 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     let threadId = session?.thread_id ?? null;
     try {
       const active = await ensureThread(started);
-      const result = await active.thread.run(sdkPrompt(frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null), {
+      const result = await active.thread.run(sdkPrompt(frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments), {
         sandbox: opts.sandbox ?? "full_access",
       });
       // run() 之后 thread id 一定就位；懒初始化的 session 在这里补建
@@ -1020,7 +1078,7 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
 
     const repoCwd = await ensureRepo(opts, env);
     const cwd = opts.cwd ?? repoCwd ?? opts.workdir;
-    const contextFile = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null);
+    const contextFile = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments);
     // 绝不把 context JSON 当 argv 传（#120）：argv 对同机任意用户可见（`ps -axww`），
     // 一条私有频道消息的正文、charter、最近 20 条上下文就全泄漏了。
     // 只传 0700 私有目录里的文件路径——protocol_reminder 本来就叫模型「先读本文件」。
@@ -1676,6 +1734,16 @@ export async function runServe(o: ServeOptions): Promise<number> {
         // 身后已缓冲的 wake 深度（#103）：内建 runner 随 working 帧上报，presence 显示「忙 + N 待处理」。
         // 本帧正在处理，故只数它 seq 之后、够格触发唤醒的缓冲帧。
         const queueDepth = pendingWakeDepth(conn.pendingFrames(), self, o.mentionsOnly === true, frame.seq);
+        // 先把入站附件放进本 serve 实例的 0700 临时目录。runner 只拿 0600 本地文件与
+        // 鉴权端点元数据，context 中绝不出现 bearer token；单个下载失败也不吞掉整次唤醒。
+        const wakeAttachments = await materializeWakeAttachments(
+          o.server,
+          o.token,
+          o.channel,
+          frame,
+          contextDir,
+          o.downloadAttachment ?? downloadAttachment,
+        );
         if (reportsBusy) busyReported = true;
         // 每任务进度/心跳（#228，扩 #103 busy）：run() 会把这条串行循环阻塞数分钟——期间频道与本机都看不到
         // 「具体这条任务在跑、活着」。用一个 setInterval 侧信道在 run() 执行期间周期性刷新（阻塞的循环靠定时器
@@ -1717,6 +1785,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 charter,
                 projectAgent: o.projectAgent ?? null,
                 cliUpgrade,
+                attachments: wakeAttachments,
                 queueDepth,
               });
               delivered = true;

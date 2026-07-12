@@ -29,6 +29,13 @@ function formatWorkflow(status: MsgFrame["status"]): string[] {
   ].filter((part): part is string => part !== null);
 }
 
+function formatAttachments(m: MsgFrame): string[] {
+  return (m.attachments ?? []).map(
+    (attachment) =>
+      `[attachment: ${attachment.filename} · ${attachment.content_type} · ${attachment.size} bytes · auth GET ${attachment.url}]`,
+  );
+}
+
 export function formatMsg(m: MsgFrame): string {
   const badges = [
     m.completion_artifact !== undefined ? "completion" : null,
@@ -53,6 +60,9 @@ export function formatMsg(m: MsgFrame): string {
   }
   if (m.retracted) return `${prefix}[retracted]`;
   const lines = (m.body ?? "").split("\n");
+  const attachments = formatAttachments(m);
+  if (lines.length === 1 && lines[0] === "" && attachments.length > 0) lines.splice(0, 1);
+  lines.push(...attachments);
   if (m.completion_artifact !== undefined) {
     const a = m.completion_artifact;
     const meta = [

@@ -94,6 +94,36 @@ function captureSearch(): { get: () => string } {
 }
 
 describe("party history 参数解析（#151）", () => {
+  test("attachment-only history output contains actionable metadata (#362)", async () => {
+    globalThis.fetch = (async () => Response.json({
+      messages: [{
+        type: "msg",
+        seq: 9,
+        sender: { name: "alice", kind: "human" },
+        kind: "message",
+        body: "",
+        mentions: [],
+        reply_to: null,
+        state: null,
+        note: null,
+        status: null,
+        attachments: [{
+          key: "dev/uuid/image.png",
+          filename: "image.png",
+          content_type: "image/png",
+          size: 99,
+          url: "/api/channels/dev/attachments/uuid/image.png",
+        }],
+        ts: 1,
+      }],
+    })) as unknown as typeof fetch;
+
+    expect(await run(["dev"])).toBe(0);
+    expect(stdout).toEqual([
+      "[9] alice(human): [attachment: image.png · image/png · 99 bytes · auth GET /api/channels/dev/attachments/uuid/image.png]",
+    ]);
+  });
+
   test("--since 与 --before 同时给出 → exit 1，且不发请求", async () => {
     globalThis.fetch = (async (_input: string | URL | Request, _init?: RequestInit): Promise<Response> => {
       throw new Error("history 不应在 flag 冲突时打网络请求");
