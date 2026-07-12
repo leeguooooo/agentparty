@@ -1,4 +1,4 @@
-import { type CSSProperties, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AuthError,
   type ChannelAgentInfo,
@@ -22,6 +22,7 @@ import {
   saveAgentToken,
 } from "../lib/agentTokenVault";
 import { useT } from "../i18n/useT";
+import { useDismissableLayer } from "./useDismissableLayer";
 import "../i18n/strings/AgentTokens";
 
 interface Props {
@@ -46,6 +47,17 @@ type ProfileForm = {
   rules: string;
 };
 
+const EMPTY_PROFILE_FORM: ProfileForm = {
+  handle: "",
+  runner: "codex",
+  repoUrl: "",
+  workdir: "",
+  baseBranch: "main",
+  worktree: "branch",
+  invitableBy: "owner",
+  rules: "",
+};
+
 export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed, active, onActiveChange }: Props) {
   const t = useT();
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -53,16 +65,7 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
   const [open, setOpen] = useState(false);
   const [agents, setAgents] = useState<ChannelAgentInfo[] | null>(null);
   const [profiles, setProfiles] = useState<ProjectAgentProfile[] | null>(null);
-  const [profileForm, setProfileForm] = useState<ProfileForm>({
-    handle: "",
-    runner: "codex",
-    repoUrl: "",
-    workdir: "",
-    baseBranch: "main",
-    worktree: "branch",
-    invitableBy: "owner",
-    rules: "",
-  });
+  const [profileForm, setProfileForm] = useState<ProfileForm>(EMPTY_PROFILE_FORM);
   const [busyName, setBusyName] = useState<string | null>(null);
   const [busyProfile, setBusyProfile] = useState<string | null>(null);
   const [creatingProfile, setCreatingProfile] = useState(false);
@@ -94,12 +97,33 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
     }
   }, [onAuthFailed, slug, t, token]);
 
+  const close = useCallback(() => {
+    if (active === undefined) setOpen(false);
+    onActiveChange?.(false);
+  }, [active, onActiveChange]);
+
   const toggle = useCallback(() => {
-    const next = !isOpen;
-    if (active === undefined) setOpen(next);
-    onActiveChange?.(next);
-    if (next && agents === null) void refresh();
-  }, [active, agents, isOpen, onActiveChange, refresh]);
+    if (isOpen) {
+      close();
+      return;
+    }
+    if (active === undefined) setOpen(true);
+    onActiveChange?.(true);
+    if (agents === null) void refresh();
+  }, [active, agents, close, isOpen, onActiveChange, refresh]);
+
+  useDismissableLayer({ active: isOpen, onDismiss: close, outsideRef: rootRef });
+
+  useEffect(() => {
+    if (isOpen) return;
+    setPanelStyle({});
+    setProfileForm(EMPTY_PROFILE_FORM);
+    setEditingRules(null);
+    setRulesDraft("");
+    setError(null);
+    setCopied(null);
+    setRevealed(new Set());
+  }, [isOpen]);
 
   useLayoutEffect(() => {
     if (!isOpen) return;
@@ -291,7 +315,13 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
         {t("AgentTokens.open")}
       </button>
       {isOpen && (
-        <div className="agenttokens-panel" style={panelStyle}>
+        <div
+          className="agenttokens-panel"
+          style={panelStyle}
+          role="dialog"
+          aria-modal="true"
+          aria-label={t("AgentTokens.title")}
+        >
           <div className="agenttokens-head">
             <span className="agenttokens-title">{t("AgentTokens.title")}</span>
             <button type="button" className="d-btn agenttokens-refresh" onClick={refresh}>

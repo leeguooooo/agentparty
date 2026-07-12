@@ -73,13 +73,39 @@ function profile(overrides: Partial<ProfileFixture> = {}): ProfileFixture {
 }
 
 let renderer: ReactTestRenderer | null = null;
+let windowEvents: TestEventTarget;
+let documentEvents: TestEventTarget;
+const insideTarget = {};
+
+class TestEventTarget {
+  private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+  addEventListener(type: string, listener: (event: unknown) => void) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: (event: unknown) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  emit(type: string, event: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+
+  count(type: string) {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+}
 
 beforeEach(() => {
   profilesFixture = [];
   createCalls.length = 0;
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage({ ap_locale: "en" }) });
-  const windowEvents = new EventTarget();
+  windowEvents = new TestEventTarget();
+  documentEvents = new TestEventTarget();
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
@@ -89,12 +115,20 @@ beforeEach(() => {
       removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
     },
   });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      addEventListener: documentEvents.addEventListener.bind(documentEvents),
+      removeEventListener: documentEvents.removeEventListener.bind(documentEvents),
+    },
+  });
 });
 
 afterEach(async () => {
   if (renderer !== null) await act(async () => renderer?.unmount());
   renderer = null;
   Reflect.deleteProperty(globalThis, "window");
+  Reflect.deleteProperty(globalThis, "document");
   Reflect.deleteProperty(globalThis, "localStorage");
 });
 
@@ -111,7 +145,17 @@ function baseProps() {
 async function renderOpen(): Promise<ReactTestRenderer> {
   let r!: ReactTestRenderer;
   await act(async () => {
-    r = create(<LocaleProvider><AgentTokens {...baseProps()} /></LocaleProvider>);
+    r = create(<LocaleProvider><AgentTokens {...baseProps()} /></LocaleProvider>, {
+      createNodeMock(element) {
+        if ((element.props as { className?: string }).className === "agenttokens") {
+          return {
+            contains: (target: unknown) => target === insideTarget,
+            getBoundingClientRect: () => ({ bottom: 40, right: 700 }),
+          };
+        }
+        return {};
+      },
+    });
   });
   renderer = r;
   // 打开面板 → 触发 refresh()，拉取 profiles
@@ -201,5 +245,65 @@ describe("AgentTokens project-agent rules edit", () => {
     });
     expect(createCalls).toHaveLength(0);
     expect(allText(r)).toContain("keep me");
+  });
+});
+
+describe("AgentTokens dismiss behavior", () => {
+  test("exposes the panel as a modal dialog and ignores pointer presses inside the component", async () => {
+    const r = await renderOpen();
+    const panel = findClass(r, "agenttokens-panel");
+    expect(panel.props.role).toBe("dialog");
+    expect(panel.props["aria-modal"]).toBe("true");
+
+    act(() => documentEvents.emit("pointerdown", { target: insideTarget }));
+    expect(r.root.findAll((node) => node.props.className === "agenttokens-panel")).toHaveLength(1);
+  });
+
+  test("Escape and outside pointer presses close, clear drafts, and clean up listeners", async () => {
+    profilesFixture = [profile()];
+    const r = await renderOpen();
+    const handleInput = r.root.findAll((node) => node.props.className === "agenttokens-input t-mono")[0]!;
+    act(() => handleInput.props.onChange({ target: { value: "temporary" } }));
+    act(() => findClass(r, "d-btn agenttokens-edit-rules").props.onClick());
+
+    expect(windowEvents.count("keydown")).toBe(1);
+    expect(documentEvents.count("pointerdown")).toBe(1);
+    act(() => windowEvents.emit("keydown", { key: "Escape" }));
+    expect(r.root.findAll((node) => node.props.className === "agenttokens-panel")).toHaveLength(0);
+    expect(windowEvents.count("keydown")).toBe(0);
+    expect(documentEvents.count("pointerdown")).toBe(0);
+
+    act(() => r.root.find((node) => node.props.className === "d-btn agenttokens-btn").props.onClick());
+    expect(r.root.findAll((node) => node.props.className === "agenttokens-input t-mono")[0]!.props.value).toBe("");
+    expect(r.root.findAll((node) => node.type === "textarea")).toHaveLength(0);
+    expect(allText(r)).toContain("always run the tests");
+
+    act(() => documentEvents.emit("pointerdown", { target: {} }));
+    expect(r.root.findAll((node) => node.props.className === "agenttokens-panel")).toHaveLength(0);
+  });
+
+  test("controlled dismiss requests onActiveChange without mutating the active prop", async () => {
+    const changes: boolean[] = [];
+    await act(async () => {
+      renderer = create(
+        <LocaleProvider>
+          <AgentTokens {...baseProps()} active={true} onActiveChange={(open) => changes.push(open)} />
+        </LocaleProvider>,
+        {
+          createNodeMock(element) {
+            if ((element.props as { className?: string }).className === "agenttokens") {
+              return {
+                contains: (target: unknown) => target === insideTarget,
+                getBoundingClientRect: () => ({ bottom: 40, right: 700 }),
+              };
+            }
+            return {};
+          },
+        },
+      );
+    });
+    act(() => documentEvents.emit("pointerdown", { target: {} }));
+    expect(changes).toEqual([false]);
+    expect(renderer!.root.findAll((node) => node.props.className === "agenttokens-panel")).toHaveLength(1);
   });
 });

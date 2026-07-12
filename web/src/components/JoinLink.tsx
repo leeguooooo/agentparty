@@ -5,7 +5,7 @@
 //   · 参与模式（participate）→ /join/<code> 成员链接，对方登录后成为正式成员，可读可发。
 //   · 观看模式（watch）→ /c/<slug>?t=<token> 只读围观链接，无需登录，可读但发送禁用（复用 readonly 角色）。
 // token 明文只在创建时回一次，所以观看链接只在生成时展示一次；列表只列 name + 撤销。
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AuthError,
   createJoinLink,
@@ -18,6 +18,7 @@ import {
   type ShareLinkInfo,
 } from "../lib/api";
 import { useT, type TFunc } from "../i18n/useT";
+import { useDismissableLayer } from "./useDismissableLayer";
 import "../i18n/strings/JoinLink";
 
 interface Props {
@@ -63,6 +64,7 @@ function expiryLabel(link: JoinLinkInfo, t: TFunc): string {
 
 export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange }: Props) {
   const t = useT();
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const EXPIRY_OPTIONS = expiryOptions(t);
   const USES_OPTIONS = usesOptions(t);
   const [open, setOpen] = useState(false);
@@ -104,12 +106,32 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange }: 
     }
   }, [token, slug, handleErr]);
 
+  const close = useCallback(() => {
+    if (active === undefined) setOpen(false);
+    onActiveChange?.(false);
+  }, [active, onActiveChange]);
+
   const toggle = useCallback(() => {
-    const next = !isOpen;
-    if (active === undefined) setOpen(next);
-    onActiveChange?.(next);
-    if (next && links === null) void refresh();
-  }, [active, isOpen, links, onActiveChange, refresh]);
+    if (isOpen) {
+      close();
+      return;
+    }
+    if (active === undefined) setOpen(true);
+    onActiveChange?.(true);
+    if (links === null) void refresh();
+  }, [active, close, isOpen, links, onActiveChange, refresh]);
+
+  useDismissableLayer({ active: isOpen, onDismiss: close, outsideRef: rootRef });
+
+  useEffect(() => {
+    if (isOpen) return;
+    setMode("participate");
+    setWatchUrl(null);
+    setError(null);
+    setExpiryIdx(0);
+    setUsesIdx(0);
+    setCopied(null);
+  }, [isOpen]);
 
   const selectMode = useCallback(
     (next: InviteMode) => {
@@ -187,12 +209,12 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange }: 
   const activeLinks = (links ?? []).filter((l) => l.revoked_at === null && (l.expires_at === null || l.expires_at > Date.now()));
 
   return (
-    <div className="joinlink">
+    <div className="joinlink" ref={rootRef}>
       <button type="button" className="d-btn joinlink-btn" onClick={toggle} aria-expanded={isOpen}>
         {t("JoinLink.button")}
       </button>
       {isOpen && (
-        <div className="joinlink-panel">
+        <div className="joinlink-panel" role="dialog" aria-modal="true" aria-label={t("JoinLink.button")}>
           <div className="joinlink-mode" role="radiogroup" aria-label={t("JoinLink.modeLabel")}>
             {(["participate", "watch"] as InviteMode[]).map((m) => (
               <label key={m} className={`joinlink-mode-opt${mode === m ? " is-active" : ""}`}>

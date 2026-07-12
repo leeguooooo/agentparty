@@ -29,23 +29,63 @@ mock.module("../lib/api", () => ({
 const { JoinLink } = await import("./JoinLink");
 
 let renderer: ReactTestRenderer | null = null;
+let windowEvents: TestEventTarget;
+let documentEvents: TestEventTarget;
+const insideTarget = {};
+
+class TestEventTarget {
+  private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+  addEventListener(type: string, listener: (event: unknown) => void) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: (event: unknown) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  emit(type: string, event: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+
+  count(type: string) {
+    return this.listeners.get(type)?.size ?? 0;
+  }
+}
 
 beforeEach(() => {
   joinCalls.length = 0;
   shareCalls.length = 0;
+  windowEvents = new TestEventTarget();
+  documentEvents = new TestEventTarget();
+  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: windowEvents });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: documentEvents });
 });
 
 afterEach(() => {
   act(() => renderer?.unmount());
   renderer = null;
+  Reflect.deleteProperty(globalThis, "window");
+  Reflect.deleteProperty(globalThis, "document");
 });
 
-function render() {
+function render(props: { active?: boolean; onActiveChange?(open: boolean): void } = { active: true }) {
   act(() => {
     renderer = create(
       <LocaleProvider>
-        <JoinLink slug="devchan" token="ap_owner" onAuthFailed={() => {}} active={true} />
+        <JoinLink slug="devchan" token="ap_owner" onAuthFailed={() => {}} {...props} />
       </LocaleProvider>,
+      {
+        createNodeMock(element) {
+          if ((element.props as { className?: string }).className === "joinlink") {
+            return { contains: (target: unknown) => target === insideTarget };
+          }
+          return {};
+        },
+      },
     );
   });
   return renderer as ReactTestRenderer;
@@ -77,5 +117,46 @@ describe("JoinLink invite mode selector", () => {
     await act(async () => {});
     expect(shareCalls).toEqual([{ slug: "devchan" }]);
     expect(joinCalls).toEqual([]);
+  });
+});
+
+describe("JoinLink dismiss behavior", () => {
+  test("exposes the open panel as a modal dialog", () => {
+    const r = render();
+    const panel = r.root.find((node) => node.props.className === "joinlink-panel");
+    expect(panel.props.role).toBe("dialog");
+    expect(panel.props["aria-modal"]).toBe("true");
+  });
+
+  test("Escape and an outside pointer press request controlled close, while an inside press does not", () => {
+    const changes: boolean[] = [];
+    render({ active: true, onActiveChange: (open) => changes.push(open) });
+
+    act(() => documentEvents.emit("pointerdown", { target: insideTarget }));
+    expect(changes).toEqual([]);
+
+    act(() => documentEvents.emit("pointerdown", { target: {} }));
+    expect(changes).toEqual([false]);
+
+    act(() => windowEvents.emit("keydown", { key: "Escape" }));
+    expect(changes).toEqual([false, false]);
+  });
+
+  test("uncontrolled close resets panel-only mode and removes global listeners", async () => {
+    const r = render({});
+    const trigger = r.root.find((node) => node.props.className === "d-btn joinlink-btn");
+    await act(async () => trigger.props.onClick());
+    const watchRadio = r.root.find((node) => node.type === "input" && node.props.value === "watch");
+    await act(async () => watchRadio.props.onChange());
+
+    expect(windowEvents.count("keydown")).toBe(1);
+    expect(documentEvents.count("pointerdown")).toBe(1);
+    act(() => documentEvents.emit("pointerdown", { target: {} }));
+    expect(windowEvents.count("keydown")).toBe(0);
+    expect(documentEvents.count("pointerdown")).toBe(0);
+
+    act(() => trigger.props.onClick());
+    const participateRadio = r.root.find((node) => node.type === "input" && node.props.value === "participate");
+    expect(participateRadio.props.checked).toBe(true);
   });
 });

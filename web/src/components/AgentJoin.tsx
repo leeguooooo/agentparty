@@ -12,6 +12,7 @@ import {
 } from "../lib/api";
 import { copyText, saveAgentToken } from "../lib/agentTokenVault";
 import { useT, type TFunc } from "../i18n/useT";
+import { useDismissableLayer } from "./useDismissableLayer";
 import "../i18n/strings/AgentJoin";
 
 interface Props {
@@ -80,16 +81,24 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
     setPhase({ kind: "compose" });
   }, [namePrefix, onActiveChange, slug]);
 
-  const close = useCallback(() => {
+  const reset = useCallback(() => {
     setPhase({ kind: "idle" });
+    setName("");
     setCopied(false);
     setNameErr(null);
+  }, []);
+
+  const close = useCallback(() => {
+    reset();
     onActiveChange?.(false);
-  }, [onActiveChange]);
+  }, [onActiveChange, reset]);
 
   useEffect(() => {
-    if (active === false && phase.kind !== "idle") close();
-  }, [active, close, phase.kind]);
+    if (active === false && phase.kind !== "idle") reset();
+  }, [active, phase.kind, reset]);
+
+  const dialogOpen = phase.kind === "compose" || phase.kind === "loading" || phase.kind === "done";
+  useDismissableLayer({ active: dialogOpen, onDismiss: close });
 
   const mint = useCallback(async () => {
     const wanted = name.trim();
