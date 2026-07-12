@@ -1,7 +1,7 @@
 // 消息渲染：message → doodle 卡片外壳 + mono 元信息 + markdown 正文；
 // status → 时间线分隔条（spec §9 第 2 块）。
 import type { AgentContext, MsgFrame, PresenceEntry, ReadCursor, Sender } from "@agentparty/shared";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
 import { displayForIdentity, resolveSenderLabel, type IdentityDisplayMap } from "../lib/identityDisplay";
@@ -122,7 +122,11 @@ export function presenceTitleBits(entry: PresenceEntry | undefined): string[] {
   ].filter((part): part is string => part !== null);
 }
 
-export function MessageCard({
+// memo 化：主输入框每次按键都会重渲染 Channel（draft 是顶层 state），中文 IME 尤其密集。
+// 卡片的所有 props（msg / 各 useCallback 回调 / useMemo 出来的 identityDisplay·receipts /
+// 逐条标量）在 draft-only 重渲染时引用稳定，浅比较即可跳过整窗口卡片的重渲染，消除输入卡顿
+// （issue #399④）。真正变动的那条卡片（新消息 / 编辑中 / 回执变化）props 会变，照常更新。
+function MessageCardImpl({
   msg,
   self,
   identityDisplay,
@@ -669,3 +673,5 @@ export function MessageCard({
     </article>
   );
 }
+
+export const MessageCard = memo(MessageCardImpl);

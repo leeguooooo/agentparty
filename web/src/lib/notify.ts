@@ -1,6 +1,6 @@
 import type { MsgFrame } from "@agentparty/shared";
 
-function isOwnMention(msg: MsgFrame, myHandle: string | null): boolean {
+export function isOwnMention(msg: MsgFrame, myHandle: string | null): boolean {
   if (myHandle === null || msg.kind !== "message" || msg.retracted) return false;
   if (msg.sender.handle === myHandle) return false;
   return msg.mentions.includes(myHandle);

@@ -13,6 +13,8 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "notification:allow-register-listener",
+    "notification:allow-get-active",
+    "notification:allow-remove-active",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled",

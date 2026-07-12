@@ -64,7 +64,9 @@ import { catchupKey, summarizeCatchup, type CatchupDigest } from "../lib/digest"
 import { buildOrgTree, type OrgMemberInput } from "../lib/orgTree";
 import { formatDivisionSection, mergeDivisionIntoCharter, type DivisionCharterRole } from "../lib/divisionCharter";
 import {
+  clearDeliveredMentionNotifications,
   isDesktopRuntime,
+  mentionNotificationId,
   sendMentionNotification,
   setDesktopBadge,
 } from "../lib/desktopRuntime";
@@ -78,7 +80,7 @@ import {
   type AgentFilterKind,
   type AgentFilterMode,
 } from "../lib/filters";
-import { nextMentionBadgeCount, shouldMarkSeen, shouldNotify, shouldToast } from "../lib/notify";
+import { isOwnMention, nextMentionBadgeCount, shouldMarkSeen, shouldNotify, shouldToast } from "../lib/notify";
 import { historyFallbackRecovered } from "../lib/historyRecovery";
 import { summarizeReplyPreview } from "../lib/replyPreview";
 import { fmtTime } from "../lib/time";
@@ -2754,11 +2756,22 @@ export function ChannelPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastSeq]);
 
+  // 当前频道已加载窗口里所有 @我的确定性通知 id：聚焦时据此精确清掉本频道在通知中心的
+  // 旧 @提醒，绝不误删其他频道的（issue #399 / CodeRabbit #401）。用 ref 供 markVisible 读最新值。
+  const mentionNotificationIds = useMemo(
+    () => state.messages.filter((m) => isOwnMention(m, selfHandle)).map((m) => mentionNotificationId(slug, m.seq)),
+    [state.messages, selfHandle, slug],
+  );
+  const mentionNotificationIdsRef = useRef<number[]>(mentionNotificationIds);
+  mentionNotificationIdsRef.current = mentionNotificationIds;
+
   useEffect(() => {
     const markVisible = () => {
       if (document.hidden) return;
       desktopMentionBadgeRef.current = 0;
       void setDesktopBadge(0);
+      // 聚焦即视为读到：清掉通知中心里本频道堆积的旧 @提醒，否则每次打开桌面版仍会看到已读的 @（issue #399）。
+      void clearDeliveredMentionNotifications(slug, mentionNotificationIdsRef.current);
       if (stickBottom.current) sendSeen(lastSeqRef.current);
     };
     document.addEventListener("visibilitychange", markVisible);

@@ -34,11 +34,15 @@ interface NotificationModule {
   isPermissionGranted(): Promise<boolean>;
   requestPermission(): Promise<Exclude<DesktopNotificationPermission, "unsupported">>;
   sendNotification(options: {
+    id?: number;
     title: string;
     body: string;
     extra?: Record<string, unknown>;
   }): void;
   onAction(handler: (notification: { extra?: Record<string, unknown> }) => void): Promise<NotificationListener>;
+  // 枚举已投递的通知 / 按 id 精确删除（issue #399）。旧壳可能没有这两条命令，标可选、调用侧兜底。
+  active?(): Promise<Array<{ id: number; extra?: Record<string, unknown> }>>;
+  removeActive?(notifications: Array<{ id: number }>): Promise<void>;
 }
 
 interface AutostartModule {
@@ -138,16 +142,52 @@ export async function requestDesktopNotificationPermission(): Promise<DesktopNot
   }
 }
 
+// 稳定通知 id：同一 (频道, seq) 的 @提醒在多窗口 / 重连 / 重开时都映射到同一 id，
+// macOS 用相同 identifier 覆盖旧通知而非再堆一条——消除通知中心里的重复（issue #399：
+// 两个 session 各弹一次、或重触发导致同一条 @ 出现多遍）。djb2 → 正 i32、非 0。
+export function mentionNotificationId(slug: string, seq: number): number {
+  const s = `${slug}:${seq}`;
+  let h = 5381;
+  for (let i = 0; i < s.length; i += 1) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h & 0x7fffffff) || 1;
+}
+
 export async function sendMentionNotification(input: MentionNotification): Promise<boolean> {
   if (!isDesktopRuntime()) return false;
   try {
     const notification = await dependencies.loadNotification();
     if (!(await notification.isPermissionGranted())) return false;
     await notification.sendNotification({
+      id: mentionNotificationId(input.slug, input.seq),
       title: input.title,
       body: input.body,
       extra: { slug: input.slug, seq: input.seq },
     });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 清掉通知中心里「当前频道」已投递的 @提醒。用户聚焦窗口即视为读到，堆积的旧通知应随之消失
+// （issue #399：「每次登录进来都显示 @我，但我都看过了」）。
+//
+// 只删当前频道，绝不用 removeAllActive——那会把其他频道仍未读的 @提醒一并误删（CodeRabbit #401）。
+// 匹配用双保险：① 确定性 id（hash(频道:seq)，调用方按已加载的本频道 @消息算好传入，不依赖平台回传
+// extra）；② 发送时写入的 extra.slug（覆盖已加载窗口外、但 extra 能回传的旧通知）。任一命中即删。
+// 旧壳缺 active / removeActive → 兜底返回 false。
+export async function clearDeliveredMentionNotifications(
+  slug: string,
+  mentionIds: readonly number[],
+): Promise<boolean> {
+  if (!isDesktopRuntime()) return false;
+  try {
+    const notification = await dependencies.loadNotification();
+    if (typeof notification.active !== "function" || typeof notification.removeActive !== "function") return false;
+    const idSet = new Set(mentionIds);
+    const delivered = await notification.active();
+    const mine = delivered.filter((n) => idSet.has(n.id) || n.extra?.slug === slug);
+    if (mine.length > 0) await notification.removeActive(mine.map((n) => ({ id: n.id })));
     return true;
   } catch {
     return false;
