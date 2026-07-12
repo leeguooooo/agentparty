@@ -1,0 +1,93 @@
+name: worker-rollback
+
+# worker 代码一键回滚（#420）。手动触发，回退到上一个（或指定的）已发布 deployment。
+# 注意：只回滚 worker 代码。D1 schema 的回退是破坏性、不可自动化的，只能人工 time-travel
+# 兜底——见 docs/deploy-rollback.md。破坏性迁移上线后如需回退，先读该 runbook。
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 回滚哪个实例
+        type: choice
+        options:
+          - prod
+          - xdream
+          - both
+        default: prod
+      deployment_id:
+        description: 目标 deployment id（留空=回退到上一个）。选 both 时必须留空。
+        type: string
+        default: ""
+      confirm:
+        description: 输入 rollback 确认执行
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-live-ops
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.pick.outputs.targets }}
+    steps:
+      - name: validate inputs
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+          SEL: ${{ github.event.inputs.environment }}
+          DEP: ${{ github.event.inputs.deployment_id }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "rollback" ]; then
+            echo "::error::confirm 必须等于 'rollback' 才会执行回滚"
+            exit 1
+          fi
+          # deployment_id 只属于单个实例；both 时禁止指定，避免把 prod 的 id 用到 xdream。
+          if [ "$SEL" = "both" ] && [ -n "$DEP" ]; then
+            echo "::error::选择 both 时不能指定 deployment_id（各实例 id 不通用）"
+            exit 1
+          fi
+      - id: pick
+        env:
+          SEL: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          case "$SEL" in
+            prod)   echo 'targets=["prod"]' >> "$GITHUB_OUTPUT" ;;
+            xdream) echo 'targets=["xdream"]' >> "$GITHUB_OUTPUT" ;;
+            both)   echo 'targets=["prod","xdream"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::invalid environment selection: $SEL"; exit 1 ;;
+          esac
+
+  rollback:
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: worker-${{ matrix.target }}
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(needs.guard.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/bun-install
+      - name: rollback ${{ matrix.target }}
+        working-directory: worker
+        env:
+          CI: "1"
+          AGENTPARTY_WRANGLER_BIN: "bunx wrangler"
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEP: ${{ github.event.inputs.deployment_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DEP" ]; then
+            node scripts/rollback-ci.mjs ${{ matrix.target }} --deployment-id "$DEP"
+          else
+            node scripts/rollback-ci.mjs ${{ matrix.target }}
+          fi
