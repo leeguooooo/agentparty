@@ -52,6 +52,7 @@ commands:
   webhook   add <channel> --name n --url URL --secret S [--filter mentions|status|needs-human|all] | remove <channel> --name n | list <channel>
   token     create --name n --role agent|human|readonly --owner label [--channel-scope slug] | revoke <name>   (ADMIN_SECRET env)
   membership activate --account a | deactivate --account a   owner-only: mark an account member/free (#277)   (ADMIN_SECRET env)
+  gdpr      erase <name> [channel] --yes | export <name> [channel] [--json]   per-identity hard-erase / export (moderator, #421)
 
 watch defaults to a 240s timeout. With --follow, it stays attached unless --timeout N is explicit.
 
@@ -145,6 +146,8 @@ export async function main(argv: string[]): Promise<number> {
       return (await import("./commands/token")).run(rest);
     case "membership":
       return (await import("./commands/membership")).run(rest);
+    case "gdpr":
+      return (await import("./commands/gdpr")).run(rest);
     case "doctor":
       return (await import("./commands/doctor")).run(rest);
     case "health":

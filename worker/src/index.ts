@@ -5545,6 +5545,75 @@ app.get("/api/channels/:slug/messages/:seq/audit", async (c) => {
   );
 });
 
+// GDPR 按身份数据出口（#421）。只读，导出某身份在本频道的全部可归因数据（消息 + 审计 + wake 账本 +
+// 读游标 + presence），满足「数据可携」/ 出境审查。授权同 kick/pause：仅频道 moderator（房主 / ap_）——
+// 导出包含 PII，不能让普通成员随手拉别人的数据。
+app.get("/api/channels/:slug/identity/:name/data", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!isChannelModerator(c.get("identity"), channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can export identity data"), 403);
+  }
+  const name = c.req.param("name");
+  if (!name || name.length > 256) {
+    return c.json(errorBody("bad_request", "valid name required"), 400);
+  }
+  return fetchChannelDO(
+    c.env,
+    slug,
+    new Request(`https://do/internal/identity/${encodeURIComponent(name)}/data${new URL(c.req.url).search}`, {
+      headers: { "x-partykit-room": slug },
+    }),
+  );
+});
+
+// GDPR 按身份硬擦除（#421）。物理删除该身份在本频道 message_audit / wake_delivery_ledger / read_cursor /
+// presence 的可识别行，并把其发过的消息正文 + 归属 PII 抹成 [erased]——补齐撤回（#196）只覆盖单条消息、
+// 覆盖不到审计/账本身份维度的合规缺口。授权同 kick：仅频道 moderator（房主 / ap_）；操作落 management_audit。
+app.delete("/api/channels/:slug/identity/:name/data", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!isChannelModerator(identity, channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can erase identity data"), 403);
+  }
+  const name = c.req.param("name");
+  if (!name || name.length > 256) {
+    return c.json(errorBody("bad_request", "valid name required"), 400);
+  }
+  const res = await fetchChannelDO(
+    c.env,
+    slug,
+    new Request(`https://do/internal/identity/${encodeURIComponent(name)}/data`, {
+      method: "DELETE",
+      headers: {
+        "x-partykit-room": slug,
+        "x-ap-name": identity.name,
+        "x-ap-kind": identity.kind,
+        "x-ap-role": identity.role,
+        "x-ap-token-hash": identity.hash,
+      },
+    }),
+  );
+  if (res.ok) {
+    const summary = (await res.clone().json().catch(() => null)) as (Record<string, unknown> & { attachment_keys?: unknown }) | null;
+    const attachmentKeys = Array.isArray(summary?.attachment_keys)
+      ? summary.attachment_keys.filter((key): key is string => typeof key === "string" && key.startsWith(`${slug}/`))
+      : [];
+    await Promise.all(attachmentKeys.map((key) => c.env.ATTACHMENTS.delete(key)));
+    await bestEffortRecordManagementAudit(c.env.DB, {
+      actor: managementAuditActor(identity),
+      action: "channel.identity.erase",
+      resource: `channel/${slug}/identity/${name}`,
+      channel: slug,
+      metadata: summary ?? {},
+    });
+  }
+  return res;
+});
+
 // 附件上传（#176）：blob 进 R2，返回引用元数据；发消息时把引用带在 attachments 字段里。
 // 鉴权同频道写：必须是可访问该频道的非 readonly token（私有频道即房主/成员/被邀 agent）。
 app.post("/api/channels/:slug/attachments", async (c) => {

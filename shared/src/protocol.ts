@@ -837,6 +837,50 @@ export interface MsgFrame {
   };
 }
 
+/** One bounded page of data attributable to an identity in a channel. */
+export interface IdentityExportData {
+  name: string;
+  exported_at: number;
+  messages: MsgFrame[];
+  audit: {
+    target_seq: number;
+    action: string;
+    actor: { name: string; kind: string };
+    old_body: string | null;
+    new_body: string | null;
+    original_byte_length: number | null;
+    created_at: number;
+  }[];
+  wake_deliveries: {
+    mention_seq: number;
+    target_name: string;
+    webhook_name: string;
+    adapter_kind: string;
+    attempt: number;
+    result: string;
+    http_status: number | null;
+    error: string | null;
+    attempted_at: number;
+    ack_seq: number | null;
+    resume_seq: number | null;
+  }[];
+  read_cursor: ReadCursor | null;
+  presence: PresenceEntry[];
+  next: { messages: number | null; audit: number | null; wake_deliveries: number | null };
+}
+
+export interface IdentityEraseSummary {
+  name: string;
+  erased_at: number;
+  messages_scrubbed: number;
+  audit_deleted: number;
+  wake_ledger_deleted: number;
+  webhook_payloads_deleted: number;
+  read_cursors_deleted: number;
+  presence_deleted: number;
+  attachment_keys: string[];
+}
+
 export interface HostSummary {
   name: string;
   lease: HostLeaseState;

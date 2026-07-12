@@ -26,6 +26,7 @@ export type ManagementAuditAction =
   | "channel.webhook.remove"
   | "channel.webhook.redeliver"
   | "channel.archive"
+  | "channel.identity.erase"
   | "membership.set";
 
 export interface ManagementAuditActor {
@@ -122,6 +123,21 @@ function safeMetadata(action: ManagementAuditAction, input: unknown): Record<str
   }
   if (action === "channel.guard.reset") {
     return metadata.guard === "loop" || metadata.guard === "workflow" ? { guard: metadata.guard } : {};
+  }
+  if (action === "channel.identity.erase") {
+    // GDPR 硬擦除（#421）：只留各表命中数（纯数字，无内容），供合规追溯「删了多少行」。
+    const result: Record<string, unknown> = {};
+    for (const field of [
+      "messages_scrubbed",
+      "audit_deleted",
+      "wake_ledger_deleted",
+      "read_cursors_deleted",
+      "presence_deleted",
+    ]) {
+      const value = metadata[field];
+      if (typeof value === "number" && Number.isInteger(value) && value >= 0) result[field] = value;
+    }
+    return result;
   }
   if (action === "membership.set") {
     return metadata.tier === "free" || metadata.tier === "member" ? { tier: metadata.tier } : {};
