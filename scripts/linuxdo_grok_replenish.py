@@ -11,6 +11,7 @@ import sys
 import tempfile
 import shutil
 import zipfile
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -148,6 +149,10 @@ def load_authorized_manifest(path: Path) -> dict:
         raise ValueError("authorized source manifest requires sources")
     staging_dir = Path(str(payload.get("staging_dir", ""))).expanduser()
     target_dir = Path(str(payload.get("target_dir", ""))).expanduser()
+    pool_file_value = payload.get("pool_file")
+    pool_file = Path(str(pool_file_value)).expanduser() if pool_file_value else None
+    headers_file_value = payload.get("http_headers_file")
+    headers_file = Path(str(headers_file_value)).expanduser() if headers_file_value else None
     if not str(staging_dir) or not str(target_dir):
         raise ValueError("staging_dir and target_dir are required")
     limits = payload.get("limits", {})
@@ -161,17 +166,28 @@ def load_authorized_manifest(path: Path) -> dict:
         source_id = source.get("id")
         topic_url = source.get("topic_url")
         attachment_url = source.get("attachment_url")
-        if not all(isinstance(value, str) and value for value in (source_id, topic_url, attachment_url)):
-            raise ValueError(f"source {index} requires id, topic_url and attachment_url")
+        attachment_url_prefix = source.get("attachment_url_prefix")
+        if not all(isinstance(value, str) and value for value in (source_id, topic_url)):
+            raise ValueError(f"source {index} requires id and topic_url")
+        if bool(attachment_url) == bool(attachment_url_prefix):
+            raise ValueError(f"source {source_id} requires exactly one attachment_url or attachment_url_prefix")
         if source_id in seen:
             raise ValueError(f"duplicate source id: {source_id}")
-        if urlparse(topic_url).scheme not in {"http", "https"} or urlparse(attachment_url).scheme not in {"http", "https"}:
+        attachment_rule = attachment_url or attachment_url_prefix
+        if urlparse(topic_url).scheme not in {"http", "https"} or urlparse(attachment_rule).scheme not in {"http", "https"}:
             raise ValueError(f"source {source_id} URLs must use http or https")
         seen.add(source_id)
-        normalized_sources.append({"id": source_id, "topic_url": topic_url, "attachment_url": attachment_url})
+        normalized = {"id": source_id, "topic_url": topic_url}
+        if attachment_url:
+            normalized["attachment_url"] = attachment_url
+        else:
+            normalized["attachment_url_prefix"] = attachment_url_prefix
+        normalized_sources.append(normalized)
     return {
         "staging_dir": staging_dir,
         "target_dir": target_dir,
+        "pool_file": pool_file,
+        "http_headers_file": headers_file,
         "limits": {
             "max_archive_bytes": _positive_limit(limits.get("max_archive_bytes", 25_000_000), "max_archive_bytes"),
             "max_extracted_bytes": _positive_limit(limits.get("max_extracted_bytes", 100_000_000), "max_extracted_bytes"),
@@ -181,8 +197,9 @@ def load_authorized_manifest(path: Path) -> dict:
     }
 
 
-def _download_exact(url: str, destination: Path, max_bytes: int) -> None:
-    request = Request(url, headers={"User-Agent": "AgentParty authorized Grok replenish/1"})
+def _download_exact(url: str, destination: Path, max_bytes: int, *, headers: dict[str, str] | None = None) -> None:
+    request_headers = {"User-Agent": "AgentParty authorized Grok replenish/1", **(headers or {})}
+    request = Request(url, headers=request_headers)
     with urlopen(request, timeout=30) as response, destination.open("wb") as output:
         content_type = (response.headers.get("Content-Type") or "").lower()
         if "text/html" in content_type:
@@ -283,8 +300,9 @@ def replenish(manifest_path: Path, source_id: str, *, attachment_url: str | None
     source = next((item for item in manifest["sources"] if item["id"] == source_id), None)
     if source is None:
         raise PermissionError(f"source is not registered: {source_id}")
-    requested_url = attachment_url or source["attachment_url"]
-    if requested_url != source["attachment_url"]:
+    registered_url = source.get("attachment_url")
+    requested_url = attachment_url or registered_url
+    if not requested_url or requested_url != registered_url:
         raise PermissionError("requested URL does not match the authorized attachment URL")
     staging_dir: Path = manifest["staging_dir"]
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +322,164 @@ def replenish(manifest_path: Path, source_id: str, *, attachment_url: str | None
         return _atomic_import(credentials, manifest["target_dir"])
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _topic_json_url(topic_url: str) -> str:
+    parsed = urlparse(topic_url)
+    path = parsed.path.rstrip("/")
+    if not path.startswith("/t/"):
+        raise ValueError("registered topic URL must be an exact /t/ URL")
+    if not path.endswith(".json"):
+        path += ".json"
+    return parsed._replace(path=path, query="", fragment="").geturl()
+
+
+def _local_http_headers(manifest: dict) -> dict[str, str]:
+    headers_file = manifest.get("http_headers_file")
+    if headers_file is None:
+        return {}
+    try:
+        payload = json.loads(headers_file.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("http_headers_file must contain valid JSON") from error
+    if not isinstance(payload, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in payload.items()):
+        raise ValueError("http_headers_file must contain a string map")
+    return payload
+
+
+def _fetch_topic_json(topic_url: str, headers: dict[str, str]) -> dict:
+    request = Request(_topic_json_url(topic_url), headers={
+        "Accept": "application/json",
+        "User-Agent": "AgentParty authorized Grok replenish/1",
+        **headers,
+    })
+    with urlopen(request, timeout=30) as response:
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        body = response.read(5_000_001)
+    if "json" not in content_type or len(body) > 5_000_000:
+        raise ValueError("topic JSON response is invalid")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as error:
+        raise ValueError("topic JSON response is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError("topic JSON response is invalid")
+    return payload
+
+
+def _attachment_allowed(source: dict, url: str) -> bool:
+    exact = source.get("attachment_url")
+    if exact:
+        return url == exact
+    prefix = source["attachment_url_prefix"]
+    parsed_prefix = urlparse(prefix)
+    parsed_url = urlparse(url)
+    return (
+        parsed_url.scheme == parsed_prefix.scheme
+        and parsed_url.netloc == parsed_prefix.netloc
+        and parsed_url.path.startswith(parsed_prefix.path)
+        and parsed_url.query == ""
+        and parsed_url.fragment == ""
+    )
+
+
+def rebuild_pool_file(target: Path, pool_file: Path) -> int:
+    credentials: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for path in sorted(target.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("target contains invalid credential JSON") from error
+        if not valid_credential(payload):
+            raise ValueError("target contains invalid credential JSON schema")
+        identity = credential_id(payload)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        credentials.append({"id": identity[:16], "token": payload["access_token"]})
+    if not credentials:
+        raise ValueError("cannot rebuild an empty credential pool")
+    pool_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{pool_file.name}.", suffix=".tmp", dir=pool_file.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(credentials, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, pool_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return len(credentials)
+
+
+def poll_registered_topics(manifest_path: Path) -> dict[str, int]:
+    manifest = load_authorized_manifest(manifest_path)
+    pool_file = manifest.get("pool_file")
+    if pool_file is None:
+        raise ValueError("pool_file is required for topic polling")
+    totals = {
+        "sources_checked": 0,
+        "attachments_seen": 0,
+        "rejected_attachments": 0,
+        "imported": 0,
+        "duplicates": 0,
+        "invalid": 0,
+        "pool_credentials": 0,
+    }
+    headers = _local_http_headers(manifest)
+    for source in manifest["sources"]:
+        topic = _fetch_topic_json(source["topic_url"], headers)
+        totals["sources_checked"] += 1
+        origin = f'{urlparse(source["topic_url"]).scheme}://{urlparse(source["topic_url"]).netloc}'
+        for candidate in discover_candidates(topic, origin):
+            url = candidate["url"]
+            if not url.lower().endswith(".zip") or not _attachment_allowed(source, url):
+                totals["rejected_attachments"] += 1
+                continue
+            totals["attachments_seen"] += 1
+            staging_dir: Path = manifest["staging_dir"]
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            work = Path(tempfile.mkdtemp(prefix=f'{source["id"]}-', dir=staging_dir))
+            try:
+                archive_path = work / "download.zip"
+                _download_exact(url, archive_path, manifest["limits"]["max_archive_bytes"], headers=headers)
+                extracted = work / "extracted"
+                extracted.mkdir()
+                _safe_extract_zip(
+                    archive_path,
+                    extracted,
+                    max_files=manifest["limits"]["max_files"],
+                    max_extracted_bytes=manifest["limits"]["max_extracted_bytes"],
+                )
+                result = _atomic_import(_validated_credentials(extracted), manifest["target_dir"])
+                for key in ("imported", "duplicates", "invalid"):
+                    totals[key] += result[key]
+                totals["pool_credentials"] = rebuild_pool_file(manifest["target_dir"], pool_file)
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+    return totals
+
+
+def watch_registered_topics(
+    manifest_path: Path,
+    interval_seconds: int,
+    *,
+    max_cycles: int | None = None,
+    sleep=time.sleep,
+) -> list[dict[str, int]]:
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+    results: list[dict[str, int]] = []
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        results.append(poll_registered_topics(manifest_path))
+        cycles += 1
+        if max_cycles is not None and cycles >= max_cycles:
+            break
+        sleep(interval_seconds)
+    return results
 
 
 def load_json(path: str) -> dict:
@@ -326,6 +502,11 @@ def parser() -> argparse.ArgumentParser:
     replenish_cmd.add_argument("manifest", type=Path)
     replenish_cmd.add_argument("source_id")
     replenish_cmd.add_argument("--attachment-url", help="must exactly match the registered attachment URL")
+    poll_cmd = commands.add_parser("poll", help="check registered topics and import authorized new ZIP attachments")
+    poll_cmd.add_argument("manifest", type=Path)
+    watch_cmd = commands.add_parser("watch", help="continuously poll registered topics")
+    watch_cmd.add_argument("manifest", type=Path)
+    watch_cmd.add_argument("--interval-seconds", type=int, default=300)
     return root
 
 
@@ -335,7 +516,13 @@ def main() -> int:
         if args.command == "discover":
             print(json.dumps(discover_candidates(load_json(args.topic_json), args.origin), ensure_ascii=False, indent=2))
             return 0
-        if args.command == "replenish":
+        if args.command == "watch":
+            for result in watch_registered_topics(args.manifest, args.interval_seconds):
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+            return 0
+        if args.command == "poll":
+            result = poll_registered_topics(args.manifest)
+        elif args.command == "replenish":
             result = replenish(args.manifest, args.source_id, attachment_url=args.attachment_url)
         else:
             result = import_authorized_directory(args.source, args.target, authorized=args.authorized)

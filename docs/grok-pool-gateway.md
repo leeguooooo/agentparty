@@ -8,6 +8,7 @@ It is an independent local process. It does not change AgentParty Worker, Web, T
 
 - The server always binds `127.0.0.1`. `GROK_POOL_HOST` is optional, but any value other than `127.0.0.1` is rejected.
 - The credential file must be local, outside Git or under the ignored `.secrets/` directory. It is never uploaded.
+- Topic polling is limited to exact topic URLs and exact attachment URL prefixes registered by the operator. It never searches or scans the site.
 - `/health` and `/v1/chat/completions` require the same `GROK_POOL_CLIENT_TOKEN` bearer token.
 - Client `Authorization` is discarded and replaced with the selected upstream token.
 - Logs and health data contain only safe credential IDs, state, status classification, cooldown deadline, and counts. They never contain tokens, request bodies, or upstream error bodies.
@@ -50,6 +51,7 @@ Optional environment:
 | `GROK_POOL_COOLDOWN_SECONDS` | `60` | `1..600` |
 | `GROK_POOL_TRANSIENT_COOLDOWN_SECONDS` | `5` | `1..600` |
 | `GROK_POOL_TIMEOUT_SECONDS` | `120` | `1..600` |
+| `GROK_POOL_RELOAD_INTERVAL_SECONDS` | `5` | `1..600`; valid file changes hot-replace the pool |
 
 Start the process:
 
@@ -86,9 +88,46 @@ Automated tests use local HTTP fixtures and fake tokens only. A real smoke is op
 | no candidate or both attempts fail | unchanged beyond classified failures | return `503` with `error.code=pool_exhausted` |
 | successful SSE followed by downstream/upstream interruption | remains as recorded at initial success | never replay |
 
-## Authorized replenish
+## Automatic authorized topic → download → pool pipeline
 
-The manifest must register a stable source ID and exact topic and attachment URLs. There is no wildcard site scan. The command downloads only the registered attachment into the configured staging directory, validates ZIP magic and limits, rejects path traversal, validates every credential JSON, deduplicates, and atomically replaces the target directory. Staging is cleaned on success and failure.
+The authorized-source manifest connects the three local artifacts:
+
+- `topic_url`: an exact registered topic URL; the poller requests only its `.json` representation.
+- `attachment_url_prefix`: the exact origin/path prefix under which ZIP attachments from that topic are authorized.
+- `target_dir`: validated xAI credential JSON files.
+- `pool_file`: the same file configured as `GROK_POOL_CREDENTIALS_FILE` for the gateway.
+- `http_headers_file`: optional local JSON string map for an operator's own authenticated session, for example `{ "Cookie": "<LOCAL_SESSION_COOKIE>" }`. Keep it under `.secrets/`; headers are never printed or stored in the manifest.
+
+Run one authorized check:
+
+```bash
+python3 scripts/linuxdo_grok_replenish.py poll \
+  .secrets/grok-pool.authorized-sources.json
+```
+
+Run continuously, checking every five minutes:
+
+```bash
+python3 scripts/linuxdo_grok_replenish.py watch \
+  .secrets/grok-pool.authorized-sources.json \
+  --interval-seconds 300
+```
+
+Each cycle performs:
+
+```text
+registered exact topics → topic JSON → authorized ZIP links only
+→ isolated staging → safe extraction/schema validation → deduplicated atomic import
+→ atomic pool-file rebuild → gateway hot reload
+```
+
+Repeated cycles are idempotent. Invalid topic responses, login/challenge HTML, unauthorized attachment paths, unsafe archives, or invalid credentials fail closed. A bad or partially written pool file does not replace the gateway's currently working in-memory pool. Unchanged credentials retain their current exhausted/cooldown state during hot reload; newly added IDs start healthy.
+
+For login-required topics, export browser/session material manually into the ignored local `http_headers_file`. The tool does not automate login, bypass verification, harvest cookies, register accounts, or search public topics.
+
+## Single authorized attachment replenish
+
+For a source registered with one exact `attachment_url` instead of a prefix, the command below downloads that attachment into the configured staging directory, validates ZIP magic and limits, rejects path traversal, validates every credential JSON, deduplicates, and atomically replaces the target directory. Staging is cleaned on success and failure.
 
 ```bash
 python3 scripts/linuxdo_grok_replenish.py replenish \
@@ -115,4 +154,4 @@ curl --fail-with-body --silent --show-error \
   -H "Authorization: Bearer ${GROK_POOL_CLIENT_TOKEN}"
 ```
 
-The response contains `ok` and per-safe-ID state/counts only. Runtime health state is intentionally in memory and resets on restart.
+The response contains `ok` and per-safe-ID state/counts only. Runtime health state is in memory; hot reload preserves state for unchanged IDs, while a full process restart resets it.

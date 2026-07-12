@@ -56,7 +56,7 @@ export function createGrokPool(options: GrokPoolOptions) {
   const cooldownMs = options.cooldownMs ?? 60_000;
   const transientCooldownMs = options.transientCooldownMs ?? 5_000;
   const logger = options.logger ?? (() => undefined);
-  const records: CredentialRecord[] = options.credentials.map((credential) => ({
+  let records: CredentialRecord[] = options.credentials.map((credential) => ({
     ...credential,
     state: "healthy",
     attempts: 0,
@@ -106,6 +106,17 @@ export function createGrokPool(options: GrokPoolOptions) {
   }
 
   return {
+    replaceCredentials(credentials: PoolCredential[]): void {
+      const existing = new Map(records.map((record) => [record.id, record]));
+      records = credentials.map((credential) => {
+        const current = existing.get(credential.id);
+        if (!current) {
+          return { ...credential, state: "healthy", attempts: 0, successes: 0, failures: 0 };
+        }
+        return { ...current, ...credential };
+      });
+    },
+
     async handle<T>(
       request: ReplayableRequest<T>,
       send: (credential: PoolCredential, request: T) => Promise<Response>,

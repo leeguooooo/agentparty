@@ -214,4 +214,41 @@ describe("authorized Grok pool server", () => {
       expect(serialized).not.toContain(secret);
     }
   });
+
+  it("hot reloads a valid credential file and keeps the old pool when reload is invalid", async () => {
+    const credentialsPath = await credentialsFile([{ id: "grok-a", token: "upstream-secret-a" }]);
+    const seen: Array<string | null> = [];
+    const upstream = await startUpstream((request) => {
+      seen.push(request.headers.get("authorization"));
+      return Response.json({ ok: true });
+    });
+    const pool = await startGrokPoolServer({
+      env: {
+        GROK_POOL_CREDENTIALS_FILE: credentialsPath,
+        GROK_POOL_CLIENT_TOKEN: "client-secret",
+        GROK_POOL_BASE_URL: upstream,
+        GROK_POOL_PORT: "8789",
+        GROK_POOL_RELOAD_INTERVAL_SECONDS: "1",
+      },
+      port: 0,
+    });
+    servers.push(pool.server);
+
+    expect((await chat(pool.url)).status).toBe(200);
+    await writeFile(credentialsPath, JSON.stringify([{ id: "grok-b", token: "upstream-secret-b" }]));
+    expect(await pool.reloadNow()).toBe(true);
+    expect((await chat(pool.url)).status).toBe(200);
+
+    await writeFile(credentialsPath, "not-json");
+    expect(await pool.reloadNow()).toBe(false);
+    expect((await chat(pool.url)).status).toBe(200);
+    expect(seen).toEqual([
+      "Bearer upstream-secret-a",
+      "Bearer upstream-secret-b",
+      "Bearer upstream-secret-b",
+    ]);
+
+    const health = await fetch(`${pool.url}/health`, { headers: { authorization: "Bearer client-secret" } });
+    expect(await health.json()).toMatchObject({ credentials: [{ id: "grok-b", state: "healthy" }] });
+  });
 });

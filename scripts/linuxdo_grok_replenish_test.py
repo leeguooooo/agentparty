@@ -122,6 +122,95 @@ class LinuxDoGrokReplenishTest(unittest.TestCase):
                 self.assertFalse((root / "escape.json").exists())
                 self.assertFalse((root / "target").exists())
 
+    def test_poll_registered_topics_discovers_downloads_imports_and_rebuilds_pool_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = make_zip_bytes({"credential.json": json.dumps(valid_credential("new@example.com"))})
+            routes = {
+                "/t/topic/authorized.json": ("application/json", json.dumps({
+                    "topic": {"id": 42, "title": "Grok CPA authorized"},
+                    "posts": [{"cooked": '<a class="attachment" href="/uploads/authorized/new.zip">new.zip</a>'}],
+                }).encode()),
+                "/uploads/authorized/new.zip": ("application/zip", archive),
+            }
+            with serve_routes(routes) as origin:
+                manifest = write_poll_manifest(root, origin)
+                result = MODULE.poll_registered_topics(manifest)
+
+            self.assertEqual(result["sources_checked"], 1)
+            self.assertEqual(result["attachments_seen"], 1)
+            self.assertEqual(result["imported"], 1)
+            pool = json.loads((root / "pool.json").read_text())
+            self.assertEqual(len(pool), 1)
+            self.assertEqual(pool[0]["id"], MODULE.credential_id(valid_credential("new@example.com"))[:16])
+            self.assertEqual(pool[0]["token"], "access-test-value")
+
+    def test_poll_is_idempotent_and_rejects_attachments_outside_the_registered_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = make_zip_bytes({"credential.json": json.dumps(valid_credential("new@example.com"))})
+            routes = {
+                "/t/topic/authorized.json": ("application/json", json.dumps({
+                    "topic": {"id": 42, "title": "Grok CPA authorized"},
+                    "posts": [{
+                        "cooked": (
+                            '<a class="attachment" href="/uploads/authorized/new.zip">new.zip</a>'
+                            '<a class="attachment" href="/uploads/untrusted/bad.zip">bad.zip</a>'
+                        ),
+                    }],
+                }).encode()),
+                "/uploads/authorized/new.zip": ("application/zip", archive),
+                "/uploads/untrusted/bad.zip": ("application/zip", archive),
+            }
+            with serve_routes(routes) as origin:
+                manifest = write_poll_manifest(root, origin)
+                first = MODULE.poll_registered_topics(manifest)
+                second = MODULE.poll_registered_topics(manifest)
+
+            self.assertEqual(first["attachments_seen"], 1)
+            self.assertEqual(first["rejected_attachments"], 1)
+            self.assertEqual(first["imported"], 1)
+            self.assertEqual(second["imported"], 0)
+            self.assertEqual(second["duplicates"], 1)
+            self.assertEqual(len(json.loads((root / "pool.json").read_text())), 1)
+
+    def test_pool_file_is_not_replaced_when_topic_or_import_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool_file = root / "pool.json"
+            pool_file.write_text(json.dumps([{"id": "existing", "token": "existing-token"}]))
+            routes = {
+                "/t/topic/authorized.json": ("text/html", b"<html>login challenge</html>"),
+            }
+            with serve_routes(routes) as origin:
+                manifest = write_poll_manifest(root, origin)
+                with self.assertRaisesRegex(ValueError, "topic JSON"):
+                    MODULE.poll_registered_topics(manifest)
+            self.assertEqual(json.loads(pool_file.read_text()), [{"id": "existing", "token": "existing-token"}])
+
+    def test_watch_repeats_polling_with_injected_sleep_and_local_auth_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = make_zip_bytes({"credential.json": json.dumps(valid_credential("new@example.com"))})
+            requests = []
+            routes = {
+                "/t/topic/authorized.json": ("application/json", json.dumps({
+                    "topic": {"id": 42, "title": "Grok CPA authorized"},
+                    "posts": [{"cooked": '<a class="attachment" href="/uploads/authorized/new.zip">new.zip</a>'}],
+                }).encode()),
+                "/uploads/authorized/new.zip": ("application/zip", archive),
+            }
+            with serve_routes(routes, requests=requests) as origin:
+                manifest = write_poll_manifest(root, origin, headers={"Cookie": "fake-session-cookie"})
+                sleeps = []
+                results = MODULE.watch_registered_topics(manifest, 7, max_cycles=2, sleep=sleeps.append)
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(sleeps, [7])
+            self.assertEqual(results[0]["imported"], 1)
+            self.assertEqual(results[1]["duplicates"], 1)
+            self.assertTrue(all(request[1] == "fake-session-cookie" for request in requests))
+
 
 def valid_credential(email: str):
     return {
@@ -166,6 +255,30 @@ def write_manifest(root: Path, attachment_url: str, **limits: int) -> Path:
     return manifest
 
 
+def write_poll_manifest(root: Path, origin: str, headers: dict | None = None) -> Path:
+    headers_file = root / "headers.json"
+    if headers is not None:
+        headers_file.write_text(json.dumps(headers))
+    manifest = root / "authorized-sources.json"
+    manifest.write_text(json.dumps({
+        "staging_dir": str(root / "staging"),
+        "target_dir": str(root / "target"),
+        "pool_file": str(root / "pool.json"),
+        **({"http_headers_file": str(headers_file)} if headers is not None else {}),
+        "limits": {
+            "max_archive_bytes": 1_000_000,
+            "max_extracted_bytes": 1_000_000,
+            "max_files": 20,
+        },
+        "sources": [{
+            "id": "registered-source",
+            "topic_url": f"{origin}/t/topic/authorized",
+            "attachment_url_prefix": f"{origin}/uploads/authorized/",
+        }],
+    }))
+    return manifest
+
+
 class serve_file:
     def __init__(self, path: Path):
         self.path = path
@@ -187,6 +300,45 @@ class serve_file:
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return f"http://127.0.0.1:{self.server.server_port}/{self.path.name}"
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
+class serve_routes:
+    def __init__(self, routes, requests=None):
+        self.routes = routes
+        self.requests = requests
+
+    def __enter__(self):
+        routes = self.routes
+        requests = self.requests
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(inner_self):
+                if requests is not None:
+                    requests.append((inner_self.path, inner_self.headers.get("Cookie")))
+                route = routes.get(inner_self.path)
+                if route is None:
+                    inner_self.send_response(404)
+                    inner_self.end_headers()
+                    return
+                content_type, content = route
+                inner_self.send_response(200)
+                inner_self.send_header("Content-Type", content_type)
+                inner_self.send_header("Content-Length", str(len(content)))
+                inner_self.end_headers()
+                inner_self.wfile.write(content)
+
+            def log_message(self, *_args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return f"http://127.0.0.1:{self.server.server_port}"
 
     def __exit__(self, *_args):
         self.server.shutdown()

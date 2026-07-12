@@ -8,6 +8,7 @@ const MAX_DURATION_SECONDS = 600;
 
 export interface GrokPoolConfig {
   credentials: PoolCredential[];
+  credentialsFile: string;
   clientToken: string;
   baseUrl: string;
   host: typeof LOOPBACK;
@@ -15,6 +16,7 @@ export interface GrokPoolConfig {
   cooldownMs: number;
   transientCooldownMs: number;
   timeoutMs: number;
+  reloadIntervalMs: number;
 }
 
 export interface StartGrokPoolServerOptions {
@@ -27,6 +29,7 @@ export interface RunningGrokPoolServer {
   server: ReturnType<typeof Bun.serve>;
   url: string;
   config: GrokPoolConfig;
+  reloadNow(): Promise<boolean>;
   stop(): void;
 }
 
@@ -73,6 +76,16 @@ function parseCredentials(value: unknown): PoolCredential[] {
   });
 }
 
+async function readCredentialsFile(credentialsFile: string): Promise<PoolCredential[]> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readFile(credentialsFile, "utf8"));
+  } catch {
+    throw new Error("unable to read valid credential JSON from GROK_POOL_CREDENTIALS_FILE");
+  }
+  return parseCredentials(payload);
+}
+
 export async function loadGrokPoolConfig(env: Record<string, string | undefined> = process.env): Promise<GrokPoolConfig> {
   const credentialsFile = required(env, "GROK_POOL_CREDENTIALS_FILE");
   if (isVersionControlled(credentialsFile)) throw new Error("GROK_POOL_CREDENTIALS_FILE must not be version controlled");
@@ -82,17 +95,19 @@ export async function loadGrokPoolConfig(env: Record<string, string | undefined>
   const cooldownSeconds = positiveInteger(env.GROK_POOL_COOLDOWN_SECONDS, "GROK_POOL_COOLDOWN_SECONDS", 60, MAX_DURATION_SECONDS);
   const transientSeconds = positiveInteger(env.GROK_POOL_TRANSIENT_COOLDOWN_SECONDS, "GROK_POOL_TRANSIENT_COOLDOWN_SECONDS", 5, MAX_DURATION_SECONDS);
   const timeoutSeconds = positiveInteger(env.GROK_POOL_TIMEOUT_SECONDS, "GROK_POOL_TIMEOUT_SECONDS", 120, MAX_DURATION_SECONDS);
-  let payload: unknown;
-  try {
-    payload = JSON.parse(await readFile(isAbsolute(credentialsFile) ? credentialsFile : resolve(credentialsFile), "utf8"));
-  } catch {
-    throw new Error("unable to read valid credential JSON from GROK_POOL_CREDENTIALS_FILE");
-  }
+  const reloadIntervalSeconds = positiveInteger(
+    env.GROK_POOL_RELOAD_INTERVAL_SECONDS,
+    "GROK_POOL_RELOAD_INTERVAL_SECONDS",
+    5,
+    MAX_DURATION_SECONDS,
+  );
+  const resolvedCredentialsFile = isAbsolute(credentialsFile) ? credentialsFile : resolve(credentialsFile);
   const baseUrl = required(env, "GROK_POOL_BASE_URL").replace(/\/+$/, "");
   const upstream = new URL(baseUrl);
   if (!/^https?:$/.test(upstream.protocol)) throw new Error("GROK_POOL_BASE_URL must use http or https");
   return {
-    credentials: parseCredentials(payload),
+    credentials: await readCredentialsFile(resolvedCredentialsFile),
+    credentialsFile: resolvedCredentialsFile,
     clientToken: required(env, "GROK_POOL_CLIENT_TOKEN"),
     baseUrl,
     host: LOOPBACK,
@@ -100,6 +115,7 @@ export async function loadGrokPoolConfig(env: Record<string, string | undefined>
     cooldownMs: cooldownSeconds * 1_000,
     transientCooldownMs: transientSeconds * 1_000,
     timeoutMs: timeoutSeconds * 1_000,
+    reloadIntervalMs: reloadIntervalSeconds * 1_000,
   };
 }
 
@@ -143,12 +159,36 @@ async function bufferRequest(request: Request): Promise<{ signal: AbortSignal; c
 
 export async function startGrokPoolServer(options: StartGrokPoolServerOptions = {}): Promise<RunningGrokPoolServer> {
   const config = await loadGrokPoolConfig(options.env ?? process.env);
-  const pool = createGrokPool({
-    credentials: config.credentials,
-    cooldownMs: config.cooldownMs,
-    transientCooldownMs: config.transientCooldownMs,
-    logger: options.logger,
-  });
+  const makePool = (credentials: PoolCredential[]) => createGrokPool({
+      credentials,
+      cooldownMs: config.cooldownMs,
+      transientCooldownMs: config.transientCooldownMs,
+      logger: options.logger,
+    });
+  let pool = makePool(config.credentials);
+  let credentialFingerprint = JSON.stringify(config.credentials);
+  let reloadInFlight: Promise<boolean> | undefined;
+  const reloadNow = () => {
+    if (reloadInFlight) return reloadInFlight;
+    reloadInFlight = (async () => {
+      try {
+        const credentials = await readCredentialsFile(config.credentialsFile);
+        const fingerprint = JSON.stringify(credentials);
+        if (fingerprint === credentialFingerprint) return false;
+        pool.replaceCredentials(credentials);
+        config.credentials = credentials;
+        credentialFingerprint = fingerprint;
+        return true;
+      } catch {
+        return false;
+      } finally {
+        reloadInFlight = undefined;
+      }
+    })();
+    return reloadInFlight;
+  };
+  const reloadTimer = setInterval(() => { void reloadNow(); }, config.reloadIntervalMs);
+  reloadTimer.unref();
   const server = Bun.serve({
     hostname: config.host,
     port: options.port ?? config.port,
@@ -169,7 +209,11 @@ export async function startGrokPoolServer(options: StartGrokPoolServerOptions = 
     server,
     url: `http://${config.host}:${server.port}`,
     config,
-    stop: () => server.stop(true),
+    reloadNow,
+    stop: () => {
+      clearInterval(reloadTimer);
+      server.stop(true);
+    },
   };
 }
 

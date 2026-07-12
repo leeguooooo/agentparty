@@ -195,4 +195,23 @@ describe("authorized Grok credential pool", () => {
     await expect(response.text()).rejects.toThrow("stream interrupted");
     expect(attempts).toEqual(["grok-a"]);
   });
+
+  it("preserves failure state for unchanged credentials during hot replacement", async () => {
+    const pool = createGrokPool({ credentials: credentials() });
+    await pool.handle(request(), async (credential) => credential.id === "grok-a"
+      ? Response.json({ error: { message: "personal-team-blocked:spending-limit" } }, { status: 403 })
+      : Response.json({ ok: true }));
+
+    pool.replaceCredentials([
+      { id: "grok-a", secret: "secret-a" },
+      { id: "grok-b", secret: "secret-b" },
+      { id: "grok-new", secret: "secret-new" },
+    ]);
+
+    expect(pool.snapshot()).toMatchObject([
+      { id: "grok-a", state: "exhausted" },
+      { id: "grok-b", state: "healthy" },
+      { id: "grok-new", state: "healthy" },
+    ]);
+  });
 });
