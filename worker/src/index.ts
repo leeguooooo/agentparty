@@ -5549,13 +5549,23 @@ app.post("/api/channels/:slug/attachments", async (c) => {
     return c.json(errorBody("too_large", `attachment exceeds ${sizeLimit} bytes${sizeHint}`), 413);
   }
   const contentType = c.req.header("content-type")?.split(";")[0]?.trim() || "application/octet-stream";
-  // key 前缀锚定 slug：下载时 worker 用权威 slug 重新拼 key，跨频道的伪造引用读不到别人的 blob
-  const objectPath = `${crypto.randomUUID()}/${filename}`;
+  // #387 内容 hash 去重：object 按内容 sha256 命名（不再随机 uuid）——同频道内同内容+同名
+  // 重复上传落到同一个 key，R2 里只存一份，省存储/带宽。key 前缀仍锚定 slug 做跨频道隔离
+  // （下载时 worker 用权威 slug 重拼 key，伪造引用读不到别人的 blob）。hash 即完整性锚。
+  const digest = await crypto.subtle.digest("SHA-256", bytes.buffer as ArrayBuffer);
+  const hash = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const objectPath = `${hash}/${filename}`;
   const key = `${slug}/${objectPath}`;
-  await c.env.ATTACHMENTS.put(key, bytes, {
-    httpMetadata: { contentType },
-    customMetadata: { filename, uploaded_by: identity.name, channel: slug },
-  });
+  // 已存在同内容同名对象 → 跳过 put（去重命中），省一次写 + 上行带宽。
+  const existing = await c.env.ATTACHMENTS.head(key);
+  if (existing === null) {
+    await c.env.ATTACHMENTS.put(key, bytes, {
+      httpMetadata: { contentType },
+      customMetadata: { filename, uploaded_by: identity.name, channel: slug },
+    });
+  }
   const meta: Attachment = {
     key,
     filename,

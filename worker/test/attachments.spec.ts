@@ -131,4 +131,27 @@ describe("channel attachments (R2)", () => {
       url: meta.url,
     });
   });
+
+  it("dedupes by content hash: same bytes+filename → same key; different bytes → different key (#387)", async () => {
+    const { token } = await seedToken("agent", uniq("owner"), { owner: "owner@ap.test" });
+    const slug = await createChannel(token);
+    const bytes = new TextEncoder().encode("identical payload for dedup");
+
+    const first = (await (await upload(slug, token, "dup.bin", bytes)).json()) as { key: string; url: string };
+    const second = (await (await upload(slug, token, "dup.bin", bytes)).json()) as { key: string; url: string };
+    // 内容 hash 命名 → 同内容同名两次上传落同一个 key（R2 里只一份）
+    expect(second.key).toBe(first.key);
+    expect(second.url).toBe(first.url);
+    // key 是 slug/<64hex>/filename
+    expect(first.key).toMatch(new RegExp(`^${slug}/[0-9a-f]{64}/dup\\.bin$`));
+
+    // 内容不同 → key 不同
+    const other = (await (await upload(slug, token, "dup.bin", new TextEncoder().encode("different"))).json()) as { key: string };
+    expect(other.key).not.toBe(first.key);
+
+    // 去重命中后仍可正常下载（对象确实在）
+    const dl = await download(slug, token, second.url.split("/attachments/")[1]!);
+    expect(dl.status).toBe(200);
+    expect(new TextEncoder().encode(await dl.text())).toEqual(bytes);
+  });
 });
