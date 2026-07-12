@@ -22,6 +22,10 @@ function memoryVault(initial: DesktopCredential | null = null) {
       credential = next;
       writes.push(next);
     },
+    writeInteractive: async (next) => {
+      credential = next;
+      writes.push(next);
+    },
     delete: async () => {
       credential = null;
       deletes += 1;
@@ -43,6 +47,7 @@ describe("desktop secure credentials", () => {
       if (command === "desktop_credential_read") return stored;
       if (command === "desktop_credential_authorize") return stored;
       if (command === "desktop_credential_write") stored = String(args?.credential);
+      if (command === "desktop_credential_write_interactive") stored = String(args?.credential);
       if (command === "desktop_credential_delete") stored = null;
       if (command === "desktop_credential_delete_interactive") stored = null;
       return null;
@@ -55,6 +60,7 @@ describe("desktop secure credentials", () => {
     };
 
     await vault.write(credential);
+    await vault.writeInteractive(credential);
     expect(await vault.read()).toEqual(credential);
     expect(await vault.authorize()).toEqual(credential);
     await vault.delete();
@@ -62,6 +68,7 @@ describe("desktop secure credentials", () => {
     expect(await vault.read()).toBeNull();
     expect(calls.map((call) => call.command)).toEqual([
       "desktop_credential_write",
+      "desktop_credential_write_interactive",
       "desktop_credential_read",
       "desktop_credential_authorize",
       "desktop_credential_delete",
@@ -168,6 +175,7 @@ describe("desktop secure credentials", () => {
     });
     let reads = 0;
     let authorizations = 0;
+    let interactiveWrites = 0;
     const vault: DesktopCredentialVault = {
       ...secure.vault,
       read: async () => {
@@ -177,6 +185,10 @@ describe("desktop secure credentials", () => {
       authorize: async () => {
         authorizations += 1;
         return secure.vault.authorize();
+      },
+      writeInteractive: async (next) => {
+        interactiveWrites += 1;
+        await secure.vault.writeInteractive(next);
       },
     };
 
@@ -192,6 +204,8 @@ describe("desktop secure credentials", () => {
     expect(access).toBe("access-new");
     expect(reads).toBe(0);
     expect(authorizations).toBe(1);
+    expect(interactiveWrites).toBe(1);
+    expect(secure.writes.at(-1)?.refreshToken).toBe("refresh-new");
   });
 });
 

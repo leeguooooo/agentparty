@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  parseDesignatedRequirement,
   parseAcceptanceCliArgs,
   parseUpdaterReceipt,
   verifyUpgradeEvidence,
@@ -12,7 +13,7 @@ function evidence(version: string, hash: string): InstalledAppEvidence {
   const executableHash = hash === "old" ? "a".repeat(64) : "b".repeat(64);
   const sidecarHash = hash === "old" ? "c".repeat(64) : "d".repeat(64);
   return {
-    schema: "agentparty.desktop-acceptance.v2",
+    schema: "agentparty.desktop-acceptance.v3",
     capturedAt: version === "0.2.90" ? "2026-07-11T00:00:00.000Z" : "2026-07-11T00:10:00.000Z",
     appPath: "/Applications/AgentParty.app",
     version,
@@ -25,6 +26,7 @@ function evidence(version: string, hash: string): InstalledAppEvidence {
     teamIdentifier: "TEAM123456",
     codeIdentifier: "com.agentparty.desktop",
     designatedRequirement: 'identifier "com.agentparty.desktop" and anchor apple generic and certificate leaf[subject.OU] = TEAM123456',
+    entitlementsSha256: "e".repeat(64),
     codesignVerified: true,
     gatekeeperAccepted: true,
     notarizationStapled: true,
@@ -42,6 +44,27 @@ const receipt: UpdaterReceipt = {
 };
 
 describe("desktop production acceptance", () => {
+  test("parses only a stable Developer ID designated requirement", () => {
+    expect(parseDesignatedRequirement(
+      'identifier "com.agentparty.desktop" and anchor apple generic and certificate leaf[subject.OU] = TEAM123456',
+    )).toEqual({
+      codeIdentifier: "com.agentparty.desktop",
+      teamIdentifier: "TEAM123456",
+    });
+    expect(() => parseDesignatedRequirement(
+      'identifier "com.agentparty.desktop" and anchor apple and certificate leaf[subject.OU] = TEAM123456',
+    )).toThrow("stable Developer ID identity");
+    expect(() => parseDesignatedRequirement(
+      'identifier "com.agentparty.desktop" and anchor apple generic and cdhash H"DEADBEEF" and certificate leaf[subject.OU] = TEAM123456',
+    )).toThrow("stable Developer ID identity");
+    expect(() => parseDesignatedRequirement(
+      'identifier "com.agentparty.desktop" and anchor apple generic',
+    )).toThrow("stable Developer ID identity");
+    expect(() => parseDesignatedRequirement(
+      'identifier "com.agentparty.desktop" and anchor apple generic or certificate leaf[subject.OU] = TEAM123456',
+    )).toThrow("stable Developer ID identity");
+  });
+
   test("parses explicit two-phase commands and rejects incomplete input", () => {
     expect(parseAcceptanceCliArgs([
       "baseline", "--app", "/Applications/AgentParty.app", "--expected-version", "0.2.90", "--output", "/tmp/base.json",
@@ -77,7 +100,7 @@ describe("desktop production acceptance", () => {
       "0.2.91",
       "2026-07-11T00:11:00.000Z",
     )).toEqual({
-      schema: "agentparty.desktop-acceptance.v2",
+      schema: "agentparty.desktop-acceptance.v3",
       status: "passed",
       fromVersion: "0.2.90",
       toVersion: "0.2.91",
@@ -125,9 +148,29 @@ describe("desktop production acceptance", () => {
     )).toThrow("exactly one running desktop process");
   });
 
-  test("rejects signing identity drift even when the Team ID is unchanged", () => {
+  test("compares stable signing semantics across certificate renewal", () => {
     const baseline = evidence("0.2.90", "old");
     const current = evidence("0.2.91", "new");
+    expect(() => verifyUpgradeEvidence(
+      baseline,
+      {
+        ...current,
+        signingAuthority: "Developer ID Application: AgentParty Renamed (TEAM123456)",
+        designatedRequirement: 'identifier "com.agentparty.desktop" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[subject.OU] = "TEAM123456"',
+      },
+      receipt,
+      [{ pid: 42, executablePath: current.executablePath }],
+      "0.2.91",
+      "2026-07-11T00:11:00.000Z",
+    )).not.toThrow();
+    expect(() => verifyUpgradeEvidence(
+      baseline,
+      { ...current, entitlementsSha256: "f".repeat(64) },
+      receipt,
+      [{ pid: 42, executablePath: current.executablePath }],
+      "0.2.91",
+      "2026-07-11T00:11:00.000Z",
+    )).toThrow("entitlements changed");
     expect(() => verifyUpgradeEvidence(
       baseline,
       { ...current, codeIdentifier: "agentparty_desktop-random-hash" },
@@ -138,7 +181,11 @@ describe("desktop production acceptance", () => {
     )).toThrow("code-signing identity changed");
     expect(() => verifyUpgradeEvidence(
       baseline,
-      { ...current, designatedRequirement: 'cdhash H"DEADBEEF"' },
+      {
+        ...current,
+        teamIdentifier: "OTHERTEAM1",
+        designatedRequirement: 'identifier "com.agentparty.desktop" and anchor apple generic and certificate leaf[subject.OU] = OTHERTEAM1',
+      },
       receipt,
       [{ pid: 42, executablePath: current.executablePath }],
       "0.2.91",

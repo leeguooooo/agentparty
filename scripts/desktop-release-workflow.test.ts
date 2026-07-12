@@ -5,7 +5,12 @@ import { spawnSync } from "node:child_process";
 
 const workflow = readFileSync(resolve(import.meta.dir, "../.github/workflows/release.yml"), "utf8");
 const workflowDocument = Bun.YAML.parse(workflow) as {
-  jobs: { release: { steps: Array<{ name?: string; run?: string }> } };
+  jobs: {
+    release: {
+      concurrency?: { group?: string; "cancel-in-progress"?: boolean };
+      steps: Array<{ name?: string; run?: string }>;
+    };
+  };
 };
 const appleSigningMode = readFileSync(resolve(import.meta.dir, "apple-signing-mode.ts"), "utf8");
 const desktopDocs = readFileSync(
@@ -283,6 +288,26 @@ describe("desktop release workflow", () => {
     const syntax = spawnSync("bash", ["-n"], { input: script, encoding: "utf8" });
     expect(syntax.status).toBe(0);
     expect(syntax.stderr).toBe("");
+  });
+
+  test("serializes fixed-channel publication and restores verified manifests on failure", () => {
+    expect(workflowDocument.jobs.release.concurrency).toEqual({
+      group: "desktop-updater-fixed-channel",
+      "cancel-in-progress": false,
+    });
+    const script = workflowDocument.jobs.release.steps.find(
+      (step) => step.name === "publish isolated desktop updater channel",
+    )?.run ?? "";
+    expect(script).toContain('backup_dir="$RUNNER_TEMP/desktop-updater-channel-backup"');
+    expect(script).toContain('|| gh release view "$channel_tag"');
+    expect(script).toContain('trap restore_channel_manifests ERR');
+    expect(script).toContain('gh release download "$channel_tag"');
+    expect(script).toContain('--check-not-older-than "$current_version" "$candidate_version"');
+    expect(script).toContain('gh release upload "$channel_tag" "${manifests[@]}"');
+    expect(script).toContain('--clobber');
+    expect(script).toContain('verification_dir="$RUNNER_TEMP/desktop-updater-channel-verification"');
+    expect(script).toContain('cmp --silent "$manifest" "$verification_dir/$manifest_name"');
+    expect(script).toContain('trap - ERR');
   });
 
   test("uses commands available on GitHub macOS runners for certificate import", () => {

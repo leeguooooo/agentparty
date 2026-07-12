@@ -483,6 +483,7 @@ describe("App desktop server pairing behavior", () => {
 
     const root = renderer!.root;
     expect(root.findByProps({ role: "alert" }).children).toContain("The secure desktop session could not be refreshed.");
+    expect(root.findByProps({ className: "d-btn d-btn--primary" }).children).toContain("Retry");
     expect(root.findByProps({ className: "desktop-recovery-updater" })).toBeTruthy();
     expect(root.findAll((node) =>
       typeof node.props.className === "string" && node.props.className.split(/\s+/).includes("desktop-updater-trigger"),
@@ -498,6 +499,41 @@ describe("App desktop server pairing behavior", () => {
     expect(apiBase()).toBe(privateOrigin);
     expect(credentialDeletes).toBe(0);
     expect(credentials.has(activeOrigin)).toBe(true);
+  });
+
+  test("offers interactive Keychain authorization only for the native authorization sentinel", async () => {
+    const commands: string[] = [];
+    invokeHandler = async (command, args) => {
+      commands.push(command);
+      if (command === "desktop_credential_migrate") return null;
+      if (command === "desktop_credential_read") throw new Error("desktop_keychain_authorization_required");
+      if (command === "desktop_credential_authorize") return storedCredential;
+      if (command === "desktop_credential_write_interactive") {
+        storedCredential = String(args?.credential);
+        return null;
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    };
+
+    await act(async () => {
+      renderer = create(<LocaleProvider><App /></LocaleProvider>);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const root = renderer!.root;
+    const recovery = root.findByProps({ className: "d-btn d-btn--primary" });
+    expect(recovery.children).toContain("Authorize and retry");
+
+    await act(async () => {
+      recovery.props.onClick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(commands).toContain("desktop_credential_authorize");
+    expect(commands).toContain("desktop_credential_write_interactive");
+    expect(root.findByProps({ className: "app-settings-btn" })).toBeTruthy();
   });
 
   test("logged-in add/pair cancellation preserves the old token, origin, runtime base, and credential", async () => {

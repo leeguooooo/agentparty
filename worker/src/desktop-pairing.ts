@@ -14,6 +14,9 @@ const WRONG_CODE_WINDOW_MS = 15 * 60 * 1000;
 const WRONG_CODE_LIMIT = 5;
 const WRONG_CODE_BLOCK_MS = 60 * 60 * 1000;
 const RECOVERY_TTL_MS = 60_000;
+const REFRESH_RECOVERY_MIN_AGE_MS = 1_000;
+const REFRESH_RECOVERY_WINDOW_MS = 5 * 60_000;
+const REFRESH_RECOVERY_CLAIM_SCALE = 4096;
 const BASE20 = "23456789BCDFGHJKLMNP";
 const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
 const textEncoder = new TextEncoder();
@@ -804,16 +807,121 @@ export async function refreshDesktopSession(request: Request, env: DesktopPairin
     return sensitiveJson(errorBody("bad_request", "valid refresh_token and device_secret required"), 400);
   }
   const refreshHash = await desktopCredentialHash(secret, "refresh", refreshToken);
-  const replay = await env.DB.prepare("SELECT session_id FROM desktop_refresh_history WHERE refresh_hash = ?")
+  const replay = await env.DB.prepare(
+    "SELECT session_id, rotated_at FROM desktop_refresh_history WHERE refresh_hash = ?",
+  )
     .bind(refreshHash)
-    .first<{ session_id: string }>();
+    .first<{ session_id: string; rotated_at: number }>();
   if (replay) {
     const now = Date.now();
-    await env.DB.prepare("UPDATE desktop_sessions SET revoked_at = COALESCE(revoked_at, ?), updated_at = ? WHERE id = ?")
-      .bind(now, now, replay.session_id)
-      .run();
-    await audit(env.DB, "refresh_replay_revoked", { sessionId: replay.session_id });
-    return sensitiveJson(errorBody("replay_detected", "refresh token replay revoked the session"), 403);
+    const session = await env.DB.prepare(
+      `SELECT id, account, device_name, device_platform, device_app_version,
+              device_secret_challenge, access_hash, access_expires_at, refresh_hash,
+              refresh_expires_at, created_at, updated_at, last_used_at, revoked_at
+         FROM desktop_sessions WHERE id = ?`,
+    )
+      .bind(replay.session_id)
+      .first<SessionRow>();
+    if (!session || session.revoked_at !== null) {
+      return sensitiveJson(errorBody("unauthorized", "invalid refresh token"), 401);
+    }
+    if (session.refresh_expires_at <= now) {
+      await env.DB.prepare("UPDATE desktop_sessions SET revoked_at = ?, updated_at = ? WHERE id = ? AND revoked_at IS NULL")
+        .bind(now, now, session.id)
+        .run();
+      await audit(env.DB, "refresh_recovery_expired", { sessionId: session.id });
+      return sensitiveJson(errorBody("expired", "refresh token expired"), 410);
+    }
+    if (!constantTimeEqual(await s256(deviceSecret), session.device_secret_challenge)) {
+      await audit(env.DB, "refresh_recovery_device_proof_failed", { sessionId: session.id });
+      return sensitiveJson(errorBody("unauthorized", "invalid device proof"), 401);
+    }
+
+    // A negative timestamp is an atomic one-shot recovery claim. Its magnitude
+    // retains the original rotation time so stale replays still age out.
+    const rotatedAt = replay.rotated_at < 0
+      ? Math.floor(-replay.rotated_at / REFRESH_RECOVERY_CLAIM_SCALE)
+      : replay.rotated_at;
+    if (replay.rotated_at < 0) {
+      await audit(env.DB, "refresh_recovery_conflict", { sessionId: session.id });
+      return sensitiveJson(errorBody("refresh_conflict", "refresh recovery already used"), 409);
+    }
+    if (rotatedAt > now || now - rotatedAt > REFRESH_RECOVERY_WINDOW_MS) {
+      await env.DB.prepare("UPDATE desktop_sessions SET revoked_at = COALESCE(revoked_at, ?), updated_at = ? WHERE id = ?")
+        .bind(now, now, replay.session_id)
+        .run();
+      await audit(env.DB, "refresh_replay_revoked", { sessionId: replay.session_id });
+      return sensitiveJson(errorBody("replay_detected", "refresh token replay revoked the session"), 403);
+    }
+    if (now - rotatedAt < REFRESH_RECOVERY_MIN_AGE_MS) {
+      await audit(env.DB, "refresh_recovery_too_early", { sessionId: session.id });
+      return sensitiveJson(
+        errorBody("refresh_conflict", "refresh recovery cannot start while the original rotation is in flight"),
+        409,
+        { "retry-after": "1" },
+      );
+    }
+
+    const nextAccess = randomCredential("apd");
+    const nextRefresh = randomCredential("apr");
+    const nextAccessHash = await desktopCredentialHash(secret, "access", nextAccess);
+    const nextRefreshHash = await desktopCredentialHash(secret, "refresh", nextRefresh);
+    const claimRandom = crypto.getRandomValues(new Uint16Array(1))[0] & (REFRESH_RECOVERY_CLAIM_SCALE - 1);
+    const claimMarker = -(rotatedAt * REFRESH_RECOVERY_CLAIM_SCALE + claimRandom);
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE desktop_refresh_history SET rotated_at = ?
+          WHERE refresh_hash = ? AND rotated_at = ? AND rotated_at >= 0`,
+      ).bind(claimMarker, refreshHash, replay.rotated_at),
+      env.DB.prepare(
+        `UPDATE desktop_sessions
+            SET access_hash = ?, access_expires_at = ?, refresh_hash = ?,
+                updated_at = ?, last_used_at = ?
+          WHERE id = ? AND refresh_hash = ? AND revoked_at IS NULL
+            AND refresh_expires_at > ?
+            AND EXISTS (
+              SELECT 1 FROM desktop_refresh_history
+               WHERE refresh_hash = ? AND session_id = ? AND rotated_at = ?
+            )`,
+      ).bind(
+        nextAccessHash,
+        now + ACCESS_TTL_MS,
+        nextRefreshHash,
+        now,
+        now,
+        session.id,
+        session.refresh_hash,
+        now,
+        refreshHash,
+        session.id,
+        claimMarker,
+      ),
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO desktop_refresh_history (refresh_hash, session_id, rotated_at)
+         SELECT ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM desktop_sessions
+             WHERE id = ? AND refresh_hash = ? AND revoked_at IS NULL
+          )`,
+      ).bind(session.refresh_hash, session.id, now, session.id, nextRefreshHash),
+    ]);
+    if (
+      results[0]?.meta.changes !== 1 ||
+      results[1]?.meta.changes !== 1 ||
+      results[2]?.meta.changes !== 1
+    ) {
+      await audit(env.DB, "refresh_recovery_conflict", { sessionId: session.id });
+      return sensitiveJson(errorBody("refresh_conflict", "concurrent refresh recovery"), 409);
+    }
+    await audit(env.DB, "session_refresh_recovered", { sessionId: session.id });
+    return sensitiveJson({
+      access_token: nextAccess,
+      token_type: "Bearer",
+      expires_in: ACCESS_TTL_MS / 1000,
+      refresh_token: nextRefresh,
+      refresh_expires_in: Math.max(0, Math.floor((session.refresh_expires_at - now) / 1000)),
+      session_id: session.id,
+    });
   }
   const session = await env.DB.prepare(
     `SELECT id, account, device_name, device_platform, device_app_version,
@@ -849,10 +957,18 @@ export async function refreshDesktopSession(request: Request, env: DesktopPairin
     ).bind(nextAccessHash, now + ACCESS_TTL_MS, nextRefreshHash, now, now, session.id, refreshHash),
     env.DB.prepare(
       `INSERT OR IGNORE INTO desktop_refresh_history (refresh_hash, session_id, rotated_at)
-       VALUES (?, ?, ?)`,
-    ).bind(refreshHash, session.id, now),
+       SELECT ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM desktop_sessions
+           WHERE id = ? AND refresh_hash = ? AND revoked_at IS NULL
+        )`,
+    ).bind(refreshHash, session.id, now, session.id, nextRefreshHash),
   ]);
   if (results[0]?.meta.changes !== 1) {
+    await audit(env.DB, "refresh_race_rejected", { sessionId: session.id });
+    return sensitiveJson(errorBody("refresh_conflict", "concurrent refresh rotation"), 409);
+  }
+  if (results[1]?.meta.changes !== 1) {
     await env.DB.prepare("UPDATE desktop_sessions SET revoked_at = COALESCE(revoked_at, ?), updated_at = ? WHERE id = ?")
       .bind(now, now, session.id)
       .run();

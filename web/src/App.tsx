@@ -61,9 +61,11 @@ import {
 import { withRefreshLock } from "./lib/refreshLock";
 import { gateSession, jwtSub } from "./lib/sessionIdentity";
 import {
+  classifyDesktopRestoreFailure,
   initialTokenForRuntime,
   restoreDesktopAccess,
   restoreDesktopAccessInteractive,
+  type DesktopRestoreFailure,
 } from "./lib/desktopAuth";
 import {
   desktopCredentialVaultForOrigin,
@@ -146,6 +148,7 @@ export function App() {
   identityRef.current = jwtSub(token);
   const [authError, setAuthError] = useState<string | null>(null);
   const [desktopBoot, setDesktopBoot] = useState<"loading" | "ready" | "error">(desktop ? "loading" : "ready");
+  const [desktopRestoreFailure, setDesktopRestoreFailure] = useState<DesktopRestoreFailure>("retryable");
   const [desktopNotice, setDesktopNotice] = useState<string | null>(null);
   const [desktopLogoutPending, setDesktopLogoutPending] = useState(false);
   const [channels, setChannels] = useState<ChannelInfo[] | null>(null);
@@ -210,11 +213,13 @@ export function App() {
     return restoreDesktopAccess(desktopCredentialVaultForOrigin(activeOrigin), activeOrigin)
       .then((accessToken) => {
         setToken(accessToken);
+        setDesktopRestoreFailure("retryable");
         setDesktopBoot("ready");
         return accessToken;
       })
       .catch((cause: unknown) => {
         setToken(null);
+        setDesktopRestoreFailure(classifyDesktopRestoreFailure(cause));
         setDesktopBoot("error");
         throw cause;
       });
@@ -226,11 +231,13 @@ export function App() {
     return restoreDesktopAccessInteractive(desktopCredentialVaultForOrigin(activeOrigin), activeOrigin)
       .then((accessToken) => {
         setToken(accessToken);
+        setDesktopRestoreFailure("retryable");
         setDesktopBoot("ready");
         return accessToken;
       })
       .catch((cause: unknown) => {
         setToken(null);
+        setDesktopRestoreFailure(classifyDesktopRestoreFailure(cause));
         setDesktopBoot("error");
         throw cause;
       });
@@ -427,11 +434,13 @@ export function App() {
     })().then((accessToken) => {
         if (!alive) return;
         setToken(accessToken);
+        setDesktopRestoreFailure("retryable");
         setDesktopBoot("ready");
       })
-      .catch(() => {
+      .catch((cause: unknown) => {
         if (!alive) return;
         setToken(null);
+        setDesktopRestoreFailure(classifyDesktopRestoreFailure(cause));
         setDesktopBoot("error");
       });
     return () => { alive = false; };
@@ -835,8 +844,16 @@ export function App() {
                 >
                   {t("App.desktop.removeLocal")}
                 </button>
-                <button type="button" className="d-btn d-btn--primary" onClick={() => void restoreDesktopInteractive().catch(() => {})}>
-                  {t("App.desktop.retry")}
+                <button
+                  type="button"
+                  className="d-btn d-btn--primary"
+                  onClick={() => void (desktopRestoreFailure === "keychain-authorization"
+                    ? restoreDesktopInteractive()
+                    : restoreDesktop()).catch(() => {})}
+                >
+                  {t(desktopRestoreFailure === "keychain-authorization"
+                    ? "App.desktop.authorizeRetry"
+                    : "App.desktop.retry")}
                 </button>
               </div>
             </section>

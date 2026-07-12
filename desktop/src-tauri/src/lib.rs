@@ -469,14 +469,42 @@ fn migrate_legacy_credential<B: CredentialBackend>(backend: &B) -> Result<Option
 }
 
 #[cfg(desktop)]
-#[tauri::command]
-fn desktop_credential_write(origin: String, credential: String) -> Result<(), String> {
+fn write_desktop_credential_with_interaction(
+    origin: String,
+    credential: String,
+    allow_interaction: bool,
+) -> Result<(), String> {
     let parsed = parse_stored_credential(&credential)?;
     if parsed.server_origin != origin {
         return Err("desktop credential origin does not match its slot".to_string());
     }
     let account = credential_account_for_origin(&origin)?;
+    #[cfg(target_os = "macos")]
+    return macos_keychain_write(
+        MACOS_CREDENTIAL_SERVICE,
+        &account,
+        &credential,
+        allow_interaction,
+    );
+    #[cfg(not(target_os = "macos"))]
     NativeCredentialBackend.write(&account, &credential)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn desktop_credential_write(origin: String, credential: String) -> Result<(), String> {
+    write_desktop_credential_with_interaction(origin, credential, false)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn desktop_credential_write_interactive(
+    app: tauri::AppHandle,
+    origin: String,
+    credential: String,
+) -> Result<(), String> {
+    wait_for_main_window(app).await?;
+    write_desktop_credential_with_interaction(origin, credential, true)
 }
 
 #[cfg(desktop)]
@@ -1082,6 +1110,7 @@ pub fn run() {
             desktop_credential_read,
             desktop_credential_authorize,
             desktop_credential_write,
+            desktop_credential_write_interactive,
             desktop_credential_delete,
             desktop_credential_delete_interactive,
             desktop_credential_migrate,

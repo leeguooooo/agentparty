@@ -165,7 +165,8 @@ export const openapiDocument = {
     "/api/desktop/sessions/refresh": {
       post: {
         summary: "rotate a desktop session with refresh token and device secret",
-        description: "Old refresh-token replay revokes the entire desktop session.",
+        description:
+          "Refresh tokens rotate on every success. A recently rotated token has a 5-minute recovery window: after the original rotation has been in flight for one second, the same bound device secret may perform one CAS-protected recovery rotation. Missing or incorrect device proof never recovers the session. Replays outside the window revoke the session.",
         requestBody: {
           required: true,
           content: {
@@ -185,6 +186,7 @@ export const openapiDocument = {
           "200": { description: "rotated access and refresh tokens" },
           "401": { description: "invalid refresh token or device proof" },
           "403": { description: "refresh replay detected and session revoked" },
+          "409": { description: "another initial or recovery rotation won the compare-and-swap; retry with the winning token" },
           "410": { description: "refresh grant expired" },
         },
       },

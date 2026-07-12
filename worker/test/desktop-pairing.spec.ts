@@ -122,7 +122,9 @@ describe("desktop device pairing", () => {
   it("publishes the complete desktop Device Flow contract in OpenAPI", async () => {
     const res = await SELF.fetch("http://ap.test/openapi.json");
     expect(res.status).toBe(200);
-    const document = (await res.json()) as { paths: Record<string, unknown> };
+    const document = (await res.json()) as {
+      paths: Record<string, { post?: { description?: string; responses?: Record<string, unknown> } }>;
+    };
     expect(Object.keys(document.paths)).toEqual(
       expect.arrayContaining([
         "/api/desktop/pairings",
@@ -135,6 +137,10 @@ describe("desktop device pairing", () => {
         "/api/desktop/sessions/revoke",
       ]),
     );
+    const refresh = document.paths["/api/desktop/sessions/refresh"]?.post;
+    expect(refresh?.description).toContain("5-minute recovery window");
+    expect(refresh?.description).toContain("device secret");
+    expect(refresh?.responses).toHaveProperty("409");
   });
 
   it("allows only a human bearer to inspect and decide by user code", async () => {

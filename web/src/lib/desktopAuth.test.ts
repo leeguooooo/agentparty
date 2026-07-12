@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { __resetDesktopPairingSingleFlightsForTests } from "./desktopPairing";
 import type { DesktopCredentialVault } from "./desktopCredentials";
 import {
+  classifyDesktopRestoreFailure,
   initialTokenForRuntime,
   restoreDesktopAccess,
   restoreDesktopAccessInteractive,
@@ -37,6 +38,7 @@ describe("desktop app authentication integration", () => {
       },
       authorize: async () => null,
       write: async () => {},
+      writeInteractive: async () => {},
       delete: async () => {},
       deleteInteractive: async () => {},
     };
@@ -71,6 +73,7 @@ describe("desktop app authentication integration", () => {
         return null;
       },
       write: async () => {},
+      writeInteractive: async () => {},
       delete: async () => {},
       deleteInteractive: async () => {},
     };
@@ -82,5 +85,12 @@ describe("desktop app authentication integration", () => {
     )).toBeNull();
     expect(reads).toBe(0);
     expect(authorizations).toBe(1);
+  });
+
+  test("only classifies the native authorization sentinel as a Keychain recovery", () => {
+    expect(classifyDesktopRestoreFailure("desktop_keychain_authorization_required")).toBe("keychain-authorization");
+    expect(classifyDesktopRestoreFailure(new Error("desktop_keychain_authorization_required"))).toBe("keychain-authorization");
+    expect(classifyDesktopRestoreFailure(new TypeError("offline"))).toBe("retryable");
+    expect(classifyDesktopRestoreFailure(new Error("desktop session refresh failed (503)"))).toBe("retryable");
   });
 });

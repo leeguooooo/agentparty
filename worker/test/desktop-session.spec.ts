@@ -84,7 +84,37 @@ describe("desktop sessions", () => {
     expect(auditStored).not.toContain(paired.deviceSecret);
   });
 
-  it("revokes the whole session when an old refresh token is replayed", async () => {
+  it("recovers a recently rotated refresh token with the bound device secret", async () => {
+    const paired = await pairedSession();
+    const refreshed = await post("/api/desktop/sessions/refresh", {
+      refresh_token: paired.tokens.refresh_token,
+      device_secret: paired.deviceSecret,
+    });
+    const generationTwo = (await refreshed.json()) as { access_token: string; refresh_token: string };
+    await env.DB.prepare("UPDATE desktop_refresh_history SET rotated_at = ? WHERE session_id = ?")
+      .bind(Date.now() - 2_000, paired.tokens.session_id)
+      .run();
+
+    const recovered = await post("/api/desktop/sessions/refresh", {
+      refresh_token: paired.tokens.refresh_token,
+      device_secret: paired.deviceSecret,
+    });
+    expect(recovered.status).toBe(200);
+    const generationThree = (await recovered.json()) as { access_token: string; refresh_token: string };
+    expect(generationThree.access_token).not.toBe(generationTwo.access_token);
+    expect(generationThree.refresh_token).not.toBe(generationTwo.refresh_token);
+    expect((await api("/api/me", generationTwo.access_token)).status).toBe(401);
+    expect((await api("/api/me", generationThree.access_token)).status).toBe(200);
+
+    const history = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM desktop_refresh_history WHERE session_id = ?",
+    )
+      .bind(paired.tokens.session_id)
+      .first<{ count: number }>();
+    expect(history?.count).toBe(2);
+  });
+
+  it("rejects an old refresh token with the wrong device proof without revoking the session", async () => {
     const paired = await pairedSession();
     const refreshed = await post("/api/desktop/sessions/refresh", {
       refresh_token: paired.tokens.refresh_token,
@@ -94,24 +124,73 @@ describe("desktop sessions", () => {
 
     const replay = await post("/api/desktop/sessions/refresh", {
       refresh_token: paired.tokens.refresh_token,
+      device_secret: `wrong-${crypto.randomUUID()}-${crypto.randomUUID()}`,
+    });
+    expect(replay.status).toBe(401);
+    expect((await api("/api/me", next.access_token)).status).toBe(200);
+
+    const audit = await env.DB.prepare(
+      "SELECT event FROM desktop_audit WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+      .bind(paired.tokens.session_id)
+      .first<{ event: string }>();
+    expect(audit?.event).toBe("refresh_recovery_device_proof_failed");
+  });
+
+  it("revokes the whole session when an old refresh token is replayed outside the recovery window", async () => {
+    const paired = await pairedSession();
+    const refreshed = await post("/api/desktop/sessions/refresh", {
+      refresh_token: paired.tokens.refresh_token,
+      device_secret: paired.deviceSecret,
+    });
+    const next = (await refreshed.json()) as { access_token: string };
+    await env.DB.prepare("UPDATE desktop_refresh_history SET rotated_at = ? WHERE session_id = ?")
+      .bind(Date.now() - 5 * 60_000 - 1, paired.tokens.session_id)
+      .run();
+
+    const replay = await post("/api/desktop/sessions/refresh", {
+      refresh_token: paired.tokens.refresh_token,
       device_secret: paired.deviceSecret,
     });
     expect(replay.status).toBe(403);
     expect((await api("/api/me", next.access_token)).status).toBe(401);
   });
 
-  it("treats concurrent use of one refresh token as replay and revokes the winner", async () => {
+  it("allows only one concurrent recovery rotation and keeps the winner usable", async () => {
+    const paired = await pairedSession();
+    await post("/api/desktop/sessions/refresh", {
+      refresh_token: paired.tokens.refresh_token,
+      device_secret: paired.deviceSecret,
+    });
+    await env.DB.prepare("UPDATE desktop_refresh_history SET rotated_at = ? WHERE session_id = ?")
+      .bind(Date.now() - 2_000, paired.tokens.session_id)
+      .run();
+    const recover = () =>
+      post("/api/desktop/sessions/refresh", {
+        refresh_token: paired.tokens.refresh_token,
+        device_secret: paired.deviceSecret,
+      });
+
+    const responses = await Promise.all([recover(), recover()]);
+    expect(responses.map((res) => res.status).sort()).toEqual([200, 409]);
+    const winner = responses.find((res) => res.status === 200)!;
+    const next = (await winner.json()) as { access_token: string };
+    expect((await api("/api/me", next.access_token)).status).toBe(200);
+  });
+
+  it("allows only one concurrent initial rotation and keeps the winner usable", async () => {
     const paired = await pairedSession();
     const refresh = () =>
       post("/api/desktop/sessions/refresh", {
         refresh_token: paired.tokens.refresh_token,
         device_secret: paired.deviceSecret,
       });
+
     const responses = await Promise.all([refresh(), refresh()]);
-    expect(responses.map((res) => res.status).sort()).toEqual([200, 403]);
+    expect(responses.map((res) => res.status).sort()).toEqual([200, 409]);
     const winner = responses.find((res) => res.status === 200)!;
     const next = (await winner.json()) as { access_token: string };
-    expect((await api("/api/me", next.access_token)).status).toBe(401);
+    expect((await api("/api/me", next.access_token)).status).toBe(200);
   });
 
   it("detects replay of a refresh token older than the immediately previous generation", async () => {
@@ -126,6 +205,9 @@ describe("desktop sessions", () => {
       device_secret: paired.deviceSecret,
     });
     const generationThree = (await second.json()) as { access_token: string };
+    await env.DB.prepare("UPDATE desktop_refresh_history SET rotated_at = ? WHERE session_id = ?")
+      .bind(Date.now() - 5 * 60_000 - 1, paired.tokens.session_id)
+      .run();
 
     const replay = await post("/api/desktop/sessions/refresh", {
       refresh_token: paired.tokens.refresh_token,

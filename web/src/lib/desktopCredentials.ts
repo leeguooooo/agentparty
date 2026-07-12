@@ -20,6 +20,7 @@ export interface DesktopCredentialVault {
   read(): Promise<DesktopCredential | null>;
   authorize(): Promise<DesktopCredential | null>;
   write(credential: DesktopCredential): Promise<void>;
+  writeInteractive(credential: DesktopCredential): Promise<void>;
   delete(): Promise<void>;
   deleteInteractive(): Promise<void>;
 }
@@ -62,6 +63,10 @@ export function createInvokeCredentialVault(originInput: string, invoke: Desktop
     async write(credential) {
       if (credential.serverOrigin !== origin) throw new Error("desktop credential origin does not match its slot");
       await invoke<null>("desktop_credential_write", { origin, credential: JSON.stringify(credential) });
+    },
+    async writeInteractive(credential) {
+      if (credential.serverOrigin !== origin) throw new Error("desktop credential origin does not match its slot");
+      await invoke<null>("desktop_credential_write_interactive", { origin, credential: JSON.stringify(credential) });
     },
     async delete() {
       await invoke<null>("desktop_credential_delete", { origin });
@@ -128,7 +133,7 @@ export async function refreshDesktopSession(
   fetcher: Fetcher = fetch,
 ): Promise<string | null> {
   const credential = await vault.read();
-  return refreshDesktopCredential(credential, vault, allowedOrigins, fetcher);
+  return refreshDesktopCredential(credential, vault, allowedOrigins, fetcher, false);
 }
 
 export async function refreshDesktopSessionInteractive(
@@ -137,7 +142,7 @@ export async function refreshDesktopSessionInteractive(
   fetcher: Fetcher = fetch,
 ): Promise<string | null> {
   const credential = await vault.authorize();
-  return refreshDesktopCredential(credential, vault, allowedOrigins, fetcher);
+  return refreshDesktopCredential(credential, vault, allowedOrigins, fetcher, true);
 }
 
 async function refreshDesktopCredential(
@@ -145,6 +150,7 @@ async function refreshDesktopCredential(
   vault: DesktopCredentialVault,
   allowedOrigins: readonly string[],
   fetcher: Fetcher,
+  interactiveWrite: boolean,
 ): Promise<string | null> {
   if (credential === null) return null;
   if (!isAllowlistedServerOrigin(credential.serverOrigin, allowedOrigins)) {
@@ -159,7 +165,9 @@ async function refreshDesktopCredential(
     }),
   });
   const tokens = await readTokenResponse(response, "desktop session refresh");
-  await vault.write(credentialFromTokens(tokens, credential.deviceSecret, credential.serverOrigin));
+  const nextCredential = credentialFromTokens(tokens, credential.deviceSecret, credential.serverOrigin);
+  if (interactiveWrite) await vault.writeInteractive(nextCredential);
+  else await vault.write(nextCredential);
   return tokens.access_token;
 }
 

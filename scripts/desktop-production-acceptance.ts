@@ -14,7 +14,7 @@ import { spawnSync } from "node:child_process";
 
 import { compareVersionPrecedence, validateVersion } from "./release-version";
 
-const SCHEMA = "agentparty.desktop-acceptance.v2";
+const SCHEMA = "agentparty.desktop-acceptance.v3";
 const BUNDLE_IDENTIFIER = "com.agentparty.desktop";
 
 export interface InstalledAppEvidence {
@@ -31,6 +31,7 @@ export interface InstalledAppEvidence {
   teamIdentifier: string;
   codeIdentifier: string;
   designatedRequirement: string;
+  entitlementsSha256: string;
   codesignVerified: true;
   gatekeeperAccepted: true;
   notarizationStapled: true;
@@ -130,6 +131,30 @@ function requireInstalledApplication(path: string): string {
   return canonical;
 }
 
+export function parseDesignatedRequirement(requirement: string): {
+  codeIdentifier: string;
+  teamIdentifier: string;
+} {
+  const identifiers = [...requirement.matchAll(/\bidentifier\s+"([^"]+)"/g)];
+  const teamMatches = [...requirement.matchAll(
+    /\bcertificate\s+leaf\[subject\.OU]\s*=\s*(?:"([A-Z0-9]{10})"|([A-Z0-9]{10})(?![A-Z0-9]))/g,
+  )];
+  const anchors = [...requirement.matchAll(/\banchor\s+apple\s+generic\b/g)];
+  const codeIdentifier = identifiers[0]?.[1];
+  const teamMatch = teamMatches[0];
+  const teamIdentifier = teamMatch?.[1] ?? teamMatch?.[2];
+  if (!codeIdentifier
+    || !teamIdentifier
+    || identifiers.length !== 1
+    || teamMatches.length !== 1
+    || anchors.length !== 1
+    || /\bor\b/i.test(requirement)
+    || /\bcdhash\b/i.test(requirement)) {
+    throw new Error("desktop designated requirement is not stable Developer ID identity");
+  }
+  return { codeIdentifier, teamIdentifier };
+}
+
 export function inspectInstalledApp(app: string, expectedVersion: string): InstalledAppEvidence {
   if (process.platform !== "darwin") throw new Error("desktop production acceptance requires macOS");
   const appPath = requireInstalledApplication(app);
@@ -157,13 +182,17 @@ export function inspectInstalledApp(app: string, expectedVersion: string): Insta
   const codeIdentifier = signature.match(/^Identifier=(.+)$/m)?.[1];
   const designatedRequirement = run("codesign", ["-d", "-r-", "--", appPath]).stderr
     .match(/^designated => (.+)$/m)?.[1];
+  const entitlements = run("codesign", ["-d", "--entitlements", ":-", "--", appPath]).stdout;
+  const entitlementsSha256 = createHash("sha256").update(entitlements).digest("hex");
   if (!signingAuthority || !teamIdentifier) throw new Error("Developer ID signing identity is missing");
   if (codeIdentifier !== bundleIdentifier) throw new Error("CodeDirectory identifier does not match the app bundle");
-  if (!designatedRequirement
-    || !designatedRequirement.includes(`identifier \"${bundleIdentifier}\"`)
-    || !designatedRequirement.includes("anchor apple")
-    || designatedRequirement.includes("cdhash")) {
+  if (!designatedRequirement) {
     throw new Error("desktop designated requirement is not stable Developer ID identity");
+  }
+  const requirementIdentity = parseDesignatedRequirement(designatedRequirement);
+  if (requirementIdentity.codeIdentifier !== bundleIdentifier
+    || requirementIdentity.teamIdentifier !== teamIdentifier) {
+    throw new Error("desktop designated requirement does not match the signed application identity");
   }
 
   return {
@@ -180,6 +209,7 @@ export function inspectInstalledApp(app: string, expectedVersion: string): Insta
     teamIdentifier,
     codeIdentifier,
     designatedRequirement,
+    entitlementsSha256,
     codesignVerified: true,
     gatekeeperAccepted: true,
     notarizationStapled: true,
@@ -204,6 +234,8 @@ function isEvidence(value: unknown): value is InstalledAppEvidence {
     && typeof item.teamIdentifier === "string"
     && typeof item.codeIdentifier === "string"
     && typeof item.designatedRequirement === "string"
+    && typeof item.entitlementsSha256 === "string"
+    && /^[0-9a-f]{64}$/.test(item.entitlementsSha256)
     && item.codesignVerified === true
     && item.gatekeeperAccepted === true
     && item.notarizationStapled === true;
@@ -211,6 +243,9 @@ function isEvidence(value: unknown): value is InstalledAppEvidence {
   try {
     validateVersion(item.version as string);
     validateVersion(item.sidecarVersion as string);
+    const requirementIdentity = parseDesignatedRequirement(item.designatedRequirement as string);
+    if (requirementIdentity.codeIdentifier !== item.codeIdentifier
+      || requirementIdentity.teamIdentifier !== item.teamIdentifier) return false;
   } catch {
     return false;
   }
@@ -260,11 +295,20 @@ export function verifyUpgradeEvidence(
   if (baseline.executableSha256 === current.executableSha256 || baseline.sidecarSha256 === current.sidecarSha256) {
     throw new Error("desktop upgrade did not replace both bundled executables");
   }
+  const baselineRequirement = parseDesignatedRequirement(baseline.designatedRequirement);
+  const currentRequirement = parseDesignatedRequirement(current.designatedRequirement);
   if (baseline.teamIdentifier !== current.teamIdentifier
-    || baseline.signingAuthority !== current.signingAuthority
     || baseline.codeIdentifier !== current.codeIdentifier
-    || baseline.designatedRequirement !== current.designatedRequirement) {
+    || baselineRequirement.codeIdentifier !== currentRequirement.codeIdentifier
+    || baselineRequirement.teamIdentifier !== currentRequirement.teamIdentifier
+    || baselineRequirement.codeIdentifier !== baseline.codeIdentifier
+    || currentRequirement.codeIdentifier !== current.codeIdentifier
+    || baselineRequirement.teamIdentifier !== baseline.teamIdentifier
+    || currentRequirement.teamIdentifier !== current.teamIdentifier) {
     throw new Error("desktop code-signing identity changed during upgrade");
+  }
+  if (baseline.entitlementsSha256 !== current.entitlementsSha256) {
+    throw new Error("desktop signed entitlements changed during upgrade");
   }
   if (!baseline.signingAuthority.startsWith("Developer ID Application:")
     || !current.signingAuthority.startsWith("Developer ID Application:")) {

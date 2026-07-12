@@ -683,6 +683,9 @@ jobs:
     needs:
       - build
       - desktop
+    concurrency:
+      group: desktop-updater-fixed-channel
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write # 建/改 Release、上传 assets
@@ -905,7 +908,8 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "AgentParty Desktop ${DESKTOP_DISTRIBUTION} channel" \
               --notes "Machine-managed desktop updater manifest channel." \
-              --prerelease
+              --prerelease \
+              || gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
           manifests=()
           for manifest in dist/latest.json dist/latest-v2.json; do
@@ -917,6 +921,79 @@ jobs:
             echo "::error::no desktop updater manifests are available"
             exit 1
           fi
+
+          candidate_version="$(jq -er '.version | strings' "${manifests[0]}")"
+          if [ "$candidate_version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::desktop updater manifest version does not match the release tag"
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"; do
+            manifest_version="$(jq -er '.version | strings' "$manifest")"
+            if [ "$manifest_version" != "$candidate_version" ]; then
+              echo "::error::desktop updater manifests disagree on candidate version"
+              exit 1
+            fi
+          done
+
+          backup_dir="$RUNNER_TEMP/desktop-updater-channel-backup"
+          rm -rf "$backup_dir"
+          mkdir -p "$backup_dir"
+          existing_assets="$(gh release view "$channel_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name')"
+          for manifest in "${manifests[@]}"; do
+            manifest_name="$(basename "$manifest")"
+            if grep -Fxq "$manifest_name" <<<"$existing_assets"; then
+              gh release download "$channel_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$manifest_name" \
+                --output "$backup_dir/$manifest_name"
+              current_version="$(jq -er '.version | strings' "$backup_dir/$manifest_name")"
+              bun scripts/release-version.ts \
+                --check-not-older-than "$current_version" "$candidate_version"
+            fi
+          done
+
+          restore_channel_manifests() {
+            original_status=$?
+            trap - ERR
+            set +e
+            restore_failed=0
+            echo "::warning::desktop updater channel publication failed; restoring previous manifests"
+            for manifest in "${manifests[@]}"; do
+              manifest_name="$(basename "$manifest")"
+              gh release delete-asset "$channel_tag" "$manifest_name" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes >/dev/null 2>&1 || true
+            done
+            for backup in "$backup_dir"/*; do
+              [ -f "$backup" ] || continue
+              gh release upload "$channel_tag" "$backup" \
+                --repo "$GITHUB_REPOSITORY" \
+                --clobber || restore_failed=1
+            done
+            if [ "$restore_failed" -ne 0 ]; then
+              echo "::error::desktop updater channel rollback was incomplete"
+              exit 1
+            fi
+            exit "$original_status"
+          }
+
+          trap restore_channel_manifests ERR
           gh release upload "$channel_tag" "${manifests[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
+          verification_dir="$RUNNER_TEMP/desktop-updater-channel-verification"
+          rm -rf "$verification_dir"
+          mkdir -p "$verification_dir"
+          for manifest in "${manifests[@]}"; do
+            manifest_name="$(basename "$manifest")"
+            gh release download "$channel_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$manifest_name" \
+              --output "$verification_dir/$manifest_name"
+            cmp --silent "$manifest" "$verification_dir/$manifest_name"
+          done
+          trap - ERR
