@@ -177,6 +177,24 @@ const defaultRuntime: DesktopStorageRuntime = {
   },
 };
 
+let desktopSnapshotQueue: Promise<void> = Promise.resolve();
+
+export async function snapshotDesktopStorage(
+  storage: Storage = localStorage,
+  runtime: DesktopStorageRuntime = defaultRuntime,
+): Promise<boolean> {
+  if (!runtime.isDesktop()) return false;
+  try {
+    const entries = collectDesktopStorage(storage);
+    const pending = desktopSnapshotQueue.then(() => runtime.snapshot(entries));
+    desktopSnapshotQueue = pending.catch(() => {});
+    await pending;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function synchronizeDesktopStorage(
   storage: Storage = localStorage,
   runtime: DesktopStorageRuntime = defaultRuntime,
@@ -184,8 +202,7 @@ export async function synchronizeDesktopStorage(
   if (!runtime.isDesktop()) return false;
   try {
     restoreDesktopStorage(storage, await runtime.restore());
-    await runtime.snapshot(collectDesktopStorage(storage));
-    return true;
+    return await snapshotDesktopStorage(storage, runtime);
   } catch {
     return false;
   }

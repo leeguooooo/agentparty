@@ -46,9 +46,12 @@ describe("server origin validation", () => {
 describe("server profiles", () => {
   test("always includes official prod/test and stores only custom label/origin", () => {
     const storage = memoryStorage();
+    const snapshots: string[] = [];
     const profiles = addCustomServerProfile(storage, {
       label: "Team Party",
       origin: "https://party.example.com",
+    }, (mutatedStorage) => {
+      snapshots.push(mutatedStorage.getItem("ap_server_profiles_v1") ?? "missing");
     });
 
     expect(profiles.slice(0, 2)).toEqual(OFFICIAL_SERVER_PROFILES);
@@ -62,13 +65,20 @@ describe("server profiles", () => {
     expect(persisted).toContain("party.example.com");
     expect(persisted).not.toMatch(/refresh|device.secret|access.token/i);
     expect(loadServerProfiles(storage)).toEqual(profiles);
+    expect(snapshots).toEqual([
+      '[{"label":"Team Party","origin":"https://party.example.com"}]',
+    ]);
   });
 
   test("persists an active origin only when it belongs to a profile", () => {
     const storage = memoryStorage();
-    addCustomServerProfile(storage, { label: "Team", origin: "https://party.example.com" });
-    saveActiveServerOrigin(storage, "https://party.example.com");
+    const snapshots: string[] = [];
+    addCustomServerProfile(storage, { label: "Team", origin: "https://party.example.com" }, () => {});
+    saveActiveServerOrigin(storage, "https://party.example.com", (mutatedStorage) => {
+      snapshots.push(mutatedStorage.getItem("ap_active_server_origin_v1") ?? "missing");
+    });
     expect(loadActiveServerOrigin(storage)).toBe("https://party.example.com");
+    expect(snapshots).toEqual(["https://party.example.com"]);
 
     expect(() => saveActiveServerOrigin(storage, "https://unknown.example.com")).toThrow();
     expect(loadActiveServerOrigin(storage)).toBe("https://party.example.com");

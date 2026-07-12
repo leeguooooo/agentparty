@@ -3,7 +3,9 @@ import { describe, expect, test } from "bun:test";
 import {
   collectDesktopStorage,
   restoreDesktopStorage,
+  snapshotDesktopStorage,
   synchronizeDesktopStorage,
+  type DesktopStorageSnapshot,
   type DesktopStorageRuntime,
 } from "./desktopStorage";
 
@@ -126,8 +128,49 @@ describe("desktop origin storage migration", () => {
     expect(calls).toEqual(["restore", "snapshot:midnight:zh"]);
   });
 
+  test("queues snapshots in mutation order and captures each mutation immediately", async () => {
+    const value = storage({
+      ap_server_profiles_v1: '[{"label":"Private","origin":"https://private.example"}]',
+    });
+    const snapshots: DesktopStorageSnapshot[] = [];
+    let releaseFirstSnapshot!: () => void;
+    const firstSnapshotBlocked = new Promise<void>((resolve) => { releaseFirstSnapshot = resolve; });
+    const runtime: DesktopStorageRuntime = {
+      isDesktop: () => true,
+      restore: async () => ({}),
+      snapshot: async (entries) => {
+        snapshots.push(entries);
+        if (snapshots.length === 1) await firstSnapshotBlocked;
+      },
+    };
+
+    const profileSnapshot = snapshotDesktopStorage(value, runtime);
+    value.setItem("ap_active_server_origin_v1", "https://private.example");
+    const activeOriginSnapshot = snapshotDesktopStorage(value, runtime);
+    value.setItem("ap_active_server_origin_v1", "https://agentparty.leeguoo.com");
+
+    await Promise.resolve();
+    expect(snapshots).toHaveLength(1);
+    releaseFirstSnapshot();
+    expect(await Promise.all([profileSnapshot, activeOriginSnapshot])).toEqual([true, true]);
+    expect(snapshots).toEqual([
+      {
+        ap_server_profiles_v1: '[{"label":"Private","origin":"https://private.example"}]',
+      },
+      {
+        ap_server_profiles_v1: '[{"label":"Private","origin":"https://private.example"}]',
+        ap_active_server_origin_v1: "https://private.example",
+      },
+    ]);
+  });
+
   test("is a non-blocking no-op outside desktop and fails closed", async () => {
     const value = storage({ ap_theme: "midnight" });
+    expect(await snapshotDesktopStorage(value, {
+      isDesktop: () => false,
+      restore: async () => { throw new Error("must not run"); },
+      snapshot: async () => { throw new Error("must not run"); },
+    })).toBe(false);
     expect(await synchronizeDesktopStorage(value, {
       isDesktop: () => false,
       restore: async () => { throw new Error("must not run"); },

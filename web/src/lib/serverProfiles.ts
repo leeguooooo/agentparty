@@ -1,4 +1,5 @@
 import { parseAuthConfigPayload, type AuthProviderConfig } from "./oidc";
+import { snapshotDesktopStorage } from "./desktopStorage";
 
 const CUSTOM_PROFILES_KEY = "ap_server_profiles_v1";
 const ACTIVE_ORIGIN_KEY = "ap_active_server_origin_v1";
@@ -8,6 +9,12 @@ export interface ServerProfileStorage {
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
 }
+
+type ServerProfileMutationHandler = (storage: ServerProfileStorage) => void;
+
+const snapshotServerProfileMutation: ServerProfileMutationHandler = (storage) => {
+  void snapshotDesktopStorage(storage as Storage);
+};
 
 export interface ServerProfile {
   id: string;
@@ -93,6 +100,7 @@ export function loadServerProfiles(storage: ServerProfileStorage = defaultStorag
 export function addCustomServerProfile(
   storage: ServerProfileStorage = defaultStorage(),
   input: { label: string; origin: string },
+  onMutation: ServerProfileMutationHandler = snapshotServerProfileMutation,
 ): ServerProfile[] {
   const label = normalizeLabel(input.label);
   const origin = normalizeServerOrigin(input.origin);
@@ -106,6 +114,7 @@ export function addCustomServerProfile(
     label: nextLabel,
     origin: nextOrigin,
   }))));
+  onMutation(storage);
   return [...OFFICIAL_SERVER_PROFILES, ...custom];
 }
 
@@ -120,12 +129,14 @@ export function loadActiveServerOrigin(storage: ServerProfileStorage = defaultSt
 export function saveActiveServerOrigin(
   storage: ServerProfileStorage = defaultStorage(),
   input: string,
+  onMutation: ServerProfileMutationHandler = snapshotServerProfileMutation,
 ): string {
   const origin = normalizeServerOrigin(input);
   if (origin === null || !loadServerProfiles(storage).some((profile) => profile.origin === origin)) {
     throw new Error("server profile is not registered");
   }
   storage.setItem(ACTIVE_ORIGIN_KEY, origin);
+  onMutation(storage);
   return origin;
 }
 
