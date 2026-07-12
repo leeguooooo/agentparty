@@ -60,6 +60,31 @@ describe("desktop UI release workflow", () => {
     expect(workflow).toContain('--published-at "$PUBLISHED_AT"');
   });
 
+  test("skips automatic publication when deterministic UI content is unchanged", () => {
+    const workflow = readFileSync(workflowPath, "utf8");
+    expect(workflow).toContain("id: publication");
+    expect(workflow).toContain("bun scripts/desktop-ui-publication.ts");
+    expect(workflow).toContain("gh release download desktop-ui");
+    expect(workflow).toContain(".plugins.updater.pubkey");
+    expect(workflow).toContain('--public-key "$UPDATER_PUBLIC_KEY"');
+    expect(workflow).toContain('if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]');
+    expect(workflow).toContain('echo "publish=true" >> "$GITHUB_OUTPUT"');
+    expect(workflow).toContain('echo "publish=$publish" >> "$GITHUB_OUTPUT"');
+    for (const step of [
+      "sign Desktop UI archive",
+      "generate Desktop UI manifest",
+      "sign Desktop UI manifest",
+      "finalize signed Desktop UI manifest envelope",
+      "publish fixed desktop-ui release channel",
+    ]) {
+      const start = workflow.indexOf(`- name: ${step}`);
+      const end = workflow.indexOf("\n      - name:", start + 1);
+      const block = workflow.slice(start, end === -1 ? undefined : end);
+      expect(start).toBeGreaterThan(-1);
+      expect(block).toContain("if: steps.publication.outputs.publish == 'true'");
+    }
+  });
+
   test("requires the Tauri v2 key and signs the archive before manifest generation", () => {
     const workflow = readFileSync(workflowPath, "utf8");
     expect(workflow).toContain("TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_V2 }}");

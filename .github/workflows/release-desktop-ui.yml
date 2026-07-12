@@ -102,7 +102,41 @@ jobs:
             --source web/dist \
             --output "dist/$ASSET"
 
+      - name: decide whether Desktop UI content changed
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "reason=manual" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p dist/current
+          if ! gh release download desktop-ui \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern desktop-ui.json \
+            --dir dist/current; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "reason=current-missing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UPDATER_PUBLIC_KEY="$(jq -er '.plugins.updater.pubkey' desktop/src-tauri/tauri.conf.json)"
+          decision="$(bun scripts/desktop-ui-publication.ts \
+            --archive "dist/$ASSET" \
+            --manifest dist/current/desktop-ui.json \
+            --public-key "$UPDATER_PUBLIC_KEY" \
+            --ui-abi "$UI_ABI" \
+            --min-shell-version "$MIN_SHELL_VERSION")"
+          publish="$(jq -er '.publish | tostring' <<<"$decision")"
+          reason="$(jq -er .reason <<<"$decision")"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "Desktop UI publication decision: $reason"
+
       - name: sign Desktop UI archive
+        if: steps.publication.outputs.publish == 'true'
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_V2 }}
@@ -115,6 +149,7 @@ jobs:
           [ -s "../dist/$ASSET.sig" ] || { echo "::error::Desktop UI signature was not generated"; exit 1; }
 
       - name: generate Desktop UI manifest
+        if: steps.publication.outputs.publish == 'true'
         run: |
           bun scripts/desktop-ui-manifest.ts \
             --version "$UI_VERSION" \
@@ -127,6 +162,7 @@ jobs:
             --output dist/desktop-ui-manifest-payload.json
 
       - name: sign Desktop UI manifest
+        if: steps.publication.outputs.publish == 'true'
         working-directory: desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_V2 }}
@@ -137,6 +173,7 @@ jobs:
           [ -s ../dist/desktop-ui-manifest-payload.json.sig ] || { echo "::error::Desktop UI manifest signature was not generated"; exit 1; }
 
       - name: finalize signed Desktop UI manifest envelope
+        if: steps.publication.outputs.publish == 'true'
         run: |
           bun scripts/desktop-ui-manifest.ts \
             --payload dist/desktop-ui-manifest-payload.json \
@@ -145,6 +182,7 @@ jobs:
           cp "dist/$VERSIONED_MANIFEST" dist/desktop-ui.json
 
       - name: publish fixed desktop-ui release channel
+        if: steps.publication.outputs.publish == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: desktop-ui
