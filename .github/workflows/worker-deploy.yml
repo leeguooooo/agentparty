@@ -1,0 +1,106 @@
+name: worker-deploy
+
+# worker 部署 + D1 迁移自动化（#420）。
+# 触发：推 v* tag（随发布走）或手动 workflow_dispatch（可只挑一个实例）。
+# 凭据用 CI secret（CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID）而非本机
+# wrangler-accounts profile —— prod / xdream 是两个独立 Cloudflare 账号，各自的
+# 一套凭据放在同名 GitHub Environment（worker-prod / worker-xdream）里。
+#
+# 迁移 ↔ 代码顺序守卫：每个实例串行跑 migrate → verify:remote-schema → deploy，
+# schema 校验失败即中断，绝不进 deploy（见 worker/scripts/deploy-ci.mjs）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 部署哪个实例
+        type: choice
+        options:
+          - both
+          - prod
+          - xdream
+        default: both
+
+permissions:
+  contents: read
+
+# 与 worker-rollback 共用一个并发组，串行化对线上的写操作，杜绝部署/回滚打架。
+concurrency:
+  group: worker-live-ops
+  cancel-in-progress: false
+
+jobs:
+  # 迁移编号守卫（快）。release.yml 的全量门禁也跑，这里独立再跑一次，
+  # 保证本 workflow 单独 dispatch 时也有守卫。
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/bun-install
+      - run: bun scripts/check-migration-numbering.ts
+
+  # 把 dispatch 的 environment 选择翻译成 matrix；tag push 时 inputs 为空 → both。
+  plan:
+    needs: guard
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.pick.outputs.targets }}
+      both: ${{ steps.pick.outputs.both }}
+    steps:
+      - id: pick
+        env:
+          SEL: ${{ github.event.inputs.environment || 'both' }}
+        run: |
+          set -euo pipefail
+          case "$SEL" in
+            prod)   echo 'targets=["prod"]' >> "$GITHUB_OUTPUT";   echo 'both=false' >> "$GITHUB_OUTPUT" ;;
+            xdream) echo 'targets=["xdream"]' >> "$GITHUB_OUTPUT"; echo 'both=false' >> "$GITHUB_OUTPUT" ;;
+            both)   echo 'targets=["prod","xdream"]' >> "$GITHUB_OUTPUT"; echo 'both=true' >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::invalid environment selection: $SEL"; exit 1 ;;
+          esac
+
+  deploy:
+    needs: plan
+    runs-on: ubuntu-latest
+    # 同名 GitHub Environment 提供该实例的 Cloudflare 凭据 + smoke token。
+    environment: worker-${{ matrix.target }}
+    strategy:
+      # prod 先于 xdream 串行部署：任一实例失败即停，避免两个实例同时半上线。
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 部署元数据要写真实 commit；deploy-ci.mjs 读 git HEAD。
+          fetch-depth: 0
+      - uses: ./.github/actions/bun-install
+      - name: deploy ${{ matrix.target }}
+        working-directory: worker
+        env:
+          CI: "1"
+          # 原生 wrangler（worker devDependency），凭 CF env 认证，非 wrangler-accounts profile。
+          AGENTPARTY_WRANGLER_BIN: "bunx wrangler"
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 写路径冒烟用的一次性 token；未配置时 deploy-ci 只跑只读健康校验并跳过写冒烟。
+          AGENTPARTY_SMOKE_TOKEN: ${{ secrets.AGENTPARTY_SMOKE_TOKEN }}
+          AGENTPARTY_SMOKE_WRITE_TOKEN: ${{ secrets.AGENTPARTY_SMOKE_WRITE_TOKEN }}
+        run: node scripts/deploy-ci.mjs ${{ matrix.target }}
+
+  # 双实例一致性：两个都部署时，确认 prod 与 xdream 对外提供同一 version+commit。
+  verify-dual:
+    needs: [plan, deploy]
+    if: needs.plan.outputs.both == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/bun-install
+      - name: verify prod + xdream serve identical build
+        working-directory: worker
+        run: node scripts/verify-dual-deployment.mjs

@@ -3,6 +3,14 @@ import { spawnSync } from "node:child_process";
 const database = process.env.AGENTPARTY_D1_DATABASE ?? "agentparty";
 const wranglerConfig = process.env.AGENTPARTY_WRANGLER_CONFIG;
 
+// 本地缺省用 wrangler-accounts（profile 包装）；CI 通过 AGENTPARTY_WRANGLER_BIN
+// 传 "bunx wrangler" 走原生 wrangler + CLOUDFLARE_API_TOKEN/ACCOUNT_ID 凭据。
+const wranglerLauncher = (process.env.AGENTPARTY_WRANGLER_BIN ?? "wrangler-accounts")
+  .trim()
+  .split(/\s+/)
+  .filter(Boolean);
+const [wranglerBin, ...wranglerPrefix] = wranglerLauncher.length > 0 ? wranglerLauncher : ["wrangler-accounts"];
+
 const required = {
   channels: [
     "id",
@@ -169,15 +177,16 @@ const requiredIndexes = {
 };
 
 function run(args) {
-  const commandArgs = wranglerConfig ? [...args, "--config", wranglerConfig] : args;
-  const res = spawnSync("wrangler-accounts", commandArgs, {
+  const configArgs = wranglerConfig ? [...args, "--config", wranglerConfig] : args;
+  const commandArgs = [...wranglerPrefix, ...configArgs];
+  const res = spawnSync(wranglerBin, commandArgs, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (res.status !== 0) {
     process.stderr.write(res.stdout);
     process.stderr.write(res.stderr);
-    throw new Error(`wrangler-accounts ${commandArgs.join(" ")} failed`);
+    throw new Error(`${wranglerBin} ${commandArgs.join(" ")} failed`);
   }
   return `${res.stdout}${res.stderr}`;
 }
