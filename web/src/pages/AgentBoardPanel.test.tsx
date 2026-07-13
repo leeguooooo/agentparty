@@ -22,10 +22,15 @@ function presence(name: string, over: Partial<PresenceEntry> = {}): PresenceEntr
   return { name, kind: "agent", state: "waiting", note: null, ts: 0, ...over } as PresenceEntry;
 }
 
-function task(id: number, assignee: string | null, state: TaskRecord["state"]): TaskRecord {
+function task(
+  id: number,
+  assignee: string | null,
+  state: TaskRecord["state"],
+  assigneeKind: "agent" | "human" | "squad" = "agent",
+): TaskRecord {
   return {
     type: "task", id, channel: "c", title: `t${id}`, desc: null, state,
-    assignee: assignee === null ? null : { name: assignee, kind: "agent" },
+    assignee: assignee === null ? null : { name: assignee, kind: assigneeKind },
     created_by: "h", created_by_kind: "human", priority: 0, labels: [], parent_id: null,
     anchor_seqs: [], completion_artifact: null, workflow_id: null, scope: [], blocked_reason: null,
     external_ref: null, created_at: 0, updated_at: 0, completed_at: null,
@@ -67,12 +72,21 @@ function allText(r: ReactTestRenderer): string {
 
 describe("AgentBoardPanel (#187)", () => {
   test("groups tasks by assignee and derives busy/offline status from presence", () => {
-    const p = [presence("alice", { state: "working", live: true }), presence("bob", { live: false })];
+    const p = [
+      presence("alice", { state: "working", live: true }),
+      presence("bob", { live: false }),
+      presence("carol", { state: "waiting", live: true }),
+      presence("dave", { state: "blocked", live: true }),
+    ];
     const tasks = [
       task(1, "alice", "in_progress"), task(2, "alice", "in_progress"), task(3, "alice", "assigned"),
       task(4, "bob", "needs_review"),
       task(5, null, "in_progress"), // 无 assignee 不计入任何 agent
       task(6, "alice", "done"), // done 不计入在手
+      task(7, "dave", "blocked"),
+      task(8, "carol", "assigned"),
+      task(9, "human-owner", "assigned", "human"),
+      task(10, "review-squad", "in_progress", "squad"),
     ];
     const r = render("en", p, tasks);
     const txt = allText(r);
@@ -85,17 +99,26 @@ describe("AgentBoardPanel (#187)", () => {
     expect(txt).toContain("offline");
     // 每个状态是一列，agent 卡片落在对应列，并直接展示真实任务进度。
     const busyLane = r.root.findByProps({ "data-status": "busy" });
+    const blockedLane = r.root.findByProps({ "data-status": "blocked" });
+    const idleLane = r.root.findByProps({ "data-status": "idle" });
     const offlineLane = r.root.findByProps({ "data-status": "offline" });
     expect(treeText(busyLane)).toContain("alice");
     expect(treeText(busyLane)).toContain("t1");
+    expect(treeText(blockedLane)).toContain("dave");
+    expect(treeText(blockedLane)).toContain("t7");
+    expect(treeText(idleLane)).toContain("carol");
+    expect(treeText(idleLane)).toContain("t8");
     expect(treeText(offlineLane)).toContain("bob");
     expect(treeText(offlineLane)).toContain("t4");
-    expect(r.root.findAllByProps({ "data-status": "idle" })).toHaveLength(1);
-    expect(r.root.findAllByProps({ "data-status": "blocked" })).toHaveLength(1);
     // 无 assignee 的 task5 不产生「未命名」agent 行
     expect(txt).not.toContain("t5");
     // 已完成任务不再属于在手工作。
     expect(txt).not.toContain("t6");
+    // human/squad 任务不能凭空生成 Agent 卡片。
+    expect(txt).not.toContain("human-owner");
+    expect(txt).not.toContain("review-squad");
+    expect(txt).not.toContain("t9");
+    expect(txt).not.toContain("t10");
   });
 
   test("empty when no agents and no assigned tasks", () => {

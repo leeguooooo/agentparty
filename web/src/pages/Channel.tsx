@@ -1450,7 +1450,7 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
   const tasksByName = new Map<string, TaskRecord[]>();
   for (const task of tasks) {
     const name = task.assignee?.name;
-    if (!name) continue;
+    if (!name || task.assignee?.kind !== "agent") continue;
     if (task.state !== "in_progress" && task.state !== "assigned" && task.state !== "needs_review" && task.state !== "blocked") continue;
     const assigned = tasksByName.get(name) ?? [];
     assigned.push(task);
