@@ -229,8 +229,7 @@ export function isAgentPartyWorktree(path: string, branch: string | null): boole
   return (
     branch?.startsWith("agentparty/") === true ||
     /(?:^|\/)agentparty-wt-[^/]+(?:\/|$)/i.test(normalized) ||
-    /(?:^|\/)\.claude\/worktrees\/agent-[^/]+(?:\/|$)/.test(normalized) ||
-    /(?:^|\/)worktrees\/[^/]+(?:\/|$)/.test(normalized)
+    /(?:^|\/)\.claude\/worktrees\/agent-[^/]+(?:\/|$)/.test(normalized)
   );
 }
 

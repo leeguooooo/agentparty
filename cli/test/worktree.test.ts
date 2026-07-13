@@ -67,7 +67,8 @@ beforeEach(() => {
   commitFile(join(root, "agentparty-wt-un"), "un.txt", "un-change\n", "un: real unmerged work");
 
   // 普通手工 worktree：即使 patch 已在 main，也不属于 AgentParty teardown 范围，绝不能清。
-  git(main, "worktree", "add", "-b", "manual", join(root, "manual-wt"), "main");
+  // 路径故意叫 worktrees/manual：通用 worktrees/* 不是 AgentParty 身份证据，仍必须跳过。
+  git(main, "worktree", "add", "-b", "manual", join(root, "worktrees", "manual"), "main");
 
   process.chdir(main);
   logs = [];
@@ -314,7 +315,7 @@ describe("party worktree prune", () => {
   test("--yes skips unrelated manual worktree", async () => {
     const code = await run(["prune", "--base", "main", "--yes"]);
     expect(code).toBe(0);
-    expect(existsSync(join(root, "manual-wt"))).toBe(true);
+    expect(existsSync(join(root, "worktrees", "manual"))).toBe(true);
     const branches = git(main, "branch", "--format=%(refname:short)").split("\n");
     expect(branches).toContain("manual");
     expect(logs.join("\n")).toMatch(/skip\s+manual\s+— unrelated/);
