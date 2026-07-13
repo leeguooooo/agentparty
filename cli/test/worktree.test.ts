@@ -136,6 +136,18 @@ describe("party worktree prune", () => {
     expect(files).toContain("dirty.txt");
   });
 
+  test("--yes: preserve push 失败时 worktree 保留、脏活不丢（安全关键路径）", async () => {
+    // 把 origin 指到不存在的地址，preserve push 必失败
+    git(main, "remote", "set-url", "origin", join(root, "nonexistent-origin.git"));
+    const code = await run(["prune", "--base", "main", "--yes"]);
+    expect(code).toBe(0);
+    // push 失败 → 绝不删 worktree（脏活还在原地）
+    expect(existsSync(join(root, "wt-md"))).toBe(true);
+    expect(existsSync(join(root, "wt-md", "dirty.txt"))).toBe(true);
+    // 明确报了跳过/失败
+    expect(errs.join("\n").toLowerCase()).toContain("md");
+  });
+
   test("--yes skips unmerged: worktree + branch survive", async () => {
     const code = await run(["prune", "--base", "main", "--yes"]);
     expect(code).toBe(0);
