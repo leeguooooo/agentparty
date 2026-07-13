@@ -3081,7 +3081,13 @@
 .vis-seg-btn:last-child { border-right: 0; }
 .vis-seg-btn.is-on { background: var(--d-ink); color: var(--t-panel); }
 .vis-seg-btn:disabled:not(.is-on) { opacity: 0.55; cursor: default; }
-.vis-help { font-size: 11.5px; color: var(--t-dim); flex-basis: 100%; margin: 2px 0 0; }
+.vis-help {
+  flex: none;
+  margin: 0;
+  color: var(--t-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
 
 /* ---- 小图雪碧图（app 运行界面，替代散落 emoji/符号） ---- */
 .ap-sprite {
