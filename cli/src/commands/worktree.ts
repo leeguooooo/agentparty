@@ -54,27 +54,31 @@ interface KillableGitProcess {
   kill(signal?: NodeJS.Signals | number): void;
 }
 
-type WindowsTreeKiller = (pid: number) => void;
+type WindowsTreeKiller = (pid: number) => Promise<boolean>;
 
-function taskkillProcessTree(pid: number): void {
-  const killer = Bun.spawn(["taskkill", "/PID", String(pid), "/T", "/F"], {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  killer.unref();
+async function taskkillProcessTree(pid: number): Promise<boolean> {
+  try {
+    const killer = Bun.spawn(["taskkill", "/PID", String(pid), "/T", "/F"], {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    killer.unref();
+    return (await killer.exited) === 0;
+  } catch {
+    return false;
+  }
 }
 
-export function terminateGitProcessTree(
+export async function terminateGitProcessTree(
   proc: KillableGitProcess,
   platform: NodeJS.Platform = process.platform,
   killGroup: typeof process.kill = process.kill,
   killWindowsTree: WindowsTreeKiller = taskkillProcessTree,
-): "group" | "tree" | "child" {
+): Promise<"group" | "tree" | "child"> {
   if (platform === "win32") {
     try {
-      killWindowsTree(proc.pid);
-      return "tree";
+      if (await killWindowsTree(proc.pid)) return "tree";
     } catch {
       // taskkill 启动失败时仍要至少终止直接子进程。
     }
@@ -119,23 +123,56 @@ export async function spawnWithTimeout(
     ]);
     return { code, stdout, stderr };
   })().catch((error): GitResult => ({ code: 1, stdout: "", stderr: String(error) }));
+
+  const stopChild = () => {
+    void terminateGitProcessTree(proc).catch(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* 已退出或终止失败；下面仍会断开父进程引用。 */
+      }
+    });
+    try {
+      void proc.stdout.cancel().catch(() => undefined);
+      void proc.stderr.cancel().catch(() => undefined);
+    } catch {
+      // Response reader 可能已经锁住流；unref 仍确保残留 pipe 不把 CLI 挂住。
+    }
+    try {
+      proc.unref();
+    } catch {
+      /* Bun 旧版本兜底：timeout/signal race 仍会立即返回。 */
+    }
+  };
+
+  let resolveSignal: ((result: GitResult) => void) | undefined;
+  const signal = new Promise<GitResult>((resolve) => {
+    resolveSignal = resolve;
+  });
+  const onSigint = () => {
+    stopChild();
+    resolveSignal?.({ code: 130, stdout: "", stderr: "interrupted by SIGINT" });
+  };
+  const onSigterm = () => {
+    stopChild();
+    resolveSignal?.({ code: 143, stdout: "", stderr: "terminated by SIGTERM" });
+  };
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+
   const timeout = new Promise<GitResult>((resolve) => {
     timer = setTimeout(() => {
-      try {
-        terminateGitProcessTree(proc);
-      } catch {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          /* 已退出或终止失败：race 仍会立即返回，绝不依赖管道收尾。 */
-        }
-      }
+      stopChild();
       resolve({ code: 124, stdout: "", stderr: `timed out after ${timeoutMs}ms: ${cmd.join(" ")}` });
     }, timeoutMs);
   });
-  const result = await Promise.race([work, timeout]);
-  if (timer) clearTimeout(timer);
-  return result;
+  try {
+    return await Promise.race([work, timeout, signal]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+  }
 }
 
 export async function runGitCommand(
@@ -143,13 +180,19 @@ export async function runGitCommand(
   cwd: string,
   opts: { timeoutMs?: number; env?: Record<string, string | undefined> } = {},
 ): Promise<GitResult> {
-  return spawnWithTimeout(["git", ...args], cwd, opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS, {
+  const env: Record<string, string | undefined> = {
     ...process.env,
     ...opts.env,
     GIT_TERMINAL_PROMPT: "0",
     GCM_INTERACTIVE: "Never",
-    GIT_SSH_COMMAND: opts.env?.GIT_SSH_COMMAND ?? process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes",
-  });
+    GIT_SSH_COMMAND: opts.env?.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.askPass",
+    GIT_CONFIG_VALUE_0: "",
+  };
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
+  return spawnWithTimeout(["git", ...args], cwd, opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS, env);
 }
 
 const defaultGit: GitRunner = (args, cwd) => runGitCommand(args, cwd);

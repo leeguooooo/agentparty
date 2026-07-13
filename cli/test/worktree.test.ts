@@ -128,14 +128,17 @@ describe("classifyWorktrees", () => {
 });
 
 describe("git runner safety", () => {
-  test("uses taskkill semantics for the full process tree on Windows", () => {
+  test("uses taskkill semantics for the full process tree on Windows", async () => {
     const treePids: number[] = [];
     const childSignals: Array<NodeJS.Signals | number | undefined> = [];
-    const result = terminateGitProcessTree(
+    const result = await terminateGitProcessTree(
       { pid: 42, kill: (signal) => childSignals.push(signal) },
       "win32",
       process.kill,
-      (pid) => treePids.push(pid),
+      async (pid) => {
+        treePids.push(pid);
+        return true;
+      },
     );
 
     expect(result).toBe("tree");
@@ -143,24 +146,55 @@ describe("git runner safety", () => {
     expect(childSignals).toEqual([]);
   });
 
+  test("falls back to the direct child when taskkill fails", async () => {
+    const childSignals: Array<NodeJS.Signals | number | undefined> = [];
+    const result = await terminateGitProcessTree(
+      { pid: 42, kill: (signal) => childSignals.push(signal) },
+      "win32",
+      process.kill,
+      async () => false,
+    );
+    expect(result).toBe("child");
+    expect(childSignals).toEqual(["SIGKILL"]);
+  });
+
   test("disables interactive Git and credential prompts", async () => {
     const bin = join(root, "bin");
     git(root, "init", "--quiet", bin);
     const fakeGit = join(bin, "git");
-    writeFileSync(fakeGit, "#!/bin/sh\nprintf '%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\"\n");
+    writeFileSync(
+      fakeGit,
+      "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$GCM_INTERACTIVE\" \"${GIT_ASKPASS-unset}\" \"${SSH_ASKPASS-unset}\" \"$GIT_SSH_COMMAND\" \"$GIT_CONFIG_KEY_0\"\n",
+    );
     chmodSync(fakeGit, 0o755);
     const result = await runGitCommand(["status"], main, {
-      env: { PATH: `${bin}:${process.env.PATH ?? ""}` },
+      env: {
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        GIT_ASKPASS: "/tmp/should-not-run",
+        SSH_ASKPASS: "/tmp/should-not-run",
+      },
     });
     expect(result.code).toBe(0);
-    expect(result.stdout).toBe("0|Never");
+    expect(result.stdout).toBe("0|Never|unset|unset|ssh -o BatchMode=yes|core.askPass");
   });
 });
 
 describe("spawnWithTimeout", () => {
+  test("SIGINT 级联终止子进程并清理信号监听器", async () => {
+    const before = process.listenerCount("SIGINT");
+    const pending = spawnWithTimeout([process.execPath, "-e", "setTimeout(() => {}, 5000)"], root, 5000);
+    await Bun.sleep(50);
+    process.emit("SIGINT");
+
+    const r = await pending;
+    expect(r.code).toBe(130);
+    expect(r.stderr).toContain("SIGINT");
+    expect(process.listenerCount("SIGINT")).toBe(before);
+  });
+
   test("超时独立返回 124，不等命令自然结束（防子进程占管道导致卡死）", async () => {
     const t0 = Date.now();
-    const r = await spawnWithTimeout(["sleep", "5"], root, 200);
+    const r = await spawnWithTimeout([process.execPath, "-e", "setTimeout(() => {}, 5000)"], root, 200);
     expect(r.code).toBe(124);
     expect(r.stderr).toContain("timed out");
     // 远早于 5s 返回 = 超时确实独立于命令/管道，没干等。
@@ -168,7 +202,7 @@ describe("spawnWithTimeout", () => {
   });
 
   test("命令按时结束时返回真实退出码与输出", async () => {
-    const r = await spawnWithTimeout(["sh", "-c", "printf ok"], root, 5000);
+    const r = await spawnWithTimeout([process.execPath, "-e", "process.stdout.write('ok')"], root, 5000);
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("ok");
   });
