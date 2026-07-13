@@ -4,6 +4,7 @@ import type { AgentContext, MsgFrame, PresenceEntry, ReadCursor, Sender } from "
 import { memo, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
+import { isClientVersionOutdated, useMinClientVersion } from "../lib/clientVersion";
 import { displayForIdentity, resolveSenderLabel, type IdentityDisplayMap } from "../lib/identityDisplay";
 import { readStateFor } from "../lib/readList";
 import { summarizeReplyPreview } from "../lib/replyPreview";
@@ -154,6 +155,7 @@ function MessageCardImpl({
   onDecisionRespond,
 }: Props) {
   const t = useT();
+  const minClientVersion = useMinClientVersion();
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const [statusExpanded, setStatusExpanded] = useState(false);
@@ -171,6 +173,9 @@ function MessageCardImpl({
       : { readers: [], unread: [] };
   // owner/email 无论是否被 handle 取代，都作为防冒充锚点保留在下方副标签 + tooltip 中（见 senderTitle）。
   const senderLabel = resolveSenderLabel(msg.sender, identityDisplay);
+  // #434：发送方 CLI 版本（发送时快照）。落后于服务端最低版本时标警告；未知版本/未拉到下限时不标。
+  const clientVersion = msg.sender.client_version ?? null;
+  const clientOutdated = isClientVersionOutdated(clientVersion, minClientVersion);
   const owner = msg.sender.owner && msg.sender.owner !== senderLabel ? msg.sender.owner : null;
   const lineage = msg.sender.lineage ?? null;
   const lineageLabel = lineage === null ? null : `child of ${lineage.parent_agent}`;
@@ -390,6 +395,23 @@ function MessageCardImpl({
         <span className={"msg-kind" + (msg.sender.kind === "human" ? " msg-kind--human" : "")}>
           {msg.sender.kind}
         </span>
+        {clientVersion !== null && (
+          <span
+            className={"t-mono msg-client-version" + (clientOutdated ? " msg-client-version--outdated" : "")}
+            title={
+              clientOutdated
+                ? t("MessageCard.clientVersion.outdated", { version: clientVersion, min: minClientVersion ?? "" })
+                : t("MessageCard.clientVersion.title", { version: clientVersion })
+            }
+          >
+            cli v{clientVersion}
+            {clientOutdated && (
+              <span className="msg-client-version-warn" aria-hidden="true">
+                {" "}⚠
+              </span>
+            )}
+          </span>
+        )}
         {msg.mentions.map((m) => {
           // #274：@提及悬停也能看到该名字的实时状态；原始名与显示名不同时保留 @原名防冒充锚点。
           const mentionTitle = [

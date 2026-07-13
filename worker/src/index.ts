@@ -1782,6 +1782,13 @@ function assignedRoleHeaders(role: CollaborationRole | null): Record<string, str
   return role === null ? {} : { "x-ap-collab-role": role, "x-ap-role-source": "assigned" };
 }
 
+// #434：把发送方 CLI 的 x-ap-client-version 透传给 DO，供 handleSend 快照进消息 sender_client_version。
+// 仅带且合法时透传（非法/缺失一律不带，DO 侧 parseClientVersion 再校验一次）。网页/无头请求天然无此头。
+function clientVersionForwardHeaders(c: Context<AppContext>): Record<string, string> {
+  const raw = c.req.header(CLIENT_VERSION_HEADER);
+  return raw ? { [CLIENT_VERSION_HEADER]: raw } : {};
+}
+
 // 人类 handle 头：仅当身份是人类且已设 handle 才带（权威值，供 do 盖 presence + stamp 消息，Task A6/A7）。
 // #165：agent 身份则带自己的 nickname（同样走 x-ap-handle，复用 do 的 presence/sender 展示管线）。
 // x-ap-handle 一律 encodeURIComponent——人类 handle 是 ASCII 编码后原样不变，agent 中文昵称则需编码
@@ -5705,6 +5712,8 @@ app.post("/api/channels/:slug/messages/:seq/:action", async (c) => {
         // 超越会被 fail-closed 拦下。edit/retract 不经 handleSend，多带此位无害。
         ...(await writeGateHeaders(c.env.DB, identity, channel)),
         ...(await handleHeader(c.env.DB, identity)),
+        // #434：supersede 走 handleSend 落新消息，透传 CLI 版本，与直接发送一致。
+        ...clientVersionForwardHeaders(c),
       },
     }),
   );
@@ -5933,6 +5942,7 @@ app.post("/api/channels/:slug/messages", async (c) => {
         // #381：public_watch 写门信号——非成员/未被邀者在 public_watch 频道会被 DO handleSend 拒发
         ...(await writeGateHeaders(c.env.DB, identity, channel)),
         ...(await handleHeader(c.env.DB, identity)),
+        ...clientVersionForwardHeaders(c),
       },
     }),
   );

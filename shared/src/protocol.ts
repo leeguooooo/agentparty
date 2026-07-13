@@ -363,6 +363,9 @@ export interface Sender {
   /** OAuth/SSO profile avatar URL. Optional; clients may render initials when absent. */
   avatar_url?: string;
   avatar_thumb?: string;
+  /** 发送这条消息时 sender 的 CLI package version（发送即快照，随消息帧下发；#434）。
+   *  仅带 x-ap-client-version 的 CLI 发送才有；网页/旧客户端/无头请求缺失时省略。旧消费方忽略。 */
+  client_version?: string;
   /** 同一身份当前活跃连接数。仅 >1 时下发，用于提示 token/session 被重复使用。 */
   connection_count?: number;
 }

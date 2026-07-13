@@ -26,6 +26,8 @@ export const MessageCardStrings: LocaleDict = {
     "MessageCard.decision.awaiting": "awaiting a human decision",
     "MessageCard.decision.resolved": "resolved → {option}",
     "MessageCard.decision.autoResolved": "auto-resolved (unattended) → {option}",
+    "MessageCard.clientVersion.title": "sender CLI version v{version}",
+    "MessageCard.clientVersion.outdated": "sender CLI v{version} is behind the recommended v{min} — upgrade suggested",
   },
   zh: {
     "MessageCard.badge.edited": "已编辑",
@@ -52,6 +54,8 @@ export const MessageCardStrings: LocaleDict = {
     "MessageCard.decision.awaiting": "等待人类决策",
     "MessageCard.decision.resolved": "已决 → {option}",
     "MessageCard.decision.autoResolved": "自动放行（无人值守）→ {option}",
+    "MessageCard.clientVersion.title": "发送方 CLI 版本 v{version}",
+    "MessageCard.clientVersion.outdated": "发送方 CLI v{version} 落后于推荐版本 v{min}，建议升级",
   },
 };
 

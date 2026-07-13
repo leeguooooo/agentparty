@@ -102,6 +102,8 @@ interface ConnState {
   serveClaimSeq?: number;
   // 上次已通告给本连接的持租状态，用于去重：只在 held 变化时才补发 serve_lease 帧。
   serveLeaseHeld?: boolean;
+  // #434：本连接最近一次 hello 上报的 CLI package version，供 WS send 快照进消息 sender_client_version。
+  clientVersion?: string;
 }
 
 const LEGACY_SESSION_ID = "__legacy__";
@@ -121,6 +123,9 @@ interface Identity {
   collabRoleSource?: CollaborationRoleSource;
   // #381：public_watch 写门信号（worker 权威）。缺省/false 且频道为 public_watch → handleSend 拒发。
   canWrite?: boolean;
+  // #434：发送方 CLI 版本（x-ap-client-version）。WS 取自 hello 快照进连接态，REST 取自请求头。
+  // 落库快照到消息 sender_client_version 列并随帧下发；缺头/网页请求为 undefined。
+  clientVersion?: string;
 }
 
 interface WebhookDeliveryResult {
@@ -697,7 +702,7 @@ function lineageFromHeaders(headers: Headers): AgentLineage | undefined {
   return lineage ?? undefined;
 }
 
-function senderFromIdentity(identity: Pick<Identity, "name" | "kind" | "owner" | "handle" | "displayName" | "avatarUrl" | "avatarThumb" | "lineage">): Sender {
+function senderFromIdentity(identity: Pick<Identity, "name" | "kind" | "owner" | "handle" | "displayName" | "avatarUrl" | "avatarThumb" | "lineage" | "clientVersion">): Sender {
   return {
     name: identity.name,
     kind: identity.kind,
@@ -707,6 +712,7 @@ function senderFromIdentity(identity: Pick<Identity, "name" | "kind" | "owner" |
     ...(identity.displayName === undefined ? {} : { display_name: identity.displayName }),
     ...(identity.avatarUrl === undefined ? {} : { avatar_url: identity.avatarUrl }),
     ...(identity.avatarThumb === undefined ? {} : { avatar_thumb: identity.avatarThumb }),
+    ...(identity.clientVersion === undefined ? {} : { client_version: identity.clientVersion }),
   };
 }
 
@@ -1093,6 +1099,10 @@ export class ChannelDO extends Server<Env> {
       "ALTER TABLE messages ADD COLUMN idempotency_key TEXT",
       // 附件引用（#176）：存 Attachment[] 的 JSON，仅元数据（key/filename/type/size/url），blob 在 R2。
       "ALTER TABLE messages ADD COLUMN attachments_json TEXT",
+      // 发送方 CLI 版本快照（#434）：发送即定格 sender 的 x-ap-client-version，随消息帧/历史下发，
+      // 网页据此显示「该条来自哪个 CLI 版本」，落后于服务端最低版本时标警告。同 messages 其余列走 DO 内建
+      // SQLite 幂等补列（非 D1 迁移）。缺头/网页/旧客户端为 NULL，消费方省略展示。
+      "ALTER TABLE messages ADD COLUMN sender_client_version TEXT",
     ]) {
       try {
         sql.exec(ddl);
@@ -1519,7 +1529,11 @@ export class ChannelDO extends Server<Env> {
     }
     if (frame.type === "hello") {
       const clientVersion = parseClientVersion(frame.client_version);
-      if (clientVersion !== null) this.recordClientVersion(st.name, connection.id, clientVersion, Date.now());
+      if (clientVersion !== null) {
+        this.recordClientVersion(st.name, connection.id, clientVersion, Date.now());
+        // #434：把版本快照进连接态，供本连接后续 send 落库到消息 sender_client_version（无需每条再解析头）。
+        st = connection.setState({ ...st, clientVersion }) ?? st;
+      }
       const since = typeof frame.since === "number" && frame.since > 0 ? Math.floor(frame.since) : 0;
       const sinceRev =
         typeof frame.since_rev === "number" && frame.since_rev >= 0 ? Math.floor(frame.since_rev) : null;
@@ -1620,6 +1634,7 @@ export class ChannelDO extends Server<Env> {
           collabRole: st.collabRole,
           collabRoleSource: st.collabRoleSource,
           canWrite: st.canWrite,
+          clientVersion: st.clientVersion,
         },
         send,
         { countRate: false, sessionId: connection.id },
@@ -3024,6 +3039,8 @@ export class ChannelDO extends Server<Env> {
         collabRole: parseCollaborationRole(request.headers.get("x-ap-collab-role") ?? undefined) ?? undefined,
         collabRoleSource: parseRoleSource(request.headers.get("x-ap-role-source") ?? undefined) ?? undefined,
         canWrite: request.headers.get("x-ap-can-write") === "1",
+        // #434：REST 发送方 CLI 版本（index.ts 已把 x-ap-client-version 转发进来），快照进消息 sender_client_version。
+        clientVersion: parseClientVersion(request.headers.get("x-ap-client-version")) ?? undefined,
       };
       if (this.isArchived()) {
         return Response.json({ error: { code: "archived", message: "channel is archived" } }, { status: 410 });
@@ -3178,6 +3195,8 @@ export class ChannelDO extends Server<Env> {
         collabRole: parseCollaborationRole(request.headers.get("x-ap-collab-role") ?? undefined) ?? undefined,
         collabRoleSource: parseRoleSource(request.headers.get("x-ap-role-source") ?? undefined) ?? undefined,
         canWrite: request.headers.get("x-ap-can-write") === "1",
+        // #434：REST 发送方 CLI 版本（index.ts 已把 x-ap-client-version 转发进来），快照进消息 sender_client_version。
+        clientVersion: parseClientVersion(request.headers.get("x-ap-client-version")) ?? undefined,
       };
       if (this.isArchived()) {
         return Response.json({ error: { code: "archived", message: "channel is archived" } }, { status: 410 });
@@ -3281,6 +3300,8 @@ export class ChannelDO extends Server<Env> {
         collabRole: parseCollaborationRole(request.headers.get("x-ap-collab-role") ?? undefined) ?? undefined,
         collabRoleSource: parseRoleSource(request.headers.get("x-ap-role-source") ?? undefined) ?? undefined,
         canWrite: request.headers.get("x-ap-can-write") === "1",
+        // #434：REST 发送方 CLI 版本（index.ts 已把 x-ap-client-version 转发进来），快照进消息 sender_client_version。
+        clientVersion: parseClientVersion(request.headers.get("x-ap-client-version")) ?? undefined,
       };
       // moderator 由 worker 层（isChannelModerator）算好后转发；DO 只信这一位。
       const isModerator = request.headers.get("x-ap-moderator") === "1";
@@ -3502,6 +3523,8 @@ export class ChannelDO extends Server<Env> {
         collabRole: parseCollaborationRole(request.headers.get("x-ap-collab-role") ?? undefined) ?? undefined,
         collabRoleSource: parseRoleSource(request.headers.get("x-ap-role-source") ?? undefined) ?? undefined,
         canWrite: request.headers.get("x-ap-can-write") === "1",
+        // #434：REST 发送方 CLI 版本（index.ts 已把 x-ap-client-version 转发进来），快照进消息 sender_client_version。
+        clientVersion: parseClientVersion(request.headers.get("x-ap-client-version")) ?? undefined,
       };
       let raw: unknown;
       try {
@@ -4009,9 +4032,9 @@ export class ChannelDO extends Server<Env> {
          status_decision_json, status_workflow_json, message_workflow_json,
          sender_role, sender_role_source, completion_artifact_json, completion_review_state, completion_review_policy,
          completion_review_replaces_seq, decision_request_json, decision_state, decision_resolution_json,
-         idempotency_key, attachments_json, ts
+         idempotency_key, attachments_json, sender_client_version, ts
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       seq,
       identity.name,
       identity.kind,
@@ -4049,6 +4072,7 @@ export class ChannelDO extends Server<Env> {
         : JSON.stringify(decisionResolution),
       frame.idempotency_key ?? null,
       attachments === undefined ? null : JSON.stringify(attachments),
+      identity.clientVersion ?? null,
       now,
     );
     let replacedUpdate: MessageUpdateFrame | undefined;
@@ -5242,6 +5266,8 @@ export class ChannelDO extends Server<Env> {
         ...(r.sender_display_name === null || r.sender_display_name === undefined ? {} : { display_name: String(r.sender_display_name) }),
         ...(r.sender_avatar_url === null || r.sender_avatar_url === undefined ? {} : { avatar_url: String(r.sender_avatar_url) }),
         ...(r.sender_avatar_thumb === null || r.sender_avatar_thumb === undefined ? {} : { avatar_thumb: String(r.sender_avatar_thumb) }),
+        // #434：历史回放/修订帧也带上发送时快照的 CLI 版本，网页展示与 live 帧一致。
+        ...(r.sender_client_version === null || r.sender_client_version === undefined ? {} : { client_version: String(r.sender_client_version) }),
       },
       kind,
       body: retracted ? "[retracted]" : String(r.body),

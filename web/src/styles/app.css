@@ -2641,6 +2641,17 @@
   background: var(--d-blue-soft);
   white-space: nowrap;
 }
+/* #434：发送方 CLI 版本徽标；落后于服务端最低版本时转琥珀色 + ⚠。 */
+.msg-client-version {
+  font-size: 10px;
+  color: var(--t-dim);
+  white-space: nowrap;
+}
+.msg-client-version--outdated {
+  color: var(--d-amber);
+  font-weight: 600;
+}
+.msg-client-version-warn { color: var(--d-amber); }
 .msg-context {
   display: inline-block;
   max-width: min(180px, 34vw);
