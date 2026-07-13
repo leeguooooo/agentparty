@@ -206,6 +206,7 @@ describe("review-ack ordering gate (#460)", () => {
   test("waits for current-head CodeRabbit review even if a stale review exists", () => {
     const result = evaluate({
       reviews: [{ ...codeRabbitReview, commit_id: "old-head" }],
+      statuses: [{ ...codeRabbitStatus[0], state: "pending" }],
       comments: [
         prAgentGuide,
         { user: user("maintainer"), body: "review-ack: early", created_at: "2026-07-13T10:03:00Z" },
@@ -218,15 +219,22 @@ describe("review-ack ordering gate (#460)", () => {
   test("rejects a human reviewer whose login only looks like CodeRabbit", () => {
     const result = evaluate({
       reviews: [{ ...codeRabbitReview, user: user("coderabbit-fan", "User") }],
+      statuses: [],
     });
     expect(result.ok).toBe(false);
     expect(result.code).toBe("waiting_coderabbit");
+  });
+
+  test("current-head CodeRabbit success status is a bot artifact even without a formal review", () => {
+    const result = evaluate({ reviews: [], comments: [] });
+    expect(result.code).toBe("missing_ack");
   });
 
   test("never accepts an ack when no bot review artifact exists", () => {
     const result = evaluate({
       requireCodeRabbit: false,
       reviews: [],
+      statuses: [],
       comments: [
         { user: user("maintainer"), body: "review-ack: no bot review", created_at: "2026-07-13T10:03:00Z" },
       ],

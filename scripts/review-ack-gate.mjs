@@ -60,7 +60,7 @@ export function evaluateReviewAck({
     statuses.filter((status) => status.context === "CodeRabbit"),
     statusTime,
   );
-  if (requireCodeRabbit && (codeRabbitStatus === undefined || codeRabbitStatus.state === "pending")) {
+  if (requireCodeRabbit && codeRabbitStatus?.state !== "success") {
     return { ok: false, code: "waiting_coderabbit", description: "等待当前 head 的 CodeRabbit review 落地" };
   }
 
@@ -72,10 +72,6 @@ export function evaluateReviewAck({
       review.state !== "PENDING" &&
       review.state !== "DISMISSED",
   );
-  if (requireCodeRabbit && codeRabbitReviews.length === 0) {
-    return { ok: false, code: "waiting_coderabbit", description: "等待当前 head 的 CodeRabbit review 落地" };
-  }
-
   // pr_agent 端点失败时 job 仍会 completed/success，但没有评论；按设计不因缺评论永久卡红。
   // 有评论时，只接受当前 pr_agent run 启动后创建/更新的 Reviewer Guide，避免拿旧 head 的评论充数。
   const prAgentArtifacts = comments.filter(
@@ -87,6 +83,7 @@ export function evaluateReviewAck({
   const botArtifactTimes = [
     ...prAgentArtifacts.map(commentTime),
     ...codeRabbitReviews.map(reviewTime),
+    ...(codeRabbitStatus?.state === "success" ? [statusTime(codeRabbitStatus)] : []),
   ].filter((time) => time > 0);
   if (botArtifactTimes.length === 0) {
     return {
