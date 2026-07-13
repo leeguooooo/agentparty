@@ -7,6 +7,7 @@ import { jsonFrame, nowTs } from "../json";
 import { readConfig, resolveChannel, refreshConfigInPlace } from "../config";
 import { cachedIdentity, statuslineIdentity, writeStatuslineCache } from "../statusline-cache";
 import { healServerUrl } from "../validation";
+import { stripTerminalControls } from "../format";
 
 const WHOAMI_FLAGS = ["json", "caps", "rejoin"];
 const HELP = `usage: party whoami [--json] [--caps] [--rejoin]
@@ -20,6 +21,10 @@ Options:
 
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function terminalPath(value: string): string {
+  return stripTerminalControls(value).replace(/[\r\n\t]+/g, " ");
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -66,8 +71,8 @@ export async function run(argv: string[]): Promise<number> {
     } else {
       console.log("runtime: not logged in");
       console.log(`server: ${auth.server ?? "none (no config server and no account session)"}`);
-      console.log(`account: ${auth.account.present ? `${auth.account.email ?? auth.account.sub ?? "present"} present server=${auth.account.server}` : `absent path=${auth.account.path}`}`);
-      console.log(`config: ${auth.config.path ? `${auth.config.kind} ${auth.config.path}` : "none"}`);
+      console.log(`account: ${auth.account.present ? `${auth.account.email ?? auth.account.sub ?? "present"} present server=${auth.account.server}` : `absent path=${terminalPath(auth.account.path)}`}`);
+      console.log(`config: ${auth.config.path ? `${auth.config.kind} ${terminalPath(auth.config.path)}` : "none"}`);
       console.log(`auth-source: ${auth.auth_source}`);
     }
     return 0;
@@ -141,17 +146,22 @@ export async function run(argv: string[]): Promise<number> {
             : `absent path=${auth.account.path}`
         }`,
       );
-      console.log(`config: ${auth.config.path ? `${auth.config.kind} ${auth.config.path} token=${auth.config.token_fingerprint ?? "none"}` : "none"}`);
+      console.log(`config: ${auth.config.path ? `${auth.config.kind} ${terminalPath(auth.config.path)} token=${auth.config.token_fingerprint ?? "none"}` : "none"}`);
       console.log(`auth-source: ${auth.auth_source}`);
       if (rejoin) {
         console.log("rejoin:");
         if (auth.config.path) {
-          const prefix = `AGENTPARTY_CONFIG=${shellSingleQuote(auth.config.path)}`;
-          console.log(`  config: ${auth.config.path}`);
+          // 只清洗展示层；认证解析仍使用 auth.config.path 原值。控制字符路径不能原样回显到终端。
+          const displayPath = terminalPath(auth.config.path);
+          const prefix = `AGENTPARTY_CONFIG=${shellSingleQuote(displayPath)}`;
+          console.log(`  config: ${displayPath}`);
           console.log(`  token: ${auth.config.token_fingerprint ?? "unknown fingerprint"} (not printed)`);
           if (boundChannel) console.log(`  channel: ${boundChannel}`);
           console.log(`  verify: ${prefix} party whoami --rejoin`);
-          if (boundChannel) console.log(`  wait:   ${prefix} party watch ${boundChannel} --mentions-only --once`);
+          if (boundChannel) {
+            console.log(`  wait:   ${prefix} party watch ${boundChannel} --mentions-only --once  # turn-scoped; re-arm every turn`);
+            console.log(`  durable: ${prefix} party serve ${boundChannel} --runner claude  # persistent terminal/project agent`);
+          }
         } else {
           console.log("  no agent config file is active; this identity comes from the account session");
           console.log("  for a durable agent identity, mint an agent token and run party init with AGENTPARTY_CONFIG");

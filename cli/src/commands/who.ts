@@ -1,6 +1,6 @@
 // party who — 从终端看频道里谁在线/可唤醒/最近，便于接着 party send --mention 把人拉进来/唤醒。
 // Claude Code 原生 @ 只认本地文件/技能，塞不进远程动态列表；本命令就是那个「动态在线列表」。
-import { type PresenceEntry, type SenderKind, type WakeKind, wakeableState } from "@agentparty/shared";
+import { autoWakeReachable, type PresenceEntry, type SenderKind, type WakeKind, wakeableState } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel } from "../config";
 import { resolveAuth } from "../oidc-cli";
@@ -96,11 +96,12 @@ export function classify(e: PresenceEntry, now: number): Row | null {
   //   offline（无 wake layer / human_driven）/ wakeable_unverified（自报 serve/watch 未经服务端验证）
   //   / wakeable_verified（webhook，或服务端观测到被 @ 后 resume 盖了 verified_at）。
   const wstate = wakeableState(e, now);
+  const wakeReachable = autoWakeReachable(e, now, STALE_MS);
   let tier: Tier;
   if (online) tier = "online";
-  // 声明了 wake layer（serve/watch/webhook，非 human_driven）→ 一律「可唤醒·待命」，哪怕 supervisor 陈旧
-  // 也不再谎报「离线·待重连」（这正是 watch --once 两次唤醒之间的常态）；可信度由 verified/unverified 另表。
-  else if (wstate !== "offline" && age <= DEAD_MS) tier = "wakeable";
+  // #454：wakeable 不只看历史声明，还必须有当前可达证据。serve/watch 的本地 listener 超过租约未续
+  // 即降级 recent；webhook 由服务端投递，仍可离线 wakeable。避免被 harness kill 的 watch --once 永久假在线。
+  else if (wstate !== "offline" && wakeReachable && age <= DEAD_MS) tier = "wakeable";
   else tier = "recent";
   if (tier !== "online") {
     // 暂停是人主动设的、有意保留的状态：不当人类/幽灵清掉，始终列出，让人看得见「谁被按了暂停」。

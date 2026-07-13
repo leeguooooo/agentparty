@@ -90,6 +90,39 @@ describe("applyLiveConnection (issue #97 read-side reachability fix)", () => {
 });
 
 describe("DO presence wiring (issue #97 end-to-end)", () => {
+  it("最后一个 watch listener 断开后立即撤销 wake 层，避免 harness kill 后 false-online（#454）", async () => {
+    const agent = await seedToken("agent");
+    const human = await seedToken("human");
+    const slug = await createChannel(agent.token);
+    const observer = await WsClient.open(slug, human.token);
+    await observer.nextOfType("welcome");
+    const watch = await WsClient.open(slug, agent.token);
+    await watch.nextOfType("welcome");
+    watch.send({
+      type: "send",
+      kind: "status",
+      state: "waiting",
+      note: "watching",
+      mentions: [],
+      residency: "supervised",
+      wake: { kind: "watch" },
+    });
+    await watch.nextOfType("sent");
+    expect((await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name)?.wake?.kind).toBe("watch");
+
+    watch.close();
+    for (;;) {
+      const frame = await observer.nextOfType("presence");
+      if (frame.name === agent.name && frame.state === "offline") break;
+    }
+
+    const offline = (await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name)!;
+    expect(offline.state).toBe("offline");
+    expect(offline.wake).toBeUndefined();
+    expect(autoWakeReachable(offline, Date.now())).toBe(false);
+    observer.close();
+  });
+
   it("活 WS 连接的 agent：/presence 标 live=true、报为非 offline、可自动唤醒", async () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);

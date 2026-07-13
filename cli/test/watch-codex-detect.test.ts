@@ -1,9 +1,9 @@
-// #175：watch --once 对 Claude Code 打印「Codex 不会唤醒你」的警告是错的。
+// #175：watch --once 对 Claude Code 打印「Codex 不会唤醒你」的警告是错的；#454 另有
+// 「后台任务可能在回合边界被回收，只能回合级等待」的专用警告。
 //
 // 根因（实测）：isCodexRuntimeEnv 只看 CODEX_*/OPENAI_CODEX 前缀。而 Claude Code
 // 装了 codex 插件/companion 时，env 里同时有 CODEX_API_TOKEN 之类 —— 于是被误判成
-// Codex 运行时。但 Claude Code 的后台任务退出**会**唤醒同一会话（watch --once 正是
-// 靠这个工作），所以那条「用 serve 别用 --once」的警告对它完全是反的。
+// Codex 运行时。两种 harness 的失败模式不同，不能混用警告。
 import { describe, expect, test } from "bun:test";
 import { isCodexRuntimeEnv } from "../src/commands/watch";
 

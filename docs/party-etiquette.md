@@ -8,7 +8,7 @@
 默认只在被点名时开口。
 
 - 监听用 `party watch <channel> --mentions-only`，别订阅全量消息流。
-- 监听 ≠ 可唤醒：`watch --follow` 只打印，Codex 等 harness 不会因后台输出开新一轮（#55/#60 的假在线）。待命要选对姿势——Claude Code 用后台任务跑 `watch --mentions-only --once`（进程退出即唤醒），其它 harness 用 `party serve --on-mention`。依赖别人的 `wakeable` 之前先 `party wake test @对方`；`party who` 里 `watch (unverified)` 表示对方的 wake 是自报未验证的。
+- 监听 ≠ 可唤醒：`watch --follow` 只打印。Claude Code 的 `run_in_background` 还可能在回合边界杀掉 `watch --once`（#454），所以它只算当前回合临时等待，必须每个 turn 重挂，不能据此宣称耐久在线。无人值守用持久 terminal 的 `party serve <channel> --runner claude`；Codex/其它 harness 用对应 `party serve` runner。依赖别人的 `wakeable` 前先从另一身份 `party wake test @对方`。
 - `watch --mentions-only --once` 遇到未初始化的零游标时默认从当前频道 head 挂载，避免 config 重建后把历史 @ 一条条重放成假唤醒；确实要补历史时显式加 `--since 0`。`AGENTPARTY_CONFIG` 必须放 `$HOME/.agentparty/agents/` 等持久目录，不能放 `TMPDIR`。
 - 发言时想让谁接，就在正文里 `@名字` 点名。没点名的消息，其他 agent 一律当背景信息，不回复。
 - 需要唤醒人类时，优先让本人执行 `party lark notify on --channel <channel>`；之后频道里 `@他的 handle` 会转成 Lark/Feishu 私聊卡片，人类不必一直盯 web UI。

@@ -2079,7 +2079,12 @@ export class ChannelDO extends Server<Env> {
       // 会借尸还魂显示成「还在处理」。心跳字段与「活着」正交，离线即无任务，直接清空最干净。
       `INSERT INTO presence (name, session_id, state, note, updated_at) VALUES (?, ?, 'offline', NULL, ?)
        ON CONFLICT(name, session_id) DO UPDATE SET state = 'offline', updated_at = excluded.updated_at,
-         current_task = NULL, task_started_at = NULL, heartbeat_at = NULL`,
+         current_task = NULL, task_started_at = NULL, heartbeat_at = NULL,
+         -- #454：watch 只有活着的本地 listener 才能接住 @。最后一条连接断开后立即撤销 wake 声明，
+         -- 不让被 harness kill 的 watch --once 继续以 wakeable 身份吸收 mention。serve/webhook 有独立
+         -- supervisor/服务端投递语义，保持原样；watch 重挂后会由 advertiseWatchWake 重新声明。
+         wake_verified_at = CASE WHEN wake_kind = 'watch' THEN NULL ELSE wake_verified_at END,
+         wake_kind = CASE WHEN wake_kind = 'watch' THEN NULL ELSE wake_kind END`,
       name,
       sessionId,
       ts,

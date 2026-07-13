@@ -40,6 +40,7 @@ afterEach(() => {
   console.log = origLog;
   console.error = origErr;
   delete process.env.AGENTPARTY_HOME;
+  delete process.env.AGENTPARTY_CONFIG;
   rmSync(home, { recursive: true, force: true });
   restMock?.stop();
   restMock = null;
@@ -414,6 +415,19 @@ describe("whoami", () => {
     expect(stdout).toContain("AGENTPARTY_CONFIG=");
     expect(stdout).toContain("party watch dev --mentions-only --once");
     expect(stdout).not.toContain("ap_rejoin_secret");
+  });
+
+  test("rejoin output strips terminal controls from an explicit config path", async () => {
+    mock = startOidcMock();
+    process.env.AGENTPARTY_CONFIG = join(home, "agent\u001b[31m.json");
+    writeConfig({ server: mock.url, token: "ap_rejoin_secret" });
+    writeState({ channel: "dev", cursor: 0 });
+    const code = await whoamiRun(["--rejoin"]);
+    expect(code).toBe(0);
+    const stdout = logs.join("\n");
+    expect(stdout).not.toContain("\u001b");
+    expect(stdout).toContain("AGENTPARTY_CONFIG=");
+    expect(stdout).toContain("party serve dev --runner claude");
   });
 
   test("prints not logged in when no auth", async () => {

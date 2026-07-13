@@ -20,23 +20,21 @@ describe("who classify（#47：可唤醒判定按 wake.kind 分口径）", () =>
     expect(watch?.tier).toBe("wakeable");
   });
 
-  // #191（owner decision 2026-07-11）：改变了 #47 的口径。陈旧的 serve/watch 不再降级为 recent/离线——
-  // 它声明了 wake layer，就是「可唤醒·待命」，只是**未经服务端验证**，如实标注 unverified，不谎称可达。
-  test("offline 13 分钟的 serve → wakeable 但 unverified（自报未验证，不再谎报离线，#191）", () => {
+  test("offline 13 分钟的 serve → recent（listener 租约已过期，#454）", () => {
     const r = classify(p({ name: "computer-use-mini", state: "offline", wake: { kind: "serve" }, last_seen: NOW - 780_000 }), NOW);
-    expect(r?.tier).toBe("wakeable");
-    expect(r?.wake_unverified).toBe(true);
+    expect(r?.tier).toBe("recent");
+    expect(r?.wake_unverified).toBeUndefined();
   });
 
-  test("offline 13 分钟的 watch 同样 → wakeable unverified（#191 待命态）", () => {
+  test("offline 13 分钟的 watch → recent，不能把已死 listener 报成 wakeable（#454）", () => {
     const r = classify(p({ name: "bot", state: "offline", wake: { kind: "watch" }, last_seen: NOW - 780_000 }), NOW);
-    expect(r?.tier).toBe("wakeable");
-    expect(r?.wake_unverified).toBe(true);
+    expect(r?.tier).toBe("recent");
+    expect(r?.wake_unverified).toBeUndefined();
   });
 
-  test("陈旧的 serve 若服务端验证过（verified_at 新鲜）→ wakeable verified，不带 unverified（#191）", () => {
+  test("陈旧的 serve 即使曾验证过也 → recent；历史成功不能替代当前 listener 租约（#454）", () => {
     const r = classify(p({ name: "bot", state: "offline", wake: { kind: "serve", verified_at: NOW - 60_000 }, last_seen: NOW - 780_000 }), NOW);
-    expect(r?.tier).toBe("wakeable");
+    expect(r?.tier).toBe("recent");
     expect(r?.wake_unverified).toBeUndefined();
   });
 

@@ -28,19 +28,19 @@ const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions
 Watch a channel for new messages. By default this waits up to 240 seconds.
 With --follow, it stays attached unless --timeout N is explicit.
 With --once, it stays attached until the FIRST matching message, prints it, and
-exits 0 — made for harness background tasks (e.g. Claude Code run_in_background):
-the process exit is the wake signal, so the mention lands in your EXISTING
-session with its context intact.
+exits 0. It is only a wake signal while the harness keeps that background task
+alive. Claude Code may kill run_in_background tasks at turn boundaries, so this
+is turn-scoped best effort, not durable unattended presence.
 For --mentions-only --once, an uninitialized cursor (0) attaches at the current
 channel head to avoid replaying old mentions. Use --since 0 to request backlog.
 Self messages are skipped by default; --exclude-self is accepted as an explicit
 automation hint for scripts that want to document that behavior.
 NOTE: --follow only PRINTS messages. Most harnesses (Codex included) never turn
 background output into a new agent turn, so a mention can sit unread while you
-look online. --once is only a wake layer when your harness proves that process
-exit resumes the same agent session. Codex CLI does not; for Codex/unknown
-harnesses keep a durable supervisor with:
-  party serve <channel> --on-mention '<cmd>'
+look online. --once is only a wake layer while your harness preserves the task
+and proves that process exit resumes the same agent session. For durable Claude
+Code/Codex presence, run a project agent from a persistent terminal with:
+  party serve <channel> --runner claude|codex
 Verify the whole chain from another identity with: party wake test @<you>
 
 Options:
@@ -60,7 +60,8 @@ Options:
 export const FOLLOW_WAKE_ADVISORY =
   "note: --follow only prints; unless your harness turns background output into a new agent turn " +
   "(Codex does not), mentions will sit here unread while you look online. " +
-  "Prefer --once (exit = wake signal) or: party serve <channel> --on-mention '<cmd>'. " +
+  "Use --once only for a turn-scoped wait, or a durable project agent with: " +
+  "party serve <channel> --runner claude|codex. " +
   "Verify from another identity: party wake test @<you>";
 
 export const ONCE_CODEX_ADVISORY =
@@ -68,17 +69,22 @@ export const ONCE_CODEX_ADVISORY =
   "Use `party serve <channel> --on-mention '<codex exec resume ...; party send ...>'` " +
   "from a durable supervisor (tmux/launchctl/daemon), then verify with `party wake test @<you>`.";
 
-export const ONCE_REARM_ADVISORY =
-  "note: --once is single-shot. Re-arm it after handling this wake, or use `party serve` for Codex/unknown harnesses.";
+export const ONCE_CLAUDE_ADVISORY =
+  "warning: Claude Code may kill `run_in_background` watchers at a turn boundary. " +
+  "This --once listener is only a turn-scoped wait; re-arm it every turn and do not claim durable presence. " +
+  "For unattended wake, run `party serve <channel> --runner claude` from a persistent terminal/project agent.";
 
-/** Claude Code：后台任务退出即唤醒同一会话，watch --once 在它上面正常工作。 */
+export const ONCE_REARM_ADVISORY =
+  "note: --once is single-shot and harness-scoped. Re-arm it every turn, or use `party serve --runner claude|codex` for durable presence.";
+
+/** Claude Code 环境：可做回合内 --once，但 run_in_background 可能在回合边界被回收（#454）。 */
 export function isClaudeCodeEnv(env: Record<string, string | undefined> = process.env): boolean {
   return env.CLAUDECODE !== undefined || Object.keys(env).some((key) => key.startsWith("CLAUDE_CODE_"));
 }
 
 export function isCodexRuntimeEnv(env: Record<string, string | undefined> = process.env): boolean {
-  // Claude Code 优先短路（#175）：它装 codex 插件/companion 时 env 里也会有 CODEX_* 变量，
-  // 但它的后台退出会唤醒——那条「Codex 不会唤醒你、改用 serve」的警告对它是反的。
+  // Claude Code 优先短路（#175）：它装 codex 插件/companion 时 env 里也会有 CODEX_* 变量；
+  // 它需要 #454 的 turn-scoped 警告，而不是 Codex 的「退出不会唤醒」警告。
   if (isClaudeCodeEnv(env)) return false;
   return Object.keys(env).some((key) => key === "CODEX" || key.startsWith("CODEX_") || key.startsWith("OPENAI_CODEX"));
 }
@@ -465,7 +471,8 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   if (flags.follow === true) console.error(FOLLOW_WAKE_ADVISORY);
-  if (flags.once === true && isCodexRuntimeEnv()) console.error(ONCE_CODEX_ADVISORY);
+  if (flags.once === true && isClaudeCodeEnv()) console.error(ONCE_CLAUDE_ADVISORY);
+  else if (flags.once === true && isCodexRuntimeEnv()) console.error(ONCE_CODEX_ADVISORY);
   const localCursor = loadCursor(channel);
   const initialLatest =
     localCursor === 0 &&

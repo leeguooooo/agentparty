@@ -743,6 +743,22 @@ describe("cli subprocess", () => {
     expect(r.stderr).toContain("party wake test");
   }, 15_000);
 
+  test("watch --once 在 Claude Code 下明确是回合级等待，不得宣称耐久 presence（#454）", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") sock.send(welcomeFrame(0, "me"));
+    });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "config.json"), JSON.stringify({ server: server.url, token: "ap_tok" }));
+    const r = await runCli(
+      ["watch", "dev", "--once", "--mentions-only", "--since", "0", "--timeout", "1"],
+      { CLAUDECODE: "1", CODEX_CI: undefined },
+    );
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("turn boundary");
+    expect(r.stderr).toContain("--runner claude");
+    expect(r.stderr).not.toContain("Codex CLI does not resume");
+  }, 15_000);
+
   test("watch --once 成功后提醒这是一次性 watcher 且不污染 stdout（#65）", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {
