@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyWorktrees, type GitRunner, run } from "../src/commands/worktree";
+import { classifyWorktrees, type GitRunner, run, sanitizeForTerminal } from "../src/commands/worktree";
 
 // 用真 git：临时仓库 + 真 worktree，覆盖 merged-clean / merged-dirty / unmerged 三态。
 // 不 mock git——命令的价值就在于对真 porcelain 输出的解析与真 cherry/status 判定。
@@ -102,7 +102,30 @@ describe("classifyWorktrees", () => {
     };
     const rows = await classifyWorktrees(main, "main", failingGit);
     const mc = rows.find((r) => r.branch === "mc");
-    expect(mc?.status).not.toBe("merged-clean");
+    // 精确断言 unmerged——not.toBe 会误放行 undefined/merged-dirty（CodeRabbit #456 指出）。
+    expect(mc?.status).toBe("unmerged");
+  });
+
+  test("rev-parse --show-toplevel 失败时抛错，绝不静默把当前 worktree 变可删", async () => {
+    // currentPath 失败被设成 "" → w.path === "" 永不命中 → 当前 worktree 保护静默失效。
+    // 必须失败即抛（同 worktree-list 失败），不能静默降级。（CodeRabbit #456 🟠）
+    const failTop: GitRunner = async (args, cwd) => {
+      if (args[0] === "rev-parse" && args.includes("--show-toplevel")) {
+        return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
+      }
+      const out = execFileSync("git", args, { cwd, encoding: "utf8" });
+      return { code: 0, stdout: out, stderr: "" };
+    };
+    await expect(classifyWorktrees(main, "main", failTop)).rejects.toThrow();
+  });
+});
+
+describe("sanitizeForTerminal", () => {
+  test("剥掉 ANSI 转义与控制字符，保留可见文本/制表/换行", () => {
+    expect(sanitizeForTerminal("\x1b[31mred\x1b[0m")).toBe("red");
+    expect(sanitizeForTerminal("a\x07b\x00c\x7f")).toBe("abc");
+    // 制表符与换行保留（stderr 常多行）。
+    expect(sanitizeForTerminal("keep\tnormal\nline")).toBe("keep\tnormal\nline");
   });
 });
 
@@ -170,6 +193,7 @@ describe("party worktree prune", () => {
     expect(existsSync(join(root, "wt-un"))).toBe(true);
     const branches = git(main, "branch", "--format=%(refname:short)").split("\n");
     expect(branches).toContain("un");
-    expect(logs.join("\n")).toContain("un");
+    // 精确匹配 skip 行本身——单看子串 "un" 会被 "executing prune" 提前满足（CodeRabbit #456）。
+    expect(logs.join("\n")).toMatch(/skip\s+un\s+—\s+unmerged/);
   });
 });
