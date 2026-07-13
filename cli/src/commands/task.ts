@@ -1,5 +1,5 @@
 // party task — channel-scoped task ledger.
-import type { MsgFrame, TaskAssigneeKind, TaskRecord, TaskState } from "@agentparty/shared";
+import type { Attachment, MsgFrame, TaskAssigneeKind, TaskRecord, TaskState } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { resolveChannel } from "../config";
 import { jsonFrame } from "../json";
@@ -297,9 +297,12 @@ export async function run(argv: string[]): Promise<number> {
         console.error("usage: party task solution <id> <file> [--channel C] | party task solution <id> --clear [--channel C]");
         return 1;
       }
-      const solution = flags.clear === true
-        ? null
-        : (await collectAttachments(cfg.server, cfg.token, slug, await resolveAttachments([path!])))[0]!;
+      let solution: Attachment | null = null;
+      if (flags.clear !== true) {
+        const uploaded = await collectAttachments(cfg.server, cfg.token, slug, await resolveAttachments([path!]));
+        if (uploaded.length !== 1) throw new Error("party task solution: upload did not return exactly one attachment");
+        solution = uploaded[0]!;
+      }
       const task = await updateTask(cfg.server, cfg.token, slug, id, { solution });
       console.log(flags.json === true ? JSON.stringify(jsonFrame(task as unknown as Record<string, unknown>)) : `updated ${formatTask(task)}`);
       return 0;

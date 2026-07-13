@@ -294,6 +294,7 @@ describe("channel task ledger", () => {
       body: JSON.stringify({ solution: { ...solution, key: `other/${solution.filename}`, url: `/api/channels/other/attachments/${solution.filename}` } }),
     });
     expect(crossChannel.status).toBe(400);
+    expect(await crossChannel.json()).toMatchObject({ error: { message: "solution must belong to the current channel" } });
 
     const cleared = await api(`/api/channels/${slug}/tasks/${task.id}`, human.token, {
       method: "PATCH",

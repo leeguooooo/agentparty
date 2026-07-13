@@ -4919,8 +4919,11 @@ app.post("/api/channels/:slug/tasks", async (c) => {
     return c.json(errorBody("bad_request", `attachments must be at most ${MAX_ATTACHMENTS} valid attachment refs`), 400);
   }
   const solution = body?.solution === undefined || body.solution === null ? undefined : parseAttachment(body.solution);
-  if (solution === null || (solution !== undefined && !solutionBelongsToChannel(solution, slug))) {
+  if (solution === null) {
     return c.json(errorBody("bad_request", "solution must be one valid attachment ref"), 400);
+  }
+  if (solution !== undefined && !solutionBelongsToChannel(solution, slug)) {
+    return c.json(errorBody("bad_request", "solution must belong to the current channel"), 400);
   }
   const state = (requestedState ?? (assignee ? "assigned" : identity.kind === "agent" ? "triage" : "backlog")) as TaskState;
   // #204 不变量：blocked_reason 只在 state=blocked 时有意义。非 blocked 一律落 null，
@@ -5069,8 +5072,11 @@ app.patch("/api/channels/:slug/tasks/:id", async (c) => {
       solutionAttachmentJson = null;
     } else {
       const solution = parseAttachment(body.solution);
-      if (solution === null || !solutionBelongsToChannel(solution, slug)) {
+      if (solution === null) {
         return c.json(errorBody("bad_request", "solution must be null or one valid attachment ref"), 400);
+      }
+      if (!solutionBelongsToChannel(solution, slug)) {
+        return c.json(errorBody("bad_request", "solution must belong to the current channel"), 400);
       }
       solutionAttachmentJson = JSON.stringify(solution);
     }
