@@ -1,11 +1,11 @@
 # 合并前必须「读了 review」的强制闸——对所有人生效，不靠任何人记忆。
 # 机制：job 显式给 PR head SHA 发一个 commit status（context=review-ack）。
-#   - 有 ack（非机器人的正式 PR review，或以 review-ack:/合并前已读/合并者 review 结论 开头的评论）→ status=success（绿、可合）
-#   - 无 ack → status=failure（红、拦合并）
+#   - 当前 head 的 pr_agent workflow 已完成、CodeRabbit review 已落地；
+#   - 非机器人的正式 PR review / review-ack 评论必须晚于最新 bot review，才能 success。
 # 用 commit status 而非 job 自身的 check-run，是因为 issue_comment 事件的 run 跑在 main ref 上、
 #   其自动 check-run 挂不到 PR head SHA；显式发 status 到 head SHA 才能让「留 ack 后」正确转绿。
 # job 名 review_ack_runner ≠ required 的 context(review-ack)，避免两个同名 check 冲突。
-# 不依赖任何 LLM 端点：端点挂时 pr_agent 自动放行，但本闸仍要求人看过并留结论。
+# pr_agent 端点挂时以 workflow completed 为已尽责，不要求它必须产出评论；CodeRabbit 仍须对当前 head 落 review。
 name: Review Ack Gate
 
 on:
@@ -15,60 +15,34 @@ on:
     types: [submitted, dismissed, edited]
   issue_comment:
     types: [created, edited, deleted]
+  workflow_run:
+    workflows: ["PR Agent (qwen · soft-gate)"]
+    types: [completed]
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
+  checks: read
   statuses: write   # 给 head SHA 发 commit status
 
 concurrency:
-  group: review-ack-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: review-ack-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
   cancel-in-progress: false
 
 jobs:
   review_ack_runner:
     if: >-
-      github.event_name != 'issue_comment' ||
-      github.event.issue.pull_request
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.pull_requests[0])
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v7
       - name: 评估 ack 并给 PR head SHA 发 review-ack commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
-        run: |
-          set -euo pipefail
-          # PR head SHA：pull_request 事件直接给；其它事件（issue_comment/review）查 PR 拿
-          SHA="${{ github.event.pull_request.head.sha }}"
-          if [ -z "$SHA" ]; then
-            # 采纳 pr-agent 建议：查 head SHA 加错误处理，拿不到就报错退出（而非静默用空 SHA 发错状态）
-            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null || true)
-          fi
-          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::error::拿不到 PR #$PR 的 head SHA，无法发 review-ack 状态"
-            exit 1
-          fi
-          echo "PR #$PR head SHA=$SHA"
-          # 机器人判定改用 GitHub API 的结构化字段 .user.type == "Bot"（采纳并致谢 #406 codex 的方案）：
-          # 比维护机器人用户名正则更稳——① 覆盖所有 GitHub App bot（github-actions/coderabbit/pr-agent/
-          # dependabot 都是 type=Bot），新增 bot 无需改名单；② 彻底避开「正则内嵌进 jq test() 字符串字面量」
-          # 的转义雷区（此前 `github-actions\[bot\]` 的 `\[` 是 jq 非法转义，让整条 jq 解析失败 + `|| echo 0`
-          # 兜底成 0，导致所有 PR 的 review-ack 恒 fail、全员合并被卡）。已在 #401/#404/#407 真实数据上验证。
-          # 采纳 pr-agent 建议：API 失败时按 0 计（fail-safe——查不到就当无 ack、保持红，绝不误放行）
-          REVIEWS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-            --jq "[.[] | select(.user.type != \"Bot\") | select(.state != \"PENDING\" and .state != \"DISMISSED\")] | length" 2>/dev/null || echo 0)
-          ACK_COMMENTS=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq "[.[] | select(.user.type != \"Bot\") | select(.body | test(\"review-ack:|合并前已读|合并者 review 结论\"; \"i\"))] | length" 2>/dev/null || echo 0)
-          REVIEWS=${REVIEWS:-0}; ACK_COMMENTS=${ACK_COMMENTS:-0}
-          echo "非机器人 PR reviews=$REVIEWS · ack 评论=$ACK_COMMENTS"
-          if [ "$REVIEWS" -gt 0 ] || [ "$ACK_COMMENTS" -gt 0 ]; then
-            STATE=success; DESC="已有 review 结论——合并者看过了"
-          else
-            STATE=failure; DESC="合并前必须先读 review 并留结论：提交一次 PR review，或评论 review-ack: 开头的合并结论"
-          fi
-          gh api -X POST "repos/$REPO/statuses/$SHA" \
-            -f state="$STATE" -f context="review-ack" -f description="$DESC" >/dev/null
-          echo "已发 commit status: review-ack=$STATE @ $SHA"
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number }}
+          REQUIRE_CODERABBIT: "true"
+        run: node scripts/review-ack-gate.mjs
