@@ -3561,7 +3561,8 @@ app.get("/api/channels/:slug/lark-directory", async (c) => {
     ).bind(slug).all<{ account: string }>()).results.map((row) => row.account));
     return c.json({
       users: page.users.map((user) => {
-        const account = knownAccounts.get(user.id) ?? directoryAccount(provider.id, user.id);
+        const account = user.identifiers.map((identifier) => knownAccounts.get(identifier)).find((known) => known !== undefined)
+          ?? directoryAccount(provider.id, user.id);
         return { id: user.id, name: user.name, avatar_url: user.avatarUrl, already_member: account !== null && members.has(account) };
       }),
       next_cursor: page.nextCursor,
@@ -3600,11 +3601,12 @@ app.post("/api/channels/:slug/lark-members", async (c) => {
   }
   try {
     const user = await getLarkDirectoryUser(c.env, provider, userId);
+    const identifiers = [...user.identifiers, "", ""].slice(0, 3);
     const known = await c.env.DB.prepare(
       `SELECT account FROM account_profiles
-        WHERE provider = ? AND provider_user_id = ? AND tenant_key = ?
+        WHERE provider = ? AND tenant_key = ? AND provider_user_id IN (?, ?, ?)
         LIMIT 1`,
-    ).bind(provider.id, user.id, profile.tenant_key).first<{ account: string }>();
+    ).bind(provider.id, profile.tenant_key, ...identifiers).first<{ account: string }>();
     const account = known?.account ?? directoryAccount(provider.id, user.id);
     if (account === null) return c.json(errorBody("bad_request", "unsupported Lark user id"), 400);
     await ensureDefaultHandle(c.env.DB, {

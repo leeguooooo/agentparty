@@ -176,6 +176,44 @@ describe("Lark organization member invitations (#358)", () => {
     expect(await third.json()).toEqual({ users: [], next_cursor: null });
   });
 
+  it("matches an existing member whose profile still stores an open_id", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    const legacyAccount = `lark-main:${uniq("legacy_alice")}`;
+    const unionId = uniq("on_alice");
+    const openId = uniq("ou_alice");
+    const userId = uniq("alice_user");
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO account_profiles (
+         account, handle, display_name, provider, provider_user_id, tenant_key, created_at, updated_at
+       ) VALUES (?, ?, 'Alice', 'lark-main', ?, 'tenant-test', ?, ?)`,
+    ).bind(legacyAccount, uniq("alice"), openId, now, now).run();
+    await env.DB.prepare(
+      "INSERT INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, ?, ?)",
+    ).bind(slug, legacyAccount, owner.account, now).run();
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=20",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: {
+          has_more: true,
+          page_token: "next-page",
+          items: [{ union_id: unionId, open_id: openId, user_id: userId, name: "Alice" }],
+        },
+      });
+
+    const response = await api(`/api/channels/${slug}/lark-directory?q=alice&limit=20`, owner.token);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      users: [{ id: unionId, name: "Alice", already_member: true }],
+    });
+  });
+
   it("maps missing v3 department visibility to the stable contact-permission error", async () => {
     const owner = await larkHuman();
     const slug = await createChannel(owner.token);
@@ -227,6 +265,40 @@ describe("Lark organization member invitations (#358)", () => {
     const audit = await api(`/api/channels/${slug}/management-audit?limit=100`, owner.token);
     const entries = ((await audit.json()) as { audit: Array<{ action: string; resource: string }> }).audit;
     expect(entries.filter((entry) => entry.action === "channel.member.add" && entry.resource === `channel/${slug}/members/lark-main:on_alice`)).toHaveLength(1);
+  });
+
+  it("reuses an open_id profile during a union_id invite and migrates it to the stable id", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    const legacyAccount = `lark-main:${uniq("legacy_alice")}`;
+    const unionId = uniq("on_alice");
+    const openId = uniq("ou_alice");
+    const userId = uniq("alice_user");
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO account_profiles (
+         account, handle, display_name, provider, provider_user_id, tenant_key, created_at, updated_at
+       ) VALUES (?, ?, 'Alice', 'lark-main', ?, 'tenant-test', ?, ?)`,
+    ).bind(legacyAccount, uniq("alice"), openId, now, now).run();
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: `/open-apis/contact/v3/users/${unionId}?user_id_type=union_id`, method: "GET" })
+      .reply(200, {
+        code: 0,
+        data: { user: { union_id: unionId, open_id: openId, user_id: userId, name: "Alice" } },
+      });
+
+    const response = await api(`/api/channels/${slug}/lark-members`, owner.token, {
+      method: "POST",
+      body: JSON.stringify({ user_id: unionId }),
+    });
+    expect(response.status).toBe(201);
+    expect(await env.DB.prepare(
+      "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, legacyAccount).first()).not.toBeNull();
+    expect(await env.DB.prepare(
+      "SELECT provider_user_id FROM account_profiles WHERE account = ?",
+    ).bind(legacyAccount).first<{ provider_user_id: string }>()).toEqual({ provider_user_id: unionId });
   });
 
   it("uses the stable contact-permission code for direct invite failures", async () => {

@@ -13,6 +13,7 @@ export interface LarkProviderConfig {
 
 export interface LarkDirectoryUser {
   id: string;
+  identifiers: string[];
   name: string;
   avatarUrl: string | null;
 }
@@ -219,7 +220,11 @@ function directoryUsers(data: Record<string, unknown>): LarkDirectoryUser[] {
   const users: LarkDirectoryUser[] = [];
   for (const value of rows) {
     if (!isRecord(value)) continue;
-    const id = typeof value.union_id === "string" ? value.union_id.trim() : "";
+    const identifiers = [value.union_id, value.open_id, value.user_id]
+      .filter((identifier): identifier is string => typeof identifier === "string" && identifier.trim().length > 0)
+      .map((identifier) => identifier.trim())
+      .filter((identifier, index, all) => all.indexOf(identifier) === index);
+    const id = identifiers[0] ?? "";
     const name = typeof value.name === "string" ? value.name.trim() : "";
     if (!id || !name) continue;
     const avatar = isRecord(value.avatar) ? value.avatar : {};
@@ -228,7 +233,7 @@ function directoryUsers(data: Record<string, unknown>): LarkDirectoryUser[] {
       : typeof value.avatar_url === "string"
         ? value.avatar_url
         : null;
-    users.push({ id, name, avatarUrl });
+    users.push({ id, identifiers, name, avatarUrl });
   }
   return users;
 }
