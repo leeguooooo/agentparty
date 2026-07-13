@@ -3,7 +3,13 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyWorktrees, type GitRunner, run, sanitizeForTerminal } from "../src/commands/worktree";
+import {
+  classifyWorktrees,
+  type GitRunner,
+  run,
+  sanitizeForTerminal,
+  spawnWithTimeout,
+} from "../src/commands/worktree";
 
 // 用真 git：临时仓库 + 真 worktree，覆盖 merged-clean / merged-dirty / unmerged 三态。
 // 不 mock git——命令的价值就在于对真 porcelain 输出的解析与真 cherry/status 判定。
@@ -124,8 +130,27 @@ describe("sanitizeForTerminal", () => {
   test("剥掉 ANSI 转义与控制字符，保留可见文本/制表/换行", () => {
     expect(sanitizeForTerminal("\x1b[31mred\x1b[0m")).toBe("red");
     expect(sanitizeForTerminal("a\x07b\x00c\x7f")).toBe("abc");
+    // 裸回车(\x0D)必须剥——可做终端行覆盖伪造已打印内容。
+    expect(sanitizeForTerminal("real\rFAKE")).toBe("realFAKE");
     // 制表符与换行保留（stderr 常多行）。
     expect(sanitizeForTerminal("keep\tnormal\nline")).toBe("keep\tnormal\nline");
+  });
+});
+
+describe("spawnWithTimeout", () => {
+  test("超时独立返回 124，不等命令自然结束（防子进程占管道导致卡死）", async () => {
+    const t0 = Date.now();
+    const r = await spawnWithTimeout(["sleep", "5"], root, 200);
+    expect(r.code).toBe(124);
+    expect(r.stderr).toContain("timed out");
+    // 远早于 5s 返回 = 超时确实独立于命令/管道，没干等。
+    expect(Date.now() - t0).toBeLessThan(4000);
+  });
+
+  test("命令按时结束时返回真实退出码与输出", async () => {
+    const r = await spawnWithTimeout(["sh", "-c", "printf ok"], root, 5000);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("ok");
   });
 });
 
