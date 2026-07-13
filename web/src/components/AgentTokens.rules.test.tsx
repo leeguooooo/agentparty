@@ -19,12 +19,16 @@ type ProfileFixture = {
   created_at: number;
   updated_at: number;
 };
+type AgentFixture = { name: string; owner: string; channel_scope: string; created_at: number; nickname?: string | null };
 
 let profilesFixture: ProfileFixture[] = [];
+let agentsFixture: AgentFixture[] = [];
 const createCalls: Array<{ token: string; body: Record<string, unknown> }> = [];
+const nicknameCalls: Array<{ token: string; slug: string; name: string; nickname: string }> = [];
 
 mock.module("../lib/api", () => ({
   AuthError: class AuthError extends Error {},
+  ConflictError: class ConflictError extends Error {},
   ForbiddenError: class ForbiddenError extends Error {},
   ValidationError: class ValidationError extends Error {},
   createProjectAgentProfile: mock(async (token: string, body: Record<string, unknown>) => {
@@ -35,9 +39,15 @@ mock.module("../lib/api", () => ({
     return existing ?? profilesFixture[0];
   }),
   inviteProjectAgent: async () => {},
-  listChannelAgents: async () => [],
+  listChannelAgents: async () => agentsFixture,
   listProjectAgentProfiles: async () => profilesFixture,
   rotateChannelAgent: async () => ({}),
+  setChannelAgentNickname: mock(async (token: string, slug: string, name: string, nickname: string) => {
+    nicknameCalls.push({ token, slug, name, nickname });
+    const agent = agentsFixture.find((entry) => entry.name === name);
+    if (agent) agent.nickname = nickname;
+    return { name, nickname };
+  }),
 }));
 
 const { AgentTokens } = await import("./AgentTokens");
@@ -101,7 +111,9 @@ class TestEventTarget {
 
 beforeEach(() => {
   profilesFixture = [];
+  agentsFixture = [];
   createCalls.length = 0;
+  nicknameCalls.length = 0;
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage({ ap_locale: "en" }) });
   windowEvents = new TestEventTarget();
@@ -195,6 +207,28 @@ describe("AgentTokens project-agent rules view", () => {
     const r = await renderOpen();
     expect(allText(r)).toContain("no rules set");
     expect(allText(r)).not.toContain("always run the tests");
+  });
+});
+
+describe("AgentTokens agent nickname management (#165)", () => {
+  test("owner can set a Chinese nickname from the agent management panel", async () => {
+    agentsFixture = [{ name: "build-bot", owner: "acct-1", channel_scope: "demo", created_at: 1, nickname: null }];
+    const r = await renderOpen();
+
+    await act(async () => findClass(r, "d-btn agenttokens-edit-nickname").props.onClick());
+    const input = findClass(r, "agenttokens-input agenttokens-nickname-input");
+    await act(async () => input.props.onChange({ target: { value: "  构建小助手  " } }));
+    await act(async () => findClass(r, "d-btn d-btn--primary agenttokens-save-nickname").props.onClick());
+
+    expect(nicknameCalls).toEqual([{ token: "tok-1", slug: "demo", name: "build-bot", nickname: "构建小助手" }]);
+    expect(findClass(r, "agenttokens-nickname").children.join("")).toBe("@构建小助手");
+  });
+
+  test("editing an existing nickname starts with the current value", async () => {
+    agentsFixture = [{ name: "build-bot", owner: "acct-1", channel_scope: "demo", created_at: 1, nickname: "旧昵称" }];
+    const r = await renderOpen();
+    await act(async () => findClass(r, "d-btn agenttokens-edit-nickname").props.onClick());
+    expect(findClass(r, "agenttokens-input agenttokens-nickname-input").props.value).toBe("旧昵称");
   });
 });
 

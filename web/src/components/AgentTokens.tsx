@@ -2,6 +2,7 @@ import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, u
 import {
   AuthError,
   type ChannelAgentInfo,
+  ConflictError,
   ForbiddenError,
   type ProjectAgentInvitableBy,
   type ProjectAgentProfile,
@@ -12,6 +13,7 @@ import {
   listChannelAgents,
   listProjectAgentProfiles,
   rotateChannelAgent,
+  setChannelAgentNickname,
   ValidationError,
 } from "../lib/api";
 import {
@@ -67,6 +69,9 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
   const [profiles, setProfiles] = useState<ProjectAgentProfile[] | null>(null);
   const [profileForm, setProfileForm] = useState<ProfileForm>(EMPTY_PROFILE_FORM);
   const [busyName, setBusyName] = useState<string | null>(null);
+  const [editingNickname, setEditingNickname] = useState<string | null>(null);
+  const [nicknameDraft, setNicknameDraft] = useState("");
+  const [savingNickname, setSavingNickname] = useState<string | null>(null);
   const [busyProfile, setBusyProfile] = useState<string | null>(null);
   const [creatingProfile, setCreatingProfile] = useState(false);
   const [editingRules, setEditingRules] = useState<string | null>(null);
@@ -120,6 +125,8 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
     setProfileForm(EMPTY_PROFILE_FORM);
     setEditingRules(null);
     setRulesDraft("");
+    setEditingNickname(null);
+    setNicknameDraft("");
     setError(null);
     setCopied(null);
     setRevealed(new Set());
@@ -217,6 +224,40 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
       else setError(t("AgentTokens.errRotate"));
     } finally {
       setBusyName(null);
+    }
+  }
+
+  function startEditNickname(agent: ChannelAgentInfo) {
+    setEditingNickname(agent.name);
+    setNicknameDraft(agent.nickname ?? "");
+    setError(null);
+  }
+
+  function cancelEditNickname() {
+    setEditingNickname(null);
+    setNicknameDraft("");
+  }
+
+  async function saveNickname(agent: ChannelAgentInfo) {
+    const nickname = nicknameDraft.trim();
+    if (nickname === "") {
+      setError(t("AgentTokens.errNicknameInvalid"));
+      return;
+    }
+    setSavingNickname(agent.name);
+    setError(null);
+    try {
+      const saved = await setChannelAgentNickname(token, slug, agent.name, nickname);
+      setAgents((current) => current?.map((entry) => entry.name === agent.name ? { ...entry, nickname: saved.nickname } : entry) ?? null);
+      cancelEditNickname();
+    } catch (err) {
+      if (err instanceof AuthError) onAuthFailed(err.message);
+      else if (err instanceof ForbiddenError) setError(t("AgentTokens.errNicknameForbidden"));
+      else if (err instanceof ConflictError) setError(t("AgentTokens.errNicknameConflict"));
+      else if (err instanceof ValidationError) setError(t("AgentTokens.errNicknameInvalid"));
+      else setError(t("AgentTokens.errNicknameSave"));
+    } finally {
+      setSavingNickname(null);
     }
   }
 
@@ -338,16 +379,47 @@ export function AgentTokens({ slug, token, accountKey, inviterName, onAuthFailed
             <ul className="agenttokens-list">
               {agents.map((agent) => {
                 const saved = findSavedAgentToken(accountKey, slug, agent.name);
+                const isEditingNickname = editingNickname === agent.name;
                 return (
                   <li key={agent.name} className="agenttokens-item">
                     <div className="agenttokens-main">
                       <strong className="agenttokens-name">{agent.name}</strong>
+                      {agent.nickname && <span className="agenttokens-nickname">@{agent.nickname}</span>}
                       <span className="agenttokens-meta">
                         {saved ? t("AgentTokens.hasPlaintext") : t("AgentTokens.noPlaintext")}
                       </span>
                     </div>
                     {saved ? tokenField(`server:${agent.name}`, saved.token) : null}
+                    {isEditingNickname && (
+                      <div className="agenttokens-nickname-edit">
+                        <input
+                          className="agenttokens-input agenttokens-nickname-input"
+                          value={nicknameDraft}
+                          maxLength={64}
+                          autoFocus
+                          onChange={(event) => setNicknameDraft(event.target.value)}
+                          placeholder={t("AgentTokens.nicknamePlaceholder")}
+                          aria-label={t("AgentTokens.nicknameLabel")}
+                        />
+                        <button
+                          type="button"
+                          className="d-btn d-btn--primary agenttokens-save-nickname"
+                          disabled={savingNickname === agent.name}
+                          onClick={() => void saveNickname(agent)}
+                        >
+                          {savingNickname === agent.name ? t("AgentTokens.savingNickname") : t("AgentTokens.saveNickname")}
+                        </button>
+                        <button type="button" className="d-btn agenttokens-cancel-nickname" disabled={savingNickname === agent.name} onClick={cancelEditNickname}>
+                          {t("AgentTokens.cancelNickname")}
+                        </button>
+                      </div>
+                    )}
                     <div className="agenttokens-actions">
+                      {!isEditingNickname && (
+                        <button type="button" className="d-btn agenttokens-edit-nickname" onClick={() => startEditNickname(agent)}>
+                          {agent.nickname ? t("AgentTokens.changeNickname") : t("AgentTokens.setNickname")}
+                        </button>
+                      )}
                       {saved ? (
                         <>
                           <button type="button" className="d-btn" onClick={() => copy(agent.name, "token", saved.token)}>

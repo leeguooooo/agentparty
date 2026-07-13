@@ -3328,6 +3328,9 @@
   color: var(--t-text);
   font-size: 13px;
 }
+.agenttokens-nickname { color: var(--d-blue); font-size: 12px; font-weight: 600; }
+.agenttokens-nickname-edit { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; align-items: center; }
+.agenttokens-nickname-input { height: 30px; }
 .agenttokens-token {
   min-width: 0;
   width: 100%;

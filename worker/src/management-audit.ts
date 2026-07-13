@@ -7,6 +7,7 @@ export type ManagementAuditActorKind = "admin" | "human" | "agent";
 export type ManagementAuditAction =
   | "token.issue"
   | "token.revoke"
+  | "agent.nickname.update"
   | "channel.create"
   | "channel.permissions.update"
   | "channel.visibility.update"

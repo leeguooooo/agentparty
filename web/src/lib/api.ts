@@ -331,6 +331,7 @@ export interface ChannelAgentInfo {
   owner: string;
   channel_scope: string;
   created_at: number;
+  nickname?: string | null;
 }
 
 export type ProjectAgentRunner = "codex" | "claude" | "codex-sdk" | "shell";
@@ -390,6 +391,28 @@ export async function listChannelAgents(token: string, slug: string): Promise<Ch
   if (!res.ok) throw new Error(`GET /api/channels/${slug}/agents failed (${res.status})`);
   const data = (await res.json()) as { agents: ChannelAgentInfo[] };
   return data.agents;
+}
+
+export async function setChannelAgentNickname(
+  token: string,
+  slug: string,
+  name: string,
+  nickname: string,
+): Promise<{ name: string; nickname: string }> {
+  const res = await fetchApi(
+    `/api/channels/${encodeURIComponent(slug)}/agents/${encodeURIComponent(name)}/nickname`,
+    {
+      method: "PUT",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ nickname }),
+    },
+  );
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("forbidden");
+  if (res.status === 400) throw new ValidationError("invalid nickname");
+  if (res.status === 409) throw new ConflictError("nickname unavailable");
+  if (!res.ok) throw new Error(`PUT /api/channels/${slug}/agents/${name}/nickname failed (${res.status})`);
+  return (await res.json()) as { name: string; nickname: string };
 }
 
 export async function listProjectAgentProfiles(token: string): Promise<ProjectAgentProfile[]> {

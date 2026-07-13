@@ -74,7 +74,7 @@ import {
   startDesktopPairing,
 } from "./desktop-pairing";
 import { handleConflict, validateHandleFormat } from "./handle";
-import { nicknameConflict, validateNicknameFormat } from "./nickname";
+import { saveAgentNickname, validateNicknameFormat } from "./nickname";
 import {
   bestEffortRecordManagementAudit,
   listManagementAudit,
@@ -2240,26 +2240,9 @@ app.put("/api/me/nickname", requireBearer, async (c) => {
   if (nickname === null) {
     return c.json(errorBody("bad_request", "nickname must be 1-64 unicode letters/digits (start alnum, then . _ -)"), 400);
   }
-  const conflict = await nicknameConflict(c.env.DB, nickname, id.name);
+  const conflict = await saveAgentNickname(c.env.DB, id.name, nickname);
   if (conflict !== null) {
     return c.json(errorBody("conflict", `nickname unavailable (${conflict})`), 409);
-  }
-  const now = Date.now();
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO agent_nicknames (name, nickname, created_at, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(name) DO UPDATE SET nickname = excluded.nickname, updated_at = excluded.updated_at`,
-    )
-      .bind(id.name, nickname, now, now)
-      .run();
-  } catch (e) {
-    // 竞态：nicknameConflict 通过后、另一 agent 抢先占了同名 → UNIQUE(nickname) 冲突。转 409（非 500）。
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("UNIQUE")) {
-      return c.json(errorBody("conflict", "nickname unavailable (taken)"), 409);
-    }
-    throw e;
   }
   return c.json({ nickname });
 });
@@ -2694,18 +2677,63 @@ app.get("/api/channels/:slug/agents", requireBearer, async (c) => {
     return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
   }
   const rows = await c.env.DB.prepare(
-    `SELECT name, owner, channel_scope, created_at
-       FROM tokens
-      WHERE owner = ?
-        AND role = 'agent'
-        AND channel_scope = ?
-        AND revoked_at IS NULL
-        AND parent_agent IS NULL
-      ORDER BY created_at DESC, name`,
+    `SELECT t.name, t.owner, t.channel_scope, t.created_at, n.nickname
+       FROM tokens t
+       LEFT JOIN agent_nicknames n ON n.name = t.name
+      WHERE t.owner = ?
+        AND t.role = 'agent'
+        AND t.channel_scope = ?
+        AND t.revoked_at IS NULL
+        AND t.parent_agent IS NULL
+      ORDER BY t.created_at DESC, t.name`,
   )
     .bind(identity.account, slug)
     .all<{ name: string; owner: string; channel_scope: string; created_at: number }>();
   return c.json({ agents: rows.results ?? [] });
+});
+
+// #165 页面入口：human owner 可给自己铸造的 channel-scoped agent 设置全局昵称。
+// 授权按 token.owner + channel_scope 双重绑定，不因“是频道 owner”就能改别家公司 agent 的全局身份。
+app.put("/api/channels/:slug/agents/:name/nickname", requireBearer, async (c) => {
+  const identity = c.get("identity");
+  const slug = c.req.param("slug");
+  const name = c.req.param("name");
+  if (identity.role !== "human" || identity.account == null) {
+    return c.json(errorBody("forbidden", "setting an agent nickname requires its owner human account"), 403);
+  }
+  if (!NAME_RE.test(name) || RESERVED_NAMES.includes(name)) {
+    return c.json(errorBody("bad_request", "valid agent name required"), 400);
+  }
+  const body = (await c.req.json().catch(() => null)) as { nickname?: unknown } | null;
+  const nickname = validateNicknameFormat(body?.nickname);
+  if (nickname === null) {
+    return c.json(errorBody("bad_request", "nickname must be 1-64 unicode letters/digits (start alnum, then . _ -)"), 400);
+  }
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, identity, channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const owned = await c.env.DB.prepare(
+    `SELECT 1
+       FROM tokens
+      WHERE name = ? AND owner = ? AND role = 'agent' AND channel_scope = ?
+        AND revoked_at IS NULL AND parent_agent IS NULL`,
+  )
+    .bind(name, identity.account, slug)
+    .first();
+  if (!owned) return c.json(errorBody("not_found", "owned channel agent not found"), 404);
+  const conflict = await saveAgentNickname(c.env.DB, name, nickname);
+  if (conflict !== null) {
+    return c.json(errorBody("conflict", `nickname unavailable (${conflict})`), 409);
+  }
+  await bestEffortRecordManagementAudit(c.env.DB, {
+    actor: managementAuditActor(identity),
+    action: "agent.nickname.update",
+    resource: `token/${name}`,
+    channel: slug,
+  });
+  return c.json({ name, nickname });
 });
 
 app.post("/api/channels/:slug/agents/:name/rotate", requireBearer, async (c) => {

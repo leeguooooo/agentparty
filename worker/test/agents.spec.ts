@@ -157,10 +157,69 @@ describe("current-account channel agent inventory", () => {
 
     const listed = await api(`/api/channels/${slug}/agents`, session);
     expect(listed.status).toBe(200);
-    const body = (await listed.json()) as { agents: { name: string; token?: string; owner: string; channel_scope: string }[] };
+    const body = (await listed.json()) as { agents: { name: string; token?: string; owner: string; channel_scope: string; nickname?: string | null }[] };
     expect(body.agents).toHaveLength(1);
     expect(body.agents[0]).toMatchObject({ name: mineBody.name, owner, channel_scope: slug });
     expect(body.agents[0]).not.toHaveProperty("token");
+  });
+
+  it("lets the owning human set a channel agent nickname and returns it in inventory", async () => {
+    const owner = "nickname-owner@leeguoo.com";
+    const session = await humanSession(owner);
+    const slug = uniq("nickname-ui");
+    expect((await api("/api/channels", session, {
+      method: "POST",
+      body: JSON.stringify({ slug, kind: "standing", visibility: "private" }),
+    })).status).toBe(201);
+    const minted = await mintAgent(session, { name: uniq("bot"), channel_scope: slug });
+    const agent = (await minted.json()) as { name: string; token: string };
+
+    const updated = await api(`/api/channels/${slug}/agents/${encodeURIComponent(agent.name)}/nickname`, session, {
+      method: "PUT",
+      body: JSON.stringify({ nickname: "页面小助手" }),
+    });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toMatchObject({ name: agent.name, nickname: "页面小助手" });
+
+    const listed = (await (await api(`/api/channels/${slug}/agents`, session)).json()) as {
+      agents: { name: string; nickname: string | null }[];
+    };
+    expect(listed.agents).toContainEqual(expect.objectContaining({ name: agent.name, nickname: "页面小助手" }));
+    expect(((await (await api("/api/me", agent.token)).json()) as { handle: string | null }).handle).toBe("页面小助手");
+    const audit = (await (await api(`/api/channels/${slug}/management-audit?limit=100`, session)).json()) as {
+      audit: { action: string; resource: string; channel: string | null; metadata: Record<string, unknown> }[];
+    };
+    expect(audit.audit).toContainEqual(expect.objectContaining({
+      action: "agent.nickname.update",
+      resource: `token/${agent.name}`,
+      channel: slug,
+      metadata: {},
+    }));
+  });
+
+  it("rejects invalid/conflicting nicknames and never lets another account rename the agent", async () => {
+    const owner = "nickname-guard@leeguoo.com";
+    const session = await humanSession(owner);
+    const other = await humanSession("nickname-other@leeguoo.com");
+    const slug = uniq("nickname-guard");
+    expect((await api("/api/channels", session, {
+      method: "POST",
+      body: JSON.stringify({ slug, kind: "standing", visibility: "public" }),
+    })).status).toBe(201);
+    const first = (await (await mintAgent(session, { name: uniq("first"), channel_scope: slug })).json()) as { name: string; token: string };
+    const second = (await (await mintAgent(session, { name: uniq("second"), channel_scope: slug })).json()) as { name: string };
+    const route = (name: string) => `/api/channels/${slug}/agents/${encodeURIComponent(name)}/nickname`;
+    const put = (token: string, name: string, nickname: unknown) => api(route(name), token, {
+      method: "PUT",
+      body: JSON.stringify({ nickname }),
+    });
+
+    expect((await put(session, first.name, "bad nickname")).status).toBe(400);
+    expect((await put(session, first.name, "唯一页面昵称")).status).toBe(200);
+    expect((await put(session, second.name, "唯一页面昵称")).status).toBe(409);
+    // 公共频道对 other 可读，仍必须被 token.owner 绑定挡住；不能靠外层 private ACL 偶然过测试。
+    expect((await put(other, first.name, "越权改名")).status).toBe(404);
+    expect((await put(first.token, first.name, "agent自己走owner端点")).status).toBe(403);
   });
 
   it("rotates only the caller's own channel-scoped agent token and invalidates the previous plaintext", async () => {

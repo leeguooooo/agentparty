@@ -34,3 +34,27 @@ export async function nicknameConflict(
   if (owner && owner.name !== forName) return "taken";
   return null;
 }
+
+export async function saveAgentNickname(
+  db: D1Database,
+  name: string,
+  nickname: string,
+): Promise<"reserved" | "token_name" | "handle" | "taken" | null> {
+  const conflict = await nicknameConflict(db, nickname, name);
+  if (conflict !== null) return conflict;
+  const now = Date.now();
+  try {
+    await db.prepare(
+      `INSERT INTO agent_nicknames (name, nickname, created_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(name) DO UPDATE SET nickname = excluded.nickname, updated_at = excluded.updated_at`,
+    )
+      .bind(name, nickname, now, now)
+      .run();
+    return null;
+  } catch (error) {
+    // nicknameConflict 之后仍可能被并发请求抢占；保持 409 语义，不把唯一键竞态冒成 500。
+    if ((error instanceof Error ? error.message : String(error)).includes("UNIQUE")) return "taken";
+    throw error;
+  }
+}
