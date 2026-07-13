@@ -171,6 +171,13 @@ export async function classifyWorktrees(
 
     // dirty 检测：在该 worktree 内跑 status --porcelain。
     const status = await git(["-C", w.path, "status", "--porcelain"], root);
+    if (status.code !== 0) {
+      // status 拿不到（磁盘/权限/索引损坏）——状态未知。空 stdout 绝不能被读成
+      // dirty=0 → merged-clean → 删。保守当未合，留给人处理，别误删。
+      row.status = "unmerged";
+      rows.push(row);
+      continue;
+    }
     row.dirty = status.stdout.split("\n").filter((l) => l.trim() !== "").length;
 
     if (row.ahead === 0) {

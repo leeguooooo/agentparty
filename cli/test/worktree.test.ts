@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyWorktrees, run } from "../src/commands/worktree";
+import { classifyWorktrees, type GitRunner, run } from "../src/commands/worktree";
 
 // 用真 git：临时仓库 + 真 worktree，覆盖 merged-clean / merged-dirty / unmerged 三态。
 // 不 mock git——命令的价值就在于对真 porcelain 输出的解析与真 cherry/status 判定。
@@ -87,6 +87,22 @@ describe("classifyWorktrees", () => {
     const realMain = realpathSync(main);
     const mainRow = rows.find((r) => r.path === realMain);
     expect(mainRow?.status).toBe("main");
+  });
+
+  test("git status 失败时绝不判 merged-clean（否则 prune 会删掉状态未知的 worktree）", async () => {
+    // 注入一个 runner：wt-mc 的 status --porcelain 失败（磁盘/权限/索引损坏等）。
+    // 空 stdout 绝不能被读成 dirty=0 → merged-clean → 删。status 拿不到 = 状态未知 = 保守保留。
+    // 命令形如 git(["-C", <wt路径>, "status", "--porcelain"], root)——按 args 内容匹配。
+    const failingGit: GitRunner = async (args, cwd) => {
+      if (args.includes("status") && args.some((a) => a.includes("wt-mc"))) {
+        return { code: 1, stdout: "", stderr: "fatal: simulated status failure" };
+      }
+      const out = execFileSync("git", args, { cwd, encoding: "utf8" });
+      return { code: 0, stdout: out, stderr: "" };
+    };
+    const rows = await classifyWorktrees(main, "main", failingGit);
+    const mc = rows.find((r) => r.branch === "mc");
+    expect(mc?.status).not.toBe("merged-clean");
   });
 });
 
