@@ -68,7 +68,11 @@ export function LarkMemberInvite({
     setError(null);
     try {
       const page: LarkDirectoryPage = await search(token, slug, normalized, 20, nextCursor);
-      setUsers((current) => nextCursor === null ? page.users : [...current, ...page.users]);
+      setUsers((current) => {
+        if (nextCursor === null) return page.users;
+        const known = new Set(current.map((user) => user.id));
+        return [...current, ...page.users.filter((user) => !known.has(user.id))];
+      });
       setCursor(page.next_cursor);
       setSearched(true);
     } catch (cause) {

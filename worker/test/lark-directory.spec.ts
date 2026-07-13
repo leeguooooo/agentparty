@@ -40,7 +40,7 @@ function mockTenantToken() {
 function mockDirectoryPage(options: { permissionDenied?: boolean; persist?: boolean } = {}) {
   const interceptor = fetchMock.get(LARK_ORIGIN)
     .intercept({
-      path: "/open-apis/contact/v1/department/user/detail/list?open_department_id=0&fetch_child=true&page_size=20",
+      path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=20",
       method: "GET",
     })
     .reply(200, options.permissionDenied
@@ -50,7 +50,7 @@ function mockDirectoryPage(options: { permissionDenied?: boolean; persist?: bool
           data: {
             has_more: true,
             page_token: "next-page",
-            user_list: [
+            items: [
               {
                 union_id: "on_alice",
                 name: "Alice Zhang",
@@ -89,9 +89,89 @@ describe("Lark organization member invitations (#358)", () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(body).toEqual({
       users: [{ id: "on_alice", name: "Alice Zhang", avatar_url: "https://cdn.example/alice.png", already_member: false }],
-      next_cursor: "next-page",
+      next_cursor: expect.stringMatching(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/),
     });
+    expect(String(body.next_cursor)).not.toContain("next-page");
     expect(JSON.stringify(body)).not.toMatch(/tenant-secret-token|must-not-leak|81000000000|access.?token/i);
+  });
+
+  it("walks recursive v3 departments with a query-bound signed cursor", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=20",
+        method: "GET",
+      })
+      .reply(200, { code: 0, data: { has_more: false, items: [{ union_id: "on_owner", name: "Owner" }] } });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=true&page_size=1",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ open_department_id: "od-engineering" }] },
+      });
+
+    const first = await api(`/api/channels/${slug}/lark-directory?q=alice&limit=20`, owner.token);
+    expect(first.status).toBe(200);
+    const firstPage = (await first.json()) as { users: unknown[]; next_cursor: string };
+    expect(firstPage.users).toEqual([]);
+    expect(firstPage.next_cursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    const tampered = `${firstPage.next_cursor.slice(0, -1)}${firstPage.next_cursor.endsWith("A") ? "B" : "A"}`;
+    const rejected = await api(
+      `/api/channels/${slug}/lark-directory?q=alice&limit=20&cursor=${encodeURIComponent(tampered)}`,
+      owner.token,
+    );
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({ error: { code: "bad_request" } });
+
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od-engineering&page_size=20",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: {
+          has_more: false,
+          items: [{ union_id: "on_alice", name: "Alice Zhang", avatar: { avatar_72: "https://cdn.example/alice.png" } }],
+        },
+      });
+    const second = await api(
+      `/api/channels/${slug}/lark-directory?q=alice&limit=20&cursor=${encodeURIComponent(firstPage.next_cursor)}`,
+      owner.token,
+    );
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({
+      users: [{ id: "on_alice", name: "Alice Zhang", avatar_url: "https://cdn.example/alice.png" }],
+      next_cursor: null,
+    });
+  });
+
+  it("maps missing v3 department visibility to the stable contact-permission error", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=20",
+        method: "GET",
+      })
+      .reply(200, { code: 0, data: { has_more: false, items: [] } });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=true&page_size=1",
+        method: "GET",
+      })
+      .reply(403, { code: 40014, msg: "no parent dept authority" });
+
+    const response = await api(`/api/channels/${slug}/lark-directory?q=alice&limit=20`, owner.token);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: "lark_contact_permission_required" } });
   });
 
   it("directly adds the selected same-tenant Lark user idempotently and records management audit", async () => {

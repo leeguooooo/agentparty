@@ -120,6 +120,41 @@ test("clears results and pagination when contact permission is revoked during lo
   expect(renderer!.root.findByProps({ role: "status" })).toBeTruthy();
 });
 
+test("deduplicates users returned through multiple department pages", async () => {
+  let searches = 0;
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          search={async () => {
+            searches += 1;
+            return searches === 1
+              ? {
+                  users: [{ id: "on_alice", name: "Alice", avatar_url: null, already_member: false }],
+                  next_cursor: "next",
+                }
+              : {
+                  users: [
+                    { id: "on_alice", name: "Alice", avatar_url: null, already_member: false },
+                    { id: "on_bob", name: "Bob", avatar_url: null, already_member: false },
+                  ],
+                  next_cursor: null,
+                };
+          }}
+        />
+      </LocaleProvider>,
+    );
+  });
+  const input = renderer!.root.findByType("input");
+  act(() => input.props.onChange({ target: { value: "a" } }));
+  await act(async () => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+  await act(async () => renderer!.root.findByProps({ className: "d-btn lark-invite-more" }).props.onClick());
+  expect(renderer!.root.findAllByProps({ "data-lark-user-id": "on_alice" })).toHaveLength(1);
+  expect(renderer!.root.findAllByProps({ "data-lark-user-id": "on_bob" })).toHaveLength(1);
+});
+
 test("disables stale invite actions when contact permission is revoked during invite", async () => {
   act(() => {
     renderer = create(
