@@ -28,7 +28,7 @@ function commentTime(comment) {
 }
 
 function runTime(run) {
-  return epoch(run.started_at ?? run.created_at ?? run.completed_at);
+  return epoch(run.run_started_at ?? run.created_at ?? run.updated_at);
 }
 
 function statusTime(status) {
@@ -39,12 +39,17 @@ export function evaluateReviewAck({
   headSha,
   reviews = [],
   comments = [],
-  checkRuns = [],
+  prAgentRuns = [],
   statuses = [],
   requireCodeRabbit = true,
 }) {
   const prAgentRun = latest(
-    checkRuns.filter((run) => run.name === "pr_agent"),
+    prAgentRuns.filter(
+      (run) =>
+        run.path === ".github/workflows/pr-agent.yml" &&
+        run.head_sha === headSha &&
+        run.event === "pull_request",
+    ),
     runTime,
   );
   if (prAgentRun === undefined || prAgentRun.status !== "completed") {
@@ -113,11 +118,12 @@ export function evaluateReviewAck({
   };
 }
 
-async function githubJson(path, token) {
+export async function githubJson(path, token, collectionKey, request = fetch) {
   const all = [];
+  let objectPage;
   let url = `https://api.github.com${path}${path.includes("?") ? "&" : "?"}per_page=100`;
   while (url !== null) {
-    const response = await fetch(url, {
+    const response = await request(url, {
       headers: {
         Accept: "application/vnd.github+json",
         Authorization: `Bearer ${token}`,
@@ -127,7 +133,13 @@ async function githubJson(path, token) {
     if (!response.ok) throw new Error(`GitHub API ${response.status}: ${await response.text()}`);
     const body = await response.json();
     if (Array.isArray(body)) all.push(...body);
-    else return body;
+    else if (collectionKey !== undefined) {
+      if (!Array.isArray(body?.[collectionKey])) {
+        throw new Error(`GitHub API response is missing collection ${collectionKey}`);
+      }
+      objectPage ??= body;
+      all.push(...body[collectionKey]);
+    } else return body;
     const next = response.headers
       .get("link")
       ?.split(",")
@@ -136,7 +148,7 @@ async function githubJson(path, token) {
       ?.match(/^<([^>]+)>/)?.[1];
     url = next ?? null;
   }
-  return all;
+  return collectionKey === undefined ? all : { ...objectPage, [collectionKey]: all };
 }
 
 async function postStatus(repo, sha, token, result) {
@@ -201,17 +213,21 @@ export async function runReviewAckGate(env, dependencies = { githubJson, postSta
     if (redHeadSha !== headSha) {
       await markRed(headSha, "正在核验当前 head 的最新 bot review 与人工 ack");
     }
-    const [reviews, comments, checksBody, statuses] = await Promise.all([
+    const [reviews, comments, runsBody, statuses] = await Promise.all([
       dependencies.githubJson(`/repos/${repo}/pulls/${pr}/reviews`, token),
       dependencies.githubJson(`/repos/${repo}/issues/${pr}/comments`, token),
-      dependencies.githubJson(`/repos/${repo}/commits/${headSha}/check-runs`, token),
+      dependencies.githubJson(
+        `/repos/${repo}/actions/workflows/pr-agent.yml/runs?head_sha=${encodeURIComponent(headSha)}`,
+        token,
+        "workflow_runs",
+      ),
       dependencies.githubJson(`/repos/${repo}/commits/${headSha}/statuses`, token),
     ]);
     const result = evaluateReviewAck({
       headSha,
       reviews,
       comments,
-      checkRuns: checksBody.check_runs ?? [],
+      prAgentRuns: runsBody.workflow_runs ?? [],
       statuses,
       requireCodeRabbit: env.REQUIRE_CODERABBIT !== "false",
     });

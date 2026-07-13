@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   evaluateReviewAck,
+  githubJson,
   runReviewAckGate,
   selectWorkflowPullNumber,
   type ReviewAckInput,
@@ -9,7 +10,15 @@ import {
 const headSha = "abc123";
 const user = (login: string, type: "User" | "Bot" = "User") => ({ login, type });
 const completedChecks = [
-  { name: "pr_agent", status: "completed", conclusion: "success", started_at: "2026-07-13T10:00:00Z" },
+  {
+    name: "PR Agent (qwen · soft-gate)",
+    path: ".github/workflows/pr-agent.yml",
+    head_sha: headSha,
+    event: "pull_request",
+    status: "completed",
+    conclusion: "success",
+    run_started_at: "2026-07-13T10:00:00Z",
+  },
 ];
 const codeRabbitStatus = [{ context: "CodeRabbit", state: "success", updated_at: "2026-07-13T10:02:00Z" }];
 const codeRabbitReview = {
@@ -30,7 +39,7 @@ function evaluate(over: Partial<ReviewAckInput> = {}) {
     headSha,
     reviews: [codeRabbitReview],
     comments: [prAgentGuide],
-    checkRuns: completedChecks,
+    prAgentRuns: completedChecks,
     statuses: codeRabbitStatus,
     ...over,
   });
@@ -45,15 +54,44 @@ describe("review-ack ordering gate (#460)", () => {
     expect(workflow).toContain("workflow_run:");
     expect(workflow).toContain('workflows: ["PR Agent (qwen · soft-gate)"]');
     expect(workflow).toContain("checks: read");
+    expect(workflow).toContain("actions: read");
     expect(workflow).toContain("statuses: write");
     expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0");
     expect(workflow).toContain("persist-credentials: false");
     expect(workflow).toContain("run: node scripts/review-ack-gate.mjs");
     expect(workflow).toContain("WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}");
-    expect(workflow).toContain(
-      "KNOWN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}",
-    );
+    expect(workflow).toContain("KNOWN_HEAD_SHA: ${{ steps.target.outputs.head_sha }}");
+    expect(workflow).toContain('gh api "repos/$REPO/pulls/$PR" --jq \'.head.sha\'');
     expect(workflow).not.toContain("workflow_run.pull_requests[0]");
+  });
+
+  test("object pagination finds the intended PR Agent workflow on a later page", async () => {
+    const decoys = Array.from({ length: 100 }, (_, index) => ({
+      name: `decoy-${index}`,
+      path: ".github/workflows/other.yml",
+      head_sha: headSha,
+      event: "pull_request",
+      status: "completed",
+      run_started_at: "2026-07-13T09:00:00Z",
+    }));
+    const pages = [
+      new Response(JSON.stringify({ total_count: 101, workflow_runs: decoys }), {
+        headers: { link: '<https://api.github.com/next>; rel="next"' },
+      }),
+      new Response(JSON.stringify({ total_count: 101, workflow_runs: completedChecks })),
+    ];
+    const body = (await githubJson("/repos/owner/repo/actions/workflows/pr-agent.yml/runs", "token", "workflow_runs", async () => pages.shift()!)) as {
+      workflow_runs: typeof completedChecks;
+    };
+    expect(body.workflow_runs).toHaveLength(101);
+    expect(evaluate({ prAgentRuns: body.workflow_runs }).code).toBe("missing_ack");
+  });
+
+  test("a same-name run from another workflow cannot satisfy the PR Agent gate", () => {
+    const result = evaluate({
+      prAgentRuns: [{ ...completedChecks[0], path: ".github/workflows/attacker.yml" }],
+    });
+    expect(result.code).toBe("waiting_pr_agent");
   });
 
   test("known event head is marked failure before PR resolution can fail", async () => {
@@ -161,7 +199,7 @@ describe("review-ack ordering gate (#460)", () => {
 
   test("waits for the current-head pr_agent workflow to finish", () => {
     const result = evaluate({
-      checkRuns: [{ ...completedChecks[0], status: "in_progress", conclusion: null }],
+      prAgentRuns: [{ ...completedChecks[0], status: "in_progress", conclusion: null }],
       comments: [{ user: user("maintainer"), body: "review-ack: early", created_at: "2026-07-13T10:03:00Z" }],
     });
     expect(result.ok).toBe(false);

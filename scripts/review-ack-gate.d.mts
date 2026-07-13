@@ -35,13 +35,16 @@ export interface ReviewAckComment {
   created_at?: string;
 }
 
-export interface ReviewAckCheckRun {
+export interface ReviewAckPrAgentRun {
   name?: string;
+  path?: string;
+  head_sha?: string;
+  event?: string;
   status?: string;
   conclusion?: string | null;
-  started_at?: string;
+  run_started_at?: string;
   created_at?: string;
-  completed_at?: string;
+  updated_at?: string;
 }
 
 export interface ReviewAckStatus {
@@ -55,7 +58,7 @@ export interface ReviewAckInput {
   headSha: string;
   reviews?: ReviewAckReview[];
   comments?: ReviewAckComment[];
-  checkRuns?: ReviewAckCheckRun[];
+  prAgentRuns?: ReviewAckPrAgentRun[];
   statuses?: ReviewAckStatus[];
   requireCodeRabbit?: boolean;
 }
@@ -70,8 +73,17 @@ export interface WorkflowPull {
 
 export function selectWorkflowPullNumber(headSha: string, pulls: WorkflowPull[]): string;
 
+export type GitHubRequest = (input: string, init?: RequestInit) => Promise<Response>;
+
+export function githubJson(
+  path: string,
+  token: string,
+  collectionKey?: string,
+  request?: GitHubRequest,
+): Promise<unknown>;
+
 export interface ReviewAckDependencies {
-  githubJson(path: string, token: string): Promise<unknown>;
+  githubJson(path: string, token: string, collectionKey?: string): Promise<unknown>;
   postStatus(
     repo: string,
     sha: string,
