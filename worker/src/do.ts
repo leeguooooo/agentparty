@@ -3899,7 +3899,9 @@ export class ChannelDO extends Server<Env> {
         };
       }
     }
-    const loopGuard = identity.kind === "agent" ? this.loopGuardMessage(identity.name) : null;
+    // status 是 presence/协调状态，不是对话消息：agent 已触发 fair-share guard 后仍必须能声明
+    // blocked/waiting，让频道知道它为什么停下。它也不消耗/重置消息 streak（#466）。
+    const loopGuard = identity.kind === "agent" && frame.kind === "message" ? this.loopGuardMessage(identity.name) : null;
     if (loopGuard !== null) {
       this.alertLoopGuard(loopGuard);
       return {
@@ -4096,12 +4098,14 @@ export class ChannelDO extends Server<Env> {
     }
     this.linkWakeResume(identity.name, msg, now);
     const workflowGuardFrame = this.applyWorkflowGuardAfterSend(identity, msg, workflowGuard, now);
-    if (identity.kind === "agent") {
-      this.setMeta("agent_streak", String(this.agentStreak() + 1));
-      this.setMeta(this.agentCountKey(identity.name), String(this.agentCount(identity.name) + 1));
-    } else {
-      this.clearLoopGuardState();
-      this.clearWorkflowGuards();
+    if (frame.kind === "message") {
+      if (identity.kind === "agent") {
+        this.setMeta("agent_streak", String(this.agentStreak() + 1));
+        this.setMeta(this.agentCountKey(identity.name), String(this.agentCount(identity.name) + 1));
+      } else {
+        this.clearLoopGuardState();
+        this.clearWorkflowGuards();
+      }
     }
     if (seq % 100 === 0) {
       sql.exec(

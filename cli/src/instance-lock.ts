@@ -11,8 +11,10 @@
 // ⚠️ 这把锁只挡**同一台机器**。跨机器的重复执行（工位机 + 家里机各跑一个 serve）
 // 需要服务端租约（#99 的另一半,`do.ts` 广播发给同名所有连接）。
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { agentpartyHome } from "./config";
 
 export type InstanceKind = "watch" | "serve";
 
@@ -27,18 +29,65 @@ function lockPath(kind: InstanceKind, channel: string, dir: string): string {
   return join(dir, `${kind}-${channel.replace(/[^a-zA-Z0-9._-]/g, "_")}.lock`);
 }
 
-function pidAlive(pid: number): boolean {
+/** 默认锁目录不再跟 cwd/workspace 走：同一身份从另一个 repo 启动也必须互斥。 */
+export function defaultInstanceLockDir(): string {
+  return join(agentpartyHome(), "instances");
+}
+
+/** token 只参与不可逆摘要，不落盘；不同 server/身份在同一频道互不阻塞。 */
+export function instanceLockTarget(server: string, token: string, channel: string): string {
+  const identity = createHash("sha256").update(server).update("\0").update(token).digest("hex").slice(0, 24);
+  return `${identity}-${channel}`;
+}
+
+interface ProcessIdentity {
+  alive: boolean;
+  startedAt?: number;
+}
+
+function inspectProcess(pid: number): ProcessIdentity {
   try {
     process.kill(pid, 0); // 信号 0：只探测存活,不真的发信号
-    return true;
   } catch {
-    return false;
+    return { alive: false };
   }
+  if (process.platform === "win32") return { alive: true };
+
+  // kill(pid, 0) 对 zombie 仍返回成功，而且 PID 可能已被系统复用。用 ps 同时核验状态与出生时间；
+  // ps 不可用时保守回落到 kill(0)，绝不误杀一个无法确认的活进程。
+  const probe = spawnSync("ps", ["-o", "lstart=", "-o", "stat=", "-p", String(pid)], {
+    encoding: "utf8",
+    timeout: 1000,
+    env: { ...process.env, LC_ALL: "C", LC_TIME: "C" },
+  });
+  if (probe.error || probe.status !== 0) return { alive: true };
+  const line = probe.stdout.trim();
+  const match = line.match(/^(\S+\s+\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\S+)/);
+  if (!match) return line === "" ? { alive: false } : { alive: true };
+  if (match[2]!.startsWith("Z")) return { alive: false };
+  const startedAt = Date.parse(match[1]!);
+  return Number.isFinite(startedAt) ? { alive: true, startedAt } : { alive: true };
+}
+
+const PROCESS_STARTED_AT =
+  inspectProcess(process.pid).startedAt ?? Math.floor((Date.now() - process.uptime() * 1000) / 1000) * 1000;
+
+function holderAlive(holder: LockHolder | null): holder is LockHolder & { pid: number } {
+  if (typeof holder?.pid !== "number") return false;
+  const processIdentity = inspectProcess(holder.pid);
+  if (!processIdentity.alive) return false;
+  if (holder.started_at === undefined || processIdentity.startedAt === undefined) return true;
+  return Math.abs(holder.started_at - processIdentity.startedAt) <= 2000;
+}
+
+export function currentProcessStartedAt(): number {
+  return PROCESS_STARTED_AT;
 }
 
 interface LockHolder {
   pid?: number;
   id?: string;
+  started_at?: number;
 }
 
 function readHolder(path: string): LockHolder | null {
@@ -57,7 +106,7 @@ export function acquireInstanceLock(kind: InstanceKind, channel: string, dir: st
   const path = lockPath(kind, channel, dir);
   const reclaimPath = `${path}.reclaim`;
   const lockId = randomUUID();
-  const body = JSON.stringify({ pid: process.pid, id: lockId, kind, channel, ts: Date.now() });
+  const body = JSON.stringify({ pid: process.pid, id: lockId, started_at: PROCESS_STARTED_AT, kind, channel, ts: Date.now() });
   let staleGeneration: string | null = null;
   mkdirSync(dir, { recursive: true });
 
@@ -70,7 +119,7 @@ export function acquireInstanceLock(kind: InstanceKind, channel: string, dir: st
     }
 
     const held = readHolder(path);
-    if (typeof held?.pid === "number" && pidAlive(held.pid)) {
+    if (holderAlive(held)) {
       return { ok: false, heldByPid: held.pid };
     }
     const generation = held?.id ?? `legacy:${held?.pid ?? "invalid"}`;
@@ -89,7 +138,7 @@ export function acquireInstanceLock(kind: InstanceKind, channel: string, dir: st
     } catch (error) {
       if (!isAlreadyExists(error)) throw error;
       const reclaimer = readHolder(reclaimPath);
-      if (typeof reclaimer?.pid === "number" && !pidAlive(reclaimer.pid)) {
+      if (typeof reclaimer?.pid === "number" && !holderAlive(reclaimer)) {
         try {
           unlinkSync(reclaimPath);
         } catch {
@@ -103,7 +152,7 @@ export function acquireInstanceLock(kind: InstanceKind, channel: string, dir: st
 
     try {
       const current = readHolder(path);
-      if (typeof current?.pid === "number" && pidAlive(current.pid)) {
+      if (holderAlive(current)) {
         return { ok: false, heldByPid: current.pid };
       }
       const currentGeneration = current?.id ?? `legacy:${current?.pid ?? "invalid"}`;
@@ -133,8 +182,8 @@ export function acquireInstanceLock(kind: InstanceKind, channel: string, dir: st
     release: () => {
       try {
         // 只删自己的锁：别人接管过就不动它
-        const cur = JSON.parse(readFileSync(path, "utf8")) as { pid?: number };
-        if (cur.pid === process.pid) unlinkSync(path);
+        const cur = JSON.parse(readFileSync(path, "utf8")) as { id?: string };
+        if (cur.id === lockId) unlinkSync(path);
       } catch {
         /* 已经没了 */
       }

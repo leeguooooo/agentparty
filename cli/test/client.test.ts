@@ -91,6 +91,88 @@ describe("ws client", () => {
     expect(conn.cursor).toBe(1);
   });
 
+  test("replayUnacked puts consumed standby frames back before newer queued frames", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(3));
+      sock.send(msgFrame(1, "standby wake"));
+      sock.send(msgFrame(2, "queued context"));
+      sock.send(msgFrame(3, "queued latest"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0);
+    const it = conn.frames[Symbol.asyncIterator]();
+    await it.next(); // welcome
+    const consumed = (await it.next()).value as { type: "msg"; seq: number; body: string };
+    expect(consumed.body).toBe("standby wake");
+
+    // seq=2/3 还在 FrameQueue，只有已取走但未 ack 的 seq=1 应被重排；不得复制仍在队里的帧。
+    expect(conn.replayUnacked()).toBe(1);
+    const replay = (await it.next()).value as { type: "msg"; seq: number; body: string };
+    const second = (await it.next()).value as { type: "msg"; seq: number; body: string };
+    const third = (await it.next()).value as { type: "msg"; seq: number; body: string };
+    expect([replay.body, second.body, third.body]).toEqual(["standby wake", "queued context", "queued latest"]);
+
+    conn.ack(3);
+    expect(conn.replayUnacked()).toBe(0);
+  });
+
+  test("fails safely at the unacked replay cap without advancing the cursor", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(3));
+      sock.send(msgFrame(1, "one"));
+      sock.send(msgFrame(2, "two"));
+      sock.send(msgFrame(3, "overflow"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0, { maxUnackedFrames: 2 });
+
+    let failure: unknown;
+    try {
+      for await (const _frame of conn.frames) {
+        // 故意不 ack：模拟 standby 冻结 cursor。
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("terminating without advancing cursor");
+    expect(conn.cursor).toBe(0);
+  });
+
+  test("reports no replay after the connection queue is closed", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(1));
+      sock.send(msgFrame(1, "standby wake"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0);
+    const it = conn.frames[Symbol.asyncIterator]();
+    await it.next(); // welcome
+    await it.next(); // msg remains unacked
+
+    conn.close();
+
+    expect(conn.replayUnacked()).toBe(0);
+  });
+
+  test("replay resolves a consumer already waiting for the next frame", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(1));
+      sock.send(msgFrame(1, "standby wake"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0);
+    const it = conn.frames[Symbol.asyncIterator]();
+    await it.next(); // welcome
+    await it.next(); // msg remains unacked
+
+    const pendingNext = it.next();
+    expect(conn.replayUnacked()).toBe(1);
+
+    const replay = (await pendingNext).value as { type: "msg"; body: string };
+    expect(replay.body).toBe("standby wake");
+  });
+
   test("dedups frames delivered by both broadcast and backfill", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {

@@ -16,12 +16,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readAccount } from "../account";
 import { connect } from "../client";
-import { readConfig, clearStuck, loadCursor, loadRevCursor, loadStuck, resolveChannel, saveCursor, saveRevCursor, saveStuck, statePath, type StuckWake } from "../config";
-import { acquireInstanceLock } from "../instance-lock";
+import { readConfig, clearStuck, loadCursor, loadRevCursor, loadStuck, resolveChannel, saveCursor, saveRevCursor, saveStuck, type StuckWake } from "../config";
+import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../instance-lock";
 import { formatMsg } from "../format";
 import { clearHealthCache, writeHealthCache } from "../health-cache";
 import { ensureFreshAccess, resolveAuthDetailed, type ResolvedAuthDetailed } from "../oidc-cli";
@@ -66,7 +66,7 @@ export const EXIT_WAKE_UNANNOUNCED = 1;
 /** 连续放弃熔断：supervisor 已经无法履行唤醒职责，停止排空后续 @。 */
 export const EXIT_WAKE_ABANDON_CIRCUIT = 11;
 
-/** 已有 serve 挂在同一 (channel, workspace) 上：拒绝启动，避免重复执行（#99）。 */
+/** 已有 serve 挂在同一 (server identity, channel, machine) 上：拒绝启动，避免重复执行（#99/#465）。 */
 export const EXIT_ALREADY_SERVING = 10;
 
 /** 传给 builtin runner 的提示：只给路径，不给正文（#120）。 */
@@ -435,7 +435,7 @@ export interface ServeOptions {
   // 但「积压」与「欠账」是两回事（#198）：跳过的只能是**已离线堆积、从未送达**的历史；
   // 送达失败被钉住的 stuck 无论多旧都必须重放，否则 #118 救下的那条 @ 会被这里吃掉。
   skipBacklog?: boolean;
-  /** 单实例锁目录（#99）。默认与 workspace state 同放；测试注入。 */
+  /** 单实例锁目录（#99/#465）。默认全机共享、再按 server/token 身份隔离；测试注入。 */
   lockDir?: string;
   /** 关掉单实例保护（逃生舱）。 */
   allowMultiple?: boolean;
@@ -1582,26 +1582,31 @@ export async function runServe(o: ServeOptions): Promise<number> {
       writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, connected_since: null, last_error: detail?.error ?? null });
     }
   };
-  const conn = connect(o.server, o.token, o.channel, o.since, {
-    onCursor: o.onCursor,
-    sinceRev: o.sinceRev,
-    onRevCursor: o.onRevCursor,
-    onStatus: onWsStatus,
-  });
-
   const skipBacklog = o.skipBacklog !== false; // 默认跳过离线积压（#193）
   // 抢锁在连 WS 之前：第二个 serve 连接都不该建，否则它已经在消费 @、已经在跑 runner 了（#99）。
   // 这把锁只挡同机；跨机器重复执行需要服务端租约（do.ts 广播发给同名所有连接）。
-  const lockDir = o.lockDir ?? dirname(statePath());
-  const lock = o.allowMultiple === true ? null : acquireInstanceLock("serve", o.channel, lockDir);
+  const lockDir = o.lockDir ?? defaultInstanceLockDir();
+  const lockTarget = o.lockDir === undefined ? instanceLockTarget(o.server, o.token, o.channel) : o.channel;
+  const lock = o.allowMultiple === true ? null : acquireInstanceLock("serve", lockTarget, lockDir);
   if (lock && !lock.ok) {
     out(
       `serve: 已有 serve 挂在 #${o.channel} 上（pid ${lock.heldByPid}）。` +
         ` 再挂一个会让同一条 @ 触发两次完整 runner——双份回帖，git push 类副作用执行两遍。` +
         ` 要么等它退出，要么 kill ${lock.heldByPid}；确实想并存请加 --allow-multiple。`,
     );
-    conn.close();
     return EXIT_ALREADY_SERVING;
+  }
+  let conn: ReturnType<typeof connect>;
+  try {
+    conn = connect(o.server, o.token, o.channel, o.since, {
+      onCursor: o.onCursor,
+      sinceRev: o.sinceRev,
+      onRevCursor: o.onRevCursor,
+      onStatus: onWsStatus,
+    });
+  } catch (error) {
+    lock?.release?.();
+    throw error;
   }
   // 挂载之初就落一份 health 基线：即便还没收到第一帧，watchdog 也能看到「这个 pid 认领了这个频道」，
   // 而不是文件缺失时无法区分「serve 没起来」和「serve 起来了但还没写过健康数据」。
@@ -1631,9 +1636,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
   // 同名 serve 跨机租约（#99）：同机单实例锁（上文）只挡本机；跨机器两台 serve 各连一条 WS，服务端广播
   // 把每条 @ 发给同名所有连接 → 两台都跑完整 runner。修复：挂上后向服务端 claim 租约，只有持租的那台跑
   // runner。hasLease 默认 true（老服务端不认租约、从不下发 serve_lease → 保持旧行为不回归）；收到
-  // held=false 转 standby（被 @ 也不跑，消息仍进历史、游标照推进），held=true（持租/顶替）恢复响应。
+  // held=false 转 standby（不跑 runner，且保留未确认 wake），held=true（持租/顶替）恢复并重放。
   let hasLease = true;
   let leaseKnown = false; // 是否至少收到过一次 serve_lease（用于只在真 standby 时打印提示）
+  // standby 收到的最早可唤醒消息。它以及后续帧都不推进 cursor；接管租约时由 Connection
+  // 把已消费但未 ack 的帧按 seq 重排到队首，避免持租者中途退出时静默吞掉在飞 wake（#465）。
+  let deferredLeaseSeq: number | null = null;
   let charter: ChannelCharter | null = o.charter ?? null;
   const refreshCharter = async (reason: string, expectedRev?: number) => {
     if (!o.fetchCharter) return;
@@ -1750,14 +1758,17 @@ export async function runServe(o: ServeOptions): Promise<number> {
       // 补发 held=true 让 standby 顶上。跨进程互斥点在服务端——本地只是遵从它的裁决。
       if (frame.type === "serve_lease" && frame.name === self) {
         const next = frame.held === true;
+        const takingOver = leaseKnown && !hasLease && next;
         if (!leaseKnown || next !== hasLease) {
           hasLease = next;
+          const replayed = takingOver ? conn.replayUnacked() : 0;
+          if (takingOver) deferredLeaseSeq = null;
           out(
             hasLease
               ? leaseKnown
-                ? "serve: 取得 serve 租约——本台顶替，开始响应 @（同名另一台已让出/掉线）。"
+                ? `serve: 取得 serve 租约——本台顶替，开始响应 @；重放 ${replayed} 条未确认帧（同名另一台已让出/掉线）。`
                 : "serve: 持有 serve 租约——本台负责跑 runner。"
-              : "serve: 未持有 serve 租约（同名另一台 serve 在跑）——本台转 standby：被 @ 也不跑 runner，消息仍进历史；持租者掉线后自动顶替。",
+              : "serve: 未持有 serve 租约（同名另一台 serve 在跑）——本台转 standby：@ 会保留为未确认欠账；持租者掉线后自动顶替并重放。",
           );
         }
         leaseKnown = true;
@@ -1787,11 +1798,16 @@ export async function runServe(o: ServeOptions): Promise<number> {
       if (wouldWake && selfPaused) {
         out(`⏸ 暂停中，跳过唤醒（消息仍在历史）: ${formatMsg(frame)}`);
       }
-      // 未持租（#99）：同名另一台 serve 在跑，本台是 standby——被 @ 也不跑 runner，但消息照进 recent/历史、
-      // 游标照推进（下方 ack），与暂停接待同路径。持租者掉线后收到 held=true 再从新消息开始响应。
-      if (wouldWake && !selfPaused && !hasLease) {
-        out(`▷ standby（未持有 serve 租约），跳过唤醒（消息仍在历史）: ${formatMsg(frame)}`);
+      // 未持租（#465）：standby 不跑 runner，也绝不能 ack 越过这条 @。记住最早 seq，并冻结后续
+      // cursor；租约顶替时 replayUnacked() 把这些帧按序放回队首。这样持租者被 kill 时至少重投，
+      // 不再出现 runner started 之后无人回复、standby 却已把同一条消息消费掉的静默丢失。
+      const deferredForLease = wouldWake && !selfPaused && !hasLease;
+      if (deferredForLease) {
+        deferredLeaseSeq = Math.min(deferredLeaseSeq ?? frame.seq, frame.seq);
+        out(`▷ standby（未持有 serve 租约），保留未确认 wake seq=${frame.seq}，接管后重放: ${formatMsg(frame)}`);
       }
+      // deferredLeaseSeq 只会在 !hasLease 时设置，held=true 分支会先清空再 replay；因此持租处理
+      // 与 standby 冻结区互斥。不要在这里额外跳过，否则一旦状态漂移反而会把欠账永久冻住。
       const qualifies = wouldWake && !selfPaused && hasLease;
       if (qualifies) {
         out(`▶ ${formatMsg(frame)}`);
@@ -1982,16 +1998,19 @@ export async function runServe(o: ServeOptions): Promise<number> {
           }
         }
       }
-      // 触发消息本身不进 recent（它就是 context 主体）；自己的/未 @ 的都算上下文
-      recent.push(frame);
-      if (recent.length > RECENT_MAX) recent.shift();
+      const heldForLease = deferredLeaseSeq !== null && frame.seq >= deferredLeaseSeq;
+      // standby 冻结区会在接管时完整重放；首次经过时不提前塞进 recent，避免重放后上下文重复。
+      if (!heldForLease) {
+        recent.push(frame);
+        if (recent.length > RECENT_MAX) recent.shift();
+      }
       // 游标只表达「已了结」（#198）：送达成功，或有界重试耗尽后**宣告过**的放弃。
       // 欠账未了结时游标绝不越过它——否则那条 @ 永远不会再被重放。
       //
       // 我曾断言这个守卫是死代码（有界重试后 stuck 恒为 null），并请门禁证伪。
       // 190-codex-dev 找到了反例：欠账那一帧若被 mentionsOnly / fromSelf 过滤掉，
       // stuck 就活着走到这里。守卫不是死的——是我的推理漏了过滤路径。
-      if (stuck === null || frame.seq < stuck.seq) conn.ack(frame.seq);
+      if ((stuck === null || frame.seq < stuck.seq) && !heldForLease) conn.ack(frame.seq);
       if (o.statusline === true) {
         writeStatuslineCache({
           ...localStatuslineBase(o.channel),
@@ -2021,6 +2040,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
     // 私有目录里躺着 charter / recent 正文。失败的唤醒把它留到本次排查结束，
     // 但绝不在进程退出后继续留在共享 tmpdir 里（#208 门禁 P2）。
     rmSync(contextDir, { recursive: true, force: true });
+    lock?.release?.();
     if (heartbeat) clearInterval(heartbeat);
     conn.close();
     if (o.statusline === true) clearStatuslineListener();

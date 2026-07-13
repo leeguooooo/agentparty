@@ -11,7 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireInstanceLock } from "../src/instance-lock";
+import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../src/instance-lock";
 import { defaultRunnerWorkdir, EXIT_ALREADY_SERVING, runnerWorkdir, runServe } from "../src/commands/serve";
 import { startMockServer, welcomeFrame } from "./mock-server";
 
@@ -127,6 +127,41 @@ describe("defaultRunnerWorkdir 接线 (#99)", () => {
 });
 
 describe("runServe 接线 (#99)", () => {
+  test("默认锁跨 cwd 使用全局身份作用域，重复 serve 在连 WS 前被拒", async () => {
+    const home = dir();
+    const previousHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    let connections = 0;
+    const server = startMockServer((f, sock) => {
+      if (f.type !== "hello") return;
+      connections++;
+      sock.send(welcomeFrame(0, "me"));
+    });
+    const held = acquireInstanceLock(
+      "serve",
+      instanceLockTarget(server.url, "ap_tok", "dev"),
+      defaultInstanceLockDir(),
+    );
+    try {
+      const code = await runServe({
+        server: server.url,
+        token: "ap_tok",
+        channel: "dev",
+        since: 0,
+        cmd: "true",
+        mentionsOnly: true,
+        out: () => {},
+      });
+      expect(code).toBe(EXIT_ALREADY_SERVING);
+      expect(connections).toBe(0);
+    } finally {
+      held.release?.();
+      server.stop();
+      if (previousHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = previousHome;
+    }
+  });
+
   test("第二个 serve 直接被拒，且连 WS 都不建（否则它已经在跑 runner 了）", async () => {
     const d = dir();
     let connections = 0;

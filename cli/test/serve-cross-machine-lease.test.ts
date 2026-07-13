@@ -1,6 +1,6 @@
 // issue #99 跨机那半（客户端侧）：serve 挂上后向服务端 claim serve 租约；只有服务端回 held=true 的那台
-// 才跑 runner。收到 held=false（另一台在跑）就转 standby：被 @ 也不触发 runner，消息仍进历史、游标照推进
-// （与 #180 暂停接待同路径）。持租者掉线后服务端补发 held=true，standby 顶上开始跑。老服务端不认租约、
+// 才跑 runner。收到 held=false（另一台在跑）就转 standby：被 @ 不触发 runner，但保留为未确认帧；
+// 持租者掉线后服务端补发 held=true，standby 顶上并按序重放。老服务端不认租约、
 // 从不下发 serve_lease → 客户端默认持租（held 未知即照跑），不回归。
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ClientFrame } from "@agentparty/shared";
@@ -41,7 +41,7 @@ function leaseFrame(held: boolean, name = "me") {
 }
 
 describe("serve 跨机租约客户端互斥（#99）", () => {
-  test("held=false（另一台持租）：@我 不跑 runner，但游标仍推进（standby）", async () => {
+  test("held=false（另一台持租）：@我 不跑 runner，也不推进游标吞掉 wake", async () => {
     let ran = 0;
     const cursors: number[] = [];
     server = startMockServer((frame, sock) => {
@@ -54,7 +54,7 @@ describe("serve 跨机租约客户端互斥（#99）", () => {
     const o = opts({ server: server.url, onCursor: (c) => cursors.push(c), runCommand: async () => { ran++; } });
     await runServe(o);
     expect(ran).toBe(0); // 不持租：runner 一次都没跑
-    expect(cursors).toContain(1); // 消息仍被消费、游标推进（不留欠账）
+    expect(cursors).not.toContain(1); // standby 保留未确认，租约接管后才能重放
     expect(o.lines.some((l) => l.includes("standby") || l.includes("租约"))).toBe(true);
   });
 
@@ -72,8 +72,8 @@ describe("serve 跨机租约客户端互斥（#99）", () => {
     expect(ran).toBe(1);
   });
 
-  test("takeover：先 held=false 跳过，收到 held=true 后的 @ 才跑", async () => {
-    let ran = 0;
+  test("takeover：held=false 期间的 @ 与接管后的 @ 都按序送达", async () => {
+    const ran: number[] = [];
     server = startMockServer((frame, sock) => {
       if (frame.type !== "hello") return;
       sock.send(welcomeFrame(0, "me"));
@@ -83,9 +83,32 @@ describe("serve 跨机租约客户端互斥（#99）", () => {
       setTimeout(() => sock.send(msgFrame(2, "@me after takeover", { mentions: ["me"] })), 60);
       setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 100);
     });
-    const o = opts({ server: server.url, runCommand: async () => { ran++; } });
+    const o = opts({ server: server.url, runCommand: async (frame) => { ran.push(frame.seq); } });
     await runServe(o);
-    expect(ran).toBe(1); // 只跑了 takeover 之后的那条
+    expect(ran).toEqual([1, 2]);
+    expect(o.lines.some((line) => line.includes("重放 1 条未确认帧"))).toBe(true);
+  });
+
+  test("runner 在租约变更到 standby 前已经启动时允许 drain 完成", async () => {
+    const events: string[] = [];
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(leaseFrame(true)), 10);
+      setTimeout(() => sock.send(msgFrame(1, "@me long wake", { mentions: ["me"] })), 20);
+      setTimeout(() => sock.send(leaseFrame(false)), 30);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 100);
+    });
+    const o = opts({
+      server: server.url,
+      runCommand: async () => {
+        events.push("started");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        events.push("finished");
+      },
+    });
+    await runServe(o);
+    expect(events).toEqual(["started", "finished"]);
   });
 
   test("老服务端从不下发 serve_lease：客户端默认持租，照常唤醒（不回归）", async () => {

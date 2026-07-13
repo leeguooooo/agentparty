@@ -51,7 +51,25 @@ class FrameQueue {
   snapshot(): ServerFrame[] {
     return [...this.items];
   }
+
+  // 租约 standby 已经取走、但没有 ack 的帧需要在接管时重新排到队首。
+  // prepend 而不是 push：它们的 seq 早于当前缓冲区，必须先还旧账再处理新帧。
+  prepend(frames: ServerFrame[]): boolean {
+    if (this.done || frames.length === 0) return false;
+    let index = 0;
+    while (index < frames.length) {
+      const waiter = this.waiters.shift();
+      if (!waiter) break;
+      waiter.resolve({ value: frames[index]!, done: false });
+      index += 1;
+    }
+    // 禁止 unshift(...frames)：参数展开到数万帧会触发 Maximum call stack size exceeded。
+    if (index < frames.length) this.items = frames.slice(index).concat(this.items);
+    return true;
+  }
 }
+
+export const DEFAULT_MAX_UNACKED_FRAMES = 4096;
 
 const RETRYABLE_NETWORK_CODES = new Set([
   "EAI_AGAIN",
@@ -98,6 +116,8 @@ export interface ConnectOptions {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   pingIntervalMs?: number;
+  /** 未确认消息缓存上限；超限时 fail-fast 且不推进 cursor，交给 supervisor 重启后安全补拉。 */
+  maxUnackedFrames?: number;
   /**
    * 连接健康探针（issue #254）：WS 生命周期转场通知，供上层（serve）落本地 health.json。
    * "open" = 握手成功（socket 已连上，尚未必然收到 welcome）；"reconnecting" = 断线后进入退避等待；
@@ -115,6 +135,11 @@ export interface Connection {
   close(): void;
   /** 已缓冲、尚未消费的帧快照（#103）：估算 serve 排队深度用。 */
   pendingFrames(): ServerFrame[];
+  /**
+   * 把已经交给消费方、但尚未 ack 的普通消息重新排到队首。
+   * serve standby 在租约接管时用它重放未送达 wake；返回实际重排数量。
+   */
+  replayUnacked(): number;
   readonly cursor: number;
   readonly revCursor: number;
 }
@@ -158,6 +183,10 @@ export function connect(
   const base = opts.backoffBaseMs ?? 1000;
   const max = opts.backoffMaxMs ?? 30_000;
   const pingEvery = opts.pingIntervalMs ?? 25_000;
+  const requestedMaxUnackedFrames = opts.maxUnackedFrames ?? DEFAULT_MAX_UNACKED_FRAMES;
+  const maxUnackedFrames = Number.isFinite(requestedMaxUnackedFrames)
+    ? Math.max(1, Math.floor(requestedMaxUnackedFrames))
+    : DEFAULT_MAX_UNACKED_FRAMES;
   const httpBase = server.replace(/\/+$/, "");
   const wsUrl = httpBase.replace(/^http/, "ws") + `/api/channels/${encodeURIComponent(slug)}/ws`;
 
@@ -173,6 +202,8 @@ export function connect(
   };
   // 已入队未 ack 的 seq，broadcast 与 hello 补拉重叠时去重
   const delivered = new Set<number>();
+  // 非修订消息的原始帧保留到 ack；serve standby 接管租约时可把已消费但未确认的帧重新排队。
+  const unacked = new Map<number, Extract<ServerFrame, { type: "msg" | "status" }>>();
   // 已递过的修订快照 seq → 指纹：跨重连去重（服务端每次 hello 都重放全部历史修订）
   const deliveredRevisions = new Map<number, string>();
   let closed = false;
@@ -187,7 +218,10 @@ export function connect(
       opts.onCursor?.(cursor);
     }
     for (const s of delivered) {
-      if (s <= cursor) delivered.delete(s);
+      if (s <= cursor) {
+        delivered.delete(s);
+        unacked.delete(s);
+      }
     }
   };
 
@@ -307,7 +341,19 @@ export function connect(
             deliveredRevisions.set(frame.seq, fp);
           } else {
             if (frame.seq <= cursor || delivered.has(frame.seq)) continue;
+            if (unacked.size >= maxUnackedFrames) {
+              const error = new Error(
+                `unacked replay buffer exceeded ${maxUnackedFrames} frames; terminating without advancing cursor`,
+              );
+              closed = true;
+              stopPing();
+              opts.onStatus?.("closed", { error: error.message });
+              queue.fail(error);
+              sock.close(1011, "unacked replay buffer exceeded");
+              return;
+            }
             delivered.add(frame.seq);
+            unacked.set(frame.seq, frame);
           }
         }
         // 自回声：sent 立即推进游标，自己的消息不会被当成新消息
@@ -383,6 +429,19 @@ export function connect(
     },
     pendingFrames() {
       return queue.snapshot();
+    },
+    replayUnacked() {
+      const pendingSeqs = new Set(
+        queue
+          .snapshot()
+          .filter((frame): frame is Extract<ServerFrame, { type: "msg" | "status" }> => frame.type === "msg" || frame.type === "status")
+          .map((frame) => frame.seq),
+      );
+      const frames = [...unacked.entries()]
+        .filter(([seq]) => seq > cursor && !pendingSeqs.has(seq))
+        .sort(([a], [b]) => a - b)
+        .map(([, frame]) => frame);
+      return queue.prepend(frames) ? frames.length : 0;
     },
     get cursor() {
       return cursor;

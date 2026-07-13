@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_ALREADY_WATCHING, runWatch } from "../src/commands/watch";
-import { acquireInstanceLock } from "../src/instance-lock";
+import { acquireInstanceLock, currentProcessStartedAt, defaultInstanceLockDir, instanceLockTarget } from "../src/instance-lock";
 import { startMockServer, welcomeFrame } from "./mock-server";
 
 const dirs: string[] = [];
@@ -29,7 +29,7 @@ describe("watch 单实例保护 (#195)", () => {
     lock.release?.();
   });
 
-  test("同一 (channel, workspace) 的第二个 watcher 被拒，并告知已有 watcher 的 pid", () => {
+  test("同一锁作用域内的第二个 watcher 被拒，并告知已有 watcher 的 pid", () => {
     const d = dir();
     const first = acquireInstanceLock("watch", "dev", d);
     expect(first.ok).toBe(true);
@@ -81,6 +81,27 @@ describe("watch 单实例保护 (#195)", () => {
     expect(lock.heldByPid).toBe(process.pid);
   });
 
+  test("PID 已复用给另一个出生时间的进程时自动回收陈旧锁", () => {
+    if (process.platform === "win32") return;
+    const d = dir();
+    writeFileSync(
+      join(d, "watch-dev.lock"),
+      JSON.stringify({ pid: process.pid, started_at: currentProcessStartedAt() - 60_000, channel: "dev" }),
+    );
+    const lock = acquireInstanceLock("watch", "dev", d);
+    expect(lock.ok).toBe(true);
+    lock.release?.();
+  });
+
+  test("生产锁目标跨 cwd 稳定，并按 server/token 身份隔离", () => {
+    expect(instanceLockTarget("https://party.test", "tok-a", "dev")).toBe(
+      instanceLockTarget("https://party.test", "tok-a", "dev"),
+    );
+    expect(instanceLockTarget("https://party.test", "tok-a", "dev")).not.toBe(
+      instanceLockTarget("https://party.test", "tok-b", "dev"),
+    );
+  });
+
   test("8 个进程并发接管同一陈旧锁时只有一个成功", async () => {
     const d = dir();
     const start = join(d, "start");
@@ -110,6 +131,43 @@ describe("watch 单实例保护 (#195)", () => {
 // 光有锁函数没接进 runWatch 等于没修。这几条断言观测的是**过程**：
 // 第二个 watcher 有没有真的去连服务端、有没有消费掉那条 @。
 describe("runWatch 接线 (#195)", () => {
+  test("默认锁跨 cwd 使用全局身份作用域，另一工作目录启动也被拒", async () => {
+    const home = dir();
+    const previousHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    let connections = 0;
+    const server = startMockServer((f, sock) => {
+      if (f.type !== "hello") return;
+      connections++;
+      sock.send(welcomeFrame(0, "me"));
+    });
+    const held = acquireInstanceLock(
+      "watch",
+      instanceLockTarget(server.url, "ap_tok", "dev"),
+      defaultInstanceLockDir(),
+    );
+    try {
+      const code = await runWatch({
+        server: server.url,
+        token: "ap_tok",
+        channel: "dev",
+        since: 0,
+        timeoutSec: 1,
+        follow: false,
+        mentionsOnly: true,
+        once: true,
+        out: () => {},
+      });
+      expect(code).toBe(EXIT_ALREADY_WATCHING);
+      expect(connections).toBe(0);
+    } finally {
+      held.release?.();
+      server.stop();
+      if (previousHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = previousHome;
+    }
+  });
+
   test("第二个 watcher 直接被拒，且连 WS 都不建（否则它已经在消费 @ 了）", async () => {
     const d = dir();
     let connections = 0;

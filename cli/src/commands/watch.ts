@@ -1,10 +1,9 @@
 // party watch — 补拉错过消息，阻塞等新消息
 import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_LOOP_GUARD, EXIT_STREAM_ENDED, EXIT_TIMEOUT, type MsgFrame } from "@agentparty/shared";
-import { dirname } from "node:path";
-import { acquireInstanceLock } from "../instance-lock";
+import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../instance-lock";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
-import { loadCursor, loadRevCursor, resolveChannel, saveCursor, saveRevCursor, statePath } from "../config";
+import { loadCursor, loadRevCursor, resolveChannel, saveCursor, saveRevCursor } from "../config";
 import { resolveAuthDetailed, type ResolvedAuthDetailed } from "../oidc-cli";
 import { formatMsg } from "../format";
 import { fetchMe, fetchMessages, fetchRecentMessages, handleRestError, postMessage } from "../rest";
@@ -108,7 +107,7 @@ export interface WatchOptions {
   out?: (line: string) => void;
   backoffBaseMs?: number;
   statusline?: boolean;
-  /** 单实例锁目录（#195）。默认与 workspace state 同放；测试注入。 */
+  /** 单实例锁目录（#195/#465）。默认全机共享、再按 server/token 身份隔离；测试注入。 */
   lockDir?: string;
   /** 关掉单实例保护（逃生舱）。 */
   allowMultiple?: boolean;
@@ -200,8 +199,9 @@ async function resolveExplicitWatchCursor(
 export async function runWatch(o: WatchOptions): Promise<number> {
   const out = o.out ?? ((line: string) => console.log(line));
   // 先抢锁，再连服务端：第二个 watcher 连 WS 都不该建，否则它已经开始消费 @ 了（#195）
-  const lockDir = o.lockDir ?? dirname(statePath());
-  const lock = o.allowMultiple === true ? null : acquireInstanceLock("watch", o.channel, lockDir);
+  const lockDir = o.lockDir ?? defaultInstanceLockDir();
+  const lockTarget = o.lockDir === undefined ? instanceLockTarget(o.server, o.token, o.channel) : o.channel;
+  const lock = o.allowMultiple === true ? null : acquireInstanceLock("watch", lockTarget, lockDir);
   if (lock && !lock.ok) {
     out(
       `watch: 已有 watcher 挂在 #${o.channel} 上（pid ${lock.heldByPid}）。` +
@@ -210,12 +210,18 @@ export async function runWatch(o: WatchOptions): Promise<number> {
     );
     return EXIT_ALREADY_WATCHING;
   }
-  const conn = connect(o.server, o.token, o.channel, o.since, {
-    onCursor: o.onCursor,
-    sinceRev: o.sinceRev,
-    onRevCursor: o.onRevCursor,
-    backoffBaseMs: o.backoffBaseMs,
-  });
+  let conn: ReturnType<typeof connect>;
+  try {
+    conn = connect(o.server, o.token, o.channel, o.since, {
+      onCursor: o.onCursor,
+      sinceRev: o.sinceRev,
+      onRevCursor: o.onRevCursor,
+      backoffBaseMs: o.backoffBaseMs,
+    });
+  } catch (error) {
+    lock?.release?.();
+    throw error;
+  }
 
   let self = "";
   let lastSeq = 0;
