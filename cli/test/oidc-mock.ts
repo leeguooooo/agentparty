@@ -31,6 +31,7 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
   const profiles: Record<string, unknown>[] = [];
   const invites: Record<string, unknown>[] = [];
   const wakeBudgets = new Map<string, { limit: number; window_ms: number }>();
+  let retention = { message_retention_ms: null as number | null, audit_retention_ms: null as number | null };
   let base = "";
 
   const server = Bun.serve({
@@ -151,6 +152,13 @@ export function startOidcMock(opts: MockOptions = {}): OidcMock {
       if (req.method === "GET" && /^\/api\/channels\/[^/]+\/loop-guard$/.test(u.pathname)) {
         // #174 loop guard 读路径 mock
         return Response.json({ enabled: true, limit: 30, streak: 27, remaining: 3, resets_on: "human" });
+      }
+      if (/^\/api\/channels\/[^/]+\/retention$/.test(u.pathname)) {
+        if (req.method === "PUT") {
+          const b = rec.body as Partial<typeof retention> | null;
+          retention = { ...retention, ...(b ?? {}) };
+        }
+        return Response.json(retention);
       }
       // #108 per-agent wake 预算 set/inspect mock（内存态）
       const wbMatch = u.pathname.match(/^\/api\/channels\/[^/]+\/wake-budget\/([^/]+)$/);

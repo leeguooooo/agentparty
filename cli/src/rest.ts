@@ -1058,6 +1058,34 @@ export async function setWorkflowGuard(
   })) as { enabled: boolean; limit: number | null };
 }
 
+export interface ChannelRetentionPolicy {
+  message_retention_ms: number | null;
+  audit_retention_ms: number | null;
+}
+
+export async function getChannelRetention(
+  server: string,
+  token: string,
+  slug: string,
+): Promise<ChannelRetentionPolicy> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/retention`, {
+    headers: bearerJson(token),
+  })) as ChannelRetentionPolicy;
+}
+
+export async function setChannelRetention(
+  server: string,
+  token: string,
+  slug: string,
+  body: Partial<ChannelRetentionPolicy>,
+): Promise<ChannelRetentionPolicy> {
+  return (await req(server, `/api/channels/${encodeURIComponent(slug)}/retention`, {
+    method: "PUT",
+    headers: bearerJson(token),
+    body: JSON.stringify(body),
+  })) as ChannelRetentionPolicy;
+}
+
 export async function setChannelVisibility(
   server: string,
   token: string,

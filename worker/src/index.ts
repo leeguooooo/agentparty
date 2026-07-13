@@ -1258,6 +1258,7 @@ async function loadChannel(db: D1Database, slug: string) {
       `SELECT slug, kind, mode, archived_at, created_by, visibility, owner_account,
               completion_gate, completion_review_policy, decision_mode, loop_guard_enabled, loop_guard_limit,
               workflow_guard_enabled, workflow_guard_limit,
+              message_retention_ms, audit_retention_ms,
               charter, charter_rev, charter_updated_at, charter_updated_by,
               charter_write_policy, charter_write_agents, charter_write_agent_allowlist_json,
               members_list_policy, members_list_agents, members_list_agent_allowlist_json
@@ -1279,6 +1280,8 @@ async function loadChannel(db: D1Database, slug: string) {
       loop_guard_limit: number | null;
       workflow_guard_enabled: number;
       workflow_guard_limit: number;
+      message_retention_ms: number | null;
+      audit_retention_ms: number | null;
       charter: string | null;
       charter_rev: number;
       charter_updated_at: number | null;
@@ -1485,6 +1488,8 @@ function channelHeaders(
     loop_guard_limit?: number | null;
     workflow_guard_enabled?: number;
     workflow_guard_limit?: number;
+    message_retention_ms?: number | null;
+    audit_retention_ms?: number | null;
     charter_rev?: number;
   },
   requestUrl: string,
@@ -1501,6 +1506,8 @@ function channelHeaders(
     "x-ap-loop-guard-limit": channel.loop_guard_limit == null ? "" : String(channel.loop_guard_limit),
     "x-ap-workflow-guard-enabled": String(channel.workflow_guard_enabled ?? 0),
     "x-ap-workflow-guard-limit": String(channel.workflow_guard_limit ?? 30),
+    "x-ap-message-retention-ms": channel.message_retention_ms == null ? "" : String(channel.message_retention_ms),
+    "x-ap-audit-retention-ms": channel.audit_retention_ms == null ? "" : String(channel.audit_retention_ms),
     "x-ap-charter-rev": String(channel.charter_rev ?? 0),
     "x-ap-host": new URL(requestUrl).host,
   };
@@ -3952,6 +3959,13 @@ app.get("/api/channels/:slug/reconcile", async (c) => {
   cmp("loop_guard_limit", channel.loop_guard_limit, state.loop_guard_limit);
   cmp("workflow_guard_enabled", channel.workflow_guard_enabled, state.workflow_guard_enabled);
   cmp("workflow_guard_limit", channel.workflow_guard_limit, state.workflow_guard_limit);
+  const cmpRetention = (field: string, d1: number | null, dobj: unknown) => {
+    if (dobj === null || dobj === undefined) return;
+    const normalized = dobj === "off" ? null : Number(dobj);
+    if (d1 !== normalized) flag(field, d1, normalized);
+  };
+  cmpRetention("message_retention_ms", channel.message_retention_ms, state.message_retention_ms);
+  cmpRetention("audit_retention_ms", channel.audit_retention_ms, state.audit_retention_ms);
   // charter_rev：单调，DO 只前进不后退；DO 落后即分裂（D1 权威更新未随 channelHeaders 抵达 DO）。
   cmp("charter_rev", channel.charter_rev, state.charter_rev);
   return c.json({
@@ -5483,6 +5497,81 @@ app.put("/api/channels/:slug/workflow-guard", async (c) => {
     metadata: { guard: "workflow_guard" },
   });
   return c.json({ enabled: body.enabled, limit });
+});
+
+const MIN_RETENTION_MS = 60_000;
+const MAX_RETENTION_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+
+function parseRetentionMs(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= MIN_RETENTION_MS && value <= MAX_RETENTION_MS
+    ? value
+    : undefined;
+}
+
+// #421: D1 is the policy source of truth; the channel DO receives the same values through an
+// authoritative /internal/init snapshot and performs physical deletion from its local SQLite/R2 data.
+app.get("/api/channels/:slug/retention", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  return c.json({
+    message_retention_ms: channel.message_retention_ms,
+    audit_retention_ms: channel.audit_retention_ms,
+  });
+});
+
+app.put("/api/channels/:slug/retention", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!isChannelModerator(identity, channel)) {
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can configure retention"), 403);
+  }
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (body === null) return c.json(errorBody("bad_request", "invalid json"), 400);
+  const hasMessage = Object.hasOwn(body, "message_retention_ms");
+  const hasAudit = Object.hasOwn(body, "audit_retention_ms");
+  const message = parseRetentionMs(body.message_retention_ms);
+  const audit = parseRetentionMs(body.audit_retention_ms);
+  if ((!hasMessage && !hasAudit) || (hasMessage && message === undefined) || (hasAudit && audit === undefined)) {
+    return c.json(
+      errorBody(
+        "bad_request",
+        `message_retention_ms or audit_retention_ms must be null or an integer between ${MIN_RETENTION_MS} and ${MAX_RETENTION_MS}`,
+      ),
+      400,
+    );
+  }
+  const messageRetention = message === undefined ? channel.message_retention_ms : message;
+  const auditRetention = audit === undefined ? channel.audit_retention_ms : audit;
+  await c.env.DB.prepare(
+    "UPDATE channels SET message_retention_ms = ?, audit_retention_ms = ? WHERE slug = ?",
+  )
+    .bind(messageRetention, auditRetention, slug)
+    .run();
+  const updated = { ...channel, message_retention_ms: messageRetention, audit_retention_ms: auditRetention };
+  await fetchChannelDO(
+    c.env,
+    slug,
+    new Request("https://do/internal/init", {
+      method: "POST",
+      headers: { "x-partykit-room": slug, ...channelHeaders(updated, c.req.url) },
+    }),
+  );
+  await bestEffortRecordManagementAudit(c.env.DB, {
+    actor: managementAuditActor(identity),
+    action: "channel.retention.update",
+    resource: `channel/${slug}/retention`,
+    channel: slug,
+    metadata: { message_retention_ms: messageRetention, audit_retention_ms: auditRetention },
+  });
+  return c.json({ message_retention_ms: messageRetention, audit_retention_ms: auditRetention });
 });
 
 app.post("/api/channels/:slug/messages/:seq/review", async (c) => {

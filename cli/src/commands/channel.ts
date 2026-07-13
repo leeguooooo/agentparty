@@ -9,6 +9,7 @@ import {
   createChannel,
   exportChannel,
   getLoopGuard,
+  getChannelRetention,
   handleRestError,
   reconcileChannel,
   inviteProjectAgent,
@@ -27,6 +28,7 @@ import {
   setChannelVisibility,
   setCompletionGate,
   setLoopGuard,
+  setChannelRetention,
   setWorkflowGuard,
   type AgentChannelPermPolicy,
   type ChannelPerms,
@@ -80,6 +82,8 @@ const HELP = `usage: party channel create <slug> [--title t] [--temp] [--party] 
        party channel guard unlimited|off|<limit> [slug]
        party channel guard status [slug] [--json]   read limit/streak/remaining before exit 4
        party channel workflow-guard off|<limit> [slug]
+       party channel retention status [slug] [--json]
+       party channel retention <message-window|off> <audit-window|off> [slug]
        party channel visibility <slug> public|private [--confirm]
        party channel members <slug>
        party channel perms <slug> [--json]
@@ -110,6 +114,7 @@ Options:
   --public    create a public channel
   --policy p  completion review policy: sender or owner
   guard limit consecutive agent messages before human intervention; off/unlimited disables it
+  retention windows use 60s, 30m, 24h, or 30d; off disables expiry for that data class
   --confirm   confirm private-to-public visibility switch
   --remove    revoke the channel-scoped token and remove membership when kicking
   --expires d join-link expiry like 7d, 12h, 30m, 60s
@@ -138,6 +143,15 @@ function parseDurationSec(input: string | undefined): number | null | undefined 
   const unit = m[2];
   const mult = unit === "s" ? 1 : unit === "m" ? 60 : unit === "h" ? 3600 : 86400;
   return n * mult;
+}
+
+function formatDurationMs(value: number | null): string {
+  if (value === null) return "off";
+  const units: [number, string][] = [[86_400_000, "d"], [3_600_000, "h"], [60_000, "m"], [1000, "s"]];
+  for (const [size, suffix] of units) {
+    if (value % size === 0) return `${value / size}${suffix}`;
+  }
+  return `${value}ms`;
 }
 
 function parsePositiveIntFlag(input: string | undefined): number | null | undefined {
@@ -437,6 +451,46 @@ export async function run(argv: string[]): Promise<number> {
           ? await setWorkflowGuard(cfg.server, cfg.token, slug, { enabled: false })
           : await setWorkflowGuard(cfg.server, cfg.token, slug, { enabled: true, limit: limit as number });
         console.log(`workflow guard ${slug}: ${result.enabled ? `${result.limit} messages` : "off"}`);
+        return 0;
+      }
+      case "retention": {
+        const first = positionals[1];
+        if (first === "status") {
+          const slug = resolveChannel(positionals[2]);
+          if (!slug || !isSlug(slug)) {
+            console.error("usage: party channel retention status [slug] [--json]");
+            return 1;
+          }
+          const policy = await getChannelRetention(cfg.server, cfg.token, slug);
+          if (flags.json === true) console.log(JSON.stringify(policy));
+          else {
+            console.log(`retention ${slug}: messages=${formatDurationMs(policy.message_retention_ms)} audit=${formatDurationMs(policy.audit_retention_ms)}`);
+          }
+          return 0;
+        }
+        const second = positionals[2];
+        const slug = resolveChannel(positionals[3]);
+        if (!first || !second || !slug || !isSlug(slug)) {
+          console.error("usage: party channel retention <message-window|off> <audit-window|off> [slug]");
+          return 1;
+        }
+        const parseWindow = (value: string): number | null | undefined => {
+          if (value === "off") return null;
+          const seconds = parseDurationSec(value);
+          return seconds === undefined || seconds === null || seconds < 60 ? undefined : seconds * 1000;
+        };
+        const messageRetention = parseWindow(first);
+        const auditRetention = parseWindow(second);
+        if (messageRetention === undefined || auditRetention === undefined) {
+          console.error("retention windows must be off or a duration of at least 60s (for example 30d)");
+          return 1;
+        }
+        const policy = await setChannelRetention(cfg.server, cfg.token, slug, {
+          message_retention_ms: messageRetention,
+          audit_retention_ms: auditRetention,
+        });
+        console.log(`retention ${slug}: messages=${first} audit=${second}`);
+        if (policy.message_retention_ms !== messageRetention || policy.audit_retention_ms !== auditRetention) return 1;
         return 0;
       }
       case "visibility": {

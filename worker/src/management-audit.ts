@@ -28,6 +28,7 @@ export type ManagementAuditAction =
   | "channel.archive"
   | "channel.identity.erase"
   | "channel.export"
+  | "channel.retention.update"
   | "membership.set";
 
 export interface ManagementAuditActor {
@@ -137,6 +138,16 @@ function safeMetadata(action: ManagementAuditAction, input: unknown): Record<str
     ]) {
       const value = metadata[field];
       if (typeof value === "number" && Number.isInteger(value) && value >= 0) result[field] = value;
+    }
+    return result;
+  }
+  if (action === "channel.retention.update") {
+    const result: Record<string, unknown> = {};
+    for (const field of ["message_retention_ms", "audit_retention_ms"]) {
+      const value = metadata[field];
+      if (value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000)) {
+        result[field] = value;
+      }
     }
     return result;
   }

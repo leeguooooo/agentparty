@@ -1665,17 +1665,72 @@ export class ChannelDO extends Server<Env> {
     this.resumeDuePauses(now);
     await this.retryWebhooks(now);
     await this.checkTempArchive(now);
-    this.pruneStorage(now);
+    await this.pruneStorage(now);
     await this.scheduleNextAlarm(now, live);
   }
 
   // #128：DO 存储有界修剪。wake_delivery_ledger / message_audit / read_cursor 此前只增不减，
   // DO SQLite 无上限增长（10GB 上限前先拖慢 who/hello）。onAlarm 周期跑（60s presence 扫描顺带），
   // 全走已在 DO 单线程内的 sql.exec，热路径零成本；每张表各按「消费者仍需的窗口」定界，见各方法注释。
-  private pruneStorage(now: number) {
+  private async pruneStorage(now: number) {
+    await this.pruneRetainedContent(now);
     this.pruneWakeLedger(now);
     this.pruneMessageAudit();
     this.pruneReadCursors(now);
+  }
+
+  private retentionMs(key: "message_retention_ms" | "audit_retention_ms"): number | null {
+    const value = Number(this.getMeta(key) ?? "");
+    return Number.isSafeInteger(value) && value >= 60_000 ? value : null;
+  }
+
+  // #421: the policy is stored in D1 and authoritatively mirrored into DO meta.  Expired message
+  // rows are physically deleted together with delivery copies and R2 blobs; audit history has its
+  // own independent window so a tenant may retain an action trail longer than message content.
+  private async pruneRetainedContent(now: number) {
+    const messageRetention = this.retentionMs("message_retention_ms");
+    const auditRetention = this.retentionMs("audit_retention_ms");
+    const attachmentKeys = new Set<string>();
+    if (messageRetention !== null) {
+      const cutoff = now - messageRetention;
+      const expired = this.ctx.storage.sql
+        .exec("SELECT seq, attachments_json FROM messages WHERE ts <= ?", cutoff)
+        .toArray();
+      for (const row of expired) {
+        for (const attachment of parseStoredAttachments(row.attachments_json) ?? []) {
+          if (attachment.key.startsWith(`${this.name}/`)) attachmentKeys.add(attachment.key);
+        }
+      }
+      if (expired.length > 0) {
+        // Delete blobs first.  If R2 is transiently unavailable the alarm retries while the message
+        // rows still retain their keys; deleting SQLite first would make those blobs unreachable.
+        const keys = [...attachmentKeys];
+        for (let i = 0; i < keys.length; i += 1000) {
+          await this.env.ATTACHMENTS.delete(keys.slice(i, i + 1000));
+        }
+        this.ctx.storage.transactionSync(() => {
+          this.ctx.storage.sql.exec(
+            `DELETE FROM webhook_queue
+              WHERE json_valid(payload)
+                AND CAST(json_extract(payload, '$.seq') AS INTEGER) IN
+                    (SELECT seq FROM messages WHERE ts <= ?)`,
+            cutoff,
+          );
+          this.ctx.storage.sql.exec(
+            "DELETE FROM webhook_dead_letters WHERE mention_seq IN (SELECT seq FROM messages WHERE ts <= ?)",
+            cutoff,
+          );
+          this.ctx.storage.sql.exec(
+            "DELETE FROM wake_delivery_ledger WHERE mention_seq IN (SELECT seq FROM messages WHERE ts <= ?)",
+            cutoff,
+          );
+          this.ctx.storage.sql.exec("DELETE FROM messages WHERE ts <= ?", cutoff);
+        });
+      }
+    }
+    if (auditRetention !== null) {
+      this.ctx.storage.sql.exec("DELETE FROM message_audit WHERE created_at <= ?", now - auditRetention);
+    }
   }
 
   // wake_delivery_ledger：按时间窗裁。保留窗口 WAKE_LEDGER_RETENTION_MS 严格大于预算窗口上限
@@ -1988,6 +2043,16 @@ export class ChannelDO extends Server<Env> {
       const basis = this.lastActivityTs();
       if (basis !== null) candidates.push(basis + this.tempIdleMs());
     }
+    const messageRetention = this.retentionMs("message_retention_ms");
+    if (messageRetention !== null) {
+      const oldest = this.ctx.storage.sql.exec("SELECT MIN(ts) AS t FROM messages").one().t;
+      if (oldest !== null) candidates.push(Number(oldest) + messageRetention);
+    }
+    const auditRetention = this.retentionMs("audit_retention_ms");
+    if (auditRetention !== null) {
+      const oldest = this.ctx.storage.sql.exec("SELECT MIN(created_at) AS t FROM message_audit").one().t;
+      if (oldest !== null) candidates.push(Number(oldest) + auditRetention);
+    }
     if (candidates.length > 0) {
       await this.ctx.storage.setAlarm(Math.max(Math.min(...candidates), now + 1000));
     }
@@ -2168,6 +2233,18 @@ export class ChannelDO extends Server<Env> {
         this.setMeta("workflow_guard_limit", String(Math.min(workflowGuardLimit, 1000)));
       }
     }
+    if (authoritative || this.getMeta("message_retention_ms") === null) {
+      const raw = h.get("x-ap-message-retention-ms");
+      if (raw === "") this.setMeta("message_retention_ms", "off");
+      const value = Number(raw ?? "");
+      if (Number.isSafeInteger(value) && value >= 60_000) this.setMeta("message_retention_ms", String(value));
+    }
+    if (authoritative || this.getMeta("audit_retention_ms") === null) {
+      const raw = h.get("x-ap-audit-retention-ms");
+      if (raw === "") this.setMeta("audit_retention_ms", "off");
+      const value = Number(raw ?? "");
+      if (Number.isSafeInteger(value) && value >= 60_000) this.setMeta("audit_retention_ms", String(value));
+    }
     // charter_rev：单调守卫，只前进不后退（旧快照的小 rev 丢弃）
     const charterRev = Number(h.get("x-ap-charter-rev") ?? "");
     if (Number.isInteger(charterRev) && charterRev >= 0) {
@@ -2187,6 +2264,8 @@ export class ChannelDO extends Server<Env> {
     if (this.getMeta("ckind") === "temp" && !this.isArchived()) {
       await this.ensureAlarmAt(msg.ts + this.tempIdleMs());
     }
+    const retention = this.retentionMs("message_retention_ms");
+    if (retention !== null) await this.ensureAlarmAt(msg.ts + retention);
   }
 
   // spec §15：对每个 webhook 判 filter → 立即尝试投递，失败入队由 alarm 重试
@@ -2713,6 +2792,11 @@ export class ChannelDO extends Server<Env> {
     if (current === null || current > ts) await this.ctx.storage.setAlarm(ts);
   }
 
+  private async scheduleAuditRetention(createdAt: number) {
+    const retention = this.retentionMs("audit_retention_ms");
+    if (retention !== null) await this.ensureAlarmAt(createdAt + retention);
+  }
+
   // worker 转发来的内部 rest
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -2769,6 +2853,9 @@ export class ChannelDO extends Server<Env> {
         const born = Date.now();
         this.setMeta("born", String(born));
         await this.ensureAlarmAt(born + this.tempIdleMs());
+      }
+      if (this.retentionMs("message_retention_ms") !== null || this.retentionMs("audit_retention_ms") !== null) {
+        await this.ensureAlarmAt(Date.now() + 1000);
       }
       return Response.json({ ok: true });
     }
@@ -2849,6 +2936,8 @@ export class ChannelDO extends Server<Env> {
         loop_guard_limit: this.getMeta("loop_guard_limit"),
         workflow_guard_enabled: this.getMeta("workflow_guard_enabled"),
         workflow_guard_limit: this.getMeta("workflow_guard_limit"),
+        message_retention_ms: this.getMeta("message_retention_ms"),
+        audit_retention_ms: this.getMeta("audit_retention_ms"),
         charter_rev: this.charterRev(),
         message_count: Number(msgCount.n ?? 0),
       });
@@ -2996,6 +3085,7 @@ export class ChannelDO extends Server<Env> {
         const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
         const frame = this.rowToFrame(updated);
         this.broadcastFrame(this.messageUpdate("edit", identity, frame, now));
+        await this.scheduleAuditRetention(now);
         return Response.json({ message: frame });
       }
       if (action === "retract") {
@@ -3035,6 +3125,7 @@ export class ChannelDO extends Server<Env> {
         const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
         const frame = this.rowToFrame(updated);
         this.broadcastFrame(this.messageUpdate("retract", identity, frame, now));
+        await this.scheduleAuditRetention(now);
         return Response.json({ message: frame });
       }
 
@@ -3068,6 +3159,7 @@ export class ChannelDO extends Server<Env> {
       this.broadcastFrame(this.messageUpdate("supersede", identity, oldFrame, now));
       this.broadcastFrame(newFrame);
       await this.afterSend(newFrame);
+      await this.scheduleAuditRetention(now);
       return Response.json({ message: newFrame, superseded: oldFrame });
     }
     const reviewMatch = url.pathname.match(/^\/internal\/messages\/([1-9]\d*)\/review$/);

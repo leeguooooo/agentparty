@@ -36,6 +36,43 @@ export const openapiDocument = {
     },
   },
   paths: {
+    "/api/channels/{slug}/retention": {
+      get: {
+        summary: "read channel message and audit retention windows",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        responses: {
+          "200": { description: "message_retention_ms and audit_retention_ms; null disables time expiry" },
+          "403": { description: "caller cannot access the channel" },
+        },
+      },
+      put: {
+        summary: "set channel message and audit retention windows",
+        description: "Owner/moderator only. Values are null or integer milliseconds from 60000 through ten years.",
+        security: [{ bearer: [] }],
+        parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  message_retention_ms: { type: ["integer", "null"], minimum: 60000 },
+                  audit_retention_ms: { type: ["integer", "null"], minimum: 60000 },
+                },
+                minProperties: 1,
+              },
+            },
+          },
+        },
+        responses: {
+          "200": { description: "the authoritative policy stored in D1 and mirrored to the channel DO" },
+          "400": { description: "invalid or missing retention window" },
+          "403": { description: "owner/moderator required" },
+        },
+      },
+    },
     "/api/desktop/pairings": {
       post: {
         summary: "start a five-minute desktop Device Flow pairing",
