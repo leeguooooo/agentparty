@@ -264,14 +264,15 @@ export async function runWatch(o: WatchOptions): Promise<number> {
         // wake 回执表达」。同身份的网页标签页读过一条 @，不代表这个 supervisor 被它唤醒过。
         // 拿它 ack 会静默跳过从未送达的 mention。#172 需要一个独立的 wake cursor。
         // 挂上即声明 watch 唤醒层（#440，best-effort，只做一次；重连再收 welcome 不重复刷）。
+        // presence 上报走独立 REST 通道，绝不进 watch 的输出流：失败也**静默吞掉**——既不能污染
+        // stdout（--json 的帧契约按 fixture 校验，多一行就崩），也不能污染 stderr（订阅方按
+        // stderr==="" 断言）。声明失败最坏就是 agent 回到「wake_kind=null」的旧态，不比现状差。
         if (!advertised) {
           advertised = true;
           try {
             await o.advertise?.();
-          } catch (e) {
-            console.error(
-              `watch: wake 能力声明失败（不影响监听，可稍后手动 party status --wake-kind watch 声明）: ${e instanceof Error ? e.message : String(e)}`,
-            );
+          } catch {
+            /* best-effort presence：失败静默，不碰 stdout/stderr（保 --json 帧契约与 stderr 洁净） */
           }
         }
         if (o.statusline === true) {
