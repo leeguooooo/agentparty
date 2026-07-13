@@ -1447,24 +1447,33 @@ const AGENT_STATUS_ORDER: Record<AgentBoardStatus, number> = { busy: 0, blocked:
 
 export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]; tasks: TaskRecord[] }) {
   const t = useT();
-  const counts = new Map<string, { inProgress: number; queued: number; review: number; blocked: number }>();
-  const bump = (name: string, key: "inProgress" | "queued" | "review" | "blocked") => {
-    const cur = counts.get(name) ?? { inProgress: 0, queued: 0, review: 0, blocked: 0 };
-    cur[key] += 1;
-    counts.set(name, cur);
-  };
+  const tasksByName = new Map<string, TaskRecord[]>();
   for (const task of tasks) {
     const name = task.assignee?.name;
-    if (!name) continue;
-    if (task.state === "in_progress") bump(name, "inProgress");
-    else if (task.state === "assigned") bump(name, "queued");
-    else if (task.state === "needs_review") bump(name, "review");
-    else if (task.state === "blocked") bump(name, "blocked");
+    if (!name || task.assignee?.kind !== "agent") continue;
+    if (task.state !== "in_progress" && task.state !== "assigned" && task.state !== "needs_review" && task.state !== "blocked") continue;
+    const assigned = tasksByName.get(name) ?? [];
+    assigned.push(task);
+    tasksByName.set(name, assigned);
+  }
+  const taskStateOrder: Partial<Record<TaskRecord["state"], number>> = {
+    in_progress: 0,
+    blocked: 1,
+    needs_review: 2,
+    assigned: 3,
+  };
+  for (const assigned of tasksByName.values()) {
+    assigned.sort((a, b) =>
+      (taskStateOrder[a.state] ?? 99) - (taskStateOrder[b.state] ?? 99)
+      || b.priority - a.priority
+      || b.updated_at - a.updated_at
+      || a.id - b.id,
+    );
   }
   const presenceByName = new Map(presence.map((p) => [p.name, p]));
   const names = new Set<string>();
   for (const p of presence) if (p.kind !== "human") names.add(p.name);
-  for (const name of counts.keys()) names.add(name);
+  for (const name of tasksByName.keys()) names.add(name);
   const statusOf = (p: PresenceEntry | undefined): AgentBoardStatus => {
     if (!p || p.live !== true) return "offline";
     if (p.state === "blocked") return "blocked";
@@ -1474,11 +1483,23 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
   const rows = [...names]
     .map((name) => {
       const p = presenceByName.get(name);
-      const c = counts.get(name) ?? { inProgress: 0, queued: 0, review: 0, blocked: 0 };
+      const assigned = tasksByName.get(name) ?? [];
       // #187 第4项「排期」：surface presence 里的暂停/定时恢复（resume_at），看板本行直接可见。
-      return { name, status: statusOf(p), note: p?.note ?? null, paused: p?.paused === true, resumeAt: p?.resume_at ?? null, ...c };
+      return {
+        name,
+        status: statusOf(p),
+        note: p?.note ?? null,
+        paused: p?.paused === true,
+        resumeAt: p?.resume_at ?? null,
+        tasks: assigned,
+        inProgress: assigned.filter((task) => task.state === "in_progress").length,
+        queued: assigned.filter((task) => task.state === "assigned").length,
+        review: assigned.filter((task) => task.state === "needs_review").length,
+        blocked: assigned.filter((task) => task.state === "blocked").length,
+      };
     })
     .sort((a, b) => AGENT_STATUS_ORDER[a.status] - AGENT_STATUS_ORDER[b.status] || b.inProgress - a.inProgress || a.name.localeCompare(b.name));
+  const laneStatuses: AgentBoardStatus[] = ["busy", "blocked", "idle", "offline"];
 
   if (rows.length === 0) {
     return (
@@ -1489,28 +1510,59 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
   }
   return (
     <section className="agent-board-panel" aria-label={t("Channel.agentBoard.aria")}>
-      {rows.map((row) => (
-        <div key={row.name} className={`agent-board-row agent-board-row--${row.status}`}>
-          <div className="agent-board-row-head">
-            <span className="agent-board-name">{row.name}</span>
-            <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{t(`Channel.agents.status.${row.status}`)}</span>
-          </div>
-          {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
-          {row.paused && (
-            <p className="t-mono agent-board-schedule">
-              {row.resumeAt !== null
-                ? t("Channel.agents.pausedUntil", { time: fmtTime(row.resumeAt) })
-                : t("Channel.agents.pausedManual")}
-            </p>
-          )}
-          <div className="agent-board-counts t-mono">
-            <span title={t("Channel.agents.count.inProgress")}>▶ {row.inProgress}</span>
-            <span title={t("Channel.agents.count.queued")}>⏳ {row.queued}</span>
-            <span title={t("Channel.agents.count.review")}>👁 {row.review}</span>
-            {row.blocked > 0 && <span className="agent-board-count-blocked" title={t("Channel.agents.count.blocked")}>⛔ {row.blocked}</span>}
-          </div>
-        </div>
-      ))}
+      {laneStatuses.map((status) => {
+        const laneRows = rows.filter((row) => row.status === status);
+        const statusLabel = t(`Channel.agents.status.${status}`);
+        return (
+          <section
+            key={status}
+            className={`agent-board-lane agent-board-lane--${status}`}
+            data-status={status}
+            aria-label={t("Channel.tasks.columnAria", { state: statusLabel })}
+          >
+            <header className="agent-board-lane-head">
+              <h3 className={`agent-board-lane-title agent-board-status--${status}`}>{statusLabel}</h3>
+              <span className="t-mono agent-board-lane-count">{laneRows.length}</span>
+            </header>
+            <div className="agent-board-lane-cards">
+              {laneRows.length === 0 && <p className="agent-board-lane-empty">{t("Channel.tasks.columnEmpty")}</p>}
+              {laneRows.map((row) => (
+                <article key={row.name} className={`agent-board-row agent-board-row--${row.status}`} data-agent={row.name}>
+                  <div className="agent-board-row-head">
+                    <span className="agent-board-name">{row.name}</span>
+                    <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{statusLabel}</span>
+                  </div>
+                  {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
+                  {row.paused && (
+                    <p className="t-mono agent-board-schedule">
+                      {row.resumeAt !== null
+                        ? t("Channel.agents.pausedUntil", { time: fmtTime(row.resumeAt) })
+                        : t("Channel.agents.pausedManual")}
+                    </p>
+                  )}
+                  <div className="agent-board-counts t-mono">
+                    <span title={t("Channel.agents.count.inProgress")}>▶ {row.inProgress}</span>
+                    <span title={t("Channel.agents.count.queued")}>⏳ {row.queued}</span>
+                    <span title={t("Channel.agents.count.review")}>👁 {row.review}</span>
+                    {row.blocked > 0 && <span className="agent-board-count-blocked" title={t("Channel.agents.count.blocked")}>⛔ {row.blocked}</span>}
+                  </div>
+                  {row.tasks.length > 0 && (
+                    <ol className="agent-board-task-list">
+                      {row.tasks.map((task) => (
+                        <li key={task.id} className={`agent-board-task agent-board-task--${task.state}`}>
+                          <span className="t-mono agent-board-task-id">#{task.id}</span>
+                          <span className="agent-board-task-title" title={task.title}>{task.title}</span>
+                          <span className="t-mono agent-board-task-state">{t(`Channel.tasks.state.${task.state}`)}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        );
+      })}
     </section>
   );
 }
