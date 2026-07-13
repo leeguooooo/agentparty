@@ -58,6 +58,7 @@ function inspectProcess(pid: number): ProcessIdentity {
   const probe = spawnSync("ps", ["-o", "lstart=", "-o", "stat=", "-p", String(pid)], {
     encoding: "utf8",
     timeout: 1000,
+    env: { ...process.env, LC_ALL: "C", LC_TIME: "C" },
   });
   if (probe.error || probe.status !== 0) return { alive: true };
   const line = probe.stdout.trim();

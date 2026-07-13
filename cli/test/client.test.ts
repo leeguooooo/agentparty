@@ -116,6 +116,29 @@ describe("ws client", () => {
     expect(conn.replayUnacked()).toBe(0);
   });
 
+  test("fails safely at the unacked replay cap without advancing the cursor", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(3));
+      sock.send(msgFrame(1, "one"));
+      sock.send(msgFrame(2, "two"));
+      sock.send(msgFrame(3, "overflow"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0, { maxUnackedFrames: 2 });
+
+    let failure: unknown;
+    try {
+      for await (const _frame of conn.frames) {
+        // 故意不 ack：模拟 standby 冻结 cursor。
+      }
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("terminating without advancing cursor");
+    expect(conn.cursor).toBe(0);
+  });
+
   test("dedups frames delivered by both broadcast and backfill", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {

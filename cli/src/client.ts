@@ -56,9 +56,12 @@ class FrameQueue {
   // prepend 而不是 push：它们的 seq 早于当前缓冲区，必须先还旧账再处理新帧。
   prepend(frames: ServerFrame[]): void {
     if (this.done || frames.length === 0) return;
-    this.items.unshift(...frames);
+    // 禁止 unshift(...frames)：参数展开到数万帧会触发 Maximum call stack size exceeded。
+    this.items = frames.concat(this.items);
   }
 }
+
+export const DEFAULT_MAX_UNACKED_FRAMES = 4096;
 
 const RETRYABLE_NETWORK_CODES = new Set([
   "EAI_AGAIN",
@@ -105,6 +108,8 @@ export interface ConnectOptions {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   pingIntervalMs?: number;
+  /** 未确认消息缓存上限；超限时 fail-fast 且不推进 cursor，交给 supervisor 重启后安全补拉。 */
+  maxUnackedFrames?: number;
   /**
    * 连接健康探针（issue #254）：WS 生命周期转场通知，供上层（serve）落本地 health.json。
    * "open" = 握手成功（socket 已连上，尚未必然收到 welcome）；"reconnecting" = 断线后进入退避等待；
@@ -170,6 +175,7 @@ export function connect(
   const base = opts.backoffBaseMs ?? 1000;
   const max = opts.backoffMaxMs ?? 30_000;
   const pingEvery = opts.pingIntervalMs ?? 25_000;
+  const maxUnackedFrames = Math.max(1, Math.floor(opts.maxUnackedFrames ?? DEFAULT_MAX_UNACKED_FRAMES));
   const httpBase = server.replace(/\/+$/, "");
   const wsUrl = httpBase.replace(/^http/, "ws") + `/api/channels/${encodeURIComponent(slug)}/ws`;
 
@@ -324,6 +330,17 @@ export function connect(
             deliveredRevisions.set(frame.seq, fp);
           } else {
             if (frame.seq <= cursor || delivered.has(frame.seq)) continue;
+            if (unacked.size >= maxUnackedFrames) {
+              const error = new Error(
+                `unacked replay buffer exceeded ${maxUnackedFrames} frames; terminating without advancing cursor`,
+              );
+              closed = true;
+              stopPing();
+              opts.onStatus?.("closed", { error: error.message });
+              queue.fail(error);
+              sock.close(1011, "unacked replay buffer exceeded");
+              return;
+            }
             delivered.add(frame.seq);
             unacked.set(frame.seq, frame);
           }
