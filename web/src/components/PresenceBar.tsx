@@ -724,6 +724,18 @@ export function PresenceBar({
         <div className="presence-meta" aria-label="channel presence summary">
           {isPublic && <span className="d-hl public-badge">{publicWatch ? "WATCH" : "PUBLIC"}</span>}
           {party && <span className="d-hl party-badge">PARTY</span>}
+          {blockedCount > 0 && <span className="t-mono presence-alert">{blockedCount} blocked</span>}
+          {busyCount > 0 && (
+            <span className="t-mono presence-alert presence-alert--busy" title="serially handling a wake — reachable, reply may be slow">
+              ⏳ {busyCount} busy
+            </span>
+          )}
+          {duplicateCount > 0 && <span className="t-mono presence-alert presence-alert--duplicate">{duplicateCount} duplicate</span>}
+          {items.length === 0 && (
+            <span className="t-mono presence-empty" role="status" aria-live="polite">
+              nobody here yet
+            </span>
+          )}
           <button
             ref={rosterToggleRef}
             type="button"
@@ -738,18 +750,6 @@ export function PresenceBar({
             </span>
             <span className="presence-toggle-arrow" aria-hidden="true">{rosterOpen ? "▾" : "▸"}</span>
           </button>
-          {blockedCount > 0 && <span className="t-mono presence-alert">{blockedCount} blocked</span>}
-          {busyCount > 0 && (
-            <span className="t-mono presence-alert presence-alert--busy" title="serially handling a wake — reachable, reply may be slow">
-              ⏳ {busyCount} busy
-            </span>
-          )}
-          {duplicateCount > 0 && <span className="t-mono presence-alert presence-alert--duplicate">{duplicateCount} duplicate</span>}
-          {items.length === 0 && (
-            <span className="t-mono presence-empty" role="status" aria-live="polite">
-              nobody here yet
-            </span>
-          )}
         </div>
         <span className="conn t-mono" data-s={status} role="status" aria-live="polite">
           {status === "open" ? "● live" : `◌ ${status}…`}

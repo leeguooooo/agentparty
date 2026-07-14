@@ -319,6 +319,21 @@ describe("busy indicator + queue depth (#103)", () => {
 });
 
 describe("presence live roster dialog (#484)", () => {
+  test("keeps the live roster button last after every status badge (#179)", () => {
+    const r = renderWith(busyEntry({ connection_count: 2 }), { party: true });
+    const meta = r.root.findByProps({ "aria-label": "channel presence summary" });
+    const directClasses = meta.children.map((child) =>
+      typeof child === "string" ? "" : String(child.props.className ?? ""),
+    );
+
+    expect(directClasses).toEqual([
+      "d-hl party-badge",
+      "t-mono presence-alert presence-alert--busy",
+      "t-mono presence-alert presence-alert--duplicate",
+      "presence-toggle",
+    ]);
+  });
+
   // #179 的可点击计数保留；#484 把姓名列表从顶部条移进独立 modal。
   test("the live count is a real button that toggles an accessible participant dialog", async () => {
     const r = renderPresence(presenceEntry());
