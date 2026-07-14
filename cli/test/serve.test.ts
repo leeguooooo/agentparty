@@ -1009,14 +1009,11 @@ describe("builtin runner", () => {
   test("builtin claude runner writes wake context inside the runner workdir (#479)", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
+    const expectedContextPath = join(workdir, "wake-context", "6.json");
     let prompt = "";
-    let contextPath = "";
     const runProcess: RunnerProcess = async (args) => {
       prompt = String(args.at(-1));
-      const m = prompt.match(/(\/[^\s]*\.json)/);
-      contextPath = m?.[0] ?? "";
-      expect(contextPath).toStartWith(join(workdir, "wake-context") + sep);
-      expect(JSON.parse(readFileSync(contextPath, "utf8"))).toMatchObject({ channel: "dev", seq: 6 });
+      expect(JSON.parse(readFileSync(expectedContextPath, "utf8"))).toMatchObject({ channel: "dev", seq: 6 });
       return { code: 0, stdout: JSON.stringify({ session_id: uuid(6), result: "ok" }), stderr: "" };
     };
 
@@ -1030,9 +1027,10 @@ describe("builtin runner", () => {
       post,
     })(triggerFrame(6), runnerCtx());
 
-    expect(prompt).toContain(contextPath);
-    expect(existsSync(contextPath)).toBe(false);
-    expect(existsSync(join(workdir, "wake-context"))).toBe(true);
+    expect(prompt).toContain(expectedContextPath);
+    expect(expectedContextPath).toStartWith(join(workdir, "wake-context") + sep);
+    expect(existsSync(expectedContextPath)).toBe(false);
+    expect(lstatSync(join(workdir, "wake-context")).isDirectory()).toBe(true);
   });
 
   test("outer serve process posts ack and final message with reply_to and session start marker", async () => {
