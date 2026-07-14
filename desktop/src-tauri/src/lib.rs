@@ -250,12 +250,13 @@ fn write_updater_diagnostic(path: &Path, diagnostic: &UpdaterDiagnostic) -> Resu
     Ok(())
 }
 
+const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
+
 fn finalize_pending_updater_relaunch(
     path: &Path,
     current_version: &str,
     timestamp: u64,
 ) -> Result<bool, String> {
-    const MAX_DIAGNOSTIC_BYTES: u64 = 64 * 1024;
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1496,7 +1497,11 @@ mod tests {
     fn native_startup_rejects_an_oversized_updater_receipt() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("updater-diagnostic.json");
-        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        std::fs::write(
+            &path,
+            vec![b'x'; (super::MAX_DIAGNOSTIC_BYTES + 1) as usize],
+        )
+        .unwrap();
 
         assert_eq!(
             finalize_pending_updater_relaunch(&path, "0.2.91", 654_321).unwrap_err(),
