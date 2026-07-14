@@ -6312,3 +6312,177 @@
 .team-blog-tab-badge--hot { color: var(--t-accent-ink); background: var(--t-accent); border-color: var(--t-accent); font-weight: 700; }
 
 .team-blog-panel { padding-top: 12px; }
+
+/* #504 参考稿第二增量：分工卡、Agent 状态板和协调页的信息密度。 */
+.team-blog .role-board {
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+}
+.team-blog .role-board > .role-board-head {
+  padding: 0 0 10px;
+  border-bottom: 1px dashed var(--t-faint);
+  background: transparent;
+}
+.team-blog .role-board > .role-board-head h2 { display: none; }
+.team-blog .role-board > .role-board-head p::before { content: "$ ls ./roles/ --assigned  "; }
+.team-blog .role-board-body { padding: 0; gap: 12px; }
+.team-blog .role-account-head { display: none; }
+.team-blog .role-account-group,
+.team-blog .role-account-list,
+.team-blog .role-list { gap: 9px; }
+.team-blog .role-row--card {
+  position: relative;
+  grid-template-columns: minmax(230px, 0.9fr) auto minmax(220px, 1.25fr) auto auto;
+  gap: 9px;
+  padding: 12px 12px 12px 15px;
+  border: 1.5px solid var(--t-border);
+  background: var(--t-panel);
+  box-shadow: 2px 2px 0 var(--d-shadow);
+}
+.team-blog .role-row--card::before {
+  position: absolute;
+  inset: -1.5px auto -1.5px -1.5px;
+  width: 5px;
+  background: var(--t-accent);
+  content: "";
+}
+.team-blog .role-row--host::before { background: var(--t-red); }
+.team-blog .role-row--worker::before { background: var(--t-green); }
+.team-blog .role-row--reviewer::before { background: var(--d-blue); }
+.team-blog .role-live-dot,
+.agent-board-live-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border: 1.2px solid var(--t-dim);
+  border-radius: 50%;
+  background: transparent;
+}
+.team-blog .role-live-dot.is-online,
+.agent-board-live-dot { border-color: var(--t-green); background: var(--t-green); }
+.team-blog .role-owner { max-width: 118px; }
+.team-blog .role-text { white-space: normal; }
+.team-blog .role-edit-btn { padding: 3px 8px; font-size: 11px; }
+.role-unassigned-fold {
+  border: 1.5px dashed var(--t-faint);
+  background: color-mix(in srgb, var(--t-panel) 72%, transparent);
+}
+.role-unassigned-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--t-muted);
+  text-align: left;
+  cursor: pointer;
+}
+.role-unassigned-toggle:hover { color: var(--t-text); }
+.role-unassigned-chips { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 12px 12px; }
+.role-unassigned-chip {
+  padding: 4px 8px;
+  border: 1.2px solid var(--t-faint);
+  background: var(--t-panel);
+  color: var(--t-text);
+}
+
+.team-blog .agent-board-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  overflow: visible;
+}
+.agent-board-overview {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 7px;
+  border-bottom: 1px dashed var(--t-faint);
+}
+.agent-board-prompt { color: var(--t-muted); font-size: 12px; }
+.agent-board-summary { color: var(--t-dim); font-size: 11px; }
+.team-blog .agent-board-lane {
+  min-width: 0;
+  border: 1.5px solid var(--t-border);
+  border-radius: 0;
+  background: var(--t-panel);
+}
+.team-blog .agent-board-lane--idle,
+.team-blog .agent-board-lane--offline { grid-column: 1 / -1; }
+.team-blog .agent-board-lane-head { padding: 7px 9px; border-color: var(--t-faint); }
+.team-blog details.agent-board-lane > summary { cursor: pointer; list-style: none; }
+.team-blog details.agent-board-lane > summary::-webkit-details-marker { display: none; }
+.team-blog details.agent-board-lane > summary::before { content: "▸"; color: var(--t-dim); }
+.team-blog details.agent-board-lane[open] > summary::before { content: "▾"; }
+.agent-board-handoff-count { margin-left: auto; color: var(--t-dim); font-size: 10.5px; }
+.team-blog .agent-board-lane-cards { padding: 9px; }
+.team-blog .agent-board-lane--idle .agent-board-lane-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.team-blog .agent-board-lane--offline .agent-board-lane-cards { gap: 0; }
+.team-blog .agent-board-row {
+  border: 1.4px solid var(--t-border);
+  border-left-width: 4px;
+  border-radius: 0;
+  background: var(--t-panel);
+  padding: 9px 10px;
+}
+.team-blog .agent-board-row--offline {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.35fr) minmax(0, 1fr) auto;
+  align-items: center;
+  border-width: 0 0 1px;
+  border-color: var(--t-faint);
+  opacity: 0.72;
+}
+.team-blog .agent-board-row--offline:last-child { border-bottom: 0; }
+.team-blog .agent-board-row--offline .agent-board-row-head { justify-content: flex-start; }
+.team-blog .agent-board-row--offline .agent-board-note { margin: 0; }
+.team-blog .agent-board-row--offline .agent-board-task-list { grid-column: 1 / -1; }
+.team-blog .agent-board-name { display: inline-flex; align-items: center; gap: 7px; font-family: var(--t-mono); }
+.team-blog .agent-board-lane-empty {
+  margin: 0;
+  padding: 8px;
+  border: 1px dashed var(--t-faint);
+  text-align: left;
+}
+
+.team-coordination { display: grid; gap: 14px; }
+.team-coordination .catchup-panel,
+.team-coordination .host-board-panel {
+  margin: 0;
+  border: 1.5px solid var(--t-border);
+  box-shadow: 2px 2px 0 var(--d-shadow);
+  background: var(--t-panel);
+}
+.team-coordination .catchup-items li { padding-left: 8px; border-left: 4px solid var(--t-accent); }
+.team-coordination .catchup-chip { border-color: var(--t-faint); }
+.team-coordination .host-action code {
+  display: block;
+  padding: 9px 10px;
+  border: 0;
+  background: #181818;
+  color: #f5f2e8;
+  overflow-x: auto;
+}
+.team-coordination .agent-filter-panel {
+  padding: 8px 0 0;
+  border-top: 1px dashed var(--t-faint);
+}
+
+@media (max-width: 820px) {
+  .team-blog .role-row--card { grid-template-columns: minmax(0, 1fr); }
+  .team-blog .agent-board-panel { grid-template-columns: 1fr; }
+  .team-blog .agent-board-lane,
+  .team-blog .agent-board-lane--idle,
+  .team-blog .agent-board-lane--offline { grid-column: 1; }
+  .team-blog .agent-board-lane--idle .agent-board-lane-cards { grid-template-columns: 1fr; }
+  .team-blog .agent-board-row--offline { grid-template-columns: 1fr; }
+  .agent-board-overview { align-items: flex-start; flex-direction: column; }
+}

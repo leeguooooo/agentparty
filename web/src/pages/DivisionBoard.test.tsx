@@ -82,8 +82,13 @@ function render(props: DivisionBoardProps) {
 
 function personNames(): string[] {
   return renderer!.root
-    .findAll((n) => n.props.className === "role-person-name t-mono")
+    .findAll((n) => String(n.props.className ?? "").split(" ").includes("role-person-name"))
     .map((n) => (Array.isArray(n.props.children) ? n.props.children.join("") : String(n.props.children)));
+}
+
+function openUnassigned(): void {
+  const toggle = renderer!.root.findByProps({ className: "role-unassigned-toggle t-mono" });
+  act(() => toggle.props.onClick());
 }
 
 beforeEach(() => {
@@ -124,6 +129,7 @@ describe("DivisionBoard roster completeness (#169)", () => {
         },
       }),
     );
+    openUnassigned();
     const names = personNames();
     expect(names).toContain("leo-claude");
     expect(names).toContain("LEO-MAIN");
@@ -143,6 +149,7 @@ describe("DivisionBoard roster completeness (#169)", () => {
         },
       }),
     );
+    openUnassigned();
     expect(personNames().length).toBe(4);
   });
 
@@ -154,8 +161,10 @@ describe("DivisionBoard roster completeness (#169)", () => {
         },
       }),
     );
-    const unassignedLabel = renderer!.root.findAll((n) => n.props.className === "role-source role-source--unassigned t-mono");
-    expect(unassignedLabel.length).toBe(1);
+    const toggle = renderer!.root.findByProps({ className: "role-unassigned-toggle t-mono" });
+    expect(toggle.findAllByType("span").some((node) => String(node.props.children).includes("未认领"))).toBe(true);
+    openUnassigned();
+    expect(personNames()).toContain("Evan_Claude");
   });
 });
 
