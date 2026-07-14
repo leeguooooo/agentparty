@@ -983,11 +983,14 @@ export function ChannelPanelModal({
   subtitle,
   onClose,
   children,
+  hideHeader = false,
 }: {
   title: string;
   subtitle?: string;
   onClose: () => void;
   children: ReactNode;
+  // #504：内容自带头部（如团队面板博客风头）时隐藏 modal 默认头，避免双 header。
+  hideHeader?: boolean;
 }) {
   const t = useT();
   useEffect(() => {
@@ -1002,15 +1005,17 @@ export function ChannelPanelModal({
     <div className="channel-panel-overlay" role="dialog" aria-modal="true" aria-label={title}>
       <button className="channel-panel-scrim" type="button" aria-label={t("Channel.tools.close")} onClick={onClose} />
       <section className="channel-panel-card">
-        <header className="channel-panel-head">
-          <div className="channel-panel-titlebox">
-            <h2>{title}</h2>
-            {subtitle !== undefined && subtitle !== "" && <p className="t-mono">{subtitle}</p>}
-          </div>
-          <button className="d-btn channel-panel-close" type="button" onClick={onClose}>
-            {t("Channel.tools.close")}
-          </button>
-        </header>
+        {!hideHeader && (
+          <header className="channel-panel-head">
+            <div className="channel-panel-titlebox">
+              <h2>{title}</h2>
+              {subtitle !== undefined && subtitle !== "" && <p className="t-mono">{subtitle}</p>}
+            </div>
+            <button className="d-btn channel-panel-close" type="button" onClick={onClose}>
+              {t("Channel.tools.close")}
+            </button>
+          </header>
+        )}
         <div className="channel-panel-body">{children}</div>
       </section>
     </div>
@@ -4093,6 +4098,7 @@ export function ChannelPage({
             undefined
           }
           onClose={() => setActivePanel(null)}
+          hideHeader={activePanel === "team"}
         >
           {activePanel === "charter" && (
             <CharterBanner
@@ -4128,6 +4134,7 @@ export function ChannelPage({
             // 结构一目了然、页签带角标。各段数据逻辑不动（DivisionBoard 等原样），TeamTabs 只管外壳。
             // 组织架构树仍在 DivisionBoard 顶部（OrgTreePreview）。
             <TeamTabs
+              onClose={() => setActivePanel(null)}
               stats={{
                 roles: structuredRoleCount,
                 online: onlineAgentCount,

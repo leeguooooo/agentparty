@@ -6274,9 +6274,10 @@
 /* #504 团队面板「博客风」页签外壳 —— 头部 + 三页签导航，复用 neo-brutalist terminal token。 */
 .team-blog { display: flex; flex-direction: column; gap: 0; }
 .team-blog-head {
-  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  display: flex; align-items: flex-start; justify-content: flex-start; gap: 14px;
   flex-wrap: wrap; padding-bottom: 10px; border-bottom: 2px solid var(--t-border);
 }
+.team-blog-close { margin-left: auto; align-self: flex-start; flex: none; }
 .team-blog-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .team-blog-name { margin: 0; font: 700 20px/1.1 var(--t-mono); color: var(--t-text); letter-spacing: -0.5px; }
 .team-blog-prompt { font-size: 12px; color: var(--t-muted); }

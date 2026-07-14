@@ -21,9 +21,11 @@ export interface TeamTabsProps {
   board: ReactNode;
   coordination: ReactNode;
   initialTab?: TeamTab;
+  // #504：博客风头自带关闭按钮（设计里 关闭 在头右上）。传入后 modal 隐藏它自己的头，避免双 header。
+  onClose?: () => void;
 }
 
-export function TeamTabs({ stats, mentionCount, division, board, coordination, initialTab = "division" }: TeamTabsProps) {
+export function TeamTabs({ stats, mentionCount, division, board, coordination, initialTab = "division", onClose }: TeamTabsProps) {
   const t = useT();
   const [tab, setTab] = useState<TeamTab>(initialTab);
   const idPrefix = useId();
@@ -62,6 +64,11 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
             {t("Channel.team.badge.unclaimed", { count: String(stats.unclaimed) })}
           </span>
         </div>
+        {onClose !== undefined && (
+          <button type="button" className="d-btn team-blog-close" onClick={onClose}>
+            {t("Channel.tools.close")} ✕
+          </button>
+        )}
       </header>
 
       <nav className="team-blog-tabs" role="tablist" aria-label={t("Channel.tools.team")}>
