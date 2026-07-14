@@ -18,6 +18,7 @@ import {
   type ThreadLike,
 } from "../src/commands/serve";
 import type { MessagePayload } from "../src/rest";
+import type { CliUpgradeNotice } from "../src/upgrade";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
 
 let server: MockServer | null = null;
@@ -1337,6 +1338,84 @@ describe("project profile daemon", () => {
     expect(String((posts[0]!.body as { note: string }).note)).toContain("worktree=branch");
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("front agent"))).toBe(true);
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("workers should spawn under team herness-dev"))).toBe(true);
+  });
+
+  test("a channel attached after a shared version probe inherits the refreshed notice (#485)", async () => {
+    const home = tempDir();
+    const oldHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    const profile = {
+      owner_account: "fan@example.com",
+      handle: "herness-dev",
+      name: "Herness Dev",
+      runner: "codex-sdk" as const,
+      repo_url: null,
+      workdir: null,
+      base_branch: "main",
+      worktree_strategy: "branch" as const,
+      rules: "Report readiness.",
+      invitable_by: "anyone" as const,
+      created_at: 1,
+      updated_at: 1,
+    };
+    const notice: CliUpgradeNotice = {
+      running_version: "0.2.107",
+      available_version: "0.2.108",
+      auto_upgrade: false,
+      action_required: "ask_user",
+      message: "notify owner",
+      command: "install",
+    };
+    const served: ServeOptions[] = [];
+    let polls = 0;
+    let sleeps = 0;
+    try {
+      await expect(runProfileServe({
+        server: "http://agentparty.test",
+        humanToken: "acc-human",
+        ownerAccount: profile.owner_account,
+        handle: profile.handle,
+        mentionsOnly: true,
+        refreshAvailableUpgrade: async () => notice,
+        mintRuntime: async () => ({ token: "ap_profile_runtime", profile }),
+        listInvites: async () => {
+          polls += 1;
+          return (polls === 1 ? ["alpha"] : ["alpha", "beta"]).map((channel_slug, index) => ({
+            id: index + 1,
+            channel_slug,
+            owner_account: profile.owner_account,
+            profile_handle: profile.handle,
+            invited_by: "owner@example.com",
+            invited_at: index + 1,
+            profile,
+          }));
+        },
+        ensureChannelRuntime: async (_server, _token, channel) => ({
+          token: `ap_child_${channel}`,
+          name: `child-${channel}`,
+          role: "agent",
+          owner: profile.owner_account,
+          channel_scope: channel,
+          lineage: { parent_agent: profile.handle, root_agent: profile.handle, team_id: profile.handle, depth: 1, expires_at: null },
+          profile,
+        }),
+        runChannelServe: (opts) => {
+          served.push(opts);
+          if (opts.channel === "alpha") void opts.refreshAvailableUpgrade?.(null);
+          return new Promise<number>(() => {});
+        },
+        sleep: async () => {
+          sleeps += 1;
+          await Promise.resolve();
+          if (sleeps >= 2) throw new Error("stop profile test");
+        },
+      })).rejects.toThrow("stop profile test");
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = oldHome;
+    }
+
+    expect(served.find((opts) => opts.channel === "beta")?.availableUpgrade).toEqual(notice);
   });
 
   test("project-agent child names are stable and stay within the token name limit", () => {

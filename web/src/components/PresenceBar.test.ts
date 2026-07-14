@@ -195,7 +195,7 @@ afterEach(async () => {
   Reflect.deleteProperty(globalThis, "window");
 });
 
-function renderPresence(entry: PresenceEntry): ReactTestRenderer {
+function renderPresence(entry: PresenceEntry, open = false): ReactTestRenderer {
   let next!: ReactTestRenderer;
   void act(() => {
     next = create(
@@ -211,11 +211,11 @@ function renderPresence(entry: PresenceEntry): ReactTestRenderer {
     );
   });
   renderer = next;
-  openRoster(next);
+  if (open) openRoster(next);
   return next;
 }
 
-function renderPresenceRoster(count: number): ReactTestRenderer {
+function renderPresenceRoster(count: number, open = false): ReactTestRenderer {
   const roster = Array.from({ length: count }, (_, index) => {
     const name = `agent-${index + 1}`;
     return {
@@ -239,7 +239,7 @@ function renderPresenceRoster(count: number): ReactTestRenderer {
     );
   });
   renderer = next;
-  openRoster(next);
+  if (open) openRoster(next);
   return next;
 }
 
@@ -249,7 +249,7 @@ function nodesWithClass(r: ReactTestRenderer, className: string) {
 
 describe("presence client version", () => {
   test("shows an agent CLI version in expanded details and the group tooltip, then removes it when collapsed", async () => {
-    const r = renderPresence(presenceEntry("0.2.89"));
+    const r = renderPresence(presenceEntry("0.2.89"), true);
 
     const versions = nodesWithClass(r, "presence-client-version");
     expect(versions).toHaveLength(1);
@@ -265,7 +265,7 @@ describe("presence client version", () => {
   });
 
   test("does not render a version label for legacy presence entries", () => {
-    const r = renderPresence(presenceEntry());
+    const r = renderPresence(presenceEntry(), true);
 
     expect(nodesWithClass(r, "presence-client-version")).toHaveLength(0);
   });
@@ -295,7 +295,7 @@ describe("busy indicator + queue depth (#103)", () => {
   });
 
   test("busy 项渲染琥珀徽章 + 顶部「N busy」汇总", () => {
-    const r = renderPresence(busyEntry({ queue_depth: 3 }));
+    const r = renderPresence(busyEntry({ queue_depth: 3 }), true);
     const badges = nodesWithClass(r, "presence-busy");
     expect(badges.length).toBeGreaterThan(0);
     expect(badges.some((n) => n.children.join("").includes("⏳ busy · 3 queued"))).toBe(true);
@@ -305,7 +305,7 @@ describe("busy indicator + queue depth (#103)", () => {
   });
 
   test("busy 但无队列：徽章只显示「busy」，不显示 queued", () => {
-    const r = renderPresence(busyEntry({ queue_depth: 0 }));
+    const r = renderPresence(busyEntry({ queue_depth: 0 }), true);
     const badges = nodesWithClass(r, "presence-busy");
     expect(badges.some((n) => n.children.join("") === "⏳ busy")).toBe(true);
     expect(badges.some((n) => n.children.join("").includes("queued"))).toBe(false);
@@ -336,11 +336,16 @@ describe("presence live roster dialog (#484)", () => {
     expect(summary?.[0]?.children.join("")).toBe("1/1 live");
 
     expect(toggle?.props["aria-haspopup"]).toBe("dialog");
+    expect(toggle?.props["aria-expanded"]).toBe(false);
+    expect(r.root.findAllByProps({ role: "dialog" })).toHaveLength(0);
+    await act(async () => {
+      toggle?.props.onClick();
+    });
     expect(r.root.findAllByProps({ role: "dialog" })).toHaveLength(1);
     expect(r.root.findByProps({ role: "dialog" }).props["aria-modal"]).toBe("true");
     expect(r.root.findByProps({ "aria-label": "Participant groups by owner" })).toBeDefined();
 
-    // helper 已点开弹框；再次点击应关闭，姓名组从 DOM 移除，顶部不再留一整排列表。
+    // 再次点击应关闭，姓名组从 DOM 移除，顶部不再留一整排列表。
     expect(toggle?.props["aria-expanded"]).toBe(true);
     expect(nodesWithClass(r, "presence-group")).toHaveLength(1);
     await act(async () => {
@@ -362,7 +367,7 @@ describe("presence group popover overflow (#357)", () => {
   }
 
   test("caps the hover popover at ten members and reports the hidden count", async () => {
-    const r = renderPresenceRoster(12);
+    const r = renderPresenceRoster(12, true);
     await focusGroup(r);
 
     const popover = nodesWithClass(r, "presence-popover")[0];
@@ -372,7 +377,7 @@ describe("presence group popover overflow (#357)", () => {
   });
 
   test("clicking the compact group closes the popover and expands all members inline", async () => {
-    const r = renderPresenceRoster(12);
+    const r = renderPresenceRoster(12, true);
     await focusGroup(r);
 
     const group = nodesWithClass(r, "presence-group")[0];
@@ -391,14 +396,14 @@ describe("presence group popover overflow (#357)", () => {
 
   test("uses the existing Chinese expand text for the overflow affordance", async () => {
     localStorage.setItem("ap_locale", "zh");
-    const r = renderPresenceRoster(11);
+    const r = renderPresenceRoster(11, true);
     await focusGroup(r);
 
     expect(nodesWithClass(r, "presence-popover-more")[0]?.children.join("")).toBe("+1 · 展开参与者");
   });
 
   test("mouse can cross the trigger gap into the popover without closing it (#457)", async () => {
-    const r = renderPresenceRoster(3);
+    const r = renderPresenceRoster(3, true);
     const group = nodesWithClass(r, "presence-group")[0];
     await act(async () => {
       group?.props.onMouseEnter({
@@ -428,7 +433,7 @@ describe("presence group popover overflow (#357)", () => {
   });
 });
 
-function renderWith(entry: PresenceEntry, extra: Record<string, unknown>): ReactTestRenderer {
+function renderWith(entry: PresenceEntry, extra: Record<string, unknown>, open = false): ReactTestRenderer {
   let next!: ReactTestRenderer;
   void act(() => {
     next = create(
@@ -445,7 +450,7 @@ function renderWith(entry: PresenceEntry, extra: Record<string, unknown>): React
     );
   });
   renderer = next;
-  openRoster(next);
+  if (open) openRoster(next);
   return next;
 }
 
@@ -462,14 +467,14 @@ describe("presence 暂停接待（#180）", () => {
   });
 
   test("被暂停的 agent 渲染 ⏸ paused chip（与 offline 视觉区分）", () => {
-    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true }, {});
+    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true }, {}, true);
     const chip = nodesWithClass(r, "presence-paused");
     expect(chip.length).toBeGreaterThanOrEqual(1);
   });
 
   test("带 resume_at 时 chip 显示恢复时刻", () => {
     const resumeAt = Date.now() + 3_600_000;
-    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true, resume_at: resumeAt }, {});
+    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true, resume_at: resumeAt }, {}, true);
     const chip = nodesWithClass(r, "presence-paused")[0];
     expect(String(chip?.children.join(""))).toContain("resumes");
   });
@@ -492,6 +497,7 @@ describe("presence 暂停接待（#180）", () => {
     const r = renderWith(
       { name: "agent-a", kind: "agent", state: "working", note: null, ts: Date.now() },
       { canModerate: true, onPauseAgent: (name: string, resumeAt: number | null) => calls.push({ name, resumeAt }), onResumeAgent: () => {} },
+      true,
     );
     await openPopover(r);
     const select = nodesWithClass(r, "presence-pause-select")[0];
@@ -509,6 +515,7 @@ describe("presence 暂停接待（#180）", () => {
     const r = renderWith(
       { name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true },
       { canModerate: true, onPauseAgent: () => {}, onResumeAgent: (name: string) => resumed.push(name) },
+      true,
     );
     await openPopover(r);
     const btn = nodesWithClass(r, "presence-resume")[0];
@@ -522,7 +529,7 @@ describe("presence 暂停接待（#180）", () => {
   });
 
   test("非 moderator 详情弹层不渲染任何暂停/恢复控件", async () => {
-    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true }, { canModerate: false });
+    const r = renderWith({ name: "agent-a", kind: "agent", state: "waiting", note: null, ts: Date.now(), paused: true }, { canModerate: false }, true);
     await openPopover(r);
     expect(nodesWithClass(r, "presence-pause-select")).toHaveLength(0);
     expect(nodesWithClass(r, "presence-resume")).toHaveLength(0);

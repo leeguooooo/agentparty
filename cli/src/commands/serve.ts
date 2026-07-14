@@ -1434,6 +1434,7 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const upgradeProbeIntervalMs = opts.upgradeProbeIntervalMs ?? 5 * 60_000;
   const refreshAvailableUpgrade = opts.refreshAvailableUpgrade;
+  let currentAvailableUpgrade = opts.availableUpgrade ?? null;
   let nextSharedUpgradeProbeAt = 0;
   let sharedUpgradeProbe: Promise<CliUpgradeNotice | null> | null = null;
   const sharedRefreshAvailableUpgrade = refreshAvailableUpgrade === undefined
@@ -1442,7 +1443,10 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
         const now = Date.now();
         if (sharedUpgradeProbe === null || now >= nextSharedUpgradeProbeAt) {
           nextSharedUpgradeProbeAt = now + upgradeProbeIntervalMs;
-          sharedUpgradeProbe = refreshAvailableUpgrade(current);
+          sharedUpgradeProbe = refreshAvailableUpgrade(currentAvailableUpgrade ?? current).then((next) => {
+            currentAvailableUpgrade = next;
+            return next;
+          });
         }
         return sharedUpgradeProbe;
       };
@@ -1487,7 +1491,7 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
       onCursor: (c) => saveCursor(channel, c),
       onRevCursor: (r) => saveRevCursor(channel, r),
       projectAgent: ctx,
-      availableUpgrade: opts.availableUpgrade ?? null,
+      availableUpgrade: currentAvailableUpgrade,
       refreshAvailableUpgrade: sharedRefreshAvailableUpgrade,
       upgradeProbeIntervalMs,
       advertise: async () => {
