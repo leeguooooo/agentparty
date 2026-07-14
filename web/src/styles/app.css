@@ -2621,6 +2621,125 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.msg-agent-popover {
+  position: relative;
+  min-width: 0;
+}
+.msg-agent-trigger {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  cursor: help;
+  text-align: left;
+}
+.msg-agent-trigger:focus-visible {
+  outline: 1.5px solid var(--t-accent);
+  outline-offset: 2px;
+}
+.msg-agent-card {
+  position: absolute;
+  z-index: 65;
+  top: calc(100% + 7px);
+  left: 0;
+  width: min(360px, calc(100vw - 32px));
+  padding: 11px 12px;
+  border: 1.5px solid var(--d-ink);
+  background: var(--t-panel);
+  color: var(--t-text);
+  box-shadow: 4px 4px 0 var(--d-shadow);
+  font-family: var(--d-body);
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 60ms linear, transform 60ms linear, visibility 0s linear 60ms;
+}
+.msg-agent-popover:hover .msg-agent-card,
+.msg-agent-popover:focus-within .msg-agent-card {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition-delay: 0s;
+}
+.msg-agent-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--t-faint);
+}
+.msg-agent-card-head strong {
+  color: hsl(var(--ah, 220) 58% var(--agent-l-name));
+  font-size: 13px;
+}
+.msg-agent-card-head span {
+  min-width: 0;
+  color: var(--t-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-agent-card-facts {
+  display: grid;
+  gap: 5px;
+  margin: 8px 0;
+}
+.msg-agent-card-facts > div {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 8px;
+}
+.msg-agent-card-facts dt {
+  color: var(--t-dim);
+}
+.msg-agent-card-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.msg-agent-card-recent {
+  padding-top: 7px;
+  border-top: 1px solid var(--t-faint);
+}
+.msg-agent-card-recent h4,
+.msg-agent-card-recent p {
+  margin: 0;
+}
+.msg-agent-card-recent h4 {
+  margin-bottom: 5px;
+  color: var(--t-dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+.msg-agent-card-recent p {
+  color: var(--t-muted);
+}
+.msg-agent-card-recent ol {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.msg-agent-card-recent li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+}
+.msg-agent-card-recent li > span:first-child {
+  color: var(--t-dim);
+}
+.msg-agent-card-recent li > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msg-kind {
   font-size: 10px;
   letter-spacing: 0.5px;
@@ -3750,7 +3869,9 @@
 }
 /* #271(c)：任务卡标题可点开详情弹层 */
 .task-card-title {
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
   border: 0;
   padding: 0;
   background: none;
@@ -3959,11 +4080,15 @@
   min-width: 0;
 }
 .task-card-main strong {
+  display: block;
   min-width: 0;
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.task-card-main .task-id,
+.task-card-main .task-state {
+  flex: none;
 }
 .task-card p {
   margin: 6px 0 0;

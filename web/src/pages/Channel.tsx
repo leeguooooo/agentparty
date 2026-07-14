@@ -93,6 +93,8 @@ import { ChannelToolstrip } from "../components/ChannelToolstrip";
 import "../i18n/strings/Channel";
 import "../i18n/strings/Composer";
 
+const EMPTY_RECENT_MESSAGES: MsgFrame[] = [];
+
 interface Props {
   slug: string;
   token: string;
@@ -2113,6 +2115,7 @@ function TeamThread({
   actionError,
   busySeq,
   messageBySeq,
+  recentMessagesByAgent,
   presence,
   agentRoles,
   onReply,
@@ -2138,6 +2141,7 @@ function TeamThread({
   busySeq: number | null;
   // seq → 消息，用于把 reply_to 解析成完整的被引用消息（同一份 Map 从 ChannelPage 传下来，不在这里重建）
   messageBySeq: Map<number, MsgFrame>;
+  recentMessagesByAgent: Map<string, MsgFrame[]>;
   // #274：name → presence 条目，MessageCard 悬停发送者名/@提及展示实时状态
   presence: Record<string, PresenceEntry>;
   agentRoles: Record<string, ChannelRoleInfo>;
@@ -2191,6 +2195,7 @@ function TeamThread({
             canModerate={canModerate}
             presence={presence}
             agentRoles={agentRoles}
+            recentMessages={recentMessagesByAgent.get(message.sender.name) ?? EMPTY_RECENT_MESSAGES}
             quotedMessage={message.reply_to !== null ? messageBySeq.get(message.reply_to) ?? null : null}
             onReply={onReply}
             onEdit={onEdit}
@@ -3469,6 +3474,18 @@ export function ChannelPage({
   // seq → 消息：给引用预览用，把 reply_to 解析成完整消息（含发送者/正文/撤回状态）而不止一个编号。
   // 只在已加载窗口内查得到——超出 MESSAGE_CAP 或翻页边界外的历史引用会查不到，MessageCard 侧降级回纯编号。
   const messageBySeq = useMemo(() => new Map(state.messages.map((m) => [m.seq, m])), [state.messages]);
+  const recentMessagesByAgent = useMemo(() => {
+    const byAgent = new Map<string, MsgFrame[]>();
+    for (let index = state.messages.length - 1; index >= 0; index--) {
+      const message = state.messages[index]!;
+      if (message.sender.kind !== "agent" || message.retracted) continue;
+      const recent = byAgent.get(message.sender.name) ?? [];
+      if (recent.length >= 3) continue;
+      recent.push(message);
+      byAgent.set(message.sender.name, recent);
+    }
+    return byAgent;
+  }, [state.messages]);
   const completions = useMemo(() => completionMessages(state.messages), [state.messages]);
   const timelineMessages = completionOnly ? completions : state.messages;
   const visibleMessages = useMemo(() => filterByAgent(timelineMessages, agentFilter), [agentFilter, timelineMessages]);
@@ -4100,6 +4117,7 @@ export function ChannelPage({
                   canModerate={canModerate}
                   presence={state.presence}
                   agentRoles={channelRolesByName}
+                  recentMessages={recentMessagesByAgent.get(item.message.sender.name) ?? EMPTY_RECENT_MESSAGES}
                   quotedMessage={item.message.reply_to !== null ? messageBySeq.get(item.message.reply_to) ?? null : null}
                   onReply={startReply}
                   onEdit={startEdit}
@@ -4134,6 +4152,7 @@ export function ChannelPage({
                   actionError={messageActionError}
                   busySeq={messageActionBusySeq}
                   messageBySeq={messageBySeq}
+                  recentMessagesByAgent={recentMessagesByAgent}
                   presence={state.presence}
                   agentRoles={channelRolesByName}
                   onReply={startReply}

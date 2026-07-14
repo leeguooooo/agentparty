@@ -1356,6 +1356,22 @@ export interface PresenceFrame {
   paused?: boolean;
   /** 定时恢复接待的时刻（epoch ms）。 */
   resume_at?: number;
+  /** 当前身份是否仍持有活连接；与 PresenceEntry 同口径。 */
+  live?: boolean;
+  /** serve 正在处理 wake；与 PresenceEntry 同口径。 */
+  busy?: boolean;
+  /** 当前 wake 身后的排队深度。 */
+  queue_depth?: number;
+  /** 同名 serve 的待命实例数。 */
+  serve_standbys?: number;
+  /** 当前处理的触发消息 seq；仅活跃任务时下发。 */
+  current_task?: number;
+  /** 当前任务开始时间；与 current_task 同生共死。 */
+  task_started_at?: number;
+  /** 当前任务最近心跳；与 current_task 同生共死。 */
+  heartbeat_at?: number;
+  /** 同一身份当前活跃连接数。 */
+  connection_count?: number;
 }
 
 export interface ErrorFrame {

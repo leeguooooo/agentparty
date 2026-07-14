@@ -47,6 +47,8 @@ interface Props {
   presence?: Record<string, PresenceEntry>;
   // #448：频道公开分工（role/responsibility）。只展示频道内已公开的信息，不把账号私有 profile prompt 塞进消息。
   agentRoles?: Record<string, ChannelRoleAssignment>;
+  // #490：发送者信息卡展示最近工作；Channel 已按 agent 截成最多三条，避免卡片自己反复扫整段历史。
+  recentMessages?: MsgFrame[];
   // 频道决策协议（#284）：人类/moderator 是否可对本条 decision_request 拍板 + 回调。
   canRespondDecision?: boolean;
   decisionBusy?: boolean;
@@ -140,6 +142,98 @@ export function agentInfoTitleBits(
   ].filter((part): part is string => part !== null);
 }
 
+function activityLine(message: MsgFrame): string {
+  const raw = message.kind === "message" ? message.body : (message.note ?? "");
+  const line = (raw.split("\n")[0] ?? "").trim();
+  if (line.length <= 88) return line;
+  return `${line.slice(0, 88)}…`;
+}
+
+function AgentInfoPopover({
+  id,
+  label,
+  name,
+  kind,
+  owner,
+  entry,
+  assignment,
+  recentMessages,
+}: {
+  id: string;
+  label: string;
+  name: string;
+  kind: Sender["kind"];
+  owner: string | null;
+  entry: PresenceEntry | undefined;
+  assignment: ChannelRoleAssignment | undefined;
+  recentMessages: MsgFrame[];
+}) {
+  const t = useT();
+  const leader = assignment?.reports_to ?? entry?.lineage?.parent_agent ?? null;
+  const role = assignment?.role ?? entry?.role ?? null;
+  const responsibility = assignment?.responsibility?.trim() || null;
+  const currentTask = typeof entry?.current_task === "number" ? `#${entry.current_task}` : null;
+  const note = entry?.note?.trim() || null;
+  const current = [currentTask, note, entry?.state].filter((part): part is string => Boolean(part)).join(" · ");
+  const activity = recentMessages
+    .map((message) => ({ message, text: activityLine(message) }))
+    .filter((item) => item.text !== "")
+    .slice(0, 3);
+  return (
+    <div className="msg-agent-popover">
+      <button
+        type="button"
+        className="msg-sender msg-agent-trigger"
+        aria-describedby={id}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") event.currentTarget.blur();
+        }}
+      >
+        {label}
+      </button>
+      <aside id={id} className="msg-agent-card" role="tooltip">
+        <header className="msg-agent-card-head">
+          <strong>{label}</strong>
+          <span className="t-mono">@{name}</span>
+        </header>
+        <dl className="msg-agent-card-facts">
+          <div>
+            <dt>{t("MessageCard.agentCard.identity")}</dt>
+            <dd>{[kind, owner].filter(Boolean).join(" · ")}</dd>
+          </div>
+          <div>
+            <dt>{t("MessageCard.agentCard.leader")}</dt>
+            <dd>{leader ?? t("MessageCard.agentCard.none")}</dd>
+          </div>
+          <div>
+            <dt>{t("MessageCard.agentCard.division")}</dt>
+            <dd>{[role, responsibility].filter(Boolean).join(" · ") || t("MessageCard.agentCard.none")}</dd>
+          </div>
+          <div>
+            <dt>{t("MessageCard.agentCard.current")}</dt>
+            <dd>{current || t("MessageCard.agentCard.none")}</dd>
+          </div>
+        </dl>
+        <section className="msg-agent-card-recent" aria-label={t("MessageCard.agentCard.recent")}>
+          <h4>{t("MessageCard.agentCard.recent")}</h4>
+          {activity.length === 0 ? (
+            <p>{t("MessageCard.agentCard.noRecent")}</p>
+          ) : (
+            <ol>
+              {activity.map(({ message, text }) => (
+                <li key={message.seq}>
+                  <span className="t-mono">#{message.seq}</span>
+                  <span>{text}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      </aside>
+    </div>
+  );
+}
+
 // memo 化：主输入框每次按键都会重渲染 Channel（draft 是顶层 state），中文 IME 尤其密集。
 // 卡片的所有 props（msg / 各 useCallback 回调 / useMemo 出来的 identityDisplay·receipts /
 // 逐条标量）在 draft-only 重渲染时引用稳定，浅比较即可跳过整窗口卡片的重渲染，消除输入卡顿
@@ -168,6 +262,7 @@ function MessageCardImpl({
   onEditSave,
   presence,
   agentRoles,
+  recentMessages = [],
   canRespondDecision,
   decisionBusy,
   onDecisionRespond,
@@ -402,7 +497,16 @@ function MessageCardImpl({
         ) : (
           <span className="msg-avatar" aria-hidden="true" />
         )}
-        <span className="msg-sender" title={senderTitle}>{senderLabel}</span>
+        <AgentInfoPopover
+          id={`agent-info-${msg.seq}-${msg.sender.name}`}
+          label={senderLabel}
+          name={msg.sender.name}
+          kind={msg.sender.kind}
+          owner={msg.sender.owner ?? null}
+          entry={presence?.[msg.sender.name]}
+          assignment={agentRoles?.[msg.sender.name]}
+          recentMessages={recentMessages}
+        />
         {/* owner(lark 长 id）不再每条平铺——它已在 senderTitle 里，悬停发送者名即见；
            防冒充锚点保留在 tooltip + kind 徽章，行内只留重要内容（名字/类型/提及）。 */}
         {lineageLabel !== null && (

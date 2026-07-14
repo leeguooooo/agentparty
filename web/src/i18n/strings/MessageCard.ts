@@ -28,6 +28,13 @@ export const MessageCardStrings: LocaleDict = {
     "MessageCard.decision.autoResolved": "auto-resolved (unattended) → {option}",
     "MessageCard.clientVersion.title": "sender CLI version v{version}",
     "MessageCard.clientVersion.outdated": "sender CLI v{version} is behind the recommended v{min} — upgrade suggested",
+    "MessageCard.agentCard.identity": "Identity",
+    "MessageCard.agentCard.leader": "Leader",
+    "MessageCard.agentCard.division": "Role & division",
+    "MessageCard.agentCard.current": "Current work",
+    "MessageCard.agentCard.recent": "Recent work",
+    "MessageCard.agentCard.none": "Not reported",
+    "MessageCard.agentCard.noRecent": "No recent work in the loaded channel history",
   },
   zh: {
     "MessageCard.badge.edited": "已编辑",
@@ -56,6 +63,13 @@ export const MessageCardStrings: LocaleDict = {
     "MessageCard.decision.autoResolved": "自动放行（无人值守）→ {option}",
     "MessageCard.clientVersion.title": "发送方 CLI 版本 v{version}",
     "MessageCard.clientVersion.outdated": "发送方 CLI v{version} 落后于推荐版本 v{min}，建议升级",
+    "MessageCard.agentCard.identity": "身份",
+    "MessageCard.agentCard.leader": "所属 Leader",
+    "MessageCard.agentCard.division": "角色与分工",
+    "MessageCard.agentCard.current": "进行中的工作",
+    "MessageCard.agentCard.recent": "最近工作",
+    "MessageCard.agentCard.none": "未上报",
+    "MessageCard.agentCard.noRecent": "当前已加载频道记录里没有最近工作",
   },
 };
 

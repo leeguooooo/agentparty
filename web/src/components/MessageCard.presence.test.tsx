@@ -89,9 +89,13 @@ function render(msg: MsgFrame, extra: Record<string, unknown> = {}) {
   return renderer!.root;
 }
 
-function senderTitle(root: ReactTestInstance): string {
-  const span = root.find((n) => n.type === "span" && String(n.props.className ?? "").includes("msg-sender"));
-  return String(span.props.title ?? "");
+function textContent(node: ReactTestInstance): string {
+  return node.children.map((child) => typeof child === "string" ? child : textContent(child)).join("");
+}
+
+function senderCardText(root: ReactTestInstance): string {
+  const card = root.find((n) => n.type === "aside" && String(n.props.className ?? "").includes("msg-agent-card"));
+  return textContent(card);
 }
 
 function mentionTitle(root: ReactTestInstance): string | undefined {
@@ -149,15 +153,13 @@ describe("agentInfoTitleBits (#448)", () => {
   });
 });
 
-describe("发送者名/@提及悬停展示实时状态 (#274)", () => {
-  test("传入 presence map 时 senderTitle 追加 status/task 行", () => {
+describe("发送者即时信息卡/@提及悬停展示实时状态 (#274/#490)", () => {
+  test("传入 presence map 时 sender 信息卡展示状态、当前任务和排队", () => {
     const root = render(baseMsg({}), {
       presence: { planner: presenceEntry({ state: "working", busy: true, current_task: 510, queue_depth: 2 }) },
     });
-    const title = senderTitle(root);
-    expect(title).toContain("status: busy");
-    expect(title).toContain("task: #510");
-    expect(title).toContain("queued: 2");
+    const card = senderCardText(root);
+    expect(card).toContain("Current work#510 · working");
   });
 
   test("sender 与 @ 悬停都能看到频道公开职责", () => {
@@ -172,18 +174,55 @@ describe("发送者名/@提及悬停展示实时状态 (#274)", () => {
       presence: { planner: presenceEntry({ note: "实现中" }) },
       agentRoles: { planner: role },
     });
-    expect(senderTitle(root)).toContain("responsibility: 先读 issue，再实现和验证");
-    expect(senderTitle(root)).toContain("note: 实现中");
+    expect(senderCardText(root)).toContain("Role & divisionworker · 先读 issue，再实现和验证");
+    expect(senderCardText(root)).toContain("Current work实现中 · working");
     expect(mentionTitle(root)).toContain("responsibility: 先读 issue，再实现和验证");
   });
 
-  test("不传 presence（或查不到该名字）时 senderTitle 不含 status/task 行", () => {
+  test("不传 presence（或查不到该名字）时 sender 信息卡明确显示未上报", () => {
     const root = render(baseMsg({}));
-    const title = senderTitle(root);
-    expect(title).toContain("sender: planner");
-    expect(title).not.toContain("status:");
-    expect(title).not.toContain("task:");
-    expect(title).not.toContain("queued:");
+    const card = senderCardText(root);
+    expect(card).toContain("@planner");
+    expect(card).toContain("Current workNot reported");
+  });
+
+  test("信息卡展示 leader、分工和最近三项工作", () => {
+    const recent = [
+      baseMsg({ seq: 12, body: "第三项工作" }),
+      baseMsg({ seq: 11, body: "第二项工作" }),
+      baseMsg({ seq: 10, body: "第一项工作" }),
+    ];
+    const root = render(baseMsg({}), {
+      presence: { planner: presenceEntry({ lineage: { parent_agent: "lead-a", root_agent: "lead-a", team_id: "team-a", depth: 1, expires_at: null } }) },
+      agentRoles: {
+        planner: {
+          name: "planner",
+          role: "worker",
+          responsibility: "发布验证",
+          reports_to: "lead-b",
+          assigned_by: "host",
+          assigned_at: 1,
+        },
+      },
+      recentMessages: recent,
+    });
+    const card = senderCardText(root);
+    expect(card).toContain("Leaderlead-b");
+    expect(card).toContain("Role & divisionworker · 发布验证");
+    expect(card).toContain("#12第三项工作");
+    expect(card).toContain("#11第二项工作");
+    expect(card).toContain("#10第一项工作");
+  });
+
+  test("键盘聚焦发送者后可用 Escape 收起信息卡", () => {
+    const root = render(baseMsg({}));
+    const trigger = root.find((n) => n.type === "button" && String(n.props.className ?? "").includes("msg-agent-trigger"));
+    let blurred = false;
+    trigger.props.onKeyDown({
+      key: "Escape",
+      currentTarget: { blur: () => { blurred = true; } },
+    });
+    expect(blurred).toBe(true);
   });
 
   test("@提及悬停也能看到该名字的状态；presence 查不到时 title 保持缺省", () => {

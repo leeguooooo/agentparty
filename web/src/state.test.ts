@@ -135,4 +135,31 @@ describe("channel state", () => {
 
     expect(next.presence["child-a"]?.handle).toBe("leo");
   });
+
+  test("carries active-task heartbeat fields through incremental presence frames (#472)", () => {
+    const frame: PresenceFrame = {
+      type: "presence",
+      name: "runner-a",
+      kind: "agent",
+      state: "working",
+      note: "handling wake",
+      ts: 1_725_000_000_000,
+      live: true,
+      busy: true,
+      queue_depth: 2,
+      current_task: 45,
+      task_started_at: 1_725_000_000_100,
+      heartbeat_at: 1_725_000_001_000,
+    };
+    const next = channelReducer(initialChannelState, { type: "frame", frame });
+
+    expect(next.presence["runner-a"]).toMatchObject({
+      live: true,
+      busy: true,
+      queue_depth: 2,
+      current_task: 45,
+      task_started_at: 1_725_000_000_100,
+      heartbeat_at: 1_725_000_001_000,
+    });
+  });
 });
