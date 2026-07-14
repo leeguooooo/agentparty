@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agentparty-desktop"
-version = "0.2.105"
+version = "0.2.106"
 dependencies = [
  "base64 0.22.1",
  "core-foundation 0.10.1",
