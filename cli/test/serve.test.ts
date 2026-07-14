@@ -429,6 +429,8 @@ describe("runServe", () => {
       expect(ctx.protocol_reminder).toContain("party history");
       expect(ctx.protocol_reminder).toContain("trellis");
       expect(ctx.protocol_reminder).toContain("不要触发项目自带的其它频道/工作流机制");
+      expect(ctx.protocol_reminder).toContain("禁止在 runner 子进程里调用 AskUserQuestion");
+      expect(ctx.protocol_reminder).toContain("让 serve 立即恢复监听");
     } finally {
       unlinkSync(path);
     }
@@ -628,6 +630,32 @@ describe("runServe", () => {
       running_version: "0.2.72",
       installed_version: "0.2.73",
       auto_upgrade: false,
+      action_required: "ask_user",
+    });
+  });
+
+  test("passes a newer deployed CLI notice into the runner context so the agent can notify its owner (#485)", async () => {
+    const s = closeAfterOneMention();
+    const notices: unknown[] = [];
+    const o = opts({
+      server: s.url,
+      availableUpgrade: {
+        running_version: "0.2.107",
+        available_version: "0.2.108",
+        auto_upgrade: false,
+        action_required: "ask_user",
+        message: "服务器已有新版；请主动提醒 owner 升级。",
+        command: "curl -fsSL https://example.test/install.sh | sh",
+      },
+      runCommand: async (_frame, ctx) => {
+        notices.push(ctx.cliUpgrade);
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(notices[0]).toMatchObject({
+      running_version: "0.2.107",
+      available_version: "0.2.108",
       action_required: "ask_user",
     });
   });
@@ -1093,6 +1121,7 @@ describe("builtin runner", () => {
       cliUpgrade: {
         running_version: "0.2.72",
         installed_version: "0.2.73",
+        available_version: "0.2.73",
         auto_upgrade: false,
         action_required: "ask_user",
         message: "检测到 party CLI 已有新版本 v0.2.73（当前运行 v0.2.72）。继续任务前先询问用户是否升级。",

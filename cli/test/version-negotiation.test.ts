@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { fetchServerVersion } from "../src/rest";
-import { RUNNING_VERSION, serverMinVersionNotice } from "../src/upgrade";
+import { RUNNING_VERSION, serverMinVersionNotice, serverVersionUpgradeNotice } from "../src/upgrade";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => {
@@ -61,5 +61,22 @@ describe("CLI↔worker version negotiation (issue #137)", () => {
     const enforced = serverMinVersionNotice("9.9.9", true, { runningVersion: "0.2.60" });
     expect(enforced?.enforced).toBe(true);
     expect(enforced?.message).toContain("拒绝");
+  });
+
+  test("serverVersionUpgradeNotice asks the agent to notify its owner when the deployed release is newer (#485)", () => {
+    const notice = serverVersionUpgradeNotice("v0.2.108", { runningVersion: "0.2.107" });
+    expect(notice).toMatchObject({
+      running_version: "0.2.107",
+      available_version: "0.2.108",
+      auto_upgrade: false,
+      action_required: "ask_user",
+    });
+    expect(notice?.installed_version).toBeUndefined();
+    expect(notice?.message).toContain("主动提醒 owner 升级");
+    expect(notice?.command).toContain("install.sh");
+
+    expect(serverVersionUpgradeNotice("0.2.107", { runningVersion: "0.2.107" })).toBeNull();
+    expect(serverVersionUpgradeNotice("0.2.106", { runningVersion: "0.2.107" })).toBeNull();
+    expect(serverVersionUpgradeNotice("dev", { runningVersion: "0.2.107" })).toBeNull();
   });
 });

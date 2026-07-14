@@ -165,6 +165,12 @@ function busyEntry(over: Partial<PresenceEntry> = {}): PresenceEntry {
 const participants: Sender[] = [{ name: "agent-a", kind: "agent" }];
 let renderer: ReactTestRenderer | null = null;
 
+function openRoster(r: ReactTestRenderer): void {
+  const toggle = r.root.findByProps({ "aria-haspopup": "dialog" });
+  if (toggle.props["aria-expanded"] === true) return;
+  void act(() => toggle.props.onClick());
+}
+
 beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", {
@@ -205,6 +211,7 @@ function renderPresence(entry: PresenceEntry): ReactTestRenderer {
     );
   });
   renderer = next;
+  openRoster(next);
   return next;
 }
 
@@ -232,6 +239,7 @@ function renderPresenceRoster(count: number): ReactTestRenderer {
     );
   });
   renderer = next;
+  openRoster(next);
   return next;
 }
 
@@ -310,10 +318,9 @@ describe("busy indicator + queue depth (#103)", () => {
   });
 });
 
-describe("presence live toggle affordance", () => {
-  // issue #179：用户看不出「X/Y live」是可点的按钮。守住它必须是真正的 <button>
-  // （而非扁平展示文字），且计数文字就挂在这个按钮里、点击能收起参与者列表。
-  test("the live count is a real button that toggles the participant strip", async () => {
+describe("presence live roster dialog (#484)", () => {
+  // #179 的可点击计数保留；#484 把姓名列表从顶部条移进独立 modal。
+  test("the live count is a real button that toggles an accessible participant dialog", async () => {
     const r = renderPresence(presenceEntry());
 
     const toggle = nodesWithClass(r, "presence-toggle")[0];
@@ -328,12 +335,17 @@ describe("presence live toggle affordance", () => {
     expect(summary).toHaveLength(1);
     expect(summary?.[0]?.children.join("")).toBe("1/1 live");
 
-    // 展开态种子为 true，点击后应折叠：aria-expanded 翻转、参与者组从 DOM 移除。
+    expect(toggle?.props["aria-haspopup"]).toBe("dialog");
+    expect(r.root.findAllByProps({ role: "dialog" })).toHaveLength(1);
+    expect(r.root.findByProps({ role: "dialog" }).props["aria-modal"]).toBe("true");
+
+    // helper 已点开弹框；再次点击应关闭，姓名组从 DOM 移除，顶部不再留一整排列表。
     expect(toggle?.props["aria-expanded"]).toBe(true);
     expect(nodesWithClass(r, "presence-group")).toHaveLength(1);
     await act(async () => {
       toggle?.props.onClick();
     });
+    expect(r.root.findAllByProps({ role: "dialog" })).toHaveLength(0);
     expect(nodesWithClass(r, "presence-group")).toHaveLength(0);
   });
 });
@@ -432,6 +444,7 @@ function renderWith(entry: PresenceEntry, extra: Record<string, unknown>): React
     );
   });
   renderer = next;
+  openRoster(next);
   return next;
 }
 

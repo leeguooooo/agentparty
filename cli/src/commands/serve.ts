@@ -2,7 +2,7 @@
 // 用外部 supervisor 唤醒（wake GOAL 的 session 型那半；有入站 URL 的 runtime 走 webhook）。
 // 复用 client.connect 的自动重连帧流，真正常驻；命令串行执行（一条处理完再下一条，不并发抢跑）。
 import { BODY_LIMIT, EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, EXIT_UPGRADED, type Attachment, type MsgFrame, type ServerFrame } from "@agentparty/shared";
-import { maybeReexecUpgrade, upgradeNotice, type CliUpgradeNotice, type UpgradeDeps } from "../upgrade";
+import { maybeReexecUpgrade, serverVersionUpgradeNotice, upgradeNotice, type CliUpgradeNotice, type UpgradeDeps } from "../upgrade";
 import {
   appendFileSync,
   existsSync,
@@ -33,12 +33,13 @@ import {
   unreadFromCursor,
   writeStatuslineCache,
 } from "../statusline-cache";
-import { downloadAttachment, ensureProjectAgentChannelRuntime, fetchChannelCharter, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
+import { downloadAttachment, ensureProjectAgentChannelRuntime, fetchChannelCharter, fetchServerVersion, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
 import { isName, isSlug } from "../validation";
 import { buildContext } from "./status";
 
 const PROTOCOL_REMINDER =
   "被 @ 唤起：先读本文件 charter 了解频道约定；若发现 charter 与频道现状矛盾，视为一个待办上报。需要更多上下文再 `party history <channel 字段的频道>`；需要产出结论时，先用 `party send --reply-to <seq>` 把 final synthesis 发回频道，再 status done；别只回本地。" +
+  " 需要 owner 补充信息或批准时，把问题用 `party send --reply-to <seq> --mention <sender 字段的名字>` 发回本频道，然后结束本轮，让 serve 立即恢复监听；不要把 account/email 当 mention 名。禁止在 runner 子进程里调用 AskUserQuestion、request_user_input 或停住等待人工输入，否则整个频道监听会被串行阻塞。" +
   " 全程只用 party CLI 在【本频道】里协作：不要触发项目自带的其它频道/工作流机制（如 trellis 等 app-server 建频道流程）另建频道，也不要用 tmux/后台守护/子代理去接管这次唤醒——这一轮就在当前会话里用 party 回完即可。" +
   " 维护任务台账（#371）：认领活先 `party task claim <id>`（没有就 `party task create`），开工 `party status working --task <id>`，完成 `party status done --task <id>`（或 `party task done <id>`）——让台账反映真实进度，别和 GitHub issue/实际漂移。";
 
@@ -484,6 +485,8 @@ export interface ServeOptions {
   // 唤醒间隙发现磁盘装了更新的 party 就自动 re-exec 新版（issue #45）；默认只提示不动。
   autoUpgrade?: boolean;
   upgradeDeps?: UpgradeDeps; // 测试注入版本读取/re-exec
+  /** /api/version 发现服务器已有更新 CLI 时，随下一次 wake 交给 agent 主动提醒 owner（#485）。 */
+  availableUpgrade?: CliUpgradeNotice | null;
   out?: (line: string) => void;
   statusline?: boolean;
   /** 每任务心跳间隔（#228）。默认 DEFAULT_TASK_HEARTBEAT_MS；测试注入更短值。 */
@@ -1350,6 +1353,7 @@ export interface ProfileServeOptions {
   ownerAccount: string;
   handle: string;
   mentionsOnly: boolean;
+  availableUpgrade?: CliUpgradeNotice | null;
   once?: boolean;
   pollIntervalMs?: number;
   out?: (line: string) => void;
@@ -1448,6 +1452,7 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
       onCursor: (c) => saveCursor(channel, c),
       onRevCursor: (r) => saveRevCursor(channel, r),
       projectAgent: ctx,
+      availableUpgrade: opts.availableUpgrade ?? null,
       advertise: async () => {
         const note = profileReadyNote(profile, channel, prepared);
         await post(opts.server, child.token, channel, {
@@ -1889,7 +1894,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
         try {
           for (let attempt = priorAttempts + 1; attempt <= maxAttempts && retriable; attempt++) {
             try {
-              const cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps);
+              // 磁盘已经装好的新版优先（可直接 re-exec）；否则把服务器发布版提示交给 runner，
+              // 让 agent 在频道里主动请 owner 升级。旧客户端不知道新协议时最需要这条提醒（#485）。
+              const cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps) ?? o.availableUpgrade ?? null;
               await run(frame, {
                 cmd: o.cmd,
                 channel: o.channel,
@@ -2118,12 +2125,20 @@ export async function run(argv: string[]): Promise<number> {
       console.error("--profile-poll-interval must be an integer >= 500 milliseconds");
       return 1;
     }
+    let availableUpgrade: CliUpgradeNotice | null = null;
+    try {
+      availableUpgrade = serverVersionUpgradeNotice((await fetchServerVersion(account.session.server)).version);
+      if (availableUpgrade !== null) console.error(`serve: ${availableUpgrade.message}\n  ${availableUpgrade.command}`);
+    } catch {
+      // 版本探测失败不影响 project-agent supervisor。
+    }
     return runProfileServe({
       server: account.session.server,
       humanToken: account.token,
       ownerAccount: profileRef.owner,
       handle: profileRef.handle,
       mentionsOnly: flags.all !== true,
+      availableUpgrade,
       skipBacklog: flags["replay-backlog"] !== true,
       once: flags["profile-once"] === true,
       pollIntervalMs,
@@ -2152,6 +2167,14 @@ export async function run(argv: string[]): Promise<number> {
     console.error("channel must match [a-z0-9][a-z0-9-]{0,63}");
     return 1;
   }
+  let availableUpgrade: CliUpgradeNotice | null = null;
+  try {
+    const serverVersion = await fetchServerVersion(server);
+    availableUpgrade = serverVersionUpgradeNotice(serverVersion.version);
+    if (availableUpgrade !== null) console.error(`serve: ${availableUpgrade.message}\n  ${availableUpgrade.command}`);
+  } catch {
+    // 老部署没有 /api/version、临时断网都不能阻止 serve 挂上；下一次启动再探测。
+  }
   return runServe({
     server,
     token,
@@ -2168,6 +2191,7 @@ export async function run(argv: string[]): Promise<number> {
     advertise: () => advertiseServeWake(auth, channel),
     fetchCharter: () => fetchChannelCharter(server, token, channel),
     autoUpgrade: flags["auto-upgrade"] === true,
+    availableUpgrade,
     statusline: true,
     builtinRunner: harness
       ? {
