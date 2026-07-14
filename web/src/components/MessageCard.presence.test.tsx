@@ -214,6 +214,17 @@ describe("发送者即时信息卡/@提及悬停展示实时状态 (#274/#490)",
     expect(card).toContain("#10第一项工作");
   });
 
+  test("键盘聚焦发送者后可用 Escape 收起信息卡", () => {
+    const root = render(baseMsg({}));
+    const trigger = root.find((n) => n.type === "button" && String(n.props.className ?? "").includes("msg-agent-trigger"));
+    let blurred = false;
+    trigger.props.onKeyDown({
+      key: "Escape",
+      currentTarget: { blur: () => { blurred = true; } },
+    });
+    expect(blurred).toBe(true);
+  });
+
   test("@提及悬停也能看到该名字的状态；presence 查不到时 title 保持缺省", () => {
     const withPresence = render(baseMsg({ mentions: ["reviewer"] }), {
       presence: { reviewer: presenceEntry({ name: "reviewer", state: "waiting", current_task: 42 }) },

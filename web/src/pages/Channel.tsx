@@ -93,6 +93,8 @@ import { ChannelToolstrip } from "../components/ChannelToolstrip";
 import "../i18n/strings/Channel";
 import "../i18n/strings/Composer";
 
+const EMPTY_RECENT_MESSAGES: MsgFrame[] = [];
+
 interface Props {
   slug: string;
   token: string;
@@ -2193,7 +2195,7 @@ function TeamThread({
             canModerate={canModerate}
             presence={presence}
             agentRoles={agentRoles}
-            recentMessages={recentMessagesByAgent.get(message.sender.name) ?? []}
+            recentMessages={recentMessagesByAgent.get(message.sender.name) ?? EMPTY_RECENT_MESSAGES}
             quotedMessage={message.reply_to !== null ? messageBySeq.get(message.reply_to) ?? null : null}
             onReply={onReply}
             onEdit={onEdit}
@@ -4115,7 +4117,7 @@ export function ChannelPage({
                   canModerate={canModerate}
                   presence={state.presence}
                   agentRoles={channelRolesByName}
-                  recentMessages={recentMessagesByAgent.get(item.message.sender.name) ?? []}
+                  recentMessages={recentMessagesByAgent.get(item.message.sender.name) ?? EMPTY_RECENT_MESSAGES}
                   quotedMessage={item.message.reply_to !== null ? messageBySeq.get(item.message.reply_to) ?? null : null}
                   onReply={startReply}
                   onEdit={startEdit}

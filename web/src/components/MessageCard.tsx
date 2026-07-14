@@ -181,7 +181,14 @@ function AgentInfoPopover({
     .slice(0, 3);
   return (
     <div className="msg-agent-popover">
-      <button type="button" className="msg-sender msg-agent-trigger" aria-describedby={id}>
+      <button
+        type="button"
+        className="msg-sender msg-agent-trigger"
+        aria-describedby={id}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") event.currentTarget.blur();
+        }}
+      >
         {label}
       </button>
       <aside id={id} className="msg-agent-card" role="tooltip">
