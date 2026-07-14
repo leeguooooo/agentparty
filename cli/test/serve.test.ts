@@ -365,6 +365,30 @@ describe("runServe", () => {
     expect(o.lines.some((line) => line.includes("命令失败 (1/1): command exited 7"))).toBe(true);
   });
 
+  test("reports custom runner SIGTERM immediately with the truthful attempt count", async () => {
+    const s = closeAfterOneMention();
+    const posts: MessagePayload[] = [];
+    const o = opts({
+      server: s.url,
+      cmd: "exit 143",
+      maxWakeAttempts: 3,
+      wakeRetryDelayMs: 0,
+      post: async (_server, _token, _channel, body) => {
+        posts.push(body);
+        return { seq: posts.length };
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(o.lines.filter((line) => line.includes("命令失败"))).toHaveLength(1);
+    expect(o.lines.some((line) => line.includes("command exited 143 (SIGTERM)"))).toBe(true);
+    const blocked = posts.find((post) => post.kind === "status" && post.state === "blocked");
+    expect(blocked).toBeDefined();
+    const blockedNote = blocked && "note" in blocked ? blocked.note : undefined;
+    expect(blockedNote).toContain("attempts=1/3");
+    expect(blockedNote).toContain("command exited 143 (SIGTERM)");
+  });
+
   test("advertises wake capability once on attach, before handling mentions", async () => {
     const s = closeAfterOneMention();
     let advertiseCalls = 0;

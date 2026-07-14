@@ -514,7 +514,9 @@ describe("重试不得重复模型副作用 (#206 门禁 P1③)", () => {
     expect(await runServe(o)).toBe(EXIT_ARCHIVED);
     expect(calls).toBe(1); // 不是 3
     expect(posts.filter((p) => p.state === "blocked")).toHaveLength(1);
-    expect(String(posts.find((p) => p.state === "blocked")!.note)).toContain("not retriable");
+    const note = String(posts.find((p) => p.state === "blocked")!.note);
+    expect(note).toContain("attempts=1/3");
+    expect(note).toContain("not retriable");
   });
 
   test("runner 根本没起来（spawn 失败）→ 模型没跑过，可以安全重试", async () => {

@@ -603,7 +603,10 @@ async function defaultRun(
   const code = await proc.exited;
   if (code !== 0) {
     // 保留 context file 供排查，抛错让 runServe 打印（不发频道）
-    throw new Error(`command exited ${code} (context: ${file})`);
+    // POSIX shell 用 128 + signal 表示被信号终止；143 = 128 + SIGTERM(15)。
+    // 明说 SIGTERM，避免 owner 只能看到一个难以辨认的数字、误以为 serve 静默吞掉了 wake。
+    const signal = code === 143 ? " (SIGTERM)" : "";
+    throw new Error(`command exited ${code}${signal} (context: ${file})`);
   }
   try {
     unlinkSync(file);
@@ -1917,6 +1920,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
         let lastError = (stuck?.seq === frame.seq ? stuck.last_error : "") ?? "";
         let delivered = false;
         let retriable = true;
+        // custom/builtin runner 一旦可能已经执行过模型就不会重试；最终通告必须报告真实执行次数，
+        // 不能把配置预算 maxAttempts 伪装成实际已跑次数（例如一次 SIGTERM 不能写成 3/3）。
+        let attemptsUsed = priorAttempts;
         // 身后已缓冲的 wake 深度（#103）：内建 runner 随 working 帧上报，presence 显示「忙 + N 待处理」。
         // 本帧正在处理，故只数它 seq 之后、够格触发唤醒的缓冲帧。
         const queueDepth = pendingWakeDepth(conn.pendingFrames(), self, o.mentionsOnly === true, frame.seq);
@@ -1978,6 +1984,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
         if (typeof taskBeat.unref === "function") taskBeat.unref();
         try {
           for (let attempt = priorAttempts + 1; attempt <= maxAttempts && retriable; attempt++) {
+            attemptsUsed = attempt;
             try {
               // 磁盘已经装好的新版优先（可直接 re-exec）；否则把服务器发布版提示交给 runner，
               // 让 agent 在频道里主动请 owner 升级。旧客户端不知道新协议时最需要这条提醒（#485）。
@@ -2064,7 +2071,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
           // 没有 CLI flag，所以重试预算与退避必须**在频道里可见**：把常数藏进源码是不诚实的。
           const note =
             `wake undelivered, giving up: seq=${frame.seq}; ` +
-            `attempts=${maxAttempts}/${maxAttempts}; retry_delay_ms=${retryDelayMs}; ` +
+            `attempts=${attemptsUsed}/${maxAttempts}; retry_delay_ms=${retryDelayMs}; ` +
             `last error: ${lastError}`;
           out(`  ${note}`);
           try {
