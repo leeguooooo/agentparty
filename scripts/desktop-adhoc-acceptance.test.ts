@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   parseAdhocAcceptanceCliArgs,
   parseAdhocSignatureMetadata,
+  parseRunningProcessCommand,
   verifyAdhocUpgradeEvidence,
   type InstalledAdhocAppEvidence,
 } from "./desktop-adhoc-acceptance";
@@ -85,6 +86,17 @@ describe("desktop ad-hoc acceptance", () => {
       .toThrow("--expected-version is required");
   });
 
+  test("reads the full executable path from ps command output, including spaces and long names", () => {
+    expect(parseRunningProcessCommand(
+      "  4242 /Applications/Agent Party Preview.app/Contents/MacOS/agentparty-desktop --flag value",
+      "agentparty-desktop",
+    )).toEqual({
+      pid: 4242,
+      executablePath: "/Applications/Agent Party Preview.app/Contents/MacOS/agentparty-desktop",
+    });
+    expect(parseRunningProcessCommand("4243 agentparty-desktop --flag", "agentparty-desktop")).toBeNull();
+  });
+
   test("proves an ad-hoc N-1 to N in-app replacement without claiming Gatekeeper acceptance", () => {
     const baseline = evidence("0.2.110", false);
     const current = evidence("0.2.111", true);
@@ -139,5 +151,26 @@ describe("desktop ad-hoc acceptance", () => {
       [...running, { pid: 43, executablePath: "/tmp/agentparty-desktop" }],
       "0.2.111",
     )).toThrow("exactly one running desktop process");
+    expect(() => verifyAdhocUpgradeEvidence(
+      baseline,
+      { ...current, version: baseline.version, sidecarVersion: baseline.version },
+      { ...receipt, appVersion: baseline.version, targetVersion: baseline.version },
+      running,
+      baseline.version,
+    )).toThrow("did not advance");
+    expect(() => verifyAdhocUpgradeEvidence(
+      baseline,
+      current,
+      receipt,
+      running,
+      "0.2.112",
+    )).toThrow("does not match the expected release");
+    expect(() => verifyAdhocUpgradeEvidence(
+      baseline,
+      { ...current, entitlementsSha256: "1".repeat(64) },
+      receipt,
+      running,
+      "0.2.111",
+    )).toThrow("signed entitlements changed");
   });
 });

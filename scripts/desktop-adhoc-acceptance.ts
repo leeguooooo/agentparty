@@ -335,13 +335,27 @@ export function verifyAdhocUpgradeEvidence(
   };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function parseRunningProcessCommand(
+  line: string,
+  executableName: string,
+): { pid: number; executablePath: string } | null {
+  const match = line.trim().match(/^(\d+)\s+(.+)$/);
+  if (match === null) return null;
+  const command = match[2];
+  const executable = command.match(new RegExp(`^(.+/${escapeRegExp(executableName)})(?:\\s|$)`))?.[1];
+  if (executable === undefined || !executable.startsWith("/")) return null;
+  return { pid: Number(match[1]), executablePath: executable };
+}
+
 function runningDesktopProcesses(executableName: string): Array<{ pid: number; executablePath: string }> {
-  return run("ps", ["-axo", "pid=,comm="]).stdout
+  return run("ps", ["-axo", "pid=,command="]).stdout
     .split("\n")
-    .map((line) => line.trim().match(/^(\d+)\s+(.+)$/))
-    .filter((match): match is RegExpMatchArray => match !== null)
-    .map((match) => ({ pid: Number(match[1]), executablePath: match[2] }))
-    .filter(({ executablePath }) => basename(executablePath) === executableName);
+    .map((line) => parseRunningProcessCommand(line, executableName))
+    .filter((process): process is { pid: number; executablePath: string } => process !== null);
 }
 
 function readJson(path: string): unknown {
