@@ -118,4 +118,32 @@ describe("TeamTabs (#504 博客风页签)", () => {
     expect(text).toContain("COORD_PANEL");
     expect(text).not.toContain("BOARD_PANEL");
   });
+
+  test("页签使用 roving tabIndex、ARIA 关联和左右方向键循环切换", () => {
+    const r = render();
+    let tabs = tabButtons(r);
+    const panel = r.root.findByProps({ role: "tabpanel" });
+    expect(tabs.map((button) => button.props.tabIndex)).toEqual([0, -1, -1]);
+    expect(tabs[0]!.props["aria-controls"]).toBe(panel.props.id);
+    expect(panel.props["aria-labelledby"]).toBe(tabs[0]!.props.id);
+
+    let prevented = false;
+    act(() => {
+      tabs[0]!.props.onKeyDown({ key: "ArrowRight", preventDefault: () => { prevented = true; } });
+    });
+    tabs = tabButtons(r);
+    expect(prevented).toBe(true);
+    expect(tabs.map((button) => button.props.tabIndex)).toEqual([-1, 0, -1]);
+    expect(r.root.findByProps({ role: "tabpanel" }).props["aria-labelledby"]).toBe(tabs[1]!.props.id);
+
+    act(() => {
+      tabs[1]!.props.onKeyDown({ key: "ArrowLeft", preventDefault: () => {} });
+    });
+    tabs = tabButtons(r);
+    act(() => {
+      tabs[0]!.props.onKeyDown({ key: "ArrowLeft", preventDefault: () => {} });
+    });
+    tabs = tabButtons(r);
+    expect(tabs.map((button) => button.props.tabIndex)).toEqual([-1, -1, 0]);
+  });
 });

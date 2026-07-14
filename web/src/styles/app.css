@@ -6359,8 +6359,8 @@
   border-radius: 50%;
   background: transparent;
 }
-.team-blog .role-live-dot.is-online,
-.agent-board-live-dot { border-color: var(--t-green); background: var(--t-green); }
+.team-blog .role-live-dot.is-online { border-color: var(--t-green); background: var(--t-green); }
+.agent-board-live-dot.is-online { border-color: var(--t-green); background: var(--t-green); }
 .team-blog .role-owner { max-width: 118px; }
 .team-blog .role-text { white-space: normal; }
 .team-blog .role-edit-btn { padding: 3px 8px; font-size: 11px; }

@@ -892,11 +892,15 @@ export function DivisionBoard({
               onClick={() => setUnassignedOpen((open) => !open)}
             >
               <span aria-hidden="true">{unassignedOpen ? "▾" : "▸"}</span>
-              <span>{t("Channel.roles.unassignedFold", { count: String(unassigned.length) })}</span>
+              <span>
+                {t(canModerate ? "Channel.roles.unassignedFold" : "Channel.roles.unassignedFoldReadonly", {
+                  count: String(unassigned.length),
+                })}
+              </span>
             </button>
             {unassignedOpen && (
               <div className="role-unassigned-chips">
-                {unassigned.map((member) => (
+                {unassigned.map((member) => canModerate ? (
                   <button
                     key={member.name}
                     type="button"
@@ -906,6 +910,14 @@ export function DivisionBoard({
                   >
                     {member.display}
                   </button>
+                ) : (
+                  <span
+                    key={member.name}
+                    className="role-unassigned-chip role-person-name t-mono"
+                    title={member.owner ?? member.accountLabel}
+                  >
+                    {member.display}
+                  </span>
                 ))}
               </div>
             )}
@@ -1584,7 +1596,7 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
             {laneRows.map((row) => (
               <article key={row.name} className={`agent-board-row agent-board-row--${row.status}`} data-agent={row.name}>
                 <div className="agent-board-row-head">
-                  <span className="agent-board-name"><span className="agent-board-live-dot" aria-hidden="true" />{row.name}</span>
+                  <span className="agent-board-name"><span className={`agent-board-live-dot${row.status === "offline" ? "" : " is-online"}`} aria-hidden="true" />{row.name}</span>
                   <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{statusLabel}</span>
                 </div>
                 {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
@@ -4073,7 +4085,7 @@ export function ChannelPage({
                 offline: offlineAgentCount,
                 unclaimed: unclaimedTeamCount,
               }}
-              mentionCount={toasts.length}
+              mentionCount={catchupDigest?.mentions ?? 0}
               division={
                 <DivisionBoard
                   canModerate={canModerate}

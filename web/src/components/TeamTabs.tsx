@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useId, useRef, useState } from "react";
 import { useT } from "../i18n/useT";
 
 // #504 团队面板「博客风」外壳：把原来一整页长滚动的三段（分工 / Agent 看板 / 协调）
@@ -26,12 +26,23 @@ export interface TeamTabsProps {
 export function TeamTabs({ stats, mentionCount, division, board, coordination, initialTab = "division" }: TeamTabsProps) {
   const t = useT();
   const [tab, setTab] = useState<TeamTab>(initialTab);
+  const idPrefix = useId();
+  const tabRefs = useRef<Record<TeamTab, HTMLButtonElement | null>>({ division: null, board: null, coordination: null });
 
   const tabs: Array<{ id: TeamTab; no: string; label: string; badge: number | null; badgeHot: boolean }> = [
     { id: "division", no: "01", label: t("Channel.team.tab.division"), badge: stats.unclaimed > 0 ? stats.unclaimed : null, badgeHot: true },
     { id: "board", no: "02", label: t("Channel.team.tab.board"), badge: null, badgeHot: false },
     { id: "coordination", no: "03", label: t("Channel.team.tab.coordination"), badge: mentionCount > 0 ? mentionCount : null, badgeHot: true },
   ];
+  const panelId = `${idPrefix}-team-panel`;
+  const tabId = (id: TeamTab) => `${idPrefix}-team-tab-${id}`;
+  const moveTab = (event: KeyboardEvent<HTMLButtonElement>, direction: -1 | 1) => {
+    event.preventDefault();
+    const current = tabs.findIndex((entry) => entry.id === tab);
+    const next = tabs[(current + direction + tabs.length) % tabs.length]!;
+    setTab(next.id);
+    tabRefs.current[next.id]?.focus();
+  };
 
   return (
     <section className="team-blog" aria-label={t("Channel.tools.team")}>
@@ -57,11 +68,19 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
         {tabs.map((entry) => (
           <button
             key={entry.id}
+            id={tabId(entry.id)}
+            ref={(node) => { tabRefs.current[entry.id] = node; }}
             type="button"
             role="tab"
             aria-selected={tab === entry.id}
+            aria-controls={panelId}
+            tabIndex={tab === entry.id ? 0 : -1}
             className={"team-blog-tab" + (tab === entry.id ? " team-blog-tab--active" : "")}
             onClick={() => setTab(entry.id)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft") moveTab(event, -1);
+              if (event.key === "ArrowRight") moveTab(event, 1);
+            }}
           >
             <span className="t-mono team-blog-tab-no">{entry.no}</span>
             <span className="team-blog-tab-label">{entry.label}</span>
@@ -74,7 +93,7 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
         ))}
       </nav>
 
-      <div className="team-blog-panel" role="tabpanel">
+      <div id={panelId} className="team-blog-panel" role="tabpanel" aria-labelledby={tabId(tab)}>
         {tab === "division" && division}
         {tab === "board" && board}
         {tab === "coordination" && coordination}

@@ -36,5 +36,7 @@ describe("issue #504 team blog board layout", () => {
     expect(board).toContain("overflow: visible");
     const idle = ruleBody(".team-blog .agent-board-lane--idle,\n.team-blog .agent-board-lane--offline");
     expect(idle).toContain("grid-column: 1 / -1");
+    const online = ruleBody(".agent-board-live-dot.is-online");
+    expect(online).toContain("background: var(--t-green)");
   });
 });

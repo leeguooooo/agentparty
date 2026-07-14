@@ -87,7 +87,9 @@ function personNames(): string[] {
 }
 
 function openUnassigned(): void {
-  const toggle = renderer!.root.findByProps({ className: "role-unassigned-toggle t-mono" });
+  const toggle = renderer!.root.find((node) =>
+    String(node.props.className ?? "").split(" ").includes("role-unassigned-toggle"),
+  );
   act(() => toggle.props.onClick());
 }
 
@@ -163,8 +165,31 @@ describe("DivisionBoard roster completeness (#169)", () => {
     );
     const toggle = renderer!.root.findByProps({ className: "role-unassigned-toggle t-mono" });
     expect(toggle.findAllByType("span").some((node) => String(node.props.children).includes("未认领"))).toBe(true);
+    expect(personNames()).not.toContain("Evan_Claude");
     openUnassigned();
     expect(personNames()).toContain("Evan_Claude");
+    const chip = renderer!.root.find((node) =>
+      String(node.props.className ?? "").split(" ").includes("role-unassigned-chip"),
+    );
+    expect(chip.type).toBe("span");
+  });
+
+  test("only moderators can click an unassigned member to prefill the claim form", () => {
+    let selected = "";
+    render(
+      baseProps({
+        canModerate: true,
+        presence: { Evan_Claude: presenceEntry({ name: "Evan_Claude", account: "lark:on_evan" }) },
+        onNewRoleName: (name) => { selected = name; },
+      }),
+    );
+    openUnassigned();
+    const chip = renderer!.root.find((node) =>
+      String(node.props.className ?? "").split(" ").includes("role-unassigned-chip"),
+    );
+    expect(chip.type).toBe("button");
+    act(() => chip.props.onClick());
+    expect(selected).toBe("Evan_Claude");
   });
 });
 
