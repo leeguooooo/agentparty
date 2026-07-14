@@ -573,6 +573,8 @@ export function DivisionBoard({
   const t = useT();
   const [selfHintOpen, setSelfHintOpen] = useState(false);
   const [selfHintCopied, setSelfHintCopied] = useState(false);
+  const [editingRoleName, setEditingRoleName] = useState<string | null>(null);
+  const [unassignedOpen, setUnassignedOpen] = useState(false);
   useEffect(() => {
     if (!selfHintCopied) return;
     const timer = window.setTimeout(() => setSelfHintCopied(false), 1400);
@@ -633,8 +635,9 @@ export function DivisionBoard({
     source: view.source,
   }));
   const orgTree = buildOrgTree(orgMembers);
+  const assignedRoleViews = roleViewsWithReports.filter((view) => view.role !== null);
   const groups: Array<{ accountLabel: string; roles: typeof roleViewsWithReports }> = [];
-  for (const view of roleViewsWithReports) {
+  for (const view of assignedRoleViews) {
     const current = groups.at(-1);
     if (current !== undefined && current.accountLabel === view.accountLabel) current.roles.push(view);
     else groups.push({ accountLabel: view.accountLabel, roles: [view] });
@@ -791,8 +794,15 @@ export function DivisionBoard({
                       role?.responsibility ? t("Composer.responsibility", { responsibility: role.responsibility }) : null,
                     ].filter((part): part is string => part !== null).join("\n");
                     return (
-                      <div key={name} className="role-row">
+                      <div
+                        key={name}
+                        className={`role-row role-row--card role-row--${role?.role ?? "unassigned"}`}
+                      >
                         <div className="role-person" title={title}>
+                          <span
+                            className={`role-live-dot${presence[name]?.live === true ? " is-online" : ""}`}
+                            aria-label={presence[name]?.live === true ? t("Channel.team.badge.online", { count: "1" }) : t("Channel.team.badge.offline", { count: "1" })}
+                          />
                           {onOpenAgentDetail !== undefined ? (
                             <button
                               type="button"
@@ -825,7 +835,7 @@ export function DivisionBoard({
                         </div>
                         {role === null || draftForRole === null ? (
                           <span className="role-text role-text--unassigned">{t("Channel.roles.noRoleYet")}</span>
-                        ) : canModerate ? (
+                        ) : canModerate && editingRoleName === role.name ? (
                           <>
                             <select
                               className="role-select t-mono"
@@ -843,7 +853,7 @@ export function DivisionBoard({
                               autoComplete="off"
                               placeholder={t("Channel.roles.responsibilityPlaceholder")}
                             />
-                            <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => onSaveRole(role.name, draftForRole)}>
+                            <button className="d-btn" type="button" disabled={roleSaving === role.name} onClick={() => { onSaveRole(role.name, draftForRole); setEditingRoleName(null); }}>
                               {roleSaving === role.name ? t("Channel.roles.saving") : source === "self" ? t("Channel.roles.register") : t("Channel.roles.save")}
                             </button>
                             {source === "assigned" && (
@@ -856,6 +866,11 @@ export function DivisionBoard({
                           <>
                             <span className="role-badge t-mono">{role.role}</span>
                             <span className="role-text">{role.responsibility ?? t("Channel.roles.noResponsibility")}</span>
+                            {canModerate && (
+                              <button className="d-btn role-edit-btn" type="button" onClick={() => setEditingRoleName(role.name)}>
+                                {t("Channel.roles.edit")}
+                              </button>
+                            )}
                           </>
                         )}
                       </div>
@@ -867,6 +882,34 @@ export function DivisionBoard({
           </div>
         ) : (
           <p className="charter-empty">{t("Channel.roles.empty")}</p>
+        )}
+        {unassigned.length > 0 && (
+          <section className="role-unassigned-fold">
+            <button
+              type="button"
+              className="role-unassigned-toggle t-mono"
+              aria-expanded={unassignedOpen}
+              onClick={() => setUnassignedOpen((open) => !open)}
+            >
+              <span aria-hidden="true">{unassignedOpen ? "▾" : "▸"}</span>
+              <span>{t("Channel.roles.unassignedFold", { count: String(unassigned.length) })}</span>
+            </button>
+            {unassignedOpen && (
+              <div className="role-unassigned-chips">
+                {unassigned.map((member) => (
+                  <button
+                    key={member.name}
+                    type="button"
+                    className="role-unassigned-chip role-person-name role-person-name--btn t-mono"
+                    title={member.owner ?? member.accountLabel}
+                    onClick={() => onNewRoleName(member.name)}
+                  >
+                    {member.display}
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
         )}
         {canModerate && (
           <div className="role-row role-row--new">
@@ -1501,8 +1544,16 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
         blocked: assigned.filter((task) => task.state === "blocked").length,
       };
     })
-    .sort((a, b) => AGENT_STATUS_ORDER[a.status] - AGENT_STATUS_ORDER[b.status] || b.inProgress - a.inProgress || a.name.localeCompare(b.name));
+    .sort((a, b) =>
+      AGENT_STATUS_ORDER[a.status] - AGENT_STATUS_ORDER[b.status]
+      || (a.status === "offline" && b.status === "offline"
+        ? Number(Boolean(b.note?.trim())) - Number(Boolean(a.note?.trim()))
+        : 0)
+      || b.inProgress - a.inProgress
+      || a.name.localeCompare(b.name),
+    );
   const laneStatuses: AgentBoardStatus[] = ["busy", "blocked", "idle", "offline"];
+  const counts = Object.fromEntries(laneStatuses.map((status) => [status, rows.filter((row) => row.status === status).length])) as Record<AgentBoardStatus, number>;
 
   if (rows.length === 0) {
     return (
@@ -1513,9 +1564,75 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
   }
   return (
     <section className="agent-board-panel" aria-label={t("Channel.agentBoard.aria")}>
+      <header className="agent-board-overview">
+        <span className="t-mono agent-board-prompt">{t("Channel.agentBoard.prompt")}</span>
+        <span className="t-mono agent-board-summary">
+          {t("Channel.agentBoard.summary", {
+            busy: String(counts.busy),
+            blocked: String(counts.blocked),
+            idle: String(counts.idle),
+            offline: String(counts.offline),
+          })}
+        </span>
+      </header>
       {laneStatuses.map((status) => {
         const laneRows = rows.filter((row) => row.status === status);
         const statusLabel = t(`Channel.agents.status.${status}`);
+        const cards = (
+          <div className="agent-board-lane-cards">
+            {laneRows.length === 0 && <p className="agent-board-lane-empty">{statusLabel} · 0 — {t("Channel.tasks.columnEmpty")}</p>}
+            {laneRows.map((row) => (
+              <article key={row.name} className={`agent-board-row agent-board-row--${row.status}`} data-agent={row.name}>
+                <div className="agent-board-row-head">
+                  <span className="agent-board-name"><span className="agent-board-live-dot" aria-hidden="true" />{row.name}</span>
+                  <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{statusLabel}</span>
+                </div>
+                {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
+                {row.paused && (
+                  <p className="t-mono agent-board-schedule">
+                    {row.resumeAt !== null
+                      ? t("Channel.agents.pausedUntil", { time: fmtTime(row.resumeAt) })
+                      : t("Channel.agents.pausedManual")}
+                  </p>
+                )}
+                <div className="agent-board-counts t-mono">
+                  <span title={t("Channel.agents.count.inProgress")}>▶ {row.inProgress}</span>
+                  <span title={t("Channel.agents.count.queued")}>⏳ {row.queued}</span>
+                  <span title={t("Channel.agents.count.review")}>👁 {row.review}</span>
+                  {row.blocked > 0 && <span className="agent-board-count-blocked" title={t("Channel.agents.count.blocked")}>⛔ {row.blocked}</span>}
+                </div>
+                {row.tasks.length > 0 && (
+                  <ol className="agent-board-task-list">
+                    {row.tasks.map((task) => (
+                      <li key={task.id} className={`agent-board-task agent-board-task--${task.state}`}>
+                        <span className="t-mono agent-board-task-id">#{task.id}</span>
+                        <span className="agent-board-task-title" title={task.title}>{task.title}</span>
+                        <span className="t-mono agent-board-task-state">{t(`Channel.tasks.state.${task.state}`)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </article>
+            ))}
+          </div>
+        );
+        if (status === "offline") {
+          const handoffCount = laneRows.filter((row) => row.note?.trim()).length;
+          return (
+            <details
+              key={status}
+              className="agent-board-lane agent-board-lane--offline"
+              data-status={status}
+            >
+              <summary className="agent-board-lane-head">
+                <h3 className="agent-board-lane-title agent-board-status--offline">{statusLabel}</h3>
+                <span className="t-mono agent-board-lane-count">{laneRows.length}</span>
+                {handoffCount > 0 && <span className="t-mono agent-board-handoff-count">{t("Channel.agentBoard.handoffs", { count: String(handoffCount) })}</span>}
+              </summary>
+              {cards}
+            </details>
+          );
+        }
         return (
           <section
             key={status}
@@ -1527,42 +1644,7 @@ export function AgentBoardPanel({ presence, tasks }: { presence: PresenceEntry[]
               <h3 className={`agent-board-lane-title agent-board-status--${status}`}>{statusLabel}</h3>
               <span className="t-mono agent-board-lane-count">{laneRows.length}</span>
             </header>
-            <div className="agent-board-lane-cards">
-              {laneRows.length === 0 && <p className="agent-board-lane-empty">{t("Channel.tasks.columnEmpty")}</p>}
-              {laneRows.map((row) => (
-                <article key={row.name} className={`agent-board-row agent-board-row--${row.status}`} data-agent={row.name}>
-                  <div className="agent-board-row-head">
-                    <span className="agent-board-name">{row.name}</span>
-                    <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{statusLabel}</span>
-                  </div>
-                  {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
-                  {row.paused && (
-                    <p className="t-mono agent-board-schedule">
-                      {row.resumeAt !== null
-                        ? t("Channel.agents.pausedUntil", { time: fmtTime(row.resumeAt) })
-                        : t("Channel.agents.pausedManual")}
-                    </p>
-                  )}
-                  <div className="agent-board-counts t-mono">
-                    <span title={t("Channel.agents.count.inProgress")}>▶ {row.inProgress}</span>
-                    <span title={t("Channel.agents.count.queued")}>⏳ {row.queued}</span>
-                    <span title={t("Channel.agents.count.review")}>👁 {row.review}</span>
-                    {row.blocked > 0 && <span className="agent-board-count-blocked" title={t("Channel.agents.count.blocked")}>⛔ {row.blocked}</span>}
-                  </div>
-                  {row.tasks.length > 0 && (
-                    <ol className="agent-board-task-list">
-                      {row.tasks.map((task) => (
-                        <li key={task.id} className={`agent-board-task agent-board-task--${task.state}`}>
-                          <span className="t-mono agent-board-task-id">#{task.id}</span>
-                          <span className="agent-board-task-title" title={task.title}>{task.title}</span>
-                          <span className="t-mono agent-board-task-state">{t(`Channel.tasks.state.${task.state}`)}</span>
-                        </li>
-                      ))}
-                    </ol>
-                  )}
-                </article>
-              ))}
-            </div>
+            {cards}
           </section>
         );
       })}
@@ -3729,25 +3811,13 @@ export function ChannelPage({
   }
 
   const coordinationContent = (
-    <>
+    <div className="team-coordination">
       {catchupDigest !== null && catchupDigest.messages > 0 && seenSeq !== null && (
         <CatchupPanel
           digest={catchupDigest}
           seenSeq={seenSeq}
           latestSeq={lastSeq}
           onCaughtUp={onCaughtUp}
-        />
-      )}
-      {knownSenders.length > 0 && (
-        <AgentFilterPanel
-          senders={knownSenders}
-          filter={agentFilter}
-          visible={visibleInView}
-          total={totalInView}
-          onMode={setAgentMode}
-          onToggle={toggleAgentFilter}
-          onKind={setAgentKind}
-          onClear={clearAgentFilter}
         />
       )}
       {q === "" && <HostBoardPanel board={hostBoard} />}
@@ -3762,7 +3832,19 @@ export function ChannelPage({
           onJump={jumpToCompletion}
         />
       )}
-    </>
+      {knownSenders.length > 0 && (
+        <AgentFilterPanel
+          senders={knownSenders}
+          filter={agentFilter}
+          visible={visibleInView}
+          total={totalInView}
+          onMode={setAgentMode}
+          onToggle={toggleAgentFilter}
+          onKind={setAgentKind}
+          onClear={clearAgentFilter}
+        />
+      )}
+    </div>
   );
 
   const searchContent = (

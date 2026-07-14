@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>团队面板博客风 · #504</title>
+  <style>
+    :root { --fg:#20201d; --muted:#77746c; --accent:#ef5c4f; --border:#cbc5b8; --paper:#f8f5ed; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--fg); background:var(--paper); font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+    main { width:min(920px,calc(100% - 32px)); margin:32px auto; }
+    header { padding-bottom:18px; border-bottom:2px solid var(--fg); }
+    h1 { margin:0 0 6px; font-size:28px; }
+    h2 { margin:28px 0 10px; font-size:18px; }
+    p { margin:6px 0; color:var(--muted); }
+    code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--accent); }
+    table { width:100%; border-collapse:collapse; background:#fff; }
+    th,td { padding:11px 12px; border:1px solid var(--border); text-align:left; vertical-align:top; }
+    th { width:20%; background:#f0ece2; }
+    aside { margin-top:24px; padding:12px 14px; border-left:4px solid var(--accent); background:#fff; }
+  </style>
+</head>
+<body>
+<main>
+  <header><h1>团队面板博客风</h1><p>Issue #504 · 参考 <code>团队面板 博客风.dc.html</code></p></header>
+  <section>
+    <h2>设计总纲</h2>
+    <table>
+      <tr><th>结构</th><td>用 <code>01 分工 / 02 Agent 看板 / 03 协调</code> 三个页签替代长滚动，页签显示未认领和 @ 角标。</td></tr>
+      <tr><th>视觉</th><td>延续终端/博客风、等宽字体、单一强调色、方角细边框；长 owner ID 截断，悬停显示全值。</td></tr>
+      <tr><th>分工</th><td>已认领成员使用左侧语义色条卡片；编辑控件默认隐藏；未认领成员放进虚线折叠区并可一键带入认领表单。</td></tr>
+      <tr><th>Agent 看板</th><td>忙/阻塞为空时使用紧凑虚线占位；空闲卡使用三列网格；离线列表折叠，带交接说明者优先。</td></tr>
+      <tr><th>协调</th><td>离开摘要、主机接管和成员筛选按处理顺序排列；命令使用高对比终端块。</td></tr>
+    </table>
+  </section>
+  <aside>实现保持 DivisionBoard、AgentBoardPanel 和协调数据源不变，仅重塑信息架构、默认展开状态和视觉表达。</aside>
+</main>
+</body>
+</html>

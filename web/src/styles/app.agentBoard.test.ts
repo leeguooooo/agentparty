@@ -28,3 +28,13 @@ describe("issue #435 agent work board layout", () => {
     expect(title).toContain("text-overflow: ellipsis");
   });
 });
+
+describe("issue #504 team blog board layout", () => {
+  test("uses compact two-column lanes with idle and offline spanning the panel", () => {
+    const board = ruleBody(".team-blog .agent-board-panel");
+    expect(board).toContain("grid-template-columns: repeat(2, minmax(0, 1fr))");
+    expect(board).toContain("overflow: visible");
+    const idle = ruleBody(".team-blog .agent-board-lane--idle,\n.team-blog .agent-board-lane--offline");
+    expect(idle).toContain("grid-column: 1 / -1");
+  });
+});
