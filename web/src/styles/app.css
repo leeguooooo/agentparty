@@ -4188,304 +4188,502 @@
 }
 
 /* ==========================================================================
-   任务面板「博客/期刊风」皮肤 (#370 / 复用 #369 附件)
-   —— 全部 scoped 在 .task-ledger-panel 内，不外泄、不改全局 :root 变量、
-      不碰共享 .tag/.card/.badge 基础样式；新增 class 一律 task-journal- 前缀。
-   暖米色衬线的期刊语言，刻意偏离 app 黑白终端风，仅作用于任务面板内部。
+   任务面板「终端 / CLI 风」皮肤 (#370 / 复用 #369 附件)
+   —— 密集可扫读的命令行任务列表：暖灰白底 + 黑白描边 + 可配强调色，
+      命令/编号/id/标签用等宽（.t-mono），中文标题用无衬线。
+   全部 scoped 在 .task-ledger-panel 内：不外泄、不改全局 :root 变量、
+   不碰共享 .tag/.card/.badge 基础样式；新增 class 一律 task-journal- 前缀。
+   本地变量（含可配 accent）挂在容器上，属于 scoped 局部变量，非全局 :root。
    ========================================================================== */
 .task-ledger-panel {
-  font-family: "Georgia", "Songti SC", "Songti TC", "STSong", serif;
-  color: #2c2416;
-  background: #faf8f5;
-  padding: 22px 20px 24px;
-  border-radius: 6px;
-}
-/* 头部：居中大号衬线标题 + 斜体副标题 + 2px 实线分隔 */
-.task-ledger-panel .task-journal-masthead {
-  display: block;
-  text-align: center;
-  padding-bottom: 14px;
-  margin-bottom: 16px;
-  border-bottom: 2px solid #2c2416;
-}
-.task-ledger-panel .task-journal-title {
-  margin: 0;
-  font-size: 30px;
-  font-weight: 700;
-  letter-spacing: .01em;
-  color: #2c2416;
-  line-height: 1.15;
-}
-.task-ledger-panel .task-journal-subtitle {
-  margin: 6px 0 0;
-  font-size: 14px;
-  font-style: italic;
-  color: #6b5d4f;
-}
-/* 统计条：居中三项，大数字 + 小标签 */
-.task-ledger-panel .task-journal-stats {
-  display: flex;
-  justify-content: center;
-  gap: 40px;
-  margin-bottom: 18px;
-}
-.task-ledger-panel .task-journal-stat {
+  --tj-bg: #e8e4dc;
+  --tj-surface: #fdfcf9;
+  --tj-ink: #2c2416;
+  --tj-muted: #8a8175;
+  --tj-line: #2c2416;
+  --tj-faint: #c9c1b3;
+  --tj-accent: #e8564e;
+  --tj-amber-bg: #f4e6c6;
+  --tj-amber-ink: #8a6a24;
+  --tj-amber-line: #d9b877;
+  --tj-green-bg: #d7e8cd;
+  --tj-green-ink: #466b3a;
+  --tj-green-line: #9cc188;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 2px;
-}
-.task-ledger-panel .task-journal-stat-num {
-  font-size: 26px;
-  font-weight: 700;
-  line-height: 1;
-  color: #2c2416;
-}
-.task-ledger-panel .task-journal-stat-label {
-  font-size: 11px;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: #9b8d7f;
-}
-/* 控制条：筛选 / 新建 / 刷新 / 展开（保留功能，换暖色皮） */
-.task-ledger-panel .task-ledger-head {
-  border-bottom: 1px solid #e5ddd0;
-  padding-bottom: 12px;
-  margin-bottom: 16px;
-}
-.task-ledger-panel .task-ledger-total {
-  color: #9b8d7f;
-  font-style: italic;
-}
-.task-ledger-panel .d-btn,
-.task-ledger-panel .task-filter-select,
-.task-ledger-panel .task-journal-move {
-  font-family: inherit;
-  border: 1px solid #cdc3b4;
+  gap: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  color: var(--tj-ink);
+  background: var(--tj-bg);
+  padding: 20px 22px 22px;
   border-radius: 4px;
-  background: #fff;
-  color: #2c2416;
+}
+.task-ledger-panel .t-mono {
+  font-family: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, "Menlo", monospace;
+}
+
+/* ---- 头部：大标题 + $ 命令行 + 状态一览 pill + 右上操作 ---- */
+.task-ledger-panel .task-journal-head {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+}
+.task-ledger-panel .task-journal-head-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-right: 4px;
+}
+.task-ledger-panel .task-journal-h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  line-height: 1;
+  color: var(--tj-ink);
+}
+.task-ledger-panel .task-journal-cmd {
+  margin: 0;
+  font-size: 12px;
+  color: var(--tj-muted);
+}
+.task-ledger-panel .task-journal-head-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: center;
+}
+.task-ledger-panel .task-journal-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid var(--tj-faint);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  font-size: 12px;
+  color: var(--tj-muted);
+  white-space: nowrap;
+}
+.task-ledger-panel .task-journal-pill b { font-weight: 800; color: var(--tj-ink); }
+.task-ledger-panel .task-journal-pill--triage {
+  border-color: var(--tj-amber-line);
+  background: var(--tj-amber-bg);
+  color: var(--tj-amber-ink);
+}
+.task-ledger-panel .task-journal-pill--triage b { color: var(--tj-amber-ink); }
+.task-ledger-panel .task-journal-pill--done {
+  border-color: var(--tj-green-line);
+  background: var(--tj-green-bg);
+  color: var(--tj-green-ink);
+}
+.task-ledger-panel .task-journal-pill--done b { color: var(--tj-green-ink); }
+.task-ledger-panel .task-journal-head-actions {
+  margin-left: auto;
+  align-self: center;
+  gap: 6px;
+}
+/* 右上按钮统一终端风；新建=黑底白字实心 */
+.task-ledger-panel .d-btn {
+  font-family: inherit;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
   box-shadow: none;
+  font-size: 13px;
+  font-weight: 600;
 }
 .task-ledger-panel .d-btn:hover:not(:disabled) {
   transform: none;
-  background: #f3eee6;
+  background: #efe9df;
   box-shadow: none;
 }
-/* feed：单栏期刊流 */
+.task-ledger-panel .task-journal-newbtn {
+  background: var(--tj-ink);
+  color: #f6f2ea;
+  border-color: var(--tj-ink);
+}
+.task-ledger-panel .task-journal-newbtn:hover:not(:disabled) {
+  background: #000;
+  color: #fff;
+}
+.task-ledger-panel .task-journal-iconbtn {
+  min-width: 34px;
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 8px;
+}
+
+/* ---- 状态快筛条：$ grep --state + 带计数按钮 ---- */
+.task-ledger-panel .task-journal-filterbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--tj-faint);
+}
+.task-ledger-panel .task-journal-grep {
+  font-size: 12px;
+  color: var(--tj-muted);
+  margin-right: 2px;
+}
+.task-ledger-panel .task-journal-statebtn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.task-ledger-panel .task-journal-statebtn:hover:not(.is-active) { background: #efe9df; }
+.task-ledger-panel .task-journal-statebtn-count { font-weight: 800; }
+.task-ledger-panel .task-journal-statebtn.is-active {
+  background: var(--tj-ink);
+  border-color: var(--tj-ink);
+  color: #f6f2ea;
+}
+.task-ledger-panel .task-journal-statebtn.is-empty {
+  color: var(--tj-muted);
+  border-color: var(--tj-faint);
+  background: transparent;
+}
+.task-ledger-panel .task-journal-statebtn.is-empty.is-active {
+  color: #f6f2ea;
+  border-color: var(--tj-ink);
+  background: var(--tj-ink);
+}
+
+/* ---- 搜索 + 优先级 + 受理人 ---- */
+.task-ledger-panel .task-journal-searchbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.task-ledger-panel .task-journal-search {
+  flex: 1 1 260px;
+  min-width: 160px;
+  min-height: 32px;
+  padding: 5px 10px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
+  font-size: 13px;
+}
+.task-ledger-panel .task-journal-search::placeholder { color: var(--tj-muted); }
+.task-ledger-panel .task-journal-search:focus-visible {
+  outline: 2px solid var(--tj-accent);
+  outline-offset: 1px;
+}
+.task-ledger-panel .task-journal-prio { display: inline-flex; gap: 5px; }
+.task-ledger-panel .task-journal-priobtn {
+  min-width: 34px;
+  min-height: 32px;
+  padding: 4px 6px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.task-ledger-panel .task-journal-priobtn:hover:not(.is-active) { background: #efe9df; }
+.task-ledger-panel .task-journal-priobtn.is-active {
+  background: var(--tj-ink);
+  border-color: var(--tj-ink);
+  color: #f6f2ea;
+}
+.task-ledger-panel .task-filter-select {
+  max-width: 180px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
+  font-size: 12px;
+}
+
+/* ---- 分组：组头 pill + 虚线分隔 ---- */
+.task-ledger-panel .task-journal-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.task-ledger-panel .task-journal-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.task-ledger-panel .task-journal-group-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.task-ledger-panel .task-journal-grouptag {
+  flex: none;
+  padding: 3px 10px;
+  border: 1px solid var(--tj-amber-line);
+  border-radius: 3px;
+  background: var(--tj-amber-bg);
+  color: var(--tj-amber-ink);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.task-ledger-panel .task-journal-grouptag--in_progress {
+  border-color: var(--tj-faint); background: var(--tj-surface); color: var(--tj-muted);
+}
+.task-ledger-panel .task-journal-grouptag--blocked {
+  border-color: #d19b8f; background: #f2ded7; color: #8a4235;
+}
+.task-ledger-panel .task-journal-grouptag--done {
+  border-color: var(--tj-green-line); background: var(--tj-green-bg); color: var(--tj-green-ink);
+}
+.task-ledger-panel .task-journal-group-rule {
+  flex: 1;
+  height: 0;
+  border-top: 1px dashed var(--tj-faint);
+}
+
+/* ---- 任务行（描边矩形，密集可扫读） ---- */
 .task-ledger-panel .task-journal-feed {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
 }
-/* 任务卡 = 博客文章 */
-.task-ledger-panel .task-card.task-journal-article {
+.task-ledger-panel .task-card.task-journal-row {
   min-width: 0;
   display: block;
-  padding: 20px 22px;
-  border: 1px solid #e5ddd0;
-  border-radius: 4px;
-  background: #fff;
-  box-shadow: 0 1px 2px rgba(44, 36, 22, 0.05);
-  transition: box-shadow .18s ease, border-color .18s ease;
+  padding: 0;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
 }
-.task-ledger-panel .task-card.task-journal-article:hover {
-  box-shadow: 0 4px 14px rgba(44, 36, 22, 0.12);
-  border-color: #d8cdbb;
-}
-.task-ledger-panel .task-journal-meta-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 11px;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: #9b8d7f;
-}
-.task-ledger-panel .task-journal-dot { color: #cdc3b4; }
-.task-ledger-panel .task-journal-byline { color: #6b5d4f; }
-/* 衬线大标题（可点开详情） */
-.task-ledger-panel .task-card-title.task-journal-headline {
-  display: block;
-  width: 100%;
-  margin: 8px 0 0;
-  white-space: normal;
-  overflow: visible;
-}
-.task-ledger-panel .task-journal-headline strong {
-  display: block;
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
-  font-size: 21px;
-  font-weight: 700;
-  line-height: 1.3;
-  color: #2c2416;
-}
-.task-ledger-panel .task-journal-headline:hover strong {
-  color: #000;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-/* 摘要段（excerpt） */
-.task-ledger-panel .task-card-desc.task-journal-excerpt {
-  margin: 10px 0 0;
-  color: #6b5d4f;
-  font-size: 15px;
-  line-height: 1.6;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-}
-/* footer：左 tags，右 status 徽章 */
-.task-ledger-panel .task-journal-footer {
+.task-ledger-panel .task-journal-row-line {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  margin-top: 16px;
-  padding-top: 12px;
-  border-top: 1px solid #f0eae1;
+  padding: 12px 14px;
+  min-width: 0;
 }
-.task-ledger-panel .task-journal-tags {
+.task-ledger-panel .task-journal-row-line:hover { background: #f6f1e8; }
+.task-ledger-panel .task-journal-row-id {
+  flex: none;
+  color: var(--tj-muted);
+  font-size: 13px;
+}
+.task-ledger-panel .task-journal-row-prio {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--tj-amber-line);
+  border-radius: 2px;
+  background: var(--tj-amber-bg);
+  color: var(--tj-amber-ink);
+  font-size: 11px;
+  font-weight: 700;
+}
+.task-ledger-panel .task-card-title.task-journal-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-family: inherit;
+}
+.task-ledger-panel .task-journal-row-title strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--tj-ink);
+}
+.task-ledger-panel .task-journal-row-title:hover strong { text-decoration: underline; }
+.task-ledger-panel .task-journal-row-chips {
+  flex: none;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
 }
-.task-ledger-panel .task-label.task-journal-tag {
-  border: 1px solid #e0d6c6;
-  border-radius: 999px;
-  background: #f7f2ea;
-  color: #6b5d4f;
-  padding: 2px 10px;
-  font-size: 11px;
-  letter-spacing: .02em;
-}
-.task-ledger-panel .task-journal-fact {
-  color: #9b8d7f;
-  font-size: 11px;
-  border: 0;
-  background: none;
-  padding: 0;
-}
-/* status 徽章（各 state 暖色协调） */
-.task-ledger-panel .task-state.task-journal-status,
-.task-ledger-panel .task-detail-head .task-state {
+.task-ledger-panel .task-label.task-journal-chip,
+.task-ledger-panel .task-journal-chip {
   flex: none;
-  border: 0;
-  border-radius: 3px;
-  padding: 4px 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--tj-line);
+  border-radius: 2px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
   font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .06em;
-  text-transform: uppercase;
+  white-space: nowrap;
 }
-.task-ledger-panel .task-state--in_progress { color: #3a6b3a; background: #e8f0e8; }
-.task-ledger-panel .task-state--triage { color: #8a5a2a; background: #f3e9dc; }
-.task-ledger-panel .task-state--backlog { color: #6b5d4f; background: #efe9e0; }
-.task-ledger-panel .task-state--assigned { color: #4a5a7a; background: #e6e8f2; }
-.task-ledger-panel .task-state--needs_review { color: #4a4a7a; background: #e8e6f2; }
-.task-ledger-panel .task-state--blocked { color: #8a4235; background: #f2e0da; }
-.task-ledger-panel .task-state--done { color: #6b6b6b; background: #ece9e2; }
-/* 动作工具条（保留全部交互，换暖色皮） */
+.task-ledger-panel .task-journal-chip--assignee {
+  border-color: var(--tj-faint);
+  color: var(--tj-muted);
+}
+.task-ledger-panel .task-journal-row-toggle {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+  color: var(--tj-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: transform .15s ease;
+}
+.task-ledger-panel .task-journal-row-toggle:hover { border-color: var(--tj-faint); color: var(--tj-ink); }
+.task-ledger-panel .task-journal-row--open .task-journal-row-toggle { transform: rotate(90deg); }
+
+/* 展开体：默认收起，▸ 打开 */
+.task-ledger-panel .task-journal-row-body { display: none; }
+.task-ledger-panel .task-journal-row--open .task-journal-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 14px 14px;
+  border-top: 1px dashed var(--tj-faint);
+}
+.task-ledger-panel .task-journal-row-desc {
+  margin: 8px 0 0;
+  color: #4a3f2f;
+  font-size: 13px;
+  line-height: 1.55;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  display: block;
+}
+.task-ledger-panel .task-journal-row-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.task-ledger-panel .task-journal-fact { color: var(--tj-muted); font-size: 11px; }
+
+/* ---- 行内操作工具条（保留全部交互，换终端皮） ---- */
 .task-ledger-panel .task-card-actions.task-journal-actions {
-  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
+  margin: 0;
 }
 .task-ledger-panel .task-action-btn {
   font-family: inherit;
   min-height: 30px;
-  border: 1px solid #cdc3b4;
-  border-radius: 4px;
-  background: #fff;
-  color: #4a3f2f;
+  padding: 4px 10px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
   font-size: 12px;
   font-weight: 600;
   box-shadow: none;
 }
 .task-ledger-panel .task-action-btn:hover:not(:disabled) {
   transform: none;
-  background: #f3eee6;
-  border-color: #b9ab97;
+  background: #efe9df;
   box-shadow: none;
 }
 .task-ledger-panel .task-action-btn:disabled {
-  color: #c4b8a6;
-  border-color: #e5ddd0;
+  color: var(--tj-faint);
+  border-color: var(--tj-faint);
   box-shadow: none;
 }
 .task-ledger-panel .task-action-btn--review {
-  border-color: #3a6b3a;
-  color: #3a6b3a;
-  background: #eef4ee;
+  border-color: var(--tj-green-ink);
+  color: var(--tj-green-ink);
+  background: var(--tj-green-bg);
 }
 .task-ledger-panel .task-journal-move {
   min-height: 30px;
   padding: 3px 6px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
   font-size: 12px;
 }
+.task-ledger-panel .task-assign-form { gap: 6px; min-width: min(100%, 340px); }
 .task-ledger-panel .task-assign-form input,
 .task-ledger-panel .task-assign-form select {
   font-family: inherit;
-  border: 1px solid #cdc3b4;
-  border-radius: 4px;
-  background: #fff;
-  color: #2c2416;
+  min-height: 30px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
+  color: var(--tj-ink);
   font-size: 12px;
 }
-/* 新建任务 composer + 打回表单（暖纸卡） */
+
+/* ---- 新建任务 composer + 打回表单 ---- */
 .task-ledger-panel .task-new-form {
-  border: 1px solid #e0d6c6;
-  border-radius: 4px;
-  background: #fbf7f0;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
+  background: var(--tj-surface);
 }
 .task-ledger-panel .task-new-title,
 .task-ledger-panel .task-new-desc,
 .task-ledger-panel .task-reject-reason {
   font-family: inherit;
-  border: 1px solid #cdc3b4;
-  border-radius: 4px;
+  border: 1px solid var(--tj-line);
+  border-radius: 3px;
   background: #fff;
-  color: #2c2416;
+  color: var(--tj-ink);
   font-size: 13px;
 }
-.task-ledger-panel .task-attach-btn {
-  color: #6b5d4f;
-}
-/* 方案区（暖色强调） */
+.task-ledger-panel .task-attach-btn { color: var(--tj-muted); }
+
+/* ---- 方案区 ---- */
 .task-ledger-panel .task-solution {
-  border: 1px solid #cdbf9a;
-  border-radius: 4px;
+  border: 1px solid var(--tj-amber-line);
+  border-radius: 3px;
   background: #f7f0e2;
 }
-.task-ledger-panel .task-solution-label { color: #8a6d2a; }
-/* 详情弹层：暖纸模态 */
+.task-ledger-panel .task-solution-label { color: var(--tj-amber-ink); }
+
+/* ---- 详情弹层：终端风纸卡 ---- */
 .task-ledger-panel .task-detail-card {
   font-family: inherit;
-  border: 1px solid #d8cdbb;
-  border-radius: 6px;
-  background: #faf8f5;
-  color: #2c2416;
+  border: 1px solid var(--tj-line);
+  border-radius: 4px;
+  background: var(--tj-bg);
+  color: var(--tj-ink);
   box-shadow: 0 12px 40px rgba(44, 36, 22, 0.28);
 }
-.task-ledger-panel .task-detail-title { color: #2c2416; }
+.task-ledger-panel .task-detail-title { color: var(--tj-ink); }
 .task-ledger-panel .task-detail-desc { color: #4a3f2f; }
-.task-ledger-panel .task-detail-meta dt { color: #9b8d7f; }
-.task-ledger-panel .task-detail-head .task-id {
-  border: 1px solid #e0d6c6;
-  background: #f7f2ea;
-  color: #6b5d4f;
+.task-ledger-panel .task-detail-meta dt { color: var(--tj-muted); }
+.task-ledger-panel .task-detail-head .task-id,
+.task-ledger-panel .task-detail-head .task-state {
+  border: 1px solid var(--tj-faint);
+  border-radius: 2px;
+  background: var(--tj-surface);
+  color: var(--tj-muted);
 }
-/* 空态（筛选后无结果 / 无补充说明）暖色斜体 */
+
+/* ---- 空态 ---- */
 .task-ledger-panel .task-column-empty,
 .task-ledger-panel .charter-empty {
-  color: #9b8d7f;
-  font-style: italic;
+  color: var(--tj-muted);
+  font-size: 12px;
 }
 
 /* 浮层：脱离 grid 流铺满视口（沿用抽屉遮罩修复的做法），居中放手绘卡 */

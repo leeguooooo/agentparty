@@ -194,6 +194,9 @@ export interface RoleDraft {
 type ChannelPanel = "charter" | "team" | "tasks" | "search" | "settings";
 type AdminSurface = "agentJoin" | "agentTokens" | "joinLink";
 const TASK_BOARD_STATES: readonly TaskState[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "blocked", "done"];
+// #370：任务面板状态快筛（终端风带计数按钮）。"needs"=未完成聚合，"all"=全部，其余=对应 state。
+type StateFilter = "needs" | "triage" | "in_progress" | "blocked" | "done" | "all";
+const TASK_STATE_FILTERS: readonly StateFilter[] = ["needs", "triage", "in_progress", "blocked", "done", "all"];
 
 function taskCompletionSeq(task: TaskRecord): number | null {
   if (task.state !== "needs_review" || task.completion_artifact === null) return null;
@@ -1678,8 +1681,22 @@ export function TaskLedgerPanel({
   };
   const [rejectingTaskId, setRejectingTaskId] = useState<number | null>(null);
   const [rejectDraft, setRejectDraft] = useState("");
-  // #271(a)：按受理人筛选看板。"all" 全量，"__unassigned__" 只看未指派。
+  // #271(a)：按受理人筛选。"all" 全量，"__unassigned__" 只看未指派。
   const [assigneeFilter, setAssigneeFilter] = useState("all");
+  // #370：状态快筛（终端风带计数按钮）。needs=未完成，all=全部，其余=对应 state。默认 needs 聚焦待办、把已完成收起。
+  const [stateFilter, setStateFilter] = useState<StateFilter>("needs");
+  // #370：优先级多选切换（P1/P2/P3），空集=不筛。
+  const [priorityFilter, setPriorityFilter] = useState<Set<number>>(new Set());
+  // #370：搜索标题 / #编号 / 标签。
+  const [searchQuery, setSearchQuery] = useState("");
+  // #370：逐行展开（终端风 ▸ 手风琴），露出该任务的操作与详情。
+  const [openRows, setOpenRows] = useState<Set<number>>(new Set());
+  const toggleRow = (id: number) =>
+    setOpenRows((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
   // #271(d)：展开放大——CSS class 切宽度，外层 channel-panel-card 用 :has() 跟随。
   const [expandedView, setExpandedView] = useState(false);
   // #271(c)：任务详情弹层。存 id 不存快照，刷新后始终显示最新记录。
@@ -1692,18 +1709,63 @@ export function TaskLedgerPanel({
   const assigneeOptions = [...new Set(
     tasks.flatMap((task) => (task.assignee !== null ? [task.assignee.name] : [])),
   )].sort();
-  const visibleTasks =
-    assigneeFilter === "all" ? tasks :
-    assigneeFilter === "__unassigned__" ? tasks.filter((task) => task.assignee === null) :
-    tasks.filter((task) => task.assignee?.name === assigneeFilter);
-  // 博客风：单条期刊 feed（最新记录在前），取代看板七列。onSetState 的全状态可达性由每张卡的状态下拉保留。
-  const feedTasks = [...visibleTasks].sort((a, b) => (b.created_at - a.created_at) || (b.id - a.id));
-  // 统计条三项（进行中 / 待处理 / 已完成），基于全量台账；待处理 = 既非进行中也非已完成的其余状态之和。
+  // 状态快筛条的计数（基于全量台账，跟设计稿一样显示固定总数）。needs=未完成。
+  const needsCount = tasks.filter((task) => task.state !== "done").length;
+  const stateFilterCounts: Record<StateFilter, number> = {
+    needs: needsCount,
+    triage: counts["triage"] ?? 0,
+    in_progress: counts["in_progress"] ?? 0,
+    blocked: counts["blocked"] ?? 0,
+    done: counts["done"] ?? 0,
+    all: tasks.length,
+  };
+  const query = searchQuery.trim().toLowerCase();
+  const matchesSearch = (task: TaskRecord) => {
+    if (query === "") return true;
+    const idNeedle = query.replace(/^#/, "");
+    return (
+      String(task.id).includes(idNeedle) ||
+      task.title.toLowerCase().includes(query) ||
+      task.labels.some((label) => label.toLowerCase().includes(query))
+    );
+  };
+  const visibleTasks = tasks.filter((task) => {
+    const stateOk =
+      stateFilter === "all" ? true :
+      stateFilter === "needs" ? task.state !== "done" :
+      task.state === stateFilter;
+    const assigneeOk =
+      assigneeFilter === "all" ? true :
+      assigneeFilter === "__unassigned__" ? task.assignee === null :
+      task.assignee?.name === assigneeFilter;
+    const priorityOk = priorityFilter.size === 0 || priorityFilter.has(task.priority);
+    return stateOk && assigneeOk && priorityOk && matchesSearch(task);
+  });
+  // 终端风：按状态分组（组头 + 虚线分隔），组内最新在前。
+  const groupedTasks = TASK_BOARD_STATES
+    .map((state) => ({
+      state,
+      items: visibleTasks
+        .filter((task) => task.state === state)
+        .sort((a, b) => (b.created_at - a.created_at) || (b.id - a.id)),
+    }))
+    .filter((group) => group.items.length > 0);
+  // 头部一览三枚状态 pill（待归类 / 进行中 / 已完成）。
+  const statTriage = counts["triage"] ?? 0;
   const statInProgress = counts["in_progress"] ?? 0;
   const statDone = counts["done"] ?? 0;
-  const statPending = tasks.length - statInProgress - statDone;
   const disabled = loading || !canWrite;
   const stateLabel = (state: TaskState) => t(`Channel.tasks.state.${state}`);
+  const filterLabel = (filter: StateFilter) =>
+    filter === "needs" ? t("Channel.tasks.filter.needs") :
+    filter === "all" ? t("Channel.tasks.filter.all") :
+    stateLabel(filter);
+  const togglePriority = (level: number) =>
+    setPriorityFilter((cur) => {
+      const next = new Set(cur);
+      if (next.has(level)) next.delete(level); else next.add(level);
+      return next;
+    });
   const submitNewTask = (event: { preventDefault: () => void }) => {
     event.preventDefault();
     const title = newTitle.trim();
@@ -1721,142 +1783,152 @@ export function TaskLedgerPanel({
     const assignDraft = assignDrafts[task.id] ?? task.assignee?.name ?? "";
     const assignKind = assignKinds[task.id] ?? task.assignee?.kind ?? "agent";
     const reviewSeq = taskCompletionSeq(task);
-    // 博客风：meta 行的署名优先受理人，无受理人时退回创建者（对应设计稿 @name）。
-    const byline = task.assignee?.name ?? task.created_by;
+    const rowOpen = openRows.has(task.id);
     return (
-      <li key={task.id} className="task-card task-journal-article">
-        <div className="t-mono task-journal-meta-row">
-          <span className="task-journal-ref">{t("Channel.tasks.journalRef", { id: task.id })}</span>
-          <span className="task-journal-dot" aria-hidden="true">·</span>
-          <time className="task-journal-date">{fmtTime(task.created_at)}</time>
-          <span className="task-journal-dot" aria-hidden="true">·</span>
-          <span className="task-journal-byline">@{byline}</span>
-        </div>
-        <button
-          type="button"
-          className="task-card-title task-journal-headline"
-          aria-label={t("Channel.tasks.detailOpenAria", { id: task.id })}
-          onClick={() => setDetailTaskId(task.id)}
-        >
-          <strong>{task.title}</strong>
-        </button>
-        {task.desc !== null && <p className="task-card-desc task-journal-excerpt">{task.desc}</p>}
-        {task.attachments !== undefined && task.attachments.length > 0 && (
-          <AttachmentList attachments={task.attachments} />
-        )}
-        {task.solution !== undefined && (
-          <section className="task-solution">
-            <span className="t-mono task-solution-label">{t("Channel.tasks.solution")}</span>
-            <AttachmentList attachments={[task.solution]} />
-          </section>
-        )}
-        <div className="task-journal-footer">
-          <div className="task-journal-tags">
-            {task.labels.map((label) => <span key={label} className="t-mono task-label task-journal-tag">{label}</span>)}
-            <span className="t-mono task-journal-fact">P{task.priority}</span>
-            {task.parent_id !== null && <span className="t-mono task-journal-fact">{t("Channel.tasks.meta.parent", { id: task.parent_id })}</span>}
-            {task.anchor_seqs.map((seq) => <span key={seq} className="t-mono task-journal-fact">{t("Channel.tasks.meta.msg", { seq })}</span>)}
-          </div>
-          <span className={`t-mono task-state task-state--${task.state} task-journal-status`}>{stateLabel(task.state)}</span>
-        </div>
-        <div className="task-card-actions task-journal-actions">
-          <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "in_progress"} onClick={() => onSetState(task.id, "in_progress")}>
-            {t("Channel.tasks.action.claim")}
-          </button>
-          <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "blocked"} onClick={() => onSetState(task.id, "blocked")}>
-            {t("Channel.tasks.action.block")}
-          </button>
-          <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "done"} onClick={() => onSetState(task.id, "done")}>
-            {t("Channel.tasks.action.done")}
-          </button>
-          {/* 看板拖拽转状态改成博客风后没有列可拖，用状态下拉保留「移到任意状态」的能力（含 triage/backlog/assigned/needs_review） */}
-          <select
-            className="task-journal-move t-mono"
-            aria-label={t("Channel.tasks.moveAria", { id: task.id })}
-            disabled={disabled || taskBusy}
-            value={task.state}
-            onChange={(event) => {
-              const next = event.currentTarget.value as TaskState;
-              if (next !== task.state) onSetState(task.id, next);
-            }}
+      <li key={task.id} className={"task-card task-journal-row" + (rowOpen ? " task-journal-row--open" : "")}>
+        {/* 终端风紧凑行：#编号 · P徽章 · 标题 · 标签 chip · ▸ 展开 */}
+        <div className="task-journal-row-line">
+          <span className="t-mono task-journal-row-id">#{task.id}</span>
+          <span className="t-mono task-journal-row-prio">P{task.priority}</span>
+          <button
+            type="button"
+            className="task-card-title task-journal-row-title"
+            aria-label={t("Channel.tasks.detailOpenAria", { id: task.id })}
+            onClick={() => setDetailTaskId(task.id)}
           >
-            {TASK_BOARD_STATES.map((state) => (
-              <option key={state} value={state}>{stateLabel(state)}</option>
-            ))}
-          </select>
-          {reviewSeq !== null && (
-            <>
-              <button className="task-action-btn task-action-btn--review" type="button" disabled={disabled || taskBusy} onClick={() => onReview(task, "approve")}>
-                {t("Channel.tasks.action.approve")}
-              </button>
-              <button className="task-action-btn" type="button" disabled={disabled || taskBusy} aria-expanded={rejectingTaskId === task.id} onClick={() => { setRejectingTaskId(task.id); setRejectDraft(""); }}>
-                {t("Channel.tasks.action.reject")}
-              </button>
-            </>
+            <strong>{task.title}</strong>
+          </button>
+          <span className="task-journal-row-chips">
+            {task.labels.map((label) => <span key={label} className="t-mono task-label task-journal-chip">{label}</span>)}
+            {task.assignee !== null && <span className="t-mono task-journal-chip task-journal-chip--assignee">@{task.assignee.name}</span>}
+          </span>
+          <button
+            type="button"
+            className="task-journal-row-toggle"
+            aria-label={t("Channel.tasks.rowToggleAria", { id: task.id })}
+            aria-expanded={rowOpen}
+            onClick={() => toggleRow(task.id)}
+          >
+            ▸
+          </button>
+        </div>
+        {/* 展开体：说明 / 附件 / 方案 / 关联 / 全部操作（默认 CSS 收起，▸ 展开） */}
+        <div className="task-journal-row-body">
+          {task.desc !== null && <p className="task-card-desc task-journal-row-desc">{task.desc}</p>}
+          {task.attachments !== undefined && task.attachments.length > 0 && (
+            <AttachmentList attachments={task.attachments} />
           )}
-          <form
-            className="task-assign-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              onAssign(task.id, assignDraft, assignKind);
-            }}
-          >
-            <input
-              aria-label={t("Channel.tasks.assignAria", { id: task.id })}
-              disabled={disabled || taskBusy}
-              value={assignDraft}
-              placeholder={t("Channel.tasks.assignPlaceholder")}
-              list="task-assignee-targets"
-              autoComplete="off"
-              spellCheck={false}
-              onChange={(event) => setAssignDrafts((current) => ({ ...current, [task.id]: event.currentTarget.value }))}
-            />
-            <select
-              aria-label={t("Channel.tasks.kindAria", { id: task.id })}
-              disabled={disabled || taskBusy}
-              value={assignKind}
-              onChange={(event) => setAssignKinds((current) => ({ ...current, [task.id]: event.currentTarget.value as TaskAssigneeKind }))}
-            >
-              <option value="agent">{t("Channel.tasks.kind.agent")}</option>
-              <option value="human">{t("Channel.tasks.kind.human")}</option>
-              <option value="squad">{t("Channel.tasks.kind.squad")}</option>
-            </select>
-            <button className="task-action-btn" type="submit" disabled={disabled || taskBusy || assignDraft.trim() === ""}>
-              {t("Channel.tasks.action.assign")}
-            </button>
-          </form>
-        </div>
-        {rejectingTaskId === task.id && (
-          <div className="task-new-form task-reject-form">
-            <textarea
-              className="task-new-desc task-reject-reason"
-              aria-label={t("Channel.tasks.rejectReasonAria", { id: task.id })}
-              placeholder={t("Channel.tasks.rejectPrompt")}
-              rows={3}
-              autoFocus
-              disabled={taskBusy}
-              value={rejectDraft}
-              onChange={(event) => setRejectDraft(event.currentTarget.value)}
-            />
-            <div className="task-new-actions">
-              <button
-                className="task-action-btn task-reject-confirm"
-                type="button"
-                disabled={taskBusy || rejectDraft.trim() === ""}
-                onClick={() => {
-                  onReview(task, "reject", rejectDraft.trim());
-                  setRejectingTaskId(null);
-                  setRejectDraft("");
-                }}
-              >
-                {t("Channel.reject.confirm")}
-              </button>
-              <button className="task-action-btn task-reject-cancel" type="button" disabled={taskBusy} onClick={() => { setRejectingTaskId(null); setRejectDraft(""); }}>
-                {t("Channel.reject.cancel")}
-              </button>
+          {task.solution !== undefined && (
+            <section className="task-solution">
+              <span className="t-mono task-solution-label">{t("Channel.tasks.solution")}</span>
+              <AttachmentList attachments={[task.solution]} />
+            </section>
+          )}
+          {(task.parent_id !== null || task.anchor_seqs.length > 0) && (
+            <div className="t-mono task-journal-row-refs">
+              {task.parent_id !== null && <span className="task-journal-fact">{t("Channel.tasks.meta.parent", { id: task.parent_id })}</span>}
+              {task.anchor_seqs.map((seq) => <span key={seq} className="task-journal-fact">{t("Channel.tasks.meta.msg", { seq })}</span>)}
             </div>
+          )}
+          <div className="task-card-actions task-journal-actions">
+            <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "in_progress"} onClick={() => onSetState(task.id, "in_progress")}>
+              {t("Channel.tasks.action.claim")}
+            </button>
+            <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "blocked"} onClick={() => onSetState(task.id, "blocked")}>
+              {t("Channel.tasks.action.block")}
+            </button>
+            <button className="task-action-btn" type="button" disabled={disabled || taskBusy || task.state === "done"} onClick={() => onSetState(task.id, "done")}>
+              {t("Channel.tasks.action.done")}
+            </button>
+            {/* 保留「移到任意状态」的能力（含 triage/backlog/assigned/needs_review），替代看板拖拽 */}
+            <select
+              className="task-journal-move t-mono"
+              aria-label={t("Channel.tasks.moveAria", { id: task.id })}
+              disabled={disabled || taskBusy}
+              value={task.state}
+              onChange={(event) => {
+                const next = event.currentTarget.value as TaskState;
+                if (next !== task.state) onSetState(task.id, next);
+              }}
+            >
+              {TASK_BOARD_STATES.map((state) => (
+                <option key={state} value={state}>{stateLabel(state)}</option>
+              ))}
+            </select>
+            {reviewSeq !== null && (
+              <>
+                <button className="task-action-btn task-action-btn--review" type="button" disabled={disabled || taskBusy} onClick={() => onReview(task, "approve")}>
+                  {t("Channel.tasks.action.approve")}
+                </button>
+                <button className="task-action-btn" type="button" disabled={disabled || taskBusy} aria-expanded={rejectingTaskId === task.id} onClick={() => { setRejectingTaskId(task.id); setRejectDraft(""); }}>
+                  {t("Channel.tasks.action.reject")}
+                </button>
+              </>
+            )}
+            <form
+              className="task-assign-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onAssign(task.id, assignDraft, assignKind);
+              }}
+            >
+              <input
+                aria-label={t("Channel.tasks.assignAria", { id: task.id })}
+                disabled={disabled || taskBusy}
+                value={assignDraft}
+                placeholder={t("Channel.tasks.assignPlaceholder")}
+                list="task-assignee-targets"
+                autoComplete="off"
+                spellCheck={false}
+                onChange={(event) => setAssignDrafts((current) => ({ ...current, [task.id]: event.currentTarget.value }))}
+              />
+              <select
+                aria-label={t("Channel.tasks.kindAria", { id: task.id })}
+                disabled={disabled || taskBusy}
+                value={assignKind}
+                onChange={(event) => setAssignKinds((current) => ({ ...current, [task.id]: event.currentTarget.value as TaskAssigneeKind }))}
+              >
+                <option value="agent">{t("Channel.tasks.kind.agent")}</option>
+                <option value="human">{t("Channel.tasks.kind.human")}</option>
+                <option value="squad">{t("Channel.tasks.kind.squad")}</option>
+              </select>
+              <button className="task-action-btn" type="submit" disabled={disabled || taskBusy || assignDraft.trim() === ""}>
+                {t("Channel.tasks.action.assign")}
+              </button>
+            </form>
           </div>
-        )}
+          {rejectingTaskId === task.id && (
+            <div className="task-new-form task-reject-form">
+              <textarea
+                className="task-new-desc task-reject-reason"
+                aria-label={t("Channel.tasks.rejectReasonAria", { id: task.id })}
+                placeholder={t("Channel.tasks.rejectPrompt")}
+                rows={3}
+                autoFocus
+                disabled={taskBusy}
+                value={rejectDraft}
+                onChange={(event) => setRejectDraft(event.currentTarget.value)}
+              />
+              <div className="task-new-actions">
+                <button
+                  className="task-action-btn task-reject-confirm"
+                  type="button"
+                  disabled={taskBusy || rejectDraft.trim() === ""}
+                  onClick={() => {
+                    onReview(task, "reject", rejectDraft.trim());
+                    setRejectingTaskId(null);
+                    setRejectDraft("");
+                  }}
+                >
+                  {t("Channel.reject.confirm")}
+                </button>
+                <button className="task-action-btn task-reject-cancel" type="button" disabled={taskBusy} onClick={() => { setRejectingTaskId(null); setRejectDraft(""); }}>
+                  {t("Channel.reject.cancel")}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </li>
     );
   };
@@ -1871,56 +1943,38 @@ export function TaskLedgerPanel({
           <option key={identity.name} value={identity.name}>{identity.display}</option>
         ))}
       </datalist>
-      {/* 博客风头部：居中衬线标题 + 斜体副标题，底部实线分隔（视觉皮，纯展示） */}
-      <header className="task-journal-masthead">
-        <h2 className="task-journal-title">{t("Channel.tasks.journalTitle")}</h2>
-        <p className="task-journal-subtitle">{t("Channel.tasks.journalSubtitle")}</p>
-      </header>
-      <div className="task-journal-stats">
-        <div className="task-journal-stat">
-          <span className="task-journal-stat-num">{statInProgress}</span>
-          <span className="task-journal-stat-label">{t("Channel.tasks.stat.inProgress")}</span>
+      {/* 终端/CLI 风头部：大标题 + $ 命令行 + 状态一览 pill；右上 新建/刷新/展开 */}
+      <header className="task-journal-head">
+        <div className="task-journal-head-title">
+          <h2 className="task-journal-h1">{t("Channel.tasks.journalTitle")}</h2>
+          <p className="t-mono task-journal-cmd">{t("Channel.tasks.cmdCount", { count: tasks.length })}</p>
         </div>
-        <div className="task-journal-stat">
-          <span className="task-journal-stat-num">{statPending}</span>
-          <span className="task-journal-stat-label">{t("Channel.tasks.stat.pending")}</span>
+        <div className="task-journal-head-summary">
+          <span className="task-journal-pill task-journal-pill--triage"><b>{statTriage}</b> {t("Channel.tasks.state.triage")}</span>
+          <span className="task-journal-pill task-journal-pill--in_progress"><b>{statInProgress}</b> {t("Channel.tasks.state.in_progress")}</span>
+          <span className="task-journal-pill task-journal-pill--done"><b>{statDone}</b> {t("Channel.tasks.state.done")}</span>
         </div>
-        <div className="task-journal-stat">
-          <span className="task-journal-stat-num">{statDone}</span>
-          <span className="task-journal-stat-label">{t("Channel.tasks.stat.done")}</span>
-        </div>
-      </div>
-      <header className="task-ledger-head">
-        <p className="t-mono task-ledger-total">{t("Channel.tasks.total", { count: tasks.length })}</p>
-        <div className="task-ledger-head-actions">
-          {assigneeOptions.length > 0 && (
-            <select
-              className="task-filter-select t-mono"
-              aria-label={t("Channel.tasks.filterAria")}
-              value={assigneeFilter}
-              onChange={(event) => setAssigneeFilter(event.currentTarget.value)}
-            >
-              <option value="all">{t("Channel.tasks.filterAll")}</option>
-              <option value="__unassigned__">{t("Channel.tasks.filterUnassigned")}</option>
-              {assigneeOptions.map((name) => (
-                <option key={name} value={name}>@{name}</option>
-              ))}
-            </select>
-          )}
+        <div className="task-ledger-head-actions task-journal-head-actions">
           {canWrite && (
             <button
-              className="d-btn task-new-btn"
+              className="d-btn task-new-btn task-journal-newbtn"
               type="button"
               aria-label={t("Channel.tasks.new")}
               aria-expanded={composerOpen}
               disabled={loading}
               onClick={() => setComposerOpen((open) => !open)}
             >
-              + {t("Channel.tasks.new")}
+              ＋ {t("Channel.tasks.new")}
             </button>
           )}
-          <button className="d-btn" type="button" disabled={loading} onClick={onRefresh}>
-            {loading ? t("Channel.tasks.refreshing") : t("Channel.tasks.refresh")}
+          <button
+            className="d-btn task-journal-iconbtn"
+            type="button"
+            aria-label={loading ? t("Channel.tasks.refreshing") : t("Channel.tasks.refresh")}
+            disabled={loading}
+            onClick={onRefresh}
+          >
+            {loading ? "…" : "↻"}
           </button>
           <button
             className="d-btn task-expand-btn"
@@ -1933,6 +1987,68 @@ export function TaskLedgerPanel({
           </button>
         </div>
       </header>
+      {/* 状态快筛条：$ grep --state + 带计数的状态按钮（当前选中=黑底白字，计数为 0 置灰） */}
+      <div className="task-journal-filterbar">
+        <span className="t-mono task-journal-grep">{t("Channel.tasks.grepState")}</span>
+        {TASK_STATE_FILTERS.map((filter) => {
+          const count = stateFilterCounts[filter];
+          const active = stateFilter === filter;
+          return (
+            <button
+              key={filter}
+              type="button"
+              className={"task-journal-statebtn t-mono" + (active ? " is-active" : "") + (count === 0 ? " is-empty" : "")}
+              aria-pressed={active}
+              aria-label={t("Channel.tasks.stateFilterAria", { label: filterLabel(filter) })}
+              onClick={() => setStateFilter(filter)}
+            >
+              <span className="task-journal-statebtn-label">{filterLabel(filter)}</span>
+              <span className="task-journal-statebtn-count">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+      {/* 搜索 + 优先级 + 受理人 */}
+      <div className="task-journal-searchbar">
+        <input
+          className="task-journal-search t-mono"
+          type="search"
+          aria-label={t("Channel.tasks.searchAria")}
+          placeholder={t("Channel.tasks.searchPlaceholder")}
+          value={searchQuery}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={(event) => setSearchQuery(event.currentTarget.value)}
+        />
+        <div className="task-journal-prio">
+          {[1, 2, 3].map((level) => (
+            <button
+              key={level}
+              type="button"
+              className={"task-journal-priobtn t-mono" + (priorityFilter.has(level) ? " is-active" : "")}
+              aria-pressed={priorityFilter.has(level)}
+              aria-label={t("Channel.tasks.priorityAria", { level })}
+              onClick={() => togglePriority(level)}
+            >
+              P{level}
+            </button>
+          ))}
+        </div>
+        {assigneeOptions.length > 0 && (
+          <select
+            className="task-filter-select task-journal-assignee t-mono"
+            aria-label={t("Channel.tasks.filterAria")}
+            value={assigneeFilter}
+            onChange={(event) => setAssigneeFilter(event.currentTarget.value)}
+          >
+            <option value="all">{t("Channel.tasks.filterAll")}</option>
+            <option value="__unassigned__">{t("Channel.tasks.filterUnassigned")}</option>
+            {assigneeOptions.map((name) => (
+              <option key={name} value={name}>@{name}</option>
+            ))}
+          </select>
+        )}
+      </div>
       {composerOpen && canWrite && (
         <form className="task-new-form" onSubmit={submitNewTask}>
           <input
@@ -2003,12 +2119,28 @@ export function TaskLedgerPanel({
       {actionError !== null && <p className="banner banner--red">{actionError}</p>}
       {tasks.length === 0 && error === null ? (
         <p className="charter-empty">{t("Channel.tasks.empty")}</p>
-      ) : feedTasks.length === 0 ? (
+      ) : groupedTasks.length === 0 ? (
         <p className="t-mono task-column-empty">{t("Channel.tasks.columnEmpty")}</p>
       ) : (
-        <ol className="task-journal-feed" role="list" aria-label={t("Channel.tasks.boardAria")}>
-          {feedTasks.map(renderTask)}
-        </ol>
+        <div className="task-journal-groups" role="list" aria-label={t("Channel.tasks.boardAria")}>
+          {groupedTasks.map((group) => (
+            <section
+              key={group.state}
+              className="task-journal-group"
+              aria-label={t("Channel.tasks.columnAria", { state: stateLabel(group.state) })}
+            >
+              <header className="task-journal-group-head">
+                <span className={`t-mono task-journal-grouptag task-journal-grouptag--${group.state}`}>
+                  {stateLabel(group.state)} · {group.items.length}
+                </span>
+                <span className="task-journal-group-rule" aria-hidden="true" />
+              </header>
+              <ol className="task-journal-feed">
+                {group.items.map(renderTask)}
+              </ol>
+            </section>
+          ))}
+        </div>
       )}
       {detailTask !== null && (
         <div
