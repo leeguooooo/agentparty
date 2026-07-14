@@ -759,7 +759,7 @@ export function PresenceBar({
                 <h2 id="presence-roster-title">{t("PresenceBar.dialogTitle")}</h2>
                 <p className="t-mono">{liveGroups}/{totalGroups} live</p>
               </div>
-              <button className="d-btn channel-panel-close" type="button" onClick={closeRoster}>
+              <button className="d-btn channel-panel-close" type="button" aria-label={t("PresenceBar.close")} onClick={closeRoster}>
                 {t("PresenceBar.close")}
               </button>
             </header>
