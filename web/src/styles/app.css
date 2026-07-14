@@ -1151,10 +1151,6 @@
   padding: 2px 4px 5px;
   flex: none;
 }
-/* 折叠态（默认）：没有 chip 条，收紧一点垂直空间 */
-.presence-bar--collapsed {
-  padding-bottom: 2px;
-}
 /* 第一行：属性/告警 + 右侧连接状态 */
 .presence-head {
   display: flex;
@@ -1172,6 +1168,16 @@
   align-items: center;
   min-width: 0;
 }
+.presence-roster-overlay { z-index: 65; }
+.presence-roster-card { width: min(1080px, calc(100vw - 28px)); }
+.presence-roster-body { padding: 14px; }
+.presence-roster-body .presence-strip {
+  align-items: stretch;
+  max-height: none;
+  overflow: visible;
+  padding: 2px 3px 6px;
+}
+.presence-roster-body .presence-group { flex: 1 1 320px; }
 .presence-meta {
   gap: 7px;
   flex: 1 1 auto;

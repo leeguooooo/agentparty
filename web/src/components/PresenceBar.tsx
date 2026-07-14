@@ -1,7 +1,7 @@
 // 顶部 presence 条：每参与者一个手绘胶囊（名字 + 蜡笔状态点 + note + 相对时间），
 // 右端挂连接状态。"对方卡在哪"一眼可见（spec §9 第 3 块）。
 import { evaluateHostLease, wakeableState, type ChannelRoleAssignment, type PresenceEntry, type PresenceState, type Sender } from "@agentparty/shared";
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
 import { fmtRel } from "../lib/time";
 import type { SocketStatus } from "../lib/ws";
@@ -226,25 +226,6 @@ function groupRank(group: PresenceGroup, now: number): number {
   return Math.min(...group.items.map((item) => presenceRank(item, now)));
 }
 
-// 展开/折叠偏好：默认折叠（人多时顶部不挤），记住用户上次选择。
-const PRESENCE_EXPANDED_KEY = "ap_presence_expanded";
-
-export function readPresenceExpanded(): boolean {
-  try {
-    return localStorage.getItem(PRESENCE_EXPANDED_KEY) === "1";
-  } catch {
-    return false; // 私有模式等场景 localStorage 不可用时，默认折叠
-  }
-}
-
-function writePresenceExpanded(expanded: boolean): void {
-  try {
-    localStorage.setItem(PRESENCE_EXPANDED_KEY, expanded ? "1" : "0");
-  } catch {
-    // 写入失败不阻断本次切换，只是刷新/换标签页后会回落到默认折叠
-  }
-}
-
 export function PresenceBar({
   presence,
   participants,
@@ -270,8 +251,10 @@ export function PresenceBar({
   }, []);
   const now = Date.now();
 
-  // 默认折叠，展开态记 localStorage（记住偏好）。
-  const [expanded, setExpanded] = useState(() => readPresenceExpanded());
+  // #484：姓名 roster 不再挤占频道顶部；点 live 计数后在独立弹框里查看和操作。
+  const [rosterOpen, setRosterOpen] = useState(false);
+  const rosterToggleRef = useRef<HTMLButtonElement | null>(null);
+  const rosterCloseRef = useRef<HTMLButtonElement | null>(null);
 
   // 在线 sender 带 owner；离线/最近 presence 带 account。两者都归到同一账号块。
   const byName = new Map(participants.map((p) => [p.name, p]));
@@ -372,14 +355,16 @@ export function PresenceBar({
     },
     [],
   );
-  function toggleExpanded() {
-    setHoveredGroup(null); // 折叠会把 chip 移出 DOM，先关掉可能悬着的 popover
+  const closeRoster = useCallback(() => {
+    setHoveredGroup(null);
     setExpandedGroupKey(null);
-    setExpanded((prev) => {
-      const next = !prev;
-      writePresenceExpanded(next);
-      return next;
-    });
+    setRosterOpen(false);
+    rosterToggleRef.current?.focus();
+  }, []);
+
+  function toggleRoster() {
+    if (rosterOpen) closeRoster();
+    else setRosterOpen(true);
   }
   // 顶部计数按账号折叠后的人数（非会话行数）——离线会话已在 buildGroups 里按 account 归并。
   const { live: liveGroups, total: totalGroups } = countLiveGroups(sortedGroups);
@@ -388,7 +373,23 @@ export function PresenceBar({
   const duplicateCount = items.filter((it) => it.connectionCount > 1).length;
   // 折叠态下 chip 不在 DOM 里，popover 也不该跟着冒出来。
   const activePopoverGroup =
-    !expanded || hoveredGroup === null ? null : sortedGroups.find((group) => group.key === hoveredGroup.key) ?? null;
+    !rosterOpen || hoveredGroup === null ? null : sortedGroups.find((group) => group.key === hoveredGroup.key) ?? null;
+
+  useEffect(() => {
+    if (!rosterOpen) return;
+    rosterCloseRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeRoster();
+    };
+    window.addEventListener?.("keydown", onKeyDown);
+    return () => window.removeEventListener?.("keydown", onKeyDown);
+  }, [closeRoster, rosterOpen]);
+
+  function openAgentDetail(name: string) {
+    if (onOpenAgentDetail === undefined) return;
+    closeRoster();
+    onOpenAgentDetail(name);
+  }
 
   function showGroupPopover(group: PresenceGroup, rect: DOMRect) {
     cancelPopoverClose();
@@ -457,13 +458,13 @@ export function PresenceBar({
         title={titleParts.join(" · ")}
         role={onOpenAgentDetail !== undefined ? "button" : undefined}
         tabIndex={onOpenAgentDetail !== undefined ? 0 : undefined}
-        onClick={onOpenAgentDetail !== undefined ? () => onOpenAgentDetail(it.name) : undefined}
+        onClick={onOpenAgentDetail !== undefined ? () => openAgentDetail(it.name) : undefined}
         onKeyDown={
           onOpenAgentDetail !== undefined
             ? (e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
-                  onOpenAgentDetail(it.name);
+                  openAgentDetail(it.name);
                 }
               }
             : undefined
@@ -663,7 +664,7 @@ export function PresenceBar({
                   onOpenAgentDetail !== undefined
                     ? (e) => {
                         e.stopPropagation();
-                        onOpenAgentDetail(agent.name);
+                        openAgentDetail(agent.name);
                       }
                     : undefined
                 }
@@ -673,7 +674,7 @@ export function PresenceBar({
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
                           e.stopPropagation();
-                          onOpenAgentDetail(agent.name);
+                          openAgentDetail(agent.name);
                         }
                       }
                     : undefined
@@ -718,22 +719,24 @@ export function PresenceBar({
   }
 
   return (
-    <div className={`presence-bar${expanded ? "" : " presence-bar--collapsed"}`}>
+    <div className="presence-bar">
       <div className="presence-head">
         <div className="presence-meta" aria-label="channel presence summary">
           {isPublic && <span className="d-hl public-badge">{publicWatch ? "WATCH" : "PUBLIC"}</span>}
           {party && <span className="d-hl party-badge">PARTY</span>}
           <button
+            ref={rosterToggleRef}
             type="button"
             className="presence-toggle"
-            aria-expanded={expanded}
-            aria-label={t(expanded ? "PresenceBar.collapse" : "PresenceBar.expand")}
-            onClick={toggleExpanded}
+            aria-expanded={rosterOpen}
+            aria-haspopup="dialog"
+            aria-label={t(rosterOpen ? "PresenceBar.collapse" : "PresenceBar.expand")}
+            onClick={toggleRoster}
           >
             <span className="t-mono presence-summary">
               {liveGroups}/{totalGroups} live
             </span>
-            <span className="presence-toggle-arrow" aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+            <span className="presence-toggle-arrow" aria-hidden="true">{rosterOpen ? "▾" : "▸"}</span>
           </button>
           {blockedCount > 0 && <span className="t-mono presence-alert">{blockedCount} blocked</span>}
           {busyCount > 0 && (
@@ -752,9 +755,25 @@ export function PresenceBar({
           {status === "open" ? "● live" : `◌ ${status}…`}
         </span>
       </div>
-      {expanded && (
-        <div className="presence-strip" aria-label="participant groups by owner">
-          {sortedGroups.map((group) => renderGroup(group, expandedGroupKey === group.key ? "full" : "compact"))}
+      {rosterOpen && (
+        <div className="channel-panel-overlay presence-roster-overlay" role="dialog" aria-modal="true" aria-labelledby="presence-roster-title">
+          <button className="channel-panel-scrim" type="button" aria-label={t("PresenceBar.close")} onClick={closeRoster} />
+          <section className="channel-panel-card presence-roster-card">
+            <header className="channel-panel-head">
+              <div className="channel-panel-titlebox">
+                <h2 id="presence-roster-title">{t("PresenceBar.dialogTitle")}</h2>
+                <p className="t-mono">{liveGroups}/{totalGroups} live</p>
+              </div>
+              <button ref={rosterCloseRef} className="d-btn channel-panel-close" type="button" aria-label={t("PresenceBar.close")} onClick={closeRoster}>
+                {t("PresenceBar.close")}
+              </button>
+            </header>
+            <div className="channel-panel-body presence-roster-body">
+              <div className="presence-strip" aria-label={t("PresenceBar.participantGroupsByOwner")}>
+                {sortedGroups.map((group) => renderGroup(group, expandedGroupKey === group.key ? "full" : "compact"))}
+              </div>
+            </div>
+          </section>
         </div>
       )}
       {activePopoverGroup !== null && hoveredGroup !== null && (

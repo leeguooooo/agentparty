@@ -30,7 +30,10 @@ export interface UpgradeDeps {
 
 export interface CliUpgradeNotice {
   running_version: string;
-  installed_version: string;
+  /** 磁盘已经安装、只需 re-exec 的版本。服务器发布版提示里没有这个字段。 */
+  installed_version?: string;
+  /** 可下载安装的版本；磁盘更新和服务器发布更新两种来源都统一暴露。 */
+  available_version: string;
   auto_upgrade: boolean;
   action_required: "ask_user" | "auto_reexec";
   message: string;
@@ -69,11 +72,36 @@ export function upgradeNotice(auto: boolean, deps: UpgradeDeps = {}): CliUpgrade
   return {
     running_version: running,
     installed_version: installed,
+    available_version: installed,
     auto_upgrade: auto,
     action_required: action,
     message: auto
       ? `检测到 party CLI 已有新版本 v${installed}（当前运行 v${running}）。本轮唤醒结束后 serve 会自动 re-exec 新版。`
       : `检测到 party CLI 已有新版本 v${installed}（当前运行 v${running}）。继续任务前先询问用户是否升级；用户同意后再让用户运行升级命令并重启 serve。`,
+    command: INSTALL_LINE,
+  };
+}
+
+/**
+ * 服务器 /api/version 已经跑在更新的正式版本时，提醒旧 CLI 的 agent 联系 owner 升级（#485）。
+ * `dev` / commit hash / 非 SemVer 一律忽略，避免预览部署误导稳定版用户。
+ */
+export function serverVersionUpgradeNotice(
+  serverVersion: string,
+  deps: { runningVersion?: string } = {},
+): CliUpgradeNotice | null {
+  // 只接受正式版和 build metadata；prerelease 的优先级低于同号正式版，不能当成已发布。
+  const match = serverVersion.trim().match(/^v?(\d+\.\d+\.\d+)(?:\+[0-9A-Za-z.-]+)?$/);
+  if (!match) return null;
+  const available = match[1]!;
+  const running = deps.runningVersion ?? RUNNING_VERSION;
+  if (compareVersions(available, running) <= 0) return null;
+  return {
+    running_version: running,
+    available_version: available,
+    auto_upgrade: false,
+    action_required: "ask_user",
+    message: `AgentParty 服务器已发布 party CLI v${available}，当前 agent 仍在使用 v${running}。请用 party send 在本频道主动提醒 owner 升级，然后结束本轮、继续监听；owner 同意后运行升级命令并重启 serve。`,
     command: INSTALL_LINE,
   };
 }

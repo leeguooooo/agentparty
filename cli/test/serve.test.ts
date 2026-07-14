@@ -18,6 +18,7 @@ import {
   type ThreadLike,
 } from "../src/commands/serve";
 import type { MessagePayload } from "../src/rest";
+import type { CliUpgradeNotice } from "../src/upgrade";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
 
 let server: MockServer | null = null;
@@ -429,6 +430,8 @@ describe("runServe", () => {
       expect(ctx.protocol_reminder).toContain("party history");
       expect(ctx.protocol_reminder).toContain("trellis");
       expect(ctx.protocol_reminder).toContain("不要触发项目自带的其它频道/工作流机制");
+      expect(ctx.protocol_reminder).toContain("禁止在 runner 子进程里调用 AskUserQuestion");
+      expect(ctx.protocol_reminder).toContain("让 serve 立即恢复监听");
     } finally {
       unlinkSync(path);
     }
@@ -630,6 +633,61 @@ describe("runServe", () => {
       auto_upgrade: false,
       action_required: "ask_user",
     });
+  });
+
+  test("passes a newer deployed CLI notice into the runner context so the agent can notify its owner (#485)", async () => {
+    const s = closeAfterOneMention();
+    const notices: unknown[] = [];
+    const o = opts({
+      server: s.url,
+      availableUpgrade: {
+        running_version: "0.2.107",
+        available_version: "0.2.108",
+        auto_upgrade: false,
+        action_required: "ask_user",
+        message: "服务器已有新版；请主动提醒 owner 升级。",
+        command: "curl -fsSL https://example.test/install.sh | sh",
+      },
+      runCommand: async (_frame, ctx) => {
+        notices.push(ctx.cliUpgrade);
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(notices[0]).toMatchObject({
+      running_version: "0.2.107",
+      available_version: "0.2.108",
+      action_required: "ask_user",
+    });
+  });
+
+  test("refreshes the deployed CLI notice before a later wake without blocking serve (#485)", async () => {
+    const s = closeAfterOneMention();
+    const notices: unknown[] = [];
+    let probes = 0;
+    const o = opts({
+      server: s.url,
+      availableUpgrade: null,
+      upgradeProbeIntervalMs: 0,
+      refreshAvailableUpgrade: async () => {
+        probes += 1;
+        return {
+          running_version: "0.2.107",
+          available_version: "0.2.109",
+          auto_upgrade: false,
+          action_required: "ask_user",
+          message: "长驻 serve 检测到新发布。",
+          command: "curl -fsSL https://example.test/install.sh | sh",
+        };
+      },
+      runCommand: async (_frame, ctx) => {
+        notices.push(ctx.cliUpgrade);
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(probes).toBe(1);
+    expect(notices[0]).toMatchObject({ available_version: "0.2.109", action_required: "ask_user" });
   });
 
   test("a failing advertise does not crash the server", async () => {
@@ -1093,6 +1151,7 @@ describe("builtin runner", () => {
       cliUpgrade: {
         running_version: "0.2.72",
         installed_version: "0.2.73",
+        available_version: "0.2.73",
         auto_upgrade: false,
         action_required: "ask_user",
         message: "检测到 party CLI 已有新版本 v0.2.73（当前运行 v0.2.72）。继续任务前先询问用户是否升级。",
@@ -1204,6 +1263,7 @@ describe("project profile daemon", () => {
       updated_at: 1,
     };
     const served: ServeOptions[] = [];
+    let upgradeProbes = 0;
     const channelRuntimeCalls: Array<{ slug: string; childName: string }> = [];
     try {
       const code = await runProfileServe({
@@ -1212,6 +1272,11 @@ describe("project profile daemon", () => {
         ownerAccount: "fan@example.com",
         handle: "herness-dev",
         mentionsOnly: true,
+        upgradeProbeIntervalMs: 60_000,
+        refreshAvailableUpgrade: async () => {
+          upgradeProbes += 1;
+          return null;
+        },
         once: true,
         post,
         mintRuntime: async () => ({ token: "ap_profile_runtime", profile }),
@@ -1254,6 +1319,8 @@ describe("project profile daemon", () => {
     expect(served.map((o) => o.channel).sort()).toEqual(["alpha", "beta", "gamma"]);
     expect(served.map((o) => o.token).sort()).toEqual(["ap_child_alpha", "ap_child_beta", "ap_child_gamma"]);
     expect(new Set(served.map((o) => o.sdkRunner?.workdir)).size).toBe(3);
+    await Promise.all(served.map((o) => o.refreshAvailableUpgrade?.(null)));
+    expect(upgradeProbes).toBe(1);
     expect(new Set(served.map((o) => o.projectAgent?.channel_workdir)).size).toBe(3);
     expect(channelRuntimeCalls).toEqual([
       { slug: "alpha", childName: projectAgentChildName("herness-dev", "alpha") },
@@ -1271,6 +1338,98 @@ describe("project profile daemon", () => {
     expect(String((posts[0]!.body as { note: string }).note)).toContain("worktree=branch");
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("front agent"))).toBe(true);
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("workers should spawn under team herness-dev"))).toBe(true);
+  });
+
+  test("a cleared profile upgrade is not revived by a stale channel after a failed probe (#485)", async () => {
+    const home = tempDir();
+    const oldHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    const profile = {
+      owner_account: "fan@example.com",
+      handle: "herness-dev",
+      name: "Herness Dev",
+      runner: "codex-sdk" as const,
+      repo_url: null,
+      workdir: null,
+      base_branch: "main",
+      worktree_strategy: "branch" as const,
+      rules: "Report readiness.",
+      invitable_by: "anyone" as const,
+      created_at: 1,
+      updated_at: 1,
+    };
+    const notice: CliUpgradeNotice = {
+      running_version: "0.2.107",
+      available_version: "0.2.108",
+      auto_upgrade: false,
+      action_required: "ask_user",
+      message: "notify owner",
+      command: "install",
+    };
+    const served: ServeOptions[] = [];
+    let polls = 0;
+    let sleeps = 0;
+    let probes = 0;
+    let refreshDone: Promise<void> = Promise.resolve();
+    try {
+      await expect(runProfileServe({
+        server: "http://agentparty.test",
+        humanToken: "acc-human",
+        ownerAccount: profile.owner_account,
+        handle: profile.handle,
+        mentionsOnly: true,
+        availableUpgrade: notice,
+        upgradeProbeIntervalMs: 0,
+        refreshAvailableUpgrade: async () => {
+          probes += 1;
+          if (probes === 1) return null;
+          throw new Error("version endpoint offline");
+        },
+        mintRuntime: async () => ({ token: "ap_profile_runtime", profile }),
+        listInvites: async () => {
+          polls += 1;
+          return (polls === 1 ? ["alpha"] : ["alpha", "beta"]).map((channel_slug, index) => ({
+            id: index + 1,
+            channel_slug,
+            owner_account: profile.owner_account,
+            profile_handle: profile.handle,
+            invited_by: "owner@example.com",
+            invited_at: index + 1,
+            profile,
+          }));
+        },
+        ensureChannelRuntime: async (_server, _token, channel) => ({
+          token: `ap_child_${channel}`,
+          name: `child-${channel}`,
+          role: "agent",
+          owner: profile.owner_account,
+          channel_scope: channel,
+          lineage: { parent_agent: profile.handle, root_agent: profile.handle, team_id: profile.handle, depth: 1, expires_at: null },
+          profile,
+        }),
+        runChannelServe: (opts) => {
+          served.push(opts);
+          if (opts.channel === "alpha" && served.filter((item) => item.channel === "alpha").length === 1) {
+            refreshDone = (async () => {
+              await opts.refreshAvailableUpgrade?.(notice);
+              await expect(opts.refreshAvailableUpgrade?.(notice)).rejects.toThrow("version endpoint offline");
+            })();
+          }
+          return new Promise<number>(() => {});
+        },
+        sleep: async () => {
+          sleeps += 1;
+          await refreshDone;
+          if (sleeps >= 2) throw new Error("stop profile test");
+        },
+      })).rejects.toThrow("stop profile test");
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = oldHome;
+    }
+
+    expect(probes).toBe(2);
+    expect(served.find((opts) => opts.channel === "beta")?.availableUpgrade).toBeNull();
   });
 
   test("project-agent child names are stable and stay within the token name limit", () => {
