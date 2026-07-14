@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(desktop)]
@@ -248,6 +248,54 @@ fn write_updater_diagnostic(path: &Path, diagnostic: &UpdaterDiagnostic) -> Resu
         .and_then(|directory| directory.sync_all())
         .map_err(|_| "updater diagnostic directory sync failed".to_string())?;
     Ok(())
+}
+
+fn finalize_pending_updater_relaunch(
+    path: &Path,
+    current_version: &str,
+    timestamp: u64,
+) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read(path).map_err(|_| "updater diagnostic is unavailable".to_string())?;
+    let pending: UpdaterDiagnostic =
+        serde_json::from_slice(&raw).map_err(|_| "updater diagnostic is invalid".to_string())?;
+    validate_updater_diagnostic(&pending)?;
+    if pending.status != UpdaterDiagnosticStatus::Pending
+        || pending.stage != UpdaterDiagnosticStage::Relaunch
+        || pending.target_version.as_deref() != Some(current_version)
+    {
+        return Ok(false);
+    }
+
+    write_updater_diagnostic(
+        path,
+        &UpdaterDiagnostic {
+            status: UpdaterDiagnosticStatus::Success,
+            source: None,
+            stage: UpdaterDiagnosticStage::Relaunch,
+            category: None,
+            timestamp,
+            app_version: Some(current_version.to_string()),
+            target_version: Some(current_version.to_string()),
+        },
+    )?;
+    Ok(true)
+}
+
+#[cfg(desktop)]
+fn finalize_pending_updater_relaunch_for_app(app: &tauri::App) -> Result<bool, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "desktop app data directory is unavailable".to_string())?
+        .join(UPDATER_DIAGNOSTIC_FILE);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is unavailable".to_string())?
+        .as_millis() as u64;
+    finalize_pending_updater_relaunch(&path, &app.package_info().version.to_string(), timestamp)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1136,6 +1184,9 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                if let Err(error) = finalize_pending_updater_relaunch_for_app(app) {
+                    eprintln!("AgentParty could not finalize its updater receipt: {error}");
+                }
                 install_tray(app)?;
                 if let Err(error) = refresh_enabled_autostart(app.autolaunch().inner()) {
                     eprintln!("AgentParty could not refresh its login item: {error}");
@@ -1192,11 +1243,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        credential_account_for_origin, migrate_legacy_credential, parse_stored_credential,
-        refresh_enabled_autostart, release_info_from_build, tray_action,
-        validate_updater_diagnostic, write_updater_diagnostic, AutostartBackend, CredentialBackend,
-        ExitGuard, MainWindowGate, TrayAction, UpdaterDiagnostic, UpdaterDiagnosticCategory,
-        UpdaterDiagnosticStage, UpdaterDiagnosticStatus, CREDENTIAL_ACCOUNT,
+        credential_account_for_origin, finalize_pending_updater_relaunch,
+        migrate_legacy_credential, parse_stored_credential, refresh_enabled_autostart,
+        release_info_from_build, tray_action, validate_updater_diagnostic,
+        write_updater_diagnostic, AutostartBackend, CredentialBackend, ExitGuard, MainWindowGate,
+        TrayAction, UpdaterDiagnostic, UpdaterDiagnosticCategory, UpdaterDiagnosticStage,
+        UpdaterDiagnosticStatus, CREDENTIAL_ACCOUNT,
     };
 
     #[test]
@@ -1361,6 +1413,39 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn native_startup_completes_a_matching_pending_updater_receipt() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("updater-diagnostic.json");
+        write_updater_diagnostic(&path, &pending_updater_receipt()).unwrap();
+
+        assert!(finalize_pending_updater_relaunch(&path, "0.2.91", 654_321).unwrap());
+
+        let stored: UpdaterDiagnostic =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored.status, UpdaterDiagnosticStatus::Success);
+        assert_eq!(stored.source, None);
+        assert_eq!(stored.stage, UpdaterDiagnosticStage::Relaunch);
+        assert_eq!(stored.category, None);
+        assert_eq!(stored.timestamp, 654_321);
+        assert_eq!(stored.app_version.as_deref(), Some("0.2.91"));
+        assert_eq!(stored.target_version.as_deref(), Some("0.2.91"));
+    }
+
+    #[test]
+    fn native_startup_does_not_complete_a_mismatched_pending_updater_receipt() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("updater-diagnostic.json");
+        let pending = pending_updater_receipt();
+        write_updater_diagnostic(&path, &pending).unwrap();
+
+        assert!(!finalize_pending_updater_relaunch(&path, "0.2.92", 654_321).unwrap());
+
+        let stored: UpdaterDiagnostic =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored, pending);
     }
 
     #[derive(Default)]
