@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PresenceEntry } from "@agentparty/shared";
-import { busyNote, classify, identityNote, sessionNote, taskNote, terminalIdentityText } from "../src/commands/who";
+import { busyNote, classify, identityNote, sessionNote, taskNote, terminalIdentityText, waitingOwnerNote } from "../src/commands/who";
 
 const NOW = 1_000_000_000;
 
@@ -271,6 +271,15 @@ describe("who busy + queue depth (#103)", () => {
     const r = classify(p({ name: "bot", state: "working", busy: true, queue_depth: 0 }), NOW);
     expect(r?.busy).toBe(true);
     expect(r).not.toHaveProperty("queue_depth");
+  });
+
+  test("waiting_owner 与 busy/current_task 分开展示", () => {
+    const row = classify(p({ name: "bot", state: "waiting", waiting_owner_count: 2 }), NOW);
+    expect(row?.waiting_owner_count).toBe(2);
+    expect(row?.busy).toBeUndefined();
+    expect(row?.current_task).toBeUndefined();
+    expect(waitingOwnerNote(row!)).toBe(" · 💬 2 waiting owner");
+    expect(waitingOwnerNote({ name: "bot", kind: "agent", tier: "online", age_ms: 0 })).toBe("");
   });
 
   test("busyNote 渲染：忙、忙+队列、空闲三态", () => {

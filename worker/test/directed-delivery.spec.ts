@@ -1,0 +1,675 @@
+import type { DirectedDelivery, DirectedDeliveryFrame, PublicDirectedDelivery } from "@agentparty/shared";
+import { env, runInDurableObject } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import type { ChannelDO } from "../src/do";
+import { WsClient, api, createChannel, seedToken, uniq } from "./helpers";
+
+async function sendMention(slug: string, token: string, target: string, body = `@${target} ping`) {
+  const res = await api(`/api/channels/${slug}/messages`, token, {
+    method: "POST",
+    body: JSON.stringify({ kind: "message", body, mentions: [target], reply_to: null }),
+  });
+  expect(res.status).toBe(200);
+  return (await res.json()) as { seq: number };
+}
+
+async function claim(ws: WsClient) {
+  ws.send({ type: "hello", since: 0, directed_delivery: "v1" });
+  ws.send({ type: "serve_lease", op: "claim" });
+  return ws.nextOfType("serve_lease");
+}
+
+async function deliveryRows(
+  slug: string,
+): Promise<Array<DirectedDelivery & { lease_connection_id: string | null; lease_adapter: string | null; target_owner: string | null }>> {
+  const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+  return runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+    state.storage.sql
+      .exec("SELECT * FROM directed_deliveries ORDER BY message_seq, target_name")
+      .toArray()
+      .map((row) => ({
+        id: String(row.id),
+        message_seq: Number(row.message_seq),
+        target_name: String(row.target_name),
+        target_owner: row.target_owner === null ? null : String(row.target_owner),
+        cause: String(row.cause) as DirectedDelivery["cause"],
+        state: String(row.state) as DirectedDelivery["state"],
+        attempt: Number(row.attempt),
+        lease_until: row.lease_until === null ? null : Number(row.lease_until),
+        lease_connection_id: row.lease_connection_id === null ? null : String(row.lease_connection_id),
+        lease_adapter: row.lease_adapter === null ? null : String(row.lease_adapter),
+        work_id: row.work_id === null ? null : String(row.work_id),
+        continuation_ref: row.continuation_ref === null ? null : String(row.continuation_ref),
+        reply_seq: row.reply_seq === null ? null : Number(row.reply_seq),
+        last_error: row.last_error === null ? null : String(row.last_error),
+        created_at: Number(row.created_at),
+        updated_at: Number(row.updated_at),
+      })),
+  );
+}
+
+async function expectUpgradeRequiredWithoutRaw(ws: WsClient, forbiddenSeq?: number) {
+  for (;;) {
+    const frame = await ws.next();
+    if (frame.type === "msg" && (forbiddenSeq === undefined || frame.seq === forbiddenSeq)) {
+      throw new Error(`legacy socket received forbidden raw seq=${frame.seq}`);
+    }
+    if (frame.type === "error") {
+      expect(frame.code).toBe("unavailable");
+      expect(frame.message).toContain("upgrade_required");
+      return frame;
+    }
+  }
+}
+
+describe("持久定向投递（issue #551）", () => {
+  it("legacy serve 已持租时保持 holder，后来的 v1 为 standby 且不重复领取", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    legacy.send({ type: "serve_lease", op: "claim" });
+    expect((await legacy.nextOfType("serve_lease")).held).toBe(true);
+
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(false);
+
+    const posted = await sendMention(slug, sender.token, target.name, "rolling upgrade");
+    expect((await legacy.nextOfType("msg")).seq).toBe(posted.seq);
+    await expect(legacy.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    await expect(capable.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    expect(await deliveryRows(slug)).toMatchObject([
+      {
+        message_seq: posted.seq,
+        target_name: target.name,
+        state: "running",
+        attempt: 1,
+        lease_adapter: "legacy_serve",
+      },
+    ]);
+
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "legacy finished", mentions: [], reply_to: posted.seq }),
+    });
+    expect(reply.status).toBe(200);
+    const replySeq = ((await reply.json()) as { seq: number }).seq;
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "replied", reply_seq: replySeq });
+
+    legacy.close();
+    expect((await capable.nextOfType("serve_lease")).held).toBe(true);
+    await expect(capable.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    capable.close();
+  });
+
+  it("legacy raw handoff 超时按 unknown outcome 失败，绝不自动重派", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    legacy.send({ type: "serve_lease", op: "claim" });
+    expect((await legacy.nextOfType("serve_lease")).held).toBe(true);
+
+    const posted = await sendMention(slug, sender.token, target.name, "side effect only");
+    expect((await legacy.nextOfType("msg")).seq).toBe(posted.seq);
+    const row = (await deliveryRows(slug))[0]!;
+    expect(row).toMatchObject({ state: "running", attempt: 1, lease_adapter: "legacy_serve" });
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec("UPDATE directed_deliveries SET lease_until = ? WHERE id = ?", Date.now() - 1, row.id);
+      await instance.onAlarm();
+    });
+    expect((await deliveryRows(slug))[0]).toMatchObject({
+      state: "failed",
+      attempt: 1,
+      last_error: "runner ownership lost after task start; outcome unknown, not auto-retried",
+    });
+    legacy.close();
+  });
+
+  it("old-only watch 收到 upgrade_required 且 raw 被抑制，durable row 保持 queued", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    legacy.raw('{"type":"ping"}');
+    await legacy.nextOfType("pong");
+
+    const posted = await sendMention(slug, sender.token, target.name, "upgrade old once");
+    await expectUpgradeRequiredWithoutRaw(legacy, posted.seq);
+    expect((await deliveryRows(slug))[0]).toMatchObject({
+      message_seq: posted.seq,
+      state: "queued",
+      attempt: 0,
+      lease_adapter: null,
+    });
+  });
+
+  it("hibernated legacy state 的 helloPending=undefined 也会 suppress；old+v1 只执行一次", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    legacy.raw('{"type":"ping"}');
+    await legacy.nextOfType("pong");
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO) => {
+      for (const connection of instance.getConnections<Record<string, unknown>>()) {
+        const state = connection.state;
+        if (state?.name !== target.name || state.clientVersion !== "0.2.117") continue;
+        const persisted = { ...state };
+        delete persisted.helloPending;
+        delete persisted.helloDeadlineAt;
+        connection.setState(persisted);
+      }
+    });
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(true);
+
+    const posted = await sendMention(slug, sender.token, target.name, "persisted state safety");
+    const delivery = await capable.nextOfType("delivery");
+    await expectUpgradeRequiredWithoutRaw(legacy, posted.seq);
+    expect(delivery.delivery).toMatchObject({ message_seq: posted.seq, state: "claimed", attempt: 1 });
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "claimed", lease_adapter: "serve" });
+    capable.close();
+  });
+
+  it("old once 的 earlier ordinary/@ backfill 不会缓存目标 raw；v1 完成后重连也不重跑", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const other = await seedToken("agent", uniq("other"));
+    const slug = await createChannel(sender.token);
+    const ordinary = await api(`/api/channels/${slug}/messages`, sender.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "earlier ordinary", mentions: [], reply_to: null }),
+    });
+    expect(ordinary.status).toBe(200);
+    const ordinarySeq = ((await ordinary.json()) as { seq: number }).seq;
+    const earlierAt = await sendMention(slug, sender.token, other.name, "earlier other @");
+    const posted = await sendMention(slug, sender.token, target.name, "only v1 executes");
+
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(true);
+    const delivery = await capable.nextOfType("delivery");
+    expect(delivery.delivery).toMatchObject({ message_seq: posted.seq, state: "claimed", attempt: 1 });
+
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    expect((await legacy.nextOfType("msg")).seq).toBe(ordinarySeq);
+    expect((await legacy.nextOfType("msg")).seq).toBe(earlierAt.seq);
+    await expectUpgradeRequiredWithoutRaw(legacy, posted.seq);
+    expect((await deliveryRows(slug)).find((row) => row.message_seq === posted.seq)).toMatchObject({
+      state: "claimed",
+      attempt: 1,
+      lease_adapter: "serve",
+    });
+
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "done once", mentions: [], reply_to: posted.seq }),
+    });
+    expect(reply.status).toBe(200);
+    expect((await deliveryRows(slug)).find((row) => row.message_seq === posted.seq)).toMatchObject({
+      state: "replied",
+      attempt: 1,
+    });
+    capable.close();
+
+    const legacyReconnect = await WsClient.open(slug, target.token);
+    await legacyReconnect.nextOfType("welcome");
+    legacyReconnect.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    expect((await legacyReconnect.nextOfType("msg")).seq).toBe(ordinarySeq);
+    expect((await legacyReconnect.nextOfType("msg")).seq).toBe(earlierAt.seq);
+    await expectUpgradeRequiredWithoutRaw(legacyReconnect, posted.seq);
+
+    const v1Reconnect = await WsClient.open(slug, target.token);
+    await v1Reconnect.nextOfType("welcome");
+    expect((await claim(v1Reconnect)).held).toBe(true);
+    await expect(v1Reconnect.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    v1Reconnect.close();
+  });
+
+  it("v1 已 holder 时 legacy serve 直接 upgrade_required，完成和 holder switch 都不重放 raw", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(true);
+
+    const legacy = await WsClient.open(slug, target.token);
+    await legacy.nextOfType("welcome");
+    legacy.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    legacy.send({ type: "serve_lease", op: "claim" });
+    await expectUpgradeRequiredWithoutRaw(legacy);
+
+    const posted = await sendMention(slug, sender.token, target.name, "reviewer standby must not cache");
+    const delivery = await capable.nextOfType("delivery");
+    expect(delivery.delivery).toMatchObject({ message_seq: posted.seq, state: "claimed", attempt: 1 });
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "v1 completed", mentions: [], reply_to: posted.seq }),
+    });
+    expect(reply.status).toBe(200);
+    capable.close();
+
+    const oldReconnect = await WsClient.open(slug, target.token);
+    await oldReconnect.nextOfType("welcome");
+    oldReconnect.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    await expectUpgradeRequiredWithoutRaw(oldReconnect, posted.seq);
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "replied", attempt: 1 });
+  });
+
+  it("no-hello 持续 ping 也不能延长 deadline；alarm 关闭后 v1 立即领取", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const pending = await WsClient.open(slug, target.token);
+    await pending.nextOfType("welcome");
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(true);
+
+    const posted = await sendMention(slug, sender.token, target.name, "between welcome and hello");
+    await expect(pending.nextOfType("msg", 100)).rejects.toThrow("timeout waiting for frame");
+    await expect(capable.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "queued", attempt: 0 });
+
+    for (let i = 0; i < 3; i++) {
+      pending.raw('{"type":"ping"}');
+      await pending.nextOfType("pong");
+    }
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO) => {
+      for (const connection of instance.getConnections<Record<string, unknown>>()) {
+        const state = connection.state;
+        if (state?.name === target.name && state.helloPending === true) {
+          connection.setState({ ...state, helloDeadlineAt: Date.now() - 1, lastSeen: Date.now() });
+        }
+      }
+      await instance.onAlarm();
+    });
+    const timeout = await pending.nextOfType("error");
+    expect(timeout).toMatchObject({ code: "bad_request" });
+    expect(timeout.message).toContain("hello_required");
+    const delivery = await capable.nextOfType("delivery");
+    expect(delivery.delivery).toMatchObject({ message_seq: posted.seq, state: "claimed", attempt: 1 });
+    capable.close();
+  });
+
+  it("Web agent 无 client_version 只做观察者，不被 upgrade_required 误伤", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const web = await WsClient.open(slug, target.token);
+    await web.nextOfType("welcome");
+    web.send({ type: "hello", since: 0 });
+    const capable = await WsClient.open(slug, target.token);
+    await capable.nextOfType("welcome");
+    expect((await claim(capable)).held).toBe(true);
+    const posted = await sendMention(slug, sender.token, target.name, "web observer");
+    expect((await web.nextOfType("msg")).seq).toBe(posted.seq);
+    const delivery = await capable.nextOfType("delivery");
+    expect(delivery.delivery).toMatchObject({ message_seq: posted.seq, state: "claimed" });
+    expect((await deliveryRows(slug))[0]).toMatchObject({ lease_adapter: "serve" });
+    web.close();
+    capable.close();
+  });
+
+  it("agent 离线时只排队；上线 claim 后收到引用原 message 的 delivery", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("offline"));
+    const slug = await createChannel(sender.token);
+
+    const posted = await sendMention(slug, sender.token, target.name, "offline work");
+    expect(await deliveryRows(slug)).toMatchObject([
+      { message_seq: posted.seq, target_name: target.name, cause: "mention", state: "queued", attempt: 0 },
+    ]);
+
+    const serve = await WsClient.open(slug, target.token);
+    const welcome = await serve.nextOfType("welcome");
+    expect(welcome.directed_delivery).toBe("v1");
+    expect((await claim(serve)).held).toBe(true);
+    const frame = await serve.nextOfType("delivery");
+    expect(frame).toMatchObject({
+      delivery: { message_seq: posted.seq, target_name: target.name, state: "claimed", attempt: 1 },
+      message: { seq: posted.seq, body: "offline work" },
+    });
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "claimed", attempt: 1 });
+    serve.close();
+  });
+
+  it("同一 target 串行 claim；read cursor 不吞 work；终态回执幂等并释放下一条", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const serve = await WsClient.open(slug, target.token);
+    await serve.nextOfType("welcome");
+    expect((await claim(serve)).held).toBe(true);
+
+    const first = await sendMention(slug, sender.token, target.name, "first");
+    const firstDelivery = await serve.nextOfType("delivery");
+    const second = await sendMention(slug, sender.token, target.name, "second");
+    // 普通消息游标即使前移到第二条之后，也不能改变独立 delivery 状态。
+    serve.send({ type: "seen", seq: second.seq + 100 });
+    expect(await deliveryRows(slug)).toMatchObject([
+      { message_seq: first.seq, state: "claimed" },
+      { message_seq: second.seq, state: "queued" },
+    ]);
+
+    serve.send({
+      type: "delivery_update",
+      delivery_id: firstDelivery.delivery.id,
+      state: "waiting_owner",
+      work_id: firstDelivery.delivery.work_id,
+      continuation_ref: firstDelivery.delivery.continuation_ref,
+    });
+    const secondDelivery = await serve.nextOfType("delivery");
+    expect(secondDelivery.delivery).toMatchObject({ message_seq: second.seq, state: "claimed", attempt: 1 });
+    // 同一个挂起态帧重发是 no-op，不会把当前第二条 work 释放或改写。
+    serve.send({ type: "delivery_update", delivery_id: firstDelivery.delivery.id, state: "waiting_owner" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await deliveryRows(slug)).toMatchObject([
+      {
+        message_seq: first.seq,
+        state: "waiting_owner",
+        work_id: firstDelivery.delivery.work_id,
+        continuation_ref: firstDelivery.delivery.continuation_ref,
+      },
+      { message_seq: second.seq, state: "claimed" },
+    ]);
+    serve.send({
+      type: "delivery_update",
+      delivery_id: secondDelivery.delivery.id,
+      state: "failed",
+      error: "runner exited",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await deliveryRows(slug))[1]).toMatchObject({ state: "failed", last_error: "runner exited" });
+    serve.close();
+  });
+
+  it("holder 断连后同一 delivery 回到 queued 并由 standby 接管", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+    const standby = await WsClient.open(slug, target.token);
+    await standby.nextOfType("welcome");
+    expect((await claim(standby)).held).toBe(false);
+
+    const posted = await sendMention(slug, sender.token, target.name, "survive disconnect");
+    const firstAttempt = await holder.nextOfType("delivery");
+    holder.close();
+    expect((await standby.nextOfType("serve_lease")).held).toBe(true);
+    const retry = await standby.nextOfType("delivery");
+    expect(retry.delivery).toMatchObject({
+      id: firstAttempt.delivery.id,
+      message_seq: posted.seq,
+      cause: "retry",
+      state: "claimed",
+      attempt: 2,
+    });
+    standby.close();
+  });
+
+  it("权威 running ACK 后 heartbeat 续租；租约到期显式 failed 而不重放未知副作用", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+    const standby = await WsClient.open(slug, target.token);
+    await standby.nextOfType("welcome");
+    expect((await claim(standby)).held).toBe(false);
+    const posted = await sendMention(slug, sender.token, target.name, "long task");
+    const firstAttempt = await holder.nextOfType("delivery");
+
+    holder.send({
+      type: "delivery_update",
+      delivery_id: firstAttempt.delivery.id,
+      state: "running",
+      work_id: firstAttempt.delivery.work_id,
+      continuation_ref: firstAttempt.delivery.continuation_ref,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "running", attempt: 1 });
+    holder.send({
+      type: "heartbeat",
+      current_task: posted.seq,
+      task_started_at: Date.now() - 1000,
+      heartbeat_at: Date.now(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "running", attempt: 1 });
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec("UPDATE directed_deliveries SET lease_until = ? WHERE id = ?", Date.now() - 1, firstAttempt.delivery.id);
+      await instance.onAlarm();
+    });
+    expect((await standby.nextOfType("serve_lease")).held).toBe(true);
+    expect((await deliveryRows(slug))[0]).toMatchObject({
+      id: firstAttempt.delivery.id,
+      state: "failed",
+      attempt: 1,
+      last_error: "runner ownership lost after task start; outcome unknown, not auto-retried",
+    });
+    standby.close();
+  });
+
+  it("reply_to 与 status.summary_seq 都自动把对应 delivery 标为 replied", async () => {
+    const sender = await seedToken("human", uniq("human"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const serve = await WsClient.open(slug, target.token);
+    await serve.nextOfType("welcome");
+    expect((await claim(serve)).held).toBe(true);
+
+    const first = await sendMention(slug, sender.token, target.name, "reply please");
+    await serve.nextOfType("delivery");
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "done", mentions: [], reply_to: first.seq }),
+    });
+    expect(reply.status).toBe(200);
+    const replySeq = ((await reply.json()) as { seq: number }).seq;
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "replied", reply_seq: replySeq });
+
+    const second = await sendMention(slug, sender.token, target.name, "summarize please");
+    await serve.nextOfType("delivery");
+    const status = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({
+        kind: "status",
+        state: "done",
+        note: "summarized",
+        mentions: [],
+        summary_seq: second.seq,
+      }),
+    });
+    expect(status.status).toBe(200);
+    const statusSeq = ((await status.json()) as { seq: number }).seq;
+    expect((await deliveryRows(slug))[1]).toMatchObject({ state: "replied", reply_seq: statusSeq });
+    serve.close();
+  });
+
+  it("human/squad 本身不建 delivery；squad 只给既有路由展开出的 agent 建唯一 delivery", async () => {
+    const owner = `${uniq("owner")}@example.com`;
+    const human = await seedToken("human", uniq("human"), { owner });
+    const memberA = await seedToken("agent", uniq("agent-a"), { owner });
+    const memberB = await seedToken("agent", uniq("agent-b"), { owner });
+    const mentionedHuman = await seedToken("human", uniq("mentioned-human"), { owner });
+    const slug = await createChannel(human.token);
+    const squadName = uniq("squad").toLowerCase();
+    const squad = await api(`/api/channels/${slug}/squads`, human.token, {
+      method: "POST",
+      body: JSON.stringify({ name: squadName, leader: memberA.name, members: [memberA.name, memberB.name] }),
+    });
+    expect(squad.status).toBe(201);
+
+    await sendMention(slug, human.token, mentionedHuman.name, "human notification");
+    await sendMention(slug, human.token, squadName, "squad work");
+    const rows = await deliveryRows(slug);
+    // 现有 squad 语义：有 leader 时只路由 leader；关键是 human 与 squad 虚拟名本身都不进 work 队列。
+    expect(rows.map((row) => row.target_name)).toEqual([memberA.name]);
+    expect(rows.every((row) => row.state === "queued" && row.attempt === 0)).toBe(true);
+  });
+
+  it("standby 或错误连接不能伪造终态", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+    const standby = await WsClient.open(slug, target.token);
+    await standby.nextOfType("welcome");
+    expect((await claim(standby)).held).toBe(false);
+    await sendMention(slug, sender.token, target.name, "strict ownership");
+    const work = (await holder.nextOfType("delivery")) as DirectedDeliveryFrame;
+
+    standby.send({ type: "delivery_update", delivery_id: work.delivery.id, state: "replied" });
+    expect((await standby.nextOfType("error")).code).toBe("bad_request");
+    expect((await deliveryRows(slug))[0]).toMatchObject({ state: "claimed" });
+    holder.close();
+    standby.close();
+  });
+
+  it("同名 agent 换 owner 后不能读取或领取旧 principal 的 work，且旧队列不阻塞新 work", async () => {
+    const oldOwner = `${uniq("old-owner")}@example.com`;
+    const newOwner = `${uniq("new-owner")}@example.com`;
+    const sender = await seedToken("human", uniq("sender"), { owner: oldOwner });
+    const target = await seedToken("agent", uniq("reused-name"), { owner: oldOwner });
+    const slug = await createChannel(sender.token);
+    await env.DB.prepare("UPDATE channels SET visibility = 'public' WHERE slug = ?").bind(slug).run();
+    const oldMessage = await sendMention(slug, sender.token, target.name, "old owner private work");
+    const oldRow = (await deliveryRows(slug))[0]!;
+    expect(oldRow).toMatchObject({
+      message_seq: oldMessage.seq,
+      target_owner: oldOwner,
+      state: "queued",
+    });
+
+    // persistToken reuses the same D1 row when a revoked name is registered again. Updating owner is
+    // enough to reproduce the security boundary while keeping this test independent of token API UX.
+    await env.DB.prepare("UPDATE tokens SET owner = ? WHERE name = ?")
+      .bind(newOwner, target.name)
+      .run();
+    const legacyReplacement = await WsClient.open(slug, target.token);
+    await legacyReplacement.nextOfType("welcome");
+    legacyReplacement.send({ type: "hello", since: 0, client_version: "0.2.117" });
+    await expectUpgradeRequiredWithoutRaw(legacyReplacement, oldMessage.seq);
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: oldRow.id, state: "queued" });
+
+    const replacement = await WsClient.open(slug, target.token);
+    await replacement.nextOfType("welcome");
+    const replacementLease = await claim(replacement).catch((error: unknown) => {
+      throw new Error(`replacement did not receive serve lease: ${String(error)}`);
+    });
+    expect(replacementLease.held).toBe(true);
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: oldRow.id, state: "failed" });
+
+    replacement.send({ type: "hello", since: 0, since_rev: 0 });
+    const publicFailure = await replacement.nextOfType("delivery_state").catch((error: unknown) => {
+      throw new Error(`missing public failure replay: ${String(error)}`);
+    });
+    expect(publicFailure.delivery).toMatchObject({ id: oldRow.id, state: "failed" });
+    expect(Object.keys(publicFailure.delivery).sort()).toEqual(
+      ["created_at", "id", "message_seq", "reply_seq", "state", "target_name", "updated_at"].sort(),
+    );
+    expect(publicFailure.delivery).not.toHaveProperty("work_id");
+    expect(publicFailure.delivery).not.toHaveProperty("continuation_ref");
+    expect(publicFailure.delivery).not.toHaveProperty("last_error");
+
+    const freshMessage = await sendMention(slug, sender.token, target.name, "new owner work");
+    const freshDelivery = await replacement.nextOfType("delivery").catch((error: unknown) => {
+      throw new Error(`fresh principal did not receive new work: ${String(error)}`);
+    });
+    expect(freshDelivery.delivery).toMatchObject({
+      message_seq: freshMessage.seq,
+      target_name: target.name,
+      state: "claimed",
+    });
+    expect(freshDelivery.delivery.id).not.toBe(oldRow.id);
+    expect(await deliveryRows(slug)).toMatchObject([
+      {
+        id: oldRow.id,
+        target_owner: oldOwner,
+        state: "failed",
+        last_error: "target principal changed before delivery; refusing same-name reassignment",
+      },
+      { target_owner: newOwner, state: "claimed" },
+    ]);
+    replacement.close();
+  });
+
+  it("hello 在 message backfill 后分页回放全部 retained delivery_state", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const posted = await sendMention(slug, sender.token, target.name, "reload truth");
+    const states: DirectedDelivery["state"][] = [
+      "queued",
+      "claimed",
+      "running",
+      "waiting_owner",
+      "failed",
+      "replied",
+    ];
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      const now = Date.now();
+      // Together with the real row this crosses HELLO_BACKFILL_PAGE_SIZE=1000, proving the
+      // compound (message_seq,id) cursor does not stop at the first full page.
+      for (let i = 0; i < 1000; i++) {
+        const deliveryState = states[i % states.length]!;
+        state.storage.sql.exec(
+          `INSERT INTO directed_deliveries (
+             id, message_seq, target_name, cause, state, attempt,
+             lease_connection_id, last_lease_connection_id, lease_until, work_id, continuation_ref,
+             reply_seq, last_error, created_at, updated_at
+           ) VALUES (?, ?, ?, 'mention', ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?)`,
+          `page-${String(i).padStart(4, "0")}`,
+          posted.seq,
+          `target-${String(i).padStart(4, "0")}`,
+          deliveryState,
+          `work-${i}`,
+          `thread-${i}`,
+          now + i,
+          now + i,
+        );
+      }
+    });
+
+    const viewer = await WsClient.open(slug, sender.token);
+    await viewer.nextOfType("welcome");
+    viewer.send({ type: "hello", since: 0, since_rev: 0 });
+    expect(await viewer.nextOfType("msg")).toMatchObject({ seq: posted.seq, body: "reload truth" });
+    const replayed: PublicDirectedDelivery[] = [];
+    for (let i = 0; i < 1001; i++) replayed.push((await viewer.nextOfType("delivery_state")).delivery);
+    expect(new Set(replayed.map((delivery) => delivery.id)).size).toBe(1001);
+    expect(new Set(replayed.map((delivery) => delivery.state))).toEqual(
+      new Set(["queued", "running", "failed", "replied"]),
+    );
+    expect(replayed.every((delivery) => !("work_id" in delivery) && !("last_error" in delivery))).toBe(true);
+    viewer.close();
+  });
+});

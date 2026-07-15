@@ -5,7 +5,7 @@
 //   • status 帧里客户端塞进来的 verified_at 一律不采信。
 import { wakeableState, type PresenceEntry } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, seedToken } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken } from "./helpers";
 
 async function fetchPresence(slug: string, token: string): Promise<PresenceEntry[]> {
   const res = await api(`/api/channels/${slug}/presence`, token);
@@ -31,7 +31,7 @@ describe("server-side wake verification (issue #191)", () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     await declareWatch(ws);
 
     const me = (await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name)!;
@@ -45,7 +45,7 @@ describe("server-side wake verification (issue #191)", () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     // 客户端谎称早已验证
     await declareWatch(ws, { verified_at: 5 });
 
@@ -61,12 +61,12 @@ describe("server-side wake verification (issue #191)", () => {
     const slug = await createChannel(target.token);
 
     const targetWs = await WsClient.open(slug, target.token);
-    await targetWs.nextOfType("welcome");
+    await completeCapabilityHello(targetWs);
     await declareWatch(targetWs);
 
     // 另一身份 @ target
     const proberWs = await WsClient.open(slug, prober.token);
-    await proberWs.nextOfType("welcome");
+    await completeCapabilityHello(proberWs);
     proberWs.send({ type: "send", kind: "message", body: `@${target.name} wake test`, mentions: [target.name], reply_to: null });
     const probeSent = await proberWs.nextOfType("sent");
     const probeSeq = probeSent.seq as number;
@@ -89,11 +89,11 @@ describe("server-side wake verification (issue #191)", () => {
     const slug = await createChannel(target.token);
 
     const targetWs = await WsClient.open(slug, target.token);
-    await targetWs.nextOfType("welcome");
+    await completeCapabilityHello(targetWs);
     await declareWatch(targetWs);
 
     const otherWs = await WsClient.open(slug, other.token);
-    await otherWs.nextOfType("welcome");
+    await completeCapabilityHello(otherWs);
     // 一条不 @ target 的消息
     otherWs.send({ type: "send", kind: "message", body: "hello all", mentions: [], reply_to: null });
     const sent = await otherWs.nextOfType("sent");

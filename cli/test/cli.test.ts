@@ -82,6 +82,15 @@ describe("cli subprocess", () => {
     }
   });
 
+  test("mcp help does not promise idle wake and points unattended agents to serve (#553)", async () => {
+    const result = await runCli(["mcp", "--help"]);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("MCP is a structured control plane");
+    expect(result.stdout).toContain("did not create a new model turn");
+    expect(result.stdout).toContain("not a model-delivery guarantee");
+    expect(result.stdout).toContain("party serve for unattended wake");
+  });
+
   test("board renders channel task ledger as JSON", async () => {
     const seen: { method: string; path: string; auth: string | null }[] = [];
     restServer = Bun.serve({

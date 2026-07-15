@@ -69,6 +69,46 @@ describe("message edit/retract/supersede", () => {
     });
   });
 
+  it("moderator edit response projects stored decision lineage to public fields", async () => {
+    const { slug, owner, writer } = await scopedFixture();
+    const sent = await postMessage(slug, writer.token, "question draft");
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const lineage = {
+      delivery_id: `delivery-${crypto.randomUUID()}`,
+      origin_seq: seq,
+      origin_channel: slug,
+      work_id: `work-${crypto.randomUUID()}`,
+      continuation_ref: `continuation-${crypto.randomUUID()}`,
+    };
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET decision_request_json = ?, decision_state = 'pending' WHERE seq = ?",
+        JSON.stringify({ kind: "approval", prompt: "ship?", options: ["approve", "reject"], ...lineage }),
+        seq,
+      );
+    });
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, owner.token, {
+      method: "POST",
+      body: JSON.stringify({ body: "moderator-corrected question" }),
+    });
+    expect(edited.status).toBe(200);
+    const response = (await edited.json()) as { message: { decision_request?: Record<string, unknown> } };
+    expect(response.message.decision_request).toMatchObject({
+      kind: "approval",
+      prompt: "ship?",
+      options: ["approve", "reject"],
+    });
+    for (const key of ["delivery_id", "origin_seq", "origin_channel", "work_id", "continuation_ref"]) {
+      expect(response.message.decision_request).not.toHaveProperty(key);
+    }
+    const serialized = JSON.stringify(response);
+    for (const secret of [lineage.delivery_id, lineage.work_id, lineage.continuation_ref]) {
+      expect(serialized).not.toContain(secret);
+    }
+  });
+
   it("scrubs a retracted message from responses, live/replay frames, history, search, and public audit", async () => {
     const { slug, owner, writer } = await scopedFixture();
     const secret = "needle 🔐 secret";
@@ -83,6 +123,9 @@ describe("message edit/retract/supersede", () => {
       "future-message-workflow-secret",
       "future-reviewer-secret",
       "future-review-secret",
+      "future-decision-prompt-secret",
+      "future-decision-reason-secret",
+      "future-decision-response-secret",
     ];
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
     await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
@@ -91,7 +134,9 @@ describe("message edit/retract/supersede", () => {
             SET status_scope_json = ?, status_blocked_reason = ?, status_context_json = ?, status_decision_json = ?,
                 status_workflow_json = ?, message_workflow_json = ?, completion_artifact_json = ?,
                 completion_review_state = 'rejected', completion_review_policy = 'sender',
-                completion_reviewed_by = ?, completion_reviewed_by_kind = 'agent', completion_review_reason = ?
+                completion_reviewed_by = ?, completion_reviewed_by_kind = 'agent', completion_review_reason = ?,
+                decision_request_json = ?, decision_state = 'resolved',
+                decision_resolution_json = ?, decision_response_json = ?
           WHERE seq = ?`,
         JSON.stringify([payloadSecrets[0]]),
         payloadSecrets[1],
@@ -102,11 +147,15 @@ describe("message edit/retract/supersede", () => {
         JSON.stringify({ kind: "final_synthesis", kickoff_seq: seq, replies_count: 1, timeout: false, related_issues: [], related_prs: [] }),
         payloadSecrets[6],
         payloadSecrets[7],
+        JSON.stringify({ kind: "approval", prompt: payloadSecrets[8], options: ["approve", "reject"] }),
+        JSON.stringify({ state: "resolved", reason: payloadSecrets[9] }),
+        JSON.stringify({ request_seq: seq, chosen_index: 0, chosen_option: "approve", reason: payloadSecrets[10] }),
         seq,
       );
     });
     const live = await WsClient.open(slug, writer.token);
     await live.nextOfType("welcome");
+    live.send({ type: "hello", since: seq });
 
     const retracted = await api(`/api/channels/${slug}/messages/${seq}/retract`, owner.token, { method: "POST" });
     expect(retracted.status).toBe(200);
@@ -182,6 +231,10 @@ describe("message edit/retract/supersede", () => {
         completion_reviewed_by_owner: null,
         completion_reviewed_at: null,
         completion_review_reason: null,
+        decision_request_json: null,
+        decision_state: null,
+        decision_resolution_json: null,
+        decision_response_json: null,
       });
       const audits = state.storage.sql
         .exec("SELECT old_body, new_body FROM message_audit WHERE target_seq = ?", seq)
@@ -232,6 +285,9 @@ describe("message edit/retract/supersede", () => {
       "stored-message-workflow-secret",
       "stored-reviewer-secret",
       "stored-review-secret",
+      "stored-decision-prompt-secret",
+      "stored-decision-reason-secret",
+      "stored-decision-response-secret",
     ];
     const orphanSecret = "pruned message secret";
     const orphanSeq = seq + 100;
@@ -246,6 +302,8 @@ describe("message edit/retract/supersede", () => {
                 status_workflow_json = ?, message_workflow_json = ?, completion_artifact_json = ?,
                 completion_review_state = 'rejected', completion_review_policy = 'sender',
                 completion_reviewed_by = ?, completion_reviewed_by_kind = 'agent', completion_review_reason = ?,
+                decision_request_json = ?, decision_state = 'resolved',
+                decision_resolution_json = ?, decision_response_json = ?,
                 edited_at = ?, edited_by = ?, retracted_at = ?, retracted_by = ?
           WHERE seq = ?`,
         current,
@@ -260,6 +318,9 @@ describe("message edit/retract/supersede", () => {
         JSON.stringify({ kind: "final_synthesis", kickoff_seq: seq, replies_count: 1, timeout: false, related_issues: [], related_prs: [] }),
         storedPayloadSecrets[6],
         storedPayloadSecrets[7],
+        JSON.stringify({ kind: "approval", prompt: storedPayloadSecrets[8], options: ["approve", "reject"] }),
+        JSON.stringify({ state: "resolved", reason: storedPayloadSecrets[9] }),
+        JSON.stringify({ request_seq: seq, chosen_index: 0, chosen_option: "approve", reason: storedPayloadSecrets[10] }),
         now - 1,
         writer.name,
         now,
@@ -288,6 +349,7 @@ describe("message edit/retract/supersede", () => {
         now,
       );
       state.storage.sql.exec("DELETE FROM meta WHERE key = 'retract_scrub_v1'");
+      state.storage.sql.exec("DELETE FROM meta WHERE key = 'retract_scrub_v2'");
 
       instance.onStart();
       instance.onStart();
@@ -312,6 +374,10 @@ describe("message edit/retract/supersede", () => {
         completion_reviewed_by_owner: null,
         completion_reviewed_at: null,
         completion_review_reason: null,
+        decision_request_json: null,
+        decision_state: null,
+        decision_resolution_json: null,
+        decision_response_json: null,
       });
       const audits = state.storage.sql.exec("SELECT * FROM message_audit WHERE target_seq = ? ORDER BY id", seq).toArray();
       expect(audits).toHaveLength(2);
@@ -326,6 +392,7 @@ describe("message edit/retract/supersede", () => {
         original_byte_length: new TextEncoder().encode(orphanSecret).byteLength,
       });
       expect(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'retract_scrub_v1'").one().value).toBe("1");
+      expect(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'retract_scrub_v2'").one().value).toBe("1");
     });
 
     const history = await api(`/api/channels/${slug}/messages?since=0`, writer.token);
@@ -368,6 +435,7 @@ describe("message edit/retract/supersede", () => {
     const seq = ((await sent.json()) as { seq: number }).seq;
     const ws = await WsClient.open(slug, writer.token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: seq });
 
     const edit = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
       method: "POST",

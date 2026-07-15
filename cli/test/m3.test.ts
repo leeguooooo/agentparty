@@ -2325,19 +2325,20 @@ describe("party webhook", () => {
       "whs",
     ]);
     expect(add.code).toBe(0);
-    expect(add.stdout).toContain("webhook hermes added to dev (filter: mentions)");
+    expect(add.stdout).toContain("webhook hermes added to dev (filter: mentions) [mode: notify]");
     const addReq = reqsOf(mock, "POST", "/api/channels/dev/webhooks")[0]!;
     expect(addReq.body).toEqual({
       name: "hermes",
       url: "https://hooks.example/x",
       secret: "whs",
       filter: "mentions",
+      mode: "notify",
     });
     expect(addReq.headers.authorization).toBe("Bearer ap_tok");
 
     const list = await runCli(["webhook", "list", "dev"]);
     expect(list.code).toBe(0);
-    expect(list.stdout.trim()).toBe("hermes\tmentions\thttps://hooks.example/x");
+    expect(list.stdout.trim()).toBe("hermes\tmentions\thttps://hooks.example/x\tnotify");
 
     const rm = await runCli(["webhook", "remove", "dev", "--name", "hermes"]);
     expect(rm.code).toBe(0);
@@ -2365,6 +2366,59 @@ describe("party webhook", () => {
     ]);
     expect(r.code).toBe(0);
     expect((reqsOf(mock, "POST", "/api/channels/dev/webhooks")[0]!.body as { filter: string }).filter).toBe(filter);
+  });
+
+  test("add --mode agent 发送模式且 list 显示模式", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+    const add = await runCli([
+      "webhook",
+      "add",
+      "dev",
+      "--name",
+      "hermes",
+      "--url",
+      "https://hooks.example/x",
+      "--secret",
+      "whs",
+      "--mode",
+      "agent",
+    ]);
+    expect(add.code).toBe(0);
+    expect(add.stdout).toContain("[mode: agent]");
+    expect((reqsOf(mock, "POST", "/api/channels/dev/webhooks")[0]!.body as { mode: string }).mode).toBe("agent");
+
+    const list = await runCli(["webhook", "list", "dev"]);
+    expect(list.stdout.trim()).toBe("hermes\tmentions\thttps://hooks.example/x\tagent");
+  });
+
+  test("非法 mode 退出 1", async () => {
+    mock = startRestMock();
+    writeCfg(mock.url);
+    const r = await runCli([
+      "webhook",
+      "add",
+      "dev",
+      "--name",
+      "h",
+      "--url",
+      "https://x",
+      "--secret",
+      "s",
+      "--mode",
+      "claim-everything",
+    ]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("usage: party webhook add");
+    expect(mock.requests.length).toBe(0);
+  });
+
+  test("help 区分 notify 与 agent 的 claim 语义", async () => {
+    const r = await runCli(["webhook", "--help"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("default --mode notify");
+    expect(r.stdout).toContain("never claims directed");
+    expect(r.stdout).toContain("--mode agent");
   });
 
   test("非法 filter 退出 1", async () => {

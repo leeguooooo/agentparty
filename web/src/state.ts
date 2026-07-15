@@ -1,6 +1,15 @@
 // 频道页状态：协议帧 → React 状态的唯一归约点。
 // 消息按 seq 去重排序；status 帧同时进时间线和 presence 快照；error 帧内联展示不做 toast。
-import type { ChannelMode, MsgFrame, PresenceEntry, ReadCursor, Sender, ServerFrame } from "@agentparty/shared";
+import type {
+  ChannelMode,
+  DirectedDelivery,
+  MsgFrame,
+  PresenceEntry,
+  PublicDirectedDelivery,
+  ReadCursor,
+  Sender,
+  ServerFrame,
+} from "@agentparty/shared";
 import type { FatalReason, SocketStatus } from "./lib/ws";
 import { MENTION_SENDER_RETENTION_MS, mergeSenderIdentity, type SenderIdentitySnapshot } from "./lib/senderIdentity";
 
@@ -10,6 +19,8 @@ export interface ChannelState {
   mode: ChannelMode;
   presence: Record<string, PresenceEntry>;
   messages: MsgFrame[]; // 按 seq 升序、已去重
+  /** 定向 @ 的可靠投递状态；按 delivery id 保存，updated_at 只前进不回退。 */
+  directedDeliveries: Record<string, PublicDirectedDelivery>;
   /** 每个近期发信人的最新身份快照；独立于 messages 窗口，trim 后仍可用于 @ 候选。 */
   mentionSenders: Record<string, SenderIdentitySnapshot>;
   readCursors: Record<string, ReadCursor>; // 每身份读到第几条（Phase 2）；人类 + 流式 agent 同表
@@ -29,6 +40,7 @@ export const initialChannelState: ChannelState = {
   mode: "normal",
   presence: {},
   messages: [],
+  directedDeliveries: {},
   mentionSenders: {},
   readCursors: {},
   status: "connecting",
@@ -114,6 +126,45 @@ function replaceMessage(messages: MsgFrame[], msg: MsgFrame): MsgFrame[] {
     return msg;
   });
   return replaced ? next : insertMessage(messages, msg);
+}
+
+function upsertDirectedDelivery(
+  deliveries: Record<string, PublicDirectedDelivery>,
+  delivery: PublicDirectedDelivery,
+): Record<string, PublicDirectedDelivery> | null {
+  const previous = deliveries[delivery.id];
+  if (previous !== undefined) {
+    if (previous.updated_at > delivery.updated_at) return null;
+    // Worker can broadcast queued → claimed within the same millisecond. Equal timestamps therefore preserve
+    // websocket arrival order; only an actually identical replay is a no-op.
+    if (
+      previous.updated_at === delivery.updated_at &&
+      (Object.keys(delivery) as (keyof PublicDirectedDelivery)[]).every((key) => previous[key] === delivery[key])
+    ) {
+      return null;
+    }
+  }
+  return { ...deliveries, [delivery.id]: delivery };
+}
+
+/**
+ * WebSocket frames are a trust boundary. A target holder receives a private `delivery` object so it can
+ * execute the work, while the browser may also receive public `delivery_state` snapshots. Project both
+ * variants onto the same explicit allow-list before they enter React state: TypeScript's structural typing
+ * does not remove extra runtime properties from a full delivery object.
+ */
+function toPublicDirectedDelivery(
+  delivery: DirectedDelivery | PublicDirectedDelivery,
+): PublicDirectedDelivery {
+  return {
+    id: delivery.id,
+    message_seq: delivery.message_seq,
+    target_name: delivery.target_name,
+    state: delivery.state,
+    reply_seq: delivery.reply_seq,
+    created_at: delivery.created_at,
+    updated_at: delivery.updated_at,
+  };
 }
 
 function rememberMentionSender(
@@ -202,6 +253,34 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
         messages: replaceMessage(state.messages, frame.message),
         mentionSenders: rememberMentionSender(state.mentionSenders, frame.message),
       };
+    case "delivery": {
+      const directedDeliveries = upsertDirectedDelivery(
+        state.directedDeliveries,
+        toPublicDirectedDelivery(frame.delivery),
+      );
+      // delivery.message is a transport convenience, not a message revision. Never let an older delivery
+      // snapshot overwrite a message_update that the page already applied.
+      const messages = state.messages.some((message) => message.seq === frame.message.seq)
+        ? state.messages
+        : insertMessage(state.messages, frame.message);
+      if (directedDeliveries === null && messages === state.messages) return state;
+      return {
+        ...state,
+        directedDeliveries: directedDeliveries ?? state.directedDeliveries,
+        messages,
+        mentionSenders:
+          messages === state.messages
+            ? state.mentionSenders
+            : rememberMentionSender(state.mentionSenders, frame.message),
+      };
+    }
+    case "delivery_state": {
+      const directedDeliveries = upsertDirectedDelivery(
+        state.directedDeliveries,
+        toPublicDirectedDelivery(frame.delivery),
+      );
+      return directedDeliveries === null ? state : { ...state, directedDeliveries };
+    }
     case "presence":
       return {
         ...state,
@@ -233,6 +312,7 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
             live: frame.live,
             busy: frame.busy,
             queue_depth: frame.queue_depth,
+            waiting_owner_count: frame.waiting_owner_count,
             serve_standbys: frame.serve_standbys,
             current_task: frame.current_task,
             task_started_at: frame.task_started_at,

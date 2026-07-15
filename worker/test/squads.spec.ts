@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
 import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 describe("channel squads", () => {
@@ -100,5 +101,86 @@ describe("channel squads", () => {
     })).status).toBe(403);
 
     expect((await api(`/api/channels/${slug}/squads`, otherHuman.token)).status).toBe(403);
+  });
+
+  it("canonicalizes squad members through D1 token names", async () => {
+    const owner = `owner-${uniq("squad-canonical")}@example.com`;
+    const human = await seedToken("human", uniq("human"), { owner });
+    const agent = await seedToken("agent", uniq("CaseAgent"), { owner });
+    const slug = await createChannel(human.token);
+    const name = uniq("canonical-squad").toLowerCase();
+    expect((await api(`/api/channels/${slug}/squads`, human.token, {
+      method: "POST",
+      body: JSON.stringify({ name, leader: null, members: [agent.name] }),
+    })).status).toBe(201);
+    await env.DB.prepare(
+      "UPDATE channel_squads SET leader_name = NULL, members_json = ? WHERE channel_slug = ? AND name = ?",
+    ).bind(JSON.stringify([agent.name.toUpperCase()]), slug, name).run();
+
+    const sent = await postMessage(slug, human.token, `@${name} canonical route`);
+    expect(sent.status).toBe(200);
+    const history = await api(`/api/channels/${slug}/messages?since=0`, human.token);
+    const messages = (await history.json()) as { messages: { body: string; mentions: string[] }[] };
+    expect(messages.messages.find((message) => message.body.includes("canonical route"))?.mentions).toEqual(
+      expect.arrayContaining([name, agent.name]),
+    );
+  });
+
+  it("fails closed when squad member authority lookup is unavailable", async () => {
+    const owner = `owner-${uniq("squad-unavailable")}@example.com`;
+    const human = await seedToken("human", uniq("human"), { owner });
+    const agent = await seedToken("agent", uniq("agent"), { owner });
+    const slug = await createChannel(human.token);
+    const name = uniq("unavailable-squad").toLowerCase();
+    expect((await api(`/api/channels/${slug}/squads`, human.token, {
+      method: "POST",
+      body: JSON.stringify({ name, leader: null, members: [agent.name] }),
+    })).status).toBe(201);
+
+    const originalPrepare = env.DB.prepare.bind(env.DB);
+    const prepare = vi.spyOn(env.DB, "prepare").mockImplementation((query: string) => {
+      if (query.includes("SELECT name FROM tokens") && query.includes("role = 'agent'")) {
+        throw new Error("agent directory unavailable");
+      }
+      return originalPrepare(query);
+    });
+    let response: Response;
+    try {
+      response = await postMessage(slug, human.token, `@${name} must not persist`);
+    } finally {
+      prepare.mockRestore();
+    }
+    expect(response!.status).toBe(503);
+    expect(await response!.json()).toMatchObject({ error: { code: "unavailable" } });
+    const history = await api(`/api/channels/${slug}/messages?since=0`, human.token);
+    expect(
+      ((await history.json()) as { messages: { body: string }[] }).messages.some((message) =>
+        message.body.includes("must not persist")
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a 50-member squad expansion because the squad alias would be target 51", async () => {
+    const owner = `owner-${uniq("squad-limit")}@example.com`;
+    const human = await seedToken("human", uniq("human"), { owner });
+    const slug = await createChannel(human.token);
+    const members: string[] = [];
+    for (let index = 0; index < 50; index++) {
+      members.push((await seedToken("agent", uniq(`limit-${index}`), { owner })).name);
+    }
+    const name = uniq("limit-squad").toLowerCase();
+    expect((await api(`/api/channels/${slug}/squads`, human.token, {
+      method: "POST",
+      body: JSON.stringify({ name, leader: null, members }),
+    })).status).toBe(201);
+    const response = await postMessage(slug, human.token, `@${name} overflow`);
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ error: { code: "too_large" } });
+    const history = await api(`/api/channels/${slug}/messages?since=0`, human.token);
+    expect(
+      ((await history.json()) as { messages: { body: string }[] }).messages.some((message) =>
+        message.body.includes("overflow")
+      ),
+    ).toBe(false);
   });
 });

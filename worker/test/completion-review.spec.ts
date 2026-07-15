@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, postMessage, seedToken, uniq } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 interface MsgLike {
   seq: number;
@@ -106,7 +106,7 @@ describe("review-gated completion (#34)", () => {
     expect(readonlyReview.status).toBe(403);
 
     const ws = await WsClient.open(slug, reviewer.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     const approved = await api(`/api/channels/${slug}/messages/${completionBody.seq}/review`, reviewer.token, {
       method: "POST",
       body: JSON.stringify({ action: "approve" }),
@@ -219,7 +219,7 @@ describe("review-gated completion (#34)", () => {
     expect(rejectedRev).toBeGreaterThan(0);
 
     const ws = await WsClient.open(slug, reviewer.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     const reworked = await postCompletion(slug, writer.token, kickoffSeq, {
       replaces: rejectedSeq,
       body: "final synthesis with evidence",

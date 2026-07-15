@@ -2,7 +2,7 @@
 // 游标只表达「已了结」＝ 送达成功，或有界重试耗尽后**响亮地**放弃。
 // 「欠账」（送达失败、从没进过模型）由 stuck 表达，落盘，且永不被当作积压跳过。
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_ARCHIVED, type MsgFrame } from "@agentparty/shared";
@@ -203,6 +203,93 @@ describe("serve wake delivery (#118 / #198)", () => {
     expect(await runServe(o)).toBe(EXIT_ARCHIVED);
     expect(cursors).toEqual([1]);
     expect(stucks).toEqual([]);
+  });
+
+  test("a hung runner is aborted once, clears task heartbeat, and returns serve to listening (#550)", async () => {
+    const heartbeats: Array<Record<string, unknown>> = [];
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "heartbeat") {
+        heartbeats.push(frame as unknown as Record<string, unknown>);
+        return;
+      }
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "wait forever", { mentions: ["me"] })), 10);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 120);
+    });
+    const posts: Array<Record<string, unknown>> = [];
+    let calls = 0;
+    const o = opts({
+      server: server.url,
+      runnerTimeoutMs: 20,
+      heartbeatIntervalMs: 5,
+      maxWakeAttempts: 3,
+      post: async (_s, _t, _c, body) => {
+        posts.push(body as Record<string, unknown>);
+        return { seq: posts.length };
+      },
+      runCommand: async (_frame, ctx) => {
+        calls += 1;
+        await new Promise<void>((_resolve, reject) => {
+          ctx.signal?.addEventListener("abort", () => reject(ctx.signal?.reason), { once: true });
+        });
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(calls).toBe(1); // timeout 后模型可能已运行，绝不能自动重跑
+    const blocked = posts.find((post) => post.state === "blocked");
+    expect(String(blocked?.note)).toContain("runner timed out after 20ms");
+    expect(heartbeats.some((beat) => beat.current_task === 1)).toBe(true);
+    expect(heartbeats.some((beat) => beat.current_task === null)).toBe(true);
+  });
+
+  test("the default custom runner terminates its process group at the hard timeout (#550)", async () => {
+    const s = closeAfterOneMention();
+    const posts: Array<Record<string, unknown>> = [];
+    const startedAt = Date.now();
+    const o = opts({
+      server: s.url,
+      cmd: "sleep 10",
+      runnerTimeoutMs: 20,
+      maxWakeAttempts: 1,
+      post: async (_server, _token, _channel, body) => {
+        posts.push(body as Record<string, unknown>);
+        return { seq: posts.length };
+      },
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(String(posts.find((post) => post.state === "blocked")?.note)).toContain("runner timed out after 20ms");
+  });
+
+  test("the SIGKILL escalation reaps a descendant that ignores SIGTERM before serve continues (#550)", async () => {
+    if (process.platform === "win32") return;
+    const s = closeAfterOneMention();
+    const pidFile = join(tempDir(), "stubborn.pid");
+    const o = opts({
+      server: s.url,
+      cmd: `sh -c 'trap "" TERM; echo $$ > "${pidFile}"; while :; do sleep 5; done'`,
+      // Leave enough scheduling headroom for the nested shell to publish its PID when the full
+      // serve suite runs in parallel; 100ms made the assertion race process startup on loaded CI.
+      runnerTimeoutMs: 500,
+      maxWakeAttempts: 1,
+      post: async () => ({ seq: 1 }),
+    });
+
+    expect(await runServe(o)).toBe(EXIT_ARCHIVED);
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    let alive = true;
+    for (let i = 0; i < 20 && alive; i++) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
   });
 });
 

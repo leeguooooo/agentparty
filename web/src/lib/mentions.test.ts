@@ -370,6 +370,14 @@ describe("activeMentionQuery", () => {
   });
   test("ignores @ inside a word (email etc.)", () => {
     expect(activeMentionQuery("mail me@x", 9)).toBeNull();
+    expect(activeMentionQuery("https://github.com/@alice", 25)).toBeNull();
+    for (const source of ["请看github.com/@alice", "测试@example.com", "use @agentparty/shared", "use `@alice`"]) {
+      expect(activeMentionQuery(source, source.length), source).toBeNull();
+    }
+  });
+  test("中文正文和全角标点无需空格也触发补全", () => {
+    expect(activeMentionQuery("请@小明", 4)).toEqual({ start: 1, query: "小明" });
+    expect(activeMentionQuery("请，@小明", 5)).toEqual({ start: 2, query: "小明" });
   });
   test("null when caret not in a mention", () => {
     expect(activeMentionQuery("hello world", 11)).toBeNull();
@@ -407,19 +415,53 @@ describe("parseDraftMentions", () => {
     expect(parseDraftMentions("@bob @alice @Bob")).toEqual(["bob", "alice"]);
   });
   test("过滤 system", () => {
-    expect(parseDraftMentions("@system hi @bob")).toEqual(["bob"]);
+    // 保留并上报：服务端会明确拒绝不可路由的保留名，不能静默降级成普通正文。
+    expect(parseDraftMentions("@system hi @bob")).toEqual(["system", "bob"]);
   });
   test("没有 mention 时返回空数组", () => {
     expect(parseDraftMentions("just a plain message")).toEqual([]);
   });
   // #165：中文昵称
-  test("解析 @中文昵称，且 email 里的 @ 仍不算", () => {
+  test("解析中文无空格正文/全角标点，且 email / URL 里的 @ 仍不算", () => {
     expect(parseDraftMentions("@小助手 帮我看下")).toEqual(["小助手"]);
     expect(parseDraftMentions("hi @程序员小明 and @bob")).toEqual(["程序员小明", "bob"]);
+    expect(parseDraftMentions("请@小明看一下", ["小明"])).toEqual(["小明"]);
+    expect(parseDraftMentions("请，@小明：看一下", ["小明"])).toEqual(["小明"]);
     expect(parseDraftMentions("mail me@bar.com thanks")).toEqual([]);
     expect(parseDraftMentions("请@agent-a看一下")).toEqual(["agent-a"]);
     expect(parseDraftMentions("（@agent-a），@agent-b")).toEqual(["agent-a", "agent-b"]);
     expect(parseDraftMentions("路人甲@小明")).toEqual(["小明"]);
+    expect(parseDraftMentions("see https://github.com/@小明/repo", ["小明"])).toEqual([]);
+    expect(parseDraftMentions("请看github.com/@小明/repo", ["小明"])).toEqual([]);
+    expect(parseDraftMentions("请看：github.com/@小明/repo", ["小明"])).toEqual([]);
+    expect(parseDraftMentions("测试@example.com", ["example.com"])).toEqual([]);
+    expect(parseDraftMentions("路人甲@小明", ["小明"])).toEqual(["小明"]); // 中文正文不要求空格
+  });
+
+  test("忽略 npm scope 与 Markdown code，只提取真正的正文 mention", () => {
+    expect(parseDraftMentions("install @agentparty/shared then ping @codex", ["agentparty", "codex"])).toEqual(["codex"]);
+    expect(parseDraftMentions("use `@codex` then @alice", ["codex", "alice"])).toEqual(["alice"]);
+    expect(parseDraftMentions("```ts\nimport x from '@agentparty/shared'\n@codex\n```\n@alice", ["agentparty", "codex", "alice"])).toEqual(["alice"]);
+    expect(parseDraftMentions("~~~\n@codex\n~~~\n@alice", ["codex", "alice"])).toEqual(["alice"]);
+  });
+
+  test("句末句号不属于 mention token", () => {
+    expect(parseDraftMentions("please ask @codex.", ["codex"])).toEqual(["codex"]);
+    expect(parseDraftMentions("@first.last.", ["first.last"])).toEqual(["first.last"]);
+    expect(activeMentionQuery("@codex.", 7)).toBeNull();
+  });
+
+  test("known target 大小写唯一匹配；未知/歧义原样交给服务端报错", () => {
+    expect(parseDraftMentions("@ALICE", ["alice"])).toEqual(["alice"]);
+    expect(parseDraftMentions("@ghost", ["alice"])).toEqual(["ghost"]);
+    expect(parseDraftMentions("@小明看一下", ["小", "小明"])).toEqual(["小明看一下"]);
+  });
+
+  test("仅 ASCII alias 忽略大小写；Unicode alias 按 NFC 精确匹配", () => {
+    expect(parseDraftMentions("@ALICE @alice", ["alice"])).toEqual(["alice"]);
+    expect(parseDraftMentions("@Ägent", ["Ägent"])).toEqual(["Ägent"]);
+    expect(parseDraftMentions("@ÄGENT", ["Ägent"])).toEqual(["ÄGENT"]);
+    expect(parseDraftMentions("@Ägent @ägent", ["Ägent", "ägent"])).toEqual(["Ägent", "ägent"]);
   });
 });
 

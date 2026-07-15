@@ -1,5 +1,13 @@
 // party watch — 补拉错过消息，阻塞等新消息
-import { EXIT_ARCHIVED, EXIT_AUTH, EXIT_LOOP_GUARD, EXIT_STREAM_ENDED, EXIT_TIMEOUT, type MsgFrame } from "@agentparty/shared";
+import {
+  EXIT_ARCHIVED,
+  EXIT_AUTH,
+  EXIT_LOOP_GUARD,
+  EXIT_STREAM_ENDED,
+  EXIT_TIMEOUT,
+  type DirectedDelivery,
+  type MsgFrame,
+} from "@agentparty/shared";
 import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../instance-lock";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
@@ -7,6 +15,7 @@ import {
   loadCursor,
   loadRevCursor,
   loadStuck,
+  markWatchDirectedStuckAccepted,
   resolveChannel,
   saveCursor,
   saveRevCursor,
@@ -31,6 +40,8 @@ import {
 const WATCH_FLAGS = ["channel", "timeout", "follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest", "since"];
 const WATCH_SKIP_PAGE_SIZE = 1000;
 const WATCH_SKIP_SCAN_LIMIT = 10_000;
+const WATCH_DELIVERY_ACK_TIMEOUT_MS = 5_000;
+const WATCH_DELIVERY_ACK_POLL_MS = 10;
 const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow|--once] [--latest|--since seq] [--json] [--allow-multiple]
 
 Watch a channel for new messages. By default this waits up to 240 seconds.
@@ -121,6 +132,8 @@ export interface WatchOptions {
   skippedMentionSeqs?: number[]; // 显式 --latest/--since 快进时跳过的 @，随 once wake 交给 agent
   /** --once 打印前先持久化「尚未被模型确认」的唤醒；后续自己发消息/状态才清账（#508）。 */
   onStuck?: (stuck: StuckWake) => void;
+  /** running ACK 后按 delivery id 原子把本地 debt 标成 accepted；false/throw 都按 unknown outcome 阻断。 */
+  onDirectedAccepted?: (deliveryId: string) => boolean;
   onCursor?: (cursor: number) => void;
   onRevCursor?: (revCursor: number) => void;
   out?: (line: string) => void;
@@ -130,8 +143,50 @@ export interface WatchOptions {
   lockDir?: string;
   /** 关掉单实例保护（逃生舱）。 */
   allowMultiple?: boolean;
+  /** durable delivery running 回执等待上限；生产默认 5s，测试可注入更短时间。 */
+  deliveryAckTimeoutMs?: number;
   // watch 挂上（连上 WS、开始监听）后声明自己「有 watch 唤醒层」的钩子；run() 注入真实实现，测试可省略/替换。
   advertise?: () => Promise<void>;
+}
+
+async function confirmWatchDeliveryRunning(
+  conn: Pick<ReturnType<typeof connect>, "send" | "pendingFrames">,
+  delivery: DirectedDelivery,
+  expectedTarget: string,
+  timeoutMs: number,
+  interrupted: () => boolean,
+): Promise<void> {
+  const isExpectedAck = (frame: ReturnType<typeof conn.pendingFrames>[number]) =>
+    frame.type === "delivery_state" &&
+    frame.delivery.id === delivery.id &&
+    frame.delivery.target_name === expectedTarget &&
+    frame.delivery.state === "running";
+  // A broadcast can already be queued before our update. It is not proof that this send was
+  // accepted, so require one additional exact acknowledgement after send.
+  const existingAckCount = conn.pendingFrames().filter(isExpectedAck).length;
+  const existingErrors = new Set(conn.pendingFrames().filter((frame) => frame.type === "error"));
+  const update = {
+    type: "delivery_update" as const,
+    delivery_id: delivery.id,
+    state: "running" as const,
+    ...(delivery.work_id === null ? {} : { work_id: delivery.work_id }),
+    ...(delivery.continuation_ref === null ? {} : { continuation_ref: delivery.continuation_ref }),
+  };
+  if (!conn.send(update)) throw new Error("websocket is not open");
+
+  const finiteTimeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : WATCH_DELIVERY_ACK_TIMEOUT_MS;
+  const deadline = Date.now() + finiteTimeout;
+  for (;;) {
+    if (interrupted()) throw new Error("connection interrupted before running acknowledgement");
+    const pending = conn.pendingFrames();
+    if (pending.filter(isExpectedAck).length > existingAckCount) return;
+    const rejection = pending.find((frame) => frame.type === "error" && !existingErrors.has(frame));
+    if (rejection?.type === "error") throw new Error(`${rejection.code}: ${rejection.message}`);
+    if (Date.now() >= deadline) {
+      throw new Error(`delivery running acknowledgement timed out after ${finiteTimeout}ms`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, WATCH_DELIVERY_ACK_POLL_MS));
+  }
 }
 
 // watch 一挂上（连上 WS、开始监听）就把 presence 标成带 watch 唤醒层：residency=supervised + wake.kind=watch。
@@ -217,6 +272,14 @@ async function resolveExplicitWatchCursor(
 
 export async function runWatch(o: WatchOptions): Promise<number> {
   const out = o.out ?? ((line: string) => console.log(line));
+  // Only the single-shot watcher whose caller can persist and acknowledge directed debt is an
+  // actionable v1 adapter. Declare this in the first hello so the Worker never has to guess in the
+  // welcome -> register window; observers deliberately omit the capability.
+  const acceptsDirectedDelivery =
+    o.once === true &&
+    o.mentionsOnly &&
+    o.onStuck !== undefined &&
+    o.onDirectedAccepted !== undefined;
   // 先抢锁，再连服务端：第二个 watcher 连 WS 都不该建，否则它已经开始消费 @ 了（#195）
   const lockDir = o.lockDir ?? defaultInstanceLockDir();
   const lockTarget = o.lockDir === undefined ? instanceLockTarget(o.server, o.token, o.channel) : o.channel;
@@ -229,13 +292,20 @@ export async function runWatch(o: WatchOptions): Promise<number> {
     );
     return EXIT_ALREADY_WATCHING;
   }
+  // Capture transport interruptions by generation. A delivery received after an earlier reconnect
+  // may proceed, but a disconnect between update and ACK invalidates that exact claim attempt.
+  let connectionGeneration = 0;
   let conn: ReturnType<typeof connect>;
   try {
     conn = connect(o.server, o.token, o.channel, o.since, {
       onCursor: o.onCursor,
+      ...(acceptsDirectedDelivery ? { directedDelivery: "v1" as const } : {}),
       sinceRev: o.sinceRev,
       onRevCursor: o.onRevCursor,
       backoffBaseMs: o.backoffBaseMs,
+      onStatus: (status) => {
+        if (status === "reconnecting" || status === "closed") connectionGeneration += 1;
+      },
     });
   } catch (error) {
     lock?.release?.();
@@ -248,6 +318,10 @@ export async function runWatch(o: WatchOptions): Promise<number> {
   let timedOut = false;
   let onceDone = false;
   let code = 0;
+  // Durable work 只交给专门等待 @ 的 single-shot watcher。普通 --once 可能先被无关消息
+  // 满足并退出；若它同时 claim 了 delivery，就会把真正的 work 留到租约超时。
+  let directedDeliveryMode = false;
+  const displayedMessageSeqs = new Set<number>();
   // 人为暂停接待（#180）：镜像 serve 的 self-paused 跟踪。被 @ 时不把 --once 退出当唤醒信号，
   // 但消息照常打印进历史、游标照推进。从 welcome 的 presence 快照认出初始状态（重连也不误唤醒），
   // 之后靠 presence 帧增量翻转。恢复后不重放暂停期的 @（在历史里，agent 自行补看），与 serve 一致。
@@ -280,6 +354,14 @@ export async function runWatch(o: WatchOptions): Promise<number> {
       if (frame.type === "welcome") {
         self = frame.self;
         lastSeq = frame.last_seq;
+        // 只有专门等 @ 的 --mentions-only --once 才能把退出当成一次可行动唤醒。
+        // --follow / 普通 watch / 会被无关消息提前满足的泛用 --once 都不能 claim work。
+        directedDeliveryMode = acceptsDirectedDelivery && frame.directed_delivery === "v1";
+        // registration 是逐连接状态；每次重连收到 welcome 都重新声明。它不等价于普通消息游标，
+        // 也不允许 conn.ack/seen 变成 delivery 完成回执。
+        if (directedDeliveryMode) {
+          conn.send({ type: "delivery_adapter", adapter: "watch", op: "register" });
+        }
         // 连上/重连时若自己已被暂停接待（#180），从 welcome 的 presence 快照里认出来——
         // 重连也不会把暂停期的 @ 误当成 --once 唤醒。提示走 stderr，不污染被消费的 stdout 流。
         const mine = frame.presence?.find((p) => p.name === self);
@@ -314,6 +396,138 @@ export async function runWatch(o: WatchOptions): Promise<number> {
           });
         }
         continue;
+      }
+      // adapter ACK 和公开状态广播都不是 actionable work。尤其 delivery_state 只供展示，
+      // 绝不能让 --once 退出或让 --follow 冒充已经承接了一条 delivery。
+      if (frame.type === "delivery_adapter" || frame.type === "delivery_state") continue;
+      if (frame.type === "delivery") {
+        // Worker 只应把当前 watch 租约的 claimed work 发给 holder；客户端仍做 fail-closed
+        // 校验，避免 queued/running/replied/failed 状态或观察型 watch 被误当成一次唤醒。
+        if (
+          !directedDeliveryMode ||
+          !acceptsDirectedDelivery ||
+          frame.delivery.target_name !== self ||
+          frame.delivery.state !== "claimed"
+        ) {
+          continue;
+        }
+
+        const msg = frame.message;
+        lastSeq = Math.max(lastSeq, msg.seq);
+        if (selfPaused) {
+          // Worker 正常不会把 paused identity 的 work 分配给 watch；若竞态中收到，保持未消费、
+          // 不落本地 debt，让恢复后的同一 delivery 新租约仍可真正唤醒。
+          console.error(
+            `watch: ⏸ 暂停接待中，delivery=${frame.delivery.id} 不作为唤醒信号（未确认，等待重放）。`,
+          );
+          continue;
+        }
+
+        // 不缓存 delivery id：同一个 durable work 可以在旧租约过期后以新 attempt/lease 重投。
+        // --once 在输出第一条合法 claim 后立即 break，已足以让同一进程只消费一次，同时不会
+        // 把未来新租约永久吞掉。
+        // --once 的本地 debt 必须在输出前落盘；seq 只是找到原消息，delivery/work/continuation
+        // 才是这次 actionable work 的身份。普通 conn.ack/seen 在此路径完全不发送。
+        const directedDebt: StuckWake = {
+          seq: msg.seq,
+          delivery_id: frame.delivery.id,
+          ...(frame.delivery.work_id !== null ? { work_id: frame.delivery.work_id } : {}),
+          ...(frame.delivery.continuation_ref !== null
+            ? { continuation_ref: frame.delivery.continuation_ref }
+            : {}),
+          delivery_acceptance: "unconfirmed",
+          attempts: 0,
+          last_error: "watch delivery awaiting running acknowledgement",
+          source: "watch",
+          channel_last_seq: lastSeq,
+          skipped_mention_seqs: o.skippedMentionSeqs ?? [],
+        };
+        try {
+          o.onStuck!(directedDebt);
+        } catch (error) {
+          console.error(
+            `watch: delivery=${frame.delivery.id} 本地 debt 持久化失败，未发送 running: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          code = EXIT_STREAM_ENDED;
+          break;
+        }
+
+        const claimConnectionGeneration = connectionGeneration;
+        try {
+          await confirmWatchDeliveryRunning(
+            conn,
+            frame.delivery,
+            self,
+            o.deliveryAckTimeoutMs ?? WATCH_DELIVERY_ACK_TIMEOUT_MS,
+            () => timedOut || connectionGeneration !== claimConnectionGeneration,
+          );
+        } catch (error) {
+          console.error(
+            `watch: delivery=${frame.delivery.id} running 确认失败，未输出唤醒: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          code = EXIT_STREAM_ENDED;
+          break;
+        }
+
+        try {
+          if (!o.onDirectedAccepted!(frame.delivery.id)) {
+            throw new Error("directed debt changed before accepted state could be persisted");
+          }
+        } catch (error) {
+          console.error(
+            `watch: delivery=${frame.delivery.id} running 已确认，但本地 accepted 状态落盘失败；unknown outcome，未输出唤醒: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          code = EXIT_STREAM_ENDED;
+          break;
+        }
+
+        const lag = Math.max(0, lastSeq - msg.seq);
+        if (o.json) {
+          // 保留完整 delivery frame；不能退化成只含原 msg 的 JSON，否则 work/continuation 丢失。
+          out(
+            JSON.stringify(
+              jsonFrame({
+                ...(frame as unknown as Record<string, unknown>),
+                channel_last_seq: lastSeq,
+                lag,
+                skipped_mention_seqs: o.skippedMentionSeqs ?? [],
+              }),
+            ),
+          );
+        } else {
+          if (!displayedMessageSeqs.has(msg.seq)) {
+            out(formatMsg(msg));
+            displayedMessageSeqs.add(msg.seq);
+          }
+          const work = frame.delivery.work_id === null ? "" : ` work_id=${frame.delivery.work_id}`;
+          const continuation =
+            frame.delivery.continuation_ref === null ? "" : ` continuation_ref=${frame.delivery.continuation_ref}`;
+          out(`watch: directed delivery=${frame.delivery.id}${work}${continuation}`);
+        }
+        printed++;
+
+        if (o.statusline === true) {
+          writeStatuslineCache({
+            ...localStatuslineBase(o.channel),
+            ...heartbeatPatch("watch", Date.now(), { mentionsOnly: o.mentionsOnly }),
+            unread: unreadFromCursor(Math.max(lastSeq, msg.seq), o.channel),
+            last_message: lastMessageFromFrame(msg),
+          });
+        }
+
+        onceDone = true;
+        if (!o.json && lag > 0) {
+          out(
+            `watch: 唤醒于 delivery=${frame.delivery.id} seq=${msg.seq}，落后 ${lag} 条，head=${lastSeq}。` +
+              ` channel_last_seq=${lastSeq} lag=${lag} skipped_mention_seqs=${JSON.stringify(o.skippedMentionSeqs ?? [])}.` +
+              ` 这不是最新消息——补上下文：party history ${o.channel} --since ${msg.seq}`,
+          );
+        } else if (!o.json) {
+          out(
+            `watch: delivery=${frame.delivery.id} channel_last_seq=${lastSeq} lag=0 skipped_mention_seqs=${JSON.stringify(o.skippedMentionSeqs ?? [])}`,
+          );
+        }
+        break;
       }
       if (frame.type === "error") {
         if (o.json) {
@@ -350,7 +564,10 @@ export async function runWatch(o: WatchOptions): Promise<number> {
       const fresh = msg.seq > conn.cursor;
       // 暂停接待（#180）：qualifies 的新消息本该把 --once 退出当唤醒信号，但人按了暂停 →
       // 不退出、不发 once-wake 帧。消息仍照常打印进历史、游标照推进（下方 ack），与 serve 一致。
-      const wakes = fresh && !selfPaused;
+      // v1 下定向 @ 的 raw msg 仍是频道历史：可以展示并推进普通 transport cursor，但只有
+      // 独立 delivery frame 才是 actionable wake。这样 raw broadcast + delivery 不会跑两次。
+      const directedRaw = directedDeliveryMode && msg.mentions.includes(self);
+      const wakes = fresh && !selfPaused && !directedRaw;
       // Claude Code 会在 turn boundary 回收 run_in_background watcher（#508）。旧逻辑先打印、
       // 再 ack 游标：后台结果若被 harness 吞掉，下一次 watch 已从更高游标开始，这条 @ 永久消失。
       // 因此先落一笔 durable debt，再打印、再推进 transport cursor。agent 后续发出任何消息/状态，
@@ -381,6 +598,7 @@ export async function runWatch(o: WatchOptions): Promise<number> {
           out(o.json ? JSON.stringify(jsonFrame(frame as unknown as Record<string, unknown>)) : formatMsg(msg));
         }
         printed++;
+        displayedMessageSeqs.add(msg.seq);
       }
       // 打印（或有意跳过）之后才推进游标，退出时入队未消费的消息留给下次补拉
       if (msg.seq > 0) conn.ack(msg.seq);
@@ -525,58 +743,76 @@ export async function run(argv: string[]): Promise<number> {
       );
       return 1;
     }
-    try {
-      const [pendingPage, tail] = await Promise.all([
-        fetchMessages(cfg.server, cfg.token, channel, Math.max(0, stuck.seq - 1), 1),
-        fetchRecentMessages(cfg.server, cfg.token, channel, 1),
-      ]);
-      const pending = pendingPage.find((msg) => msg.seq === stuck.seq);
-      if (pending === undefined) {
-        console.error(
-          `error: pending watch wake seq=${stuck.seq} is no longer retained; debt was preserved. ` +
-            `Inspect channel history before clearing or advancing this workspace state.`,
-        );
-        return 1;
+    // Directed debt 在 running ACK 前只是 unknown outcome。按旧 seq-only 路径直接重放会与
+    // Worker 租约超时后的重新分配并发执行同一 work；保持 debt，重新注册等该 delivery 的新 claim。
+    if (stuck.delivery_id !== undefined && stuck.delivery_acceptance !== "accepted") {
+      console.error(
+        `watch: directed delivery=${stuck.delivery_id} 尚未确认 running；不会本地回放 seq=${stuck.seq}，` +
+          "正在重新挂接，等待服务端重新授予合法 claim。",
+      );
+    } else {
+      try {
+        const [pendingPage, tail] = await Promise.all([
+          fetchMessages(cfg.server, cfg.token, channel, Math.max(0, stuck.seq - 1), 1),
+          fetchRecentMessages(cfg.server, cfg.token, channel, 1),
+        ]);
+        const pending = pendingPage.find((msg) => msg.seq === stuck.seq);
+        if (pending === undefined) {
+          console.error(
+            `error: pending watch wake seq=${stuck.seq} is no longer retained; debt was preserved. ` +
+              `Inspect channel history before clearing or advancing this workspace state.`,
+          );
+          return 1;
+        }
+        const replay = { ...stuck, attempts: stuck.attempts + 1 };
+        if (!saveWatchStuck(channel, replay)) {
+          console.error(
+            `error: #${channel} acquired a pending serve wake while replaying seq=${stuck.seq}; ` +
+              "watch preserved that delivery debt and did not acknowledge this wake.",
+          );
+          return 1;
+        }
+        const channelLastSeq = Math.max(stuck.channel_last_seq ?? 0, tail.at(-1)?.seq ?? 0, pending.seq);
+        const lag = Math.max(0, channelLastSeq - pending.seq);
+        const skippedMentionSeqs = stuck.skipped_mention_seqs ?? [];
+        if (flags.json === true) {
+          console.log(
+            JSON.stringify(
+              jsonFrame({
+                ...(pending as unknown as Record<string, unknown>),
+                watch_replay: true,
+                pending_ack: true,
+                replay_attempt: replay.attempts,
+                ...(stuck.delivery_id !== undefined ? { delivery_id: stuck.delivery_id } : {}),
+                ...(stuck.work_id !== undefined ? { work_id: stuck.work_id } : {}),
+                ...(stuck.continuation_ref !== undefined ? { continuation_ref: stuck.continuation_ref } : {}),
+                ...(stuck.delivery_acceptance !== undefined
+                  ? { delivery_acceptance: stuck.delivery_acceptance }
+                  : {}),
+                channel_last_seq: channelLastSeq,
+                lag,
+                skipped_mention_seqs: skippedMentionSeqs,
+              }),
+            ),
+          );
+        } else {
+          console.log(
+            `watch: replaying pending unacknowledged wake seq=${stuck.seq} attempt=${replay.attempts}; ` +
+              (stuck.delivery_id !== undefined
+                ? `delivery=${stuck.delivery_id}${stuck.work_id !== undefined ? ` work_id=${stuck.work_id}` : ""}${stuck.continuation_ref !== undefined ? ` continuation_ref=${stuck.continuation_ref}` : ""}; `
+                : "") +
+              `channel_last_seq=${channelLastSeq} lag=${lag} ` +
+              `skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}; ` +
+              `send a reply/status after handling it to clear this debt.` +
+              (lag > 0 ? ` 补上下文：party history ${channel} --since ${stuck.seq}` : ""),
+          );
+          console.log(formatMsg(pending));
+        }
+        if (flags.json !== true) console.error(ONCE_REARM_ADVISORY);
+        return 0;
+      } catch (e) {
+        return handleRestError(e);
       }
-      const replay = { ...stuck, attempts: stuck.attempts + 1 };
-      if (!saveWatchStuck(channel, replay)) {
-        console.error(
-          `error: #${channel} acquired a pending serve wake while replaying seq=${stuck.seq}; ` +
-            "watch preserved that delivery debt and did not acknowledge this wake.",
-        );
-        return 1;
-      }
-      const channelLastSeq = Math.max(stuck.channel_last_seq ?? 0, tail.at(-1)?.seq ?? 0, pending.seq);
-      const lag = Math.max(0, channelLastSeq - pending.seq);
-      const skippedMentionSeqs = stuck.skipped_mention_seqs ?? [];
-      if (flags.json === true) {
-        console.log(
-          JSON.stringify(
-            jsonFrame({
-              ...(pending as unknown as Record<string, unknown>),
-              watch_replay: true,
-              pending_ack: true,
-              replay_attempt: replay.attempts,
-              channel_last_seq: channelLastSeq,
-              lag,
-              skipped_mention_seqs: skippedMentionSeqs,
-            }),
-          ),
-        );
-      } else {
-        console.log(
-          `watch: replaying pending unacknowledged wake seq=${stuck.seq} attempt=${replay.attempts}; ` +
-            `channel_last_seq=${channelLastSeq} lag=${lag} ` +
-            `skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}; ` +
-            `send a reply/status after handling it to clear this debt.` +
-            (lag > 0 ? ` 补上下文：party history ${channel} --since ${stuck.seq}` : ""),
-        );
-        console.log(formatMsg(pending));
-      }
-      if (flags.json !== true) console.error(ONCE_REARM_ADVISORY);
-      return 0;
-    } catch (e) {
-      return handleRestError(e);
     }
   }
   const initialLatest =
@@ -640,6 +876,7 @@ export async function run(argv: string[]): Promise<number> {
         );
       }
     },
+    onDirectedAccepted: (deliveryId) => markWatchDirectedStuckAccepted(channel, deliveryId),
     onCursor: (c) => saveCursor(channel, c),
     onRevCursor: (r) => saveRevCursor(channel, r),
     statusline: true,

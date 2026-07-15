@@ -3,7 +3,7 @@ import type { PresenceEntry, Sender } from "@agentparty/shared";
 import { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
-import { buildGroups, busyLabel, countLiveGroups, ownerKey, pauseResumeAt, PresenceBar, taskLabel, wakeabilityBadge, type Item } from "./PresenceBar";
+import { buildGroups, busyLabel, countLiveGroups, ownerKey, pauseResumeAt, PresenceBar, taskLabel, waitingOwnerLabel, wakeabilityBadge, type Item } from "./PresenceBar";
 
 function item(over: Partial<Item> = {}): Item {
   return {
@@ -33,6 +33,11 @@ function item(over: Partial<Item> = {}): Item {
     clientVersion: null,
     paused: false,
     resumeAt: null,
+    busy: false,
+    queueDepth: null,
+    waitingOwnerCount: 0,
+    currentTask: null,
+    heartbeatAt: null,
     ...over,
   };
 }
@@ -295,6 +300,11 @@ describe("busy indicator + queue depth (#103)", () => {
     expect(busyLabel(it({ busy: true, queueDepth: null }))).toBe("⏳ busy");
     expect(busyLabel(it({ busy: true, queueDepth: 4 }))).toBe("⏳ busy · 4 queued");
     expect(busyLabel(it({ busy: false }))).toBeNull();
+  });
+
+  test("waiting_owner 单独显示，不冒充 busy", () => {
+    expect(waitingOwnerLabel(item({ waitingOwnerCount: 2, busy: false }))).toBe("💬 2 waiting owner");
+    expect(waitingOwnerLabel(item({ waitingOwnerCount: 0 }))).toBeNull();
   });
 
   // 每任务进度/心跳（#228）：比 busy 更细——标明正在处理哪条 wake + 心跳新鲜度。

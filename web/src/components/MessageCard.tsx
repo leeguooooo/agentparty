@@ -1,6 +1,6 @@
 // 消息渲染：message → doodle 卡片外壳 + mono 元信息 + markdown 正文；
 // status → 时间线分隔条（spec §9 第 2 块）。
-import type { AgentContext, ChannelRoleAssignment, MsgFrame, PresenceEntry, ReadCursor, Sender } from "@agentparty/shared";
+import type { AgentContext, ChannelRoleAssignment, MsgFrame, PresenceEntry, PublicDirectedDelivery, ReadCursor, Sender } from "@agentparty/shared";
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
@@ -23,6 +23,7 @@ interface Props {
   self: string | null;
   identityDisplay?: IdentityDisplayMap;
   receipts?: MentionReceipt[]; // 本条被 @ 的 agent 目标的唤醒/回执状态（Phase 1）
+  deliveries?: PublicDirectedDelivery[]; // 本条定向 @ 的持久投递状态（v1，优先于启发式回执）
   readCursors?: Record<string, ReadCursor>; // 已读游标（Phase 2）
   participants?: Sender[]; // 当前连着的身份，用于算未读
   // 引用预览：reply_to 解析出的完整原消息（Channel 用 seq → msg 的 Map 查出来的）。
@@ -287,6 +288,7 @@ function MessageCardImpl({
   self,
   identityDisplay,
   receipts,
+  deliveries,
   readCursors,
   participants,
   quotedMessage,
@@ -669,6 +671,7 @@ function MessageCardImpl({
       )}
       <MessageStatus
         receipts={receipts ?? []}
+        deliveries={deliveries ?? []}
         readers={read.readers}
         unread={read.unread}
         display={(name) => displayForIdentity(name, identityDisplay)}

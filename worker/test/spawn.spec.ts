@@ -1,6 +1,6 @@
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, seedToken, uniq } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken, uniq } from "./helpers";
 
 describe("agent spawn lineage", () => {
   it("lets a channel-scoped parent agent spawn a short-lived child token", async () => {
@@ -107,7 +107,7 @@ describe("agent spawn lineage", () => {
     };
 
     const ws = await WsClient.open(slug, child.token);
-    const welcome = await ws.nextOfType("welcome");
+    const welcome = await completeCapabilityHello(ws);
     expect(welcome.participants).toContainEqual({
       name: child.name,
       kind: "agent",

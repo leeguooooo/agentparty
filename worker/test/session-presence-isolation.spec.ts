@@ -2,7 +2,7 @@ import type { PresenceEntry } from "@agentparty/shared";
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
-import { WsClient, api, createChannel, seedToken } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken } from "./helpers";
 
 async function sendStatus(
   ws: WsClient,
@@ -27,7 +27,7 @@ describe("same-name websocket session isolation (#363)", () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     await sendStatus(ws, "waiting", "ready");
 
     ws.send({
@@ -69,7 +69,7 @@ describe("same-name websocket session isolation (#363)", () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     await sendStatus(ws, "working", "interactive session", {
       agent_session: {
         harness: "claude",
@@ -95,8 +95,8 @@ describe("same-name websocket session isolation (#363)", () => {
     const slug = await createChannel(agent.token);
     const working = await WsClient.open(slug, agent.token);
     const waiting = await WsClient.open(slug, agent.token);
-    await working.nextOfType("welcome");
-    await waiting.nextOfType("welcome");
+    await completeCapabilityHello(working);
+    await completeCapabilityHello(waiting);
 
     await sendStatus(working, "working", "reviewing do.ts", { busy: true, queue_depth: 2 });
     working.send({ type: "heartbeat", current_task: 363, task_started_at: 1000, heartbeat_at: 2000 });
@@ -142,9 +142,9 @@ describe("same-name websocket session isolation (#363)", () => {
     const watcher = await WsClient.open(slug, observer.token);
     const working = await WsClient.open(slug, agent.token);
     const waiting = await WsClient.open(slug, agent.token);
-    await watcher.nextOfType("welcome");
-    await working.nextOfType("welcome");
-    await waiting.nextOfType("welcome");
+    await completeCapabilityHello(watcher);
+    await completeCapabilityHello(working);
+    await completeCapabilityHello(waiting);
 
     await sendStatus(working, "working", "session A", { busy: true });
     await sendStatus(waiting, "waiting", "session B");
@@ -178,8 +178,8 @@ describe("same-name websocket session isolation (#363)", () => {
     const slug = await createChannel(agent.token);
     const first = await WsClient.open(slug, agent.token);
     const second = await WsClient.open(slug, agent.token);
-    await first.nextOfType("welcome");
-    await second.nextOfType("welcome");
+    await completeCapabilityHello(first);
+    await completeCapabilityHello(second);
 
     first.send({ type: "send", kind: "message", body: "m1", mentions: [], reply_to: null });
     const s1 = (await first.nextOfType("sent")).seq;

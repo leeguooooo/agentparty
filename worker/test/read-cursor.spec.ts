@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { api, WsClient, createChannel, seedToken } from "./helpers";
+import { api, WsClient, completeCapabilityHello, createChannel, seedToken } from "./helpers";
 
 async function postMessage(ws: WsClient, body: string): Promise<number> {
   ws.send({ type: "send", kind: "message", body, mentions: [], reply_to: null });
@@ -13,14 +13,14 @@ describe("read cursor (Phase 2)", () => {
     const b = await seedToken("agent");
     const slug = await createChannel(a.token);
     const wa = await WsClient.open(slug, a.token);
-    await wa.nextOfType("welcome");
+    await completeCapabilityHello(wa);
     await wa.nextOfType("participants");
     const s1 = await postMessage(wa, "m1");
     await postMessage(wa, "m2");
     const s3 = await postMessage(wa, "m3");
 
     const wb = await WsClient.open(slug, b.token); // agent reader (流式 agent)
-    await wb.nextOfType("welcome");
+    await completeCapabilityHello(wb);
     await wa.nextOfType("participants");
 
     // agent B 声明已读到 s3 —— read 状态覆盖 agent，不只人类
@@ -45,7 +45,7 @@ describe("read cursor (Phase 2)", () => {
     const a = await seedToken("human");
     const slug = await createChannel(a.token);
     const wa = await WsClient.open(slug, a.token);
-    await wa.nextOfType("welcome");
+    await completeCapabilityHello(wa);
     await wa.nextOfType("participants");
     const s1 = await postMessage(wa, "m1");
     wa.send({ type: "seen", seq: s1 });
@@ -53,7 +53,7 @@ describe("read cursor (Phase 2)", () => {
 
     const c = await seedToken("human");
     const wc = await WsClient.open(slug, c.token);
-    const welcome = await wc.nextOfType("welcome");
+    const welcome = await completeCapabilityHello(wc);
     expect(welcome.read_cursors).toContainEqual(
       expect.objectContaining({ name: a.name, last_seen_seq: s1 }),
     );
@@ -66,12 +66,12 @@ describe("read cursor (Phase 2)", () => {
     const b = await seedToken("agent");
     const slug = await createChannel(a.token);
     const wa = await WsClient.open(slug, a.token);
-    await wa.nextOfType("welcome");
+    await completeCapabilityHello(wa);
     await wa.nextOfType("participants");
     const s1 = await postMessage(wa, "m1");
 
     const wb = await WsClient.open(slug, b.token);
-    await wb.nextOfType("welcome");
+    await completeCapabilityHello(wb);
     await wa.nextOfType("participants");
 
     wb.send({ type: "seen", seq: 999_999 }); // 远超 lastSeq
@@ -86,7 +86,7 @@ describe("read cursor (Phase 2)", () => {
     const a = await seedToken("human");
     const slug = await createChannel(a.token);
     const wa = await WsClient.open(slug, a.token);
-    await wa.nextOfType("welcome");
+    await completeCapabilityHello(wa);
     await wa.nextOfType("participants");
     await postMessage(wa, "m1");
     const s2 = await postMessage(wa, "m2");

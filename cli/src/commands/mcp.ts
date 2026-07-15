@@ -5,7 +5,17 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import pkg from "../../package.json" with { type: "json" };
-import { advanceCursorPastOwnMessage, loadCursor, loadRevCursor, resolveChannel, saveCursor, saveRevCursor } from "../config";
+import {
+  advanceCursorPastOwnMessage,
+  loadCursor,
+  loadRevCursor,
+  loadStuck,
+  markWatchDirectedStuckAccepted,
+  resolveChannel,
+  saveCursor,
+  saveRevCursor,
+  saveWatchStuck,
+} from "../config";
 import { jsonFrame } from "../json";
 import { resolveAuth, resolveAuthDetailed } from "../oidc-cli";
 import {
@@ -30,6 +40,13 @@ import { runWatch } from "./watch";
 const HELP = `usage: party mcp
 
 Run an AgentParty stdio MCP server.
+
+Boundary:
+  MCP is a structured control plane. In Codex 0.144.4 and Claude Code 2.1.210
+  probes, successful server notification sends did not create a new model turn
+  after the harness became idle. A client may render a diagnostic event, but
+  that is not a model-delivery guarantee. Use persistent directed delivery with
+  party serve for unattended wake; never rely on MCP notifications alone.
 
 Example:
   claude mcp add party -- party mcp
@@ -762,7 +779,8 @@ export function createMcpServer(defaultChannel?: string): McpServer {
     "party_watch_once",
     {
       title: "Wait for one matching mention",
-      description: "Wait until the next matching message arrives, then return the structured watch frame.",
+      description:
+        "Actively wait until the next matching message arrives, then return its structured frame. The tool call must remain in flight; MCP notifications do not wake an idle model turn.",
       inputSchema: {
         channel: z.string().optional(),
         timeout_sec: z.number().int().positive().max(600).optional(),
@@ -773,6 +791,58 @@ export function createMcpServer(defaultChannel?: string): McpServer {
       try {
         const cfg = await auth();
         const resolved = normalizeChannel(channel, defaultChannel);
+        const stuck = loadStuck(resolved);
+        if (stuck !== null && stuck.source !== "watch") {
+          return fail(
+            `#${resolved} has a pending serve wake at seq=${stuck.seq}; ` +
+              "party_watch_once will not overwrite or replay that delivery debt. Resume the existing party serve supervisor first.",
+          );
+        }
+
+        // Legacy raw watch debt and directed debt whose running transition was authoritatively ACKed
+        // are safe to replay locally. Unconfirmed directed debt is not: the Worker may requeue it to
+        // another adapter after lease expiry, so it must re-register and wait for a fresh claim below.
+        if (
+          stuck !== null &&
+          (stuck.delivery_id === undefined || stuck.delivery_acceptance === "accepted")
+        ) {
+          const [pendingPage, tail] = await Promise.all([
+            fetchMessages(cfg.server, cfg.token, resolved, Math.max(0, stuck.seq - 1), 1),
+            fetchRecentMessages(cfg.server, cfg.token, resolved, 1),
+          ]);
+          const pending = pendingPage.find((message) => message.seq === stuck.seq);
+          if (pending === undefined) {
+            return fail(
+              `pending watch wake seq=${stuck.seq} is no longer retained; debt was preserved. ` +
+                "Inspect channel history before clearing or advancing this workspace state.",
+            );
+          }
+          const replay = { ...stuck, attempts: stuck.attempts + 1 };
+          if (!saveWatchStuck(resolved, replay)) {
+            return fail(
+              `#${resolved} acquired a pending serve wake while replaying seq=${stuck.seq}; ` +
+                "party_watch_once preserved that debt and did not acknowledge this wake.",
+            );
+          }
+          const channelLastSeq = Math.max(stuck.channel_last_seq ?? 0, tail.at(-1)?.seq ?? 0, pending.seq);
+          const frame = jsonFrame({
+            ...(pending as unknown as Record<string, unknown>),
+            watch_replay: true,
+            pending_ack: true,
+            replay_attempt: replay.attempts,
+            ...(stuck.delivery_id !== undefined ? { delivery_id: stuck.delivery_id } : {}),
+            ...(stuck.work_id !== undefined ? { work_id: stuck.work_id } : {}),
+            ...(stuck.continuation_ref !== undefined ? { continuation_ref: stuck.continuation_ref } : {}),
+            ...(stuck.delivery_acceptance !== undefined
+              ? { delivery_acceptance: stuck.delivery_acceptance }
+              : {}),
+            channel_last_seq: channelLastSeq,
+            lag: Math.max(0, channelLastSeq - pending.seq),
+            skipped_mention_seqs: stuck.skipped_mention_seqs ?? [],
+          });
+          return ok({ type: "watch_once", channel: resolved, exit_code: 0, frames: [frame] });
+        }
+
         const lines: string[] = [];
         const code = await runWatch({
           server: cfg.server,
@@ -783,8 +853,18 @@ export function createMcpServer(defaultChannel?: string): McpServer {
           timeoutSec: timeout_sec ?? 240,
           follow: false,
           once: true,
-          mentionsOnly: mentions_only ?? true,
+          // An unconfirmed directed debt takes priority over a caller's generic watch preference:
+          // only the mention-only adapter may wait for the same work's fresh legal claim.
+          mentionsOnly: stuck?.delivery_id !== undefined ? true : (mentions_only ?? true),
           json: true,
+          onStuck: (next) => {
+            if (!saveWatchStuck(resolved, next)) {
+              throw new Error(
+                `#${resolved} has a pending serve wake; party_watch_once did not overwrite that delivery debt`,
+              );
+            }
+          },
+          onDirectedAccepted: (deliveryId) => markWatchDirectedStuckAccepted(resolved, deliveryId),
           onCursor: (c) => saveCursor(resolved, c),
           onRevCursor: (r) => saveRevCursor(resolved, r),
           out: (line) => lines.push(line),

@@ -2,14 +2,12 @@
 import {
   applyLiveConnection,
   BODY_LIMIT,
-  extractMentionTokens,
   IDEMPOTENCY_KEY_MAX,
   IDEMPOTENCY_WINDOW_MS,
   LOOP_GUARD_AGENT_N,
   LOOP_GUARD_AGENT_PARTY_N,
   LOOP_GUARD_N,
   LOOP_GUARD_PARTY_N,
-  mentionMatchKey,
   MAX_WEBHOOKS_PER_CHANNEL,
   MAX_MESSAGE_AUDIT_ROWS,
   MAX_WEBHOOK_DEAD_LETTERS,
@@ -34,6 +32,10 @@ import {
   WAKE_BUDGET_MAX_LIMIT,
   WAKE_BUDGET_MAX_WINDOW_MS,
   WAKE_BUDGET_MIN_WINDOW_MS,
+  DIRECTED_DELIVERY_LEASE_MS,
+  DELIVERY_CONTINUATION_REF_LIMIT,
+  DELIVERY_ORIGIN_CHANNEL_LIMIT,
+  DELIVERY_WORK_ID_LIMIT,
   type AgentLineage,
   type AgentSessionInfo,
   type Attachment,
@@ -46,11 +48,16 @@ import {
   type CompletionReviewPolicy,
   type CompletionReviewState,
   type DecisionKind,
+  type DecisionDeliveryLineage,
   type DecisionMode,
   type DecisionRequest,
   type DecisionResolution,
   type DecisionResponse,
   type DecisionState,
+  type DirectedDelivery,
+  type DirectedDeliveryCause,
+  type DeliveryUpdateFrame,
+  type PublicDirectedDelivery,
   type HostDecision,
   type HostDecisionKind,
   type IdentityEraseSummary,
@@ -77,6 +84,13 @@ import {
   type WebhookFilter,
   type WorkflowKind,
 } from "@agentparty/shared";
+import {
+  extractMentionTokens,
+  isValidMentionToken,
+  mentionMatchKey,
+  resolveMentionToken,
+  type MentionAlias,
+} from "@agentparty/shared/mentions";
 import { parseAttachments, parseStoredAttachments } from "./attachments";
 import { sha256Hex } from "./auth";
 import { Server, type Connection, type ConnectionContext, type WSMessage } from "partyserver";
@@ -106,8 +120,25 @@ interface ConnState {
   serveClaimSeq?: number;
   // 上次已通告给本连接的持租状态，用于去重：只在 held 变化时才补发 serve_lease 帧。
   serveLeaseHeld?: boolean;
+  // watch 可作为 directed delivery 的单次通知适配器；与 serve 共用同一 work lease，
+  // raw message 不再另触发一次。watch --once 退出后 lease 留到回复或超时，不能立刻重派。
+  watchCandidate?: boolean;
+  watchClaimSeq?: number;
   // #434：本连接最近一次 hello 上报的 CLI package version，供 WS send 快照进消息 sender_client_version。
   clientVersion?: string;
+  // 只有显式声明能消费 delivery + delivery_update v1 的连接，才可领取 durable work。
+  // 旧 serve 仍可观察 raw mention，但不能仅凭 serve_lease claim 被误当成 v1 executor。
+  directedDeliveryV1?: boolean;
+  /** New sockets do not receive live message frames until hello establishes replay/capabilities. */
+  helloPending?: boolean;
+  /** Highest message cursor declared by hello on this socket; legacy once may only reserve newer raw work. */
+  helloSince?: number;
+  /** Fixed handshake deadline. Ping/auto-response activity must never extend it. */
+  helloDeadlineAt?: number;
+  /** Set before closing an expired handshake so it stops blocking durable dispatch immediately. */
+  helloExpired?: boolean;
+  /** Prevent duplicate upgrade errors while the runtime drains a closing socket. */
+  upgradeRequired?: boolean;
 }
 
 const LEGACY_SESSION_ID = "__legacy__";
@@ -138,14 +169,52 @@ interface WebhookDeliveryResult {
   error: string | null;
 }
 
-type SendOutcome =
+interface AtomicDeliveryEffects {
+  deliveryStateIds: Set<string>;
+  presenceTargets: Set<string>;
+  dispatchTargets: Set<string>;
+}
+
+type DeliveryTerminalReason =
+  | "delivery_failed"
+  | "webhook_delivery_failed"
+  | "unknown_outcome"
+  | "owner_answer_failed"
+  | "source_retracted"
+  | "orphaned_waiting_owner";
+
+const REVIVABLE_DELIVERY_FAILURES = new Set<DeliveryTerminalReason>(["unknown_outcome"]);
+
+type SendSuccessOutcome =
   // deduped：命中幂等去重（#98）——seq/frames 来自原来那条已落库消息，调用方须跳过广播/唤醒等副作用
-  | { ok: true; seq: number; frames: ServerFrame[]; deduped?: boolean }
+  {
+      ok: true;
+      seq: number;
+      frames: ServerFrame[];
+      deduped?: boolean;
+      deliveryTargets?: string[];
+      deliveryTargetOwners?: Record<string, string>;
+      /** Durable delivery rows whose state changed while handling the send. Broadcast by id only. */
+      deliveryStateIds?: string[];
+      atomicEffects?: AtomicDeliveryEffects;
+    };
+
+type SendOutcome =
+  | SendSuccessOutcome
   | { ok: false; code: ErrorCode; message: string };
 type SendErrorOutcome = Extract<SendOutcome, { ok: false }>;
 
+interface ResolvedMentionFrame {
+  frame: SendFrame;
+  /** Canonical agent identities proven by the same directory read that validated the mentions. */
+  agentTargets: string[];
+}
+
 export const ERROR_STATUS: Record<ErrorCode, number> = {
   bad_request: 400,
+  unavailable: 503,
+  mention_not_found: 400,
+  mention_ambiguous: 409,
   unauthorized: 403,
   rate_limited: 429,
   too_large: 413,
@@ -170,12 +239,16 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
 //     ping（cli/web 一致），健康连接永远够不到 120s 静默，不会误回收；真半开的连接在其最后一次 ping 后
 //     ≤PRESENCE_SCAN_MS + 一个 ping 间隔内被标 offline（#487 验收：≤2× 新间隔，自适应下实测≈1×）。
 export const PRESENCE_SCAN_MS = 2 * PRESENCE_TIMEOUT_MS;
+export const HELLO_TIMEOUT_MS = 8_000;
 
 const STATUS_STATES: readonly string[] = ["working", "waiting", "blocked", "done"];
 const COLLAB_ROLES: readonly string[] = ["host", "worker", "reviewer", "observer"];
 const ROLE_SOURCES: readonly string[] = ["self", "assigned"];
 const RESIDENCIES: readonly string[] = ["supervised", "webhook", "bare", "human_driven", "unknown"];
 const WAKE_KINDS: readonly string[] = ["none", "watch", "serve", "webhook"];
+// agent-webhook 接到 2xx 只证明通知越过 HTTP 边界，不能冒充 replied。给外部 harness
+// 留出完成模型 turn 并回频道的时间；期间同一 principal 的 serve/watch 不得重复执行。
+const DIRECTED_WEBHOOK_LEASE_MS = 10 * 60_000;
 const HOST_DECISION_KINDS: readonly string[] = ["decision", "handoff", "takeover"];
 const WORKFLOW_KINDS: readonly string[] = ["pipeline", "parallel", "orchestrator-workers", "evaluator-optimizer"];
 const MENTION_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -223,23 +296,21 @@ function parseMentions(input: unknown): string[] | null {
   return input as string[];
 }
 
-// 正文里的 @name（允许紧邻 CJK 正文/全角标点，ASCII 标识符左边界仍避开 email）。serve/webhook 唤醒只看 mentions
-// 数组——若发送方只在正文打 @ 没进数组（裸 party send "@name"），目标永不被唤醒。故服务端
-// 从 body/note 兜底提取并 union 进 mentions，去重、剔除 system、总量截到 MAX_MENTIONS。
-// 误报无害：wake ledger 只投给真实可唤醒目标，无对应者的 @ 不会触发任何投递。
-// #165/#552：放开首字为 unicode 字母/数字，能捕获 @中文昵称；ASCII token 优先，
-// 所以 `请@agent-a看一下` 不会把后面的中文正文吞进 token。
-// 长度仍上界 64（[\p{L}\p{N}._-]{0,63}）。捕获到的 @昵称 由 resolveNicknameMentions 解析成真实 name。
-function mergeBodyMentions(explicit: string[], text: string): string[] {
-  const seen = new Set(explicit);
+// 正文与显式 mentions 数组必须走同一条服务端决议路径。词法规则与 web 共用
+// @agentparty/shared/mentions：中文正文可无空格（请@小明），email/URL/ASCII 单词内部的 @ 不算。
+// 这里只做 union；真实目标、大小写和昵称/display 唯一性在 INSERT 前由 resolveMentions 校验。
+function mergeBodyMentions(explicit: string[], text: string): string[] | null {
+  const seen = new Set(explicit.map(mentionMatchKey));
   const out = [...explicit];
-  for (const name of extractMentionTokens(text, MAX_MENTIONS)) {
-    if (name === "system" || seen.has(name)) continue;
-    seen.add(name);
+  for (const mention of extractMentionTokens(text)) {
+    const name = mention.value;
+    const key = mentionMatchKey(name);
+    if (seen.has(key)) continue;
+    if (out.length >= MAX_MENTIONS) return null;
+    seen.add(key);
     out.push(name);
-    if (out.length >= MAX_MENTIONS) break;
   }
-  return out;
+  return byteLength(JSON.stringify(out)) <= MENTIONS_JSON_LIMIT ? out : null;
 }
 
 function withExpandedMentions(frame: SendFrame, mentions: string[]): SendFrame {
@@ -335,11 +406,58 @@ function parseDecisionRequest(input: unknown): DecisionRequest | undefined | nul
   return { kind, prompt, options };
 }
 
+// decision lineage is server-owned. The public send parser above intentionally drops any client
+// supplied fields; only persisted Worker output comes through this stricter all-or-nothing parser.
+function parseStoredDecisionLineage(raw: Record<string, unknown>): DecisionDeliveryLineage | undefined {
+  const fields = [raw.delivery_id, raw.origin_seq, raw.origin_channel, raw.work_id, raw.continuation_ref];
+  if (fields.every((value) => value === undefined)) return undefined;
+  if (
+    typeof raw.delivery_id !== "string" ||
+    raw.delivery_id.length < 1 ||
+    raw.delivery_id.length > 128 ||
+    typeof raw.origin_seq !== "number" ||
+    !Number.isSafeInteger(raw.origin_seq) ||
+    raw.origin_seq <= 0 ||
+    typeof raw.origin_channel !== "string" ||
+    raw.origin_channel.length < 1 ||
+    byteLength(raw.origin_channel) > DELIVERY_ORIGIN_CHANNEL_LIMIT ||
+    typeof raw.work_id !== "string" ||
+    raw.work_id.length < 1 ||
+    raw.work_id.length > DELIVERY_WORK_ID_LIMIT ||
+    typeof raw.continuation_ref !== "string" ||
+    raw.continuation_ref.length < 1 ||
+    raw.continuation_ref.length > DELIVERY_CONTINUATION_REF_LIMIT
+  ) {
+    return undefined;
+  }
+  return {
+    delivery_id: raw.delivery_id,
+    origin_seq: raw.origin_seq,
+    origin_channel: raw.origin_channel,
+    work_id: raw.work_id,
+    continuation_ref: raw.continuation_ref,
+  };
+}
+
 function parseStoredDecisionRequest(input: unknown): DecisionRequest | undefined {
   if (typeof input !== "string" || input === "") return undefined;
   try {
-    const parsed = parseDecisionRequest(JSON.parse(input) as unknown);
-    return parsed === null ? undefined : parsed;
+    const raw = JSON.parse(input) as unknown;
+    const parsed = parseDecisionRequest(raw);
+    if (parsed === null || parsed === undefined) return undefined;
+    const rawRecord = typeof raw === "object" && raw !== null
+      ? raw as Record<string, unknown>
+      : undefined;
+    const lineage = rawRecord === undefined ? undefined : parseStoredDecisionLineage(rawRecord);
+    // Server-owned lineage is all-or-nothing. Treat a partially retained/corrupted capability as
+    // an invalid decision request rather than silently downgrading it to an unbound question.
+    if (
+      lineage === undefined &&
+      rawRecord !== undefined &&
+      ["delivery_id", "origin_seq", "origin_channel", "work_id", "continuation_ref"]
+        .some((key) => Object.prototype.hasOwnProperty.call(rawRecord, key))
+    ) return undefined;
+    return lineage === undefined ? parsed : { ...parsed, ...lineage };
   } catch {
     return undefined;
   }
@@ -382,10 +500,69 @@ function parseStoredDecisionResponse(input: unknown): DecisionResponse | undefin
     if (typeof raw.request_seq !== "number" || typeof raw.chosen_index !== "number" || typeof raw.chosen_option !== "string") {
       return undefined;
     }
-    return { request_seq: raw.request_seq, chosen_index: raw.chosen_index, chosen_option: raw.chosen_option };
+    const lineage = parseStoredDecisionLineage(raw);
+    const prompt =
+      typeof raw.prompt === "string" && raw.prompt.length > 0 && byteLength(raw.prompt) <= DECISION_PROMPT_LIMIT
+        ? raw.prompt
+        : undefined;
+    const reason =
+      typeof raw.reason === "string" && byteLength(raw.reason) <= DECISION_REASON_LIMIT
+        ? raw.reason
+        : undefined;
+    return {
+      request_seq: raw.request_seq,
+      chosen_index: raw.chosen_index,
+      chosen_option: raw.chosen_option,
+      ...(prompt === undefined ? {} : { prompt }),
+      ...(reason === undefined || reason === "" ? {} : { reason }),
+      ...(lineage === undefined ? {} : lineage),
+    };
   } catch {
     return undefined;
   }
+}
+
+// Delivery/work/continuation identifiers are executor capabilities, not channel-history fields.
+// Keep the full lineage in storage and exact-target delivery frames, while every public message
+// surface receives an explicit allowlist projection. This also makes future lineage additions
+// fail closed instead of silently becoming public.
+function publicDecisionRequest(request: DecisionRequest): DecisionRequest {
+  return {
+    kind: request.kind,
+    prompt: request.prompt,
+    options: [...request.options],
+  };
+}
+
+function publicDecisionResponse(response: DecisionResponse): DecisionResponse {
+  return {
+    request_seq: response.request_seq,
+    chosen_index: response.chosen_index,
+    chosen_option: response.chosen_option,
+    ...(response.prompt === undefined ? {} : { prompt: response.prompt }),
+    ...(response.reason === undefined ? {} : { reason: response.reason }),
+  };
+}
+
+function publicMsgFrame(frame: MsgFrame): MsgFrame {
+  if (frame.decision_request === undefined && frame.decision_response === undefined) return frame;
+  return {
+    ...frame,
+    ...(frame.decision_request === undefined
+      ? {}
+      : { decision_request: publicDecisionRequest(frame.decision_request) }),
+    ...(frame.decision_response === undefined
+      ? {}
+      : { decision_response: publicDecisionResponse(frame.decision_response) }),
+  };
+}
+
+function publicServerFrame(frame: ServerFrame): ServerFrame {
+  if (frame.type === "msg" || frame.type === "status") return publicMsgFrame(frame);
+  if (frame.type === "message_update") {
+    return { ...frame, message: publicMsgFrame(frame.message) };
+  }
+  return frame;
 }
 
 function parseStoredCompletionArtifact(input: unknown): CompletionArtifact | undefined {
@@ -818,6 +995,7 @@ function parseSendFrame(input: unknown): SendFrame | null {
     if (explicit === null) return null;
     // 正文里的 @name 也当 mention（否则裸 party send "@name" 不会唤醒目标）
     const mentions = mergeBodyMentions(explicit, f.body);
+    if (mentions === null) return null;
     const reply_to =
       f.reply_to === undefined || f.reply_to === null
         ? null
@@ -859,6 +1037,7 @@ function parseSendFrame(input: unknown): SendFrame | null {
     if (explicit === null) return null;
     // status 的 note 里 @name 同样兜底提取（如「@leo blocked on X」应唤醒 leo）
     const mentions = mergeBodyMentions(explicit, note);
+    if (mentions === null) return null;
     const role = parseCollaborationRole(f.role);
     if (role === null) return null;
     const residency = parseResidency(f.residency);
@@ -972,6 +1151,41 @@ function parseHeartbeatFrame(input: unknown): ParsedTaskHeartbeat | null {
   };
 }
 
+function parseDeliveryUpdateFrame(input: unknown): DeliveryUpdateFrame | null {
+  if (typeof input !== "object" || input === null) return null;
+  const f = input as Record<string, unknown>;
+  if (f.type !== "delivery_update") return null;
+  if (typeof f.delivery_id !== "string" || f.delivery_id.length < 1 || f.delivery_id.length > 128) return null;
+  if (f.state !== "running" && f.state !== "waiting_owner" && f.state !== "replied" && f.state !== "failed") return null;
+  const optionalText = (value: unknown, limit: number): string | undefined | null => {
+    if (value === undefined) return undefined;
+    return typeof value === "string" && value.length > 0 && value.length <= limit ? value : null;
+  };
+  const workId = optionalText(f.work_id, DELIVERY_WORK_ID_LIMIT);
+  const continuationRef = optionalText(f.continuation_ref, DELIVERY_CONTINUATION_REF_LIMIT);
+  const error = optionalText(f.error, DECISION_REASON_LIMIT);
+  if (workId === null || continuationRef === null || error === null) return null;
+  const replySeq =
+    f.reply_seq === undefined
+      ? undefined
+      : typeof f.reply_seq === "number" && Number.isSafeInteger(f.reply_seq) && f.reply_seq > 0
+        ? f.reply_seq
+        : null;
+  if (replySeq === null) return null;
+  if (f.state === "failed" && error === undefined) return null;
+  if (f.state !== "failed" && error !== undefined) return null;
+  if (f.state !== "replied" && replySeq !== undefined) return null;
+  return {
+    type: "delivery_update",
+    delivery_id: f.delivery_id,
+    state: f.state,
+    ...(workId === undefined ? {} : { work_id: workId }),
+    ...(continuationRef === undefined ? {} : { continuation_ref: continuationRef }),
+    ...(replySeq === undefined ? {} : { reply_seq: replySeq }),
+    ...(error === undefined ? {} : { error }),
+  };
+}
+
 async function hmacSha256Hex(secret: string, body: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -987,9 +1201,20 @@ async function hmacSha256Hex(secret: string, body: string): Promise<string> {
 
 interface WebhookRow {
   name: string;
+  /** Immutable identity for one concrete registration. Re-registering the same name rotates it. */
+  registrationId: string;
   url: string;
   secret: string;
   filter: WebhookFilter;
+  mode: "notify" | "agent";
+  targetOwner: string | null;
+}
+
+interface WebhookBinding {
+  name: string;
+  registrationId: string;
+  mode: "notify" | "agent";
+  targetOwner: string | null;
 }
 
 interface WorkflowGuardRow {
@@ -1042,6 +1267,7 @@ function snippetFor(frame: MsgFrame, field: SearchHit["match_field"]): string {
 
 export class ChannelDO extends Server<Env> {
   static options = { hibernate: true };
+  private atomicDeliveryEffects: AtomicDeliveryEffects | null = null;
 
   onStart() {
     const sql = this.ctx.storage.sql;
@@ -1240,23 +1466,64 @@ export class ChannelDO extends Server<Env> {
     )`);
     sql.exec(`CREATE TABLE IF NOT EXISTS webhooks (
       name TEXT PRIMARY KEY,
+      registration_id TEXT,
       url TEXT NOT NULL,
       secret TEXT NOT NULL,
       filter TEXT NOT NULL DEFAULT 'mentions',
+      mode TEXT NOT NULL DEFAULT 'notify',
+      target_owner TEXT,
       created_at INTEGER NOT NULL
     )`);
+    try {
+      sql.exec("ALTER TABLE webhooks ADD COLUMN registration_id TEXT");
+    } catch {
+      // column already exists
+    }
+    // Existing live registrations receive an identity once. Legacy queued/dead payloads are
+    // deliberately not backfilled: their creation-time registration is unknowable, so retry must
+    // fail closed instead of attaching them to whichever same-name URL happens to exist now.
+    sql.exec(
+      "UPDATE webhooks SET registration_id = lower(hex(randomblob(16))) WHERE registration_id IS NULL OR registration_id = ''",
+    );
+    try {
+      sql.exec("ALTER TABLE webhooks ADD COLUMN mode TEXT NOT NULL DEFAULT 'notify'");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE webhooks ADD COLUMN target_owner TEXT");
+    } catch {
+      // column already exists
+    }
     sql.exec(`CREATE TABLE IF NOT EXISTS webhook_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       webhook_name TEXT NOT NULL,
+      registration_id TEXT,
+      webhook_mode TEXT,
+      target_owner TEXT,
       payload TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
       next_retry_at INTEGER NOT NULL
     )`);
+    for (const ddl of [
+      "ALTER TABLE webhook_queue ADD COLUMN registration_id TEXT",
+      "ALTER TABLE webhook_queue ADD COLUMN webhook_mode TEXT",
+      "ALTER TABLE webhook_queue ADD COLUMN target_owner TEXT",
+    ]) {
+      try {
+        sql.exec(ddl);
+      } catch {
+        // column already exists
+      }
+    }
     // 死信表（#105）：重试耗尽 / 队列满而被永久放弃的投递落在这里，不再静默丢弃。
     // 保留原始 payload 以便 moderator 原样重投；有界裁剪（见 recordDeadLetter）防止写爆。
     sql.exec(`CREATE TABLE IF NOT EXISTS webhook_dead_letters (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       webhook_name TEXT NOT NULL,
+      registration_id TEXT,
+      webhook_mode TEXT,
+      target_owner TEXT,
       mention_seq INTEGER NOT NULL,
       payload TEXT NOT NULL,
       attempts INTEGER NOT NULL,
@@ -1264,6 +1531,17 @@ export class ChannelDO extends Server<Env> {
       last_error TEXT,
       dead_lettered_at INTEGER NOT NULL
     )`);
+    for (const ddl of [
+      "ALTER TABLE webhook_dead_letters ADD COLUMN registration_id TEXT",
+      "ALTER TABLE webhook_dead_letters ADD COLUMN webhook_mode TEXT",
+      "ALTER TABLE webhook_dead_letters ADD COLUMN target_owner TEXT",
+    ]) {
+      try {
+        sql.exec(ddl);
+      } catch {
+        // column already exists
+      }
+    }
     sql.exec(`CREATE TABLE IF NOT EXISTS wake_delivery_ledger (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       mention_seq INTEGER NOT NULL,
@@ -1278,6 +1556,64 @@ export class ChannelDO extends Server<Env> {
       ack_seq INTEGER,
       resume_seq INTEGER
     )`);
+    // #551：聊天历史的 read cursor 只表示“读过”，不能承担 agent work 的可靠投递。
+    // 定向投递单独持久化并引用原消息 seq；正文仍只有 messages 一份，避免复制与修订漂移。
+    sql.exec(`CREATE TABLE IF NOT EXISTS directed_deliveries (
+      id TEXT PRIMARY KEY,
+      message_seq INTEGER NOT NULL,
+      target_name TEXT NOT NULL,
+      target_owner TEXT,
+      cause TEXT NOT NULL,
+      state TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      lease_connection_id TEXT,
+      last_lease_connection_id TEXT,
+      lease_adapter TEXT,
+      lease_until INTEGER,
+      work_id TEXT,
+      continuation_ref TEXT,
+      parent_delivery_id TEXT,
+      reply_seq INTEGER,
+      last_error TEXT,
+      terminal_reason TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(message_seq, target_name)
+    )`);
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN last_lease_connection_id TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN target_owner TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN lease_adapter TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN parent_delivery_id TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN terminal_reason TEXT");
+    } catch {
+      // column already exists
+    }
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_target_state ON directed_deliveries(target_name, state, message_seq)",
+    );
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_principal_state ON directed_deliveries(target_name, target_owner, state, message_seq)",
+    );
+    sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_lease ON directed_deliveries(state, lease_until)",
+    );
     sql.exec(`CREATE TABLE IF NOT EXISTS message_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       target_seq INTEGER NOT NULL,
@@ -1328,6 +1664,182 @@ export class ChannelDO extends Server<Env> {
                OR target_seq IN (SELECT seq FROM messages WHERE retracted_at IS NOT NULL)`,
         );
         this.setMeta("retract_scrub_v1", "1");
+      });
+    }
+    if (this.getMeta("retract_scrub_v2") === null) {
+      this.ctx.storage.transactionSync(() => {
+        // Decision payloads retain prompt/reason and private delivery lineage. Historical retracts
+        // created before v2 must erase them just as eagerly as status/completion payloads.
+        sql.exec(
+          `UPDATE messages
+              SET decision_request_json = NULL, decision_state = NULL,
+                  decision_resolution_json = NULL, decision_response_json = NULL
+            WHERE retracted_at IS NOT NULL`,
+        );
+        this.setMeta("retract_scrub_v2", "1");
+      });
+    }
+    if (this.getMeta("retract_scrub_v3") === null) {
+      const now = Date.now();
+      const originChannel = this.getMeta("channel_slug") ?? this.name;
+      this.ctx.storage.transactionSync(() => {
+        // Historical queue/dead-letter payloads are immutable copies of message content. Once the
+        // source is retracted, no startup path may retain a copy that an alarm/operator can resend.
+        sql.exec(
+          `DELETE FROM webhook_queue
+            WHERE json_valid(payload)
+              AND CAST(json_extract(payload, '$.seq') AS INTEGER) IN (
+                SELECT seq FROM messages WHERE retracted_at IS NOT NULL
+              )`,
+        );
+        sql.exec(
+          `DELETE FROM webhook_dead_letters
+            WHERE mention_seq IN (SELECT seq FROM messages WHERE retracted_at IS NOT NULL)
+               OR (
+                 json_valid(payload)
+                 AND CAST(json_extract(payload, '$.seq') AS INTEGER) IN (
+                   SELECT seq FROM messages WHERE retracted_at IS NOT NULL
+                 )
+               )`,
+        );
+        // A pre-v3 retract could leave the question row pending even though its exact source was
+        // gone/retracted/corrupted. Scrub those server-owned capabilities before repairing the
+        // source rows so history replay cannot keep rendering an answerable decision.
+        const invalidBoundQuestions = sql.exec(
+          `SELECT q.seq
+             FROM messages AS q
+            WHERE q.retracted_at IS NULL
+              AND q.decision_state = 'pending'
+              AND (
+                (
+                  json_valid(q.decision_request_json)
+                  AND CASE WHEN json_valid(q.decision_request_json)
+                        THEN json_extract(q.decision_request_json, '$.delivery_id')
+                        ELSE NULL END IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                      FROM directed_deliveries AS d
+                      JOIN messages AS origin ON origin.seq = d.message_seq
+                     WHERE d.id = json_extract(q.decision_request_json, '$.delivery_id')
+                       AND d.state = 'waiting_owner'
+                       AND d.target_name = q.sender_name
+                       AND d.target_owner IS NOT NULL
+                       AND (q.sender_owner IS NULL OR q.sender_owner = d.target_owner)
+                       AND origin.retracted_at IS NULL
+                       AND q.reply_to = d.message_seq
+                       AND CAST(json_extract(q.decision_request_json, '$.origin_seq') AS INTEGER) = d.message_seq
+                       AND json_extract(q.decision_request_json, '$.origin_channel') = ?
+                       AND json_extract(q.decision_request_json, '$.work_id') = d.work_id
+                       AND json_extract(q.decision_request_json, '$.continuation_ref') = d.continuation_ref
+                  )
+                )
+                OR (
+                  CASE WHEN json_valid(q.decision_request_json)
+                    THEN json_extract(q.decision_request_json, '$.delivery_id')
+                    ELSE NULL END IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM directed_deliveries AS possible
+                     WHERE possible.message_seq = q.reply_to
+                       AND possible.target_name = q.sender_name
+                  )
+                )
+              )`,
+          originChannel,
+        ).toArray();
+        for (const question of invalidBoundQuestions) {
+          sql.exec(
+            `UPDATE messages
+                SET decision_request_json = NULL, decision_state = NULL,
+                    decision_resolution_json = NULL, decision_response_json = NULL,
+                    rev_seq = ?
+              WHERE seq = ? AND decision_state = 'pending'`,
+            this.nextRevSeq(),
+            Number(question.seq),
+          );
+        }
+        // Backfill the typed, non-revivable tombstone for all historical retracted roots and their
+        // owner-answer descendants. In particular, legacy `failed + NULL reason` rows must not be
+        // mistaken for an unknown outcome and revived after the origin has been erased.
+        sql.exec(
+          `WITH RECURSIVE retracted_tree(id) AS (
+             SELECT d.id
+               FROM directed_deliveries AS d
+               JOIN messages AS m ON m.seq = d.message_seq
+              WHERE m.retracted_at IS NOT NULL
+             UNION
+             SELECT child.id
+               FROM directed_deliveries AS child
+               JOIN retracted_tree AS parent ON child.parent_delivery_id = parent.id
+           )
+           UPDATE directed_deliveries
+              SET state = CASE WHEN state = 'replied' THEN state ELSE 'failed' END,
+                  last_error = CASE WHEN state = 'replied' THEN last_error ELSE 'source retracted, no retry' END,
+                  terminal_reason = CASE WHEN state = 'replied' THEN terminal_reason ELSE 'source_retracted' END,
+                  work_id = NULL, continuation_ref = NULL, parent_delivery_id = NULL,
+                  lease_connection_id = NULL, last_lease_connection_id = NULL,
+                  lease_adapter = NULL, lease_until = NULL, updated_at = ?
+            WHERE id IN (SELECT id FROM retracted_tree)`,
+          now,
+        );
+        // A short-lived pre-v3 build already wrote this authoritative retract terminal marker but
+        // had no typed column. Some affected rows point at a live origin because the retracted item
+        // was the pending question itself, whose lineage v2 correctly erased. Backfill that exact
+        // legacy marker once during migration; runtime revival never relies on error text.
+        sql.exec(
+          `UPDATE directed_deliveries
+              SET terminal_reason = 'source_retracted',
+                  work_id = NULL, continuation_ref = NULL, parent_delivery_id = NULL,
+                  lease_connection_id = NULL, last_lease_connection_id = NULL,
+                  lease_adapter = NULL, lease_until = NULL, updated_at = ?
+            WHERE state = 'failed'
+              AND terminal_reason IS NULL
+              AND last_error = 'source retracted, no retry'`,
+          now,
+        );
+        // Normalize legacy operator-redeliverable webhook failures once, keeping the runtime reclaim
+        // gate entirely typed instead of repeatedly interpreting presentation text.
+        sql.exec(
+          `UPDATE directed_deliveries
+              SET terminal_reason = 'webhook_delivery_failed', updated_at = ?
+            WHERE state = 'failed'
+              AND terminal_reason IS NULL
+              AND last_error LIKE 'agent webhook%'`,
+          now,
+        );
+        // Repair historical waiting_owner rows only when no exact, live pending question still
+        // owns that parked continuation. The full lineage/principal comparison prevents a retained
+        // but corrupted question from keeping unrelated work suspended forever.
+        sql.exec(
+          `UPDATE directed_deliveries AS d
+              SET state = 'failed',
+                  work_id = NULL, continuation_ref = NULL, parent_delivery_id = NULL,
+                  lease_connection_id = NULL, last_lease_connection_id = NULL,
+                  lease_adapter = NULL, lease_until = NULL,
+                  last_error = 'owner decision continuation is missing or invalid',
+                  terminal_reason = 'orphaned_waiting_owner', updated_at = ?
+            WHERE d.state = 'waiting_owner'
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM messages AS q
+                  JOIN messages AS origin ON origin.seq = d.message_seq
+                 WHERE origin.retracted_at IS NULL
+                   AND q.retracted_at IS NULL
+                   AND q.decision_state = 'pending'
+                   AND q.decision_request_json IS NOT NULL
+                   AND json_valid(q.decision_request_json)
+                   AND q.sender_name = d.target_name
+                   AND (q.sender_owner IS NULL OR q.sender_owner = d.target_owner)
+                   AND q.reply_to = d.message_seq
+                   AND json_extract(q.decision_request_json, '$.delivery_id') = d.id
+                   AND CAST(json_extract(q.decision_request_json, '$.origin_seq') AS INTEGER) = d.message_seq
+                   AND json_extract(q.decision_request_json, '$.origin_channel') = ?
+                   AND json_extract(q.decision_request_json, '$.work_id') = d.work_id
+                   AND json_extract(q.decision_request_json, '$.continuation_ref') = d.continuation_ref
+              )`,
+          now,
+          originChannel,
+        );
+        this.setMeta("retract_scrub_v3", "1");
       });
     }
     sql.exec(`CREATE TABLE IF NOT EXISTS workflow_guard_state (
@@ -1483,6 +1995,7 @@ export class ChannelDO extends Server<Env> {
 
   async onConnect(connection: Connection<ConnState>, ctx: ConnectionContext) {
     const h = ctx.request.headers;
+    const connectedAt = Date.now();
     const state: ConnState = {
       name: h.get("x-ap-name") ?? "",
       kind: h.get("x-ap-kind") === "agent" ? "agent" : "human",
@@ -1496,7 +2009,9 @@ export class ChannelDO extends Server<Env> {
       collabRoleSource: parseRoleSource(h.get("x-ap-role-source") ?? undefined) ?? undefined,
       archived: h.get("x-ap-archived") === "1",
       canWrite: h.get("x-ap-can-write") === "1",
-      lastSeen: Date.now(),
+      lastSeen: connectedAt,
+      helloPending: true,
+      helloDeadlineAt: connectedAt + HELLO_TIMEOUT_MS,
     };
     connection.setState(state);
     // mode/kind/host 随升级请求进来，写 meta 缓存（同 archived 的手法）
@@ -1540,6 +2055,7 @@ export class ChannelDO extends Server<Env> {
       participants: this.participants(),
       last_seq: this.lastSeq(),
       last_rev_seq: this.lastRevSeq(),
+      directed_delivery: "v1",
       ...(this.charterRev() > 0 ? { charter_rev: this.charterRev() } : {}),
       presence: this.presenceList(),
       read_cursors: this.readCursors(),
@@ -1547,7 +2063,7 @@ export class ChannelDO extends Server<Env> {
     this.broadcastFrame({ type: "participants", participants: this.participants() });
     // 只前移不后移：即便已有远期 alarm（temp 归档 +14 天 / webhook 重试）也保证 presence 扫描按期到来。
     // 新连接此刻刚握手（lastSeen=now），最早也要 PRESENCE_SCAN_MS 静默才可能被判半开，故排到 now+窗口即可。
-    await this.ensureAlarmAt(Date.now() + PRESENCE_SCAN_MS);
+    await this.ensureAlarmAt(connectedAt + HELLO_TIMEOUT_MS);
   }
 
   async onMessage(connection: Connection<ConnState>, message: WSMessage) {
@@ -1571,12 +2087,30 @@ export class ChannelDO extends Server<Env> {
     const frame = raw as Record<string, unknown>;
     let st = connection.state;
     if (!st) return;
-    st = connection.setState({ ...st, lastSeen: Date.now() });
+    const receivedAt = Date.now();
+    st = connection.setState({ ...st, lastSeen: receivedAt });
     if (!st) return;
+
+    if (
+      st.helloPending === true &&
+      typeof st.helloDeadlineAt === "number" &&
+      st.helloDeadlineAt <= receivedAt
+    ) {
+      this.closeHelloExpired(connection);
+      return;
+    }
 
     if (frame.type === "ping") {
       // setWebSocketAutoResponse 只匹配字面 '{"type":"ping"}'，这里兜底其余序列化
       this.sendFrame(connection, { type: "pong" });
+      return;
+    }
+    if (st.helloPending === true && frame.type !== "hello") {
+      this.sendFrame(connection, {
+        type: "error",
+        code: "bad_request",
+        message: "hello_required: send hello before any actionable frame",
+      });
       return;
     }
     if (!(await this.isTokenActive(st.tokenHash))) {
@@ -1584,13 +2118,28 @@ export class ChannelDO extends Server<Env> {
       return;
     }
     if (frame.type === "hello") {
+      // Capability is sticky for the lifetime of this socket. A later cursor refresh from a caller
+      // that omits optional fields must not silently downgrade an already-proven executor.
+      const nextDirectedDeliveryV1 = st.directedDeliveryV1 === true || frame.directed_delivery === "v1";
       const clientVersion = parseClientVersion(frame.client_version);
+      const since = typeof frame.since === "number" && frame.since > 0 ? Math.floor(frame.since) : 0;
       if (clientVersion !== null) {
         this.recordClientVersion(st.name, connection.id, clientVersion, Date.now());
-        // #434：把版本快照进连接态，供本连接后续 send 落库到消息 sender_client_version（无需每条再解析头）。
-        st = connection.setState({ ...st, clientVersion }) ?? st;
       }
-      const since = typeof frame.since === "number" && frame.since > 0 ? Math.floor(frame.since) : 0;
+      // Finish capability identity before replay. Live broadcasts were withheld while helloPending;
+      // DO message handling is serialized, so dispatch + backfill below form one gap-free handoff.
+      st = connection.setState({
+        ...st,
+        directedDeliveryV1: nextDirectedDeliveryV1,
+        ...(clientVersion === null ? {} : { clientVersion }),
+        helloSince: Math.max(st.helloSince ?? 0, since),
+        helloPending: false,
+        helloExpired: false,
+      }) ?? st;
+      if (st.kind === "agent") {
+        if (st.serveCandidate) this.reconcileServeLease(st.name);
+        else this.dispatchNextDirectedDelivery(st.name);
+      }
       const sinceRev =
         typeof frame.since_rev === "number" && frame.since_rev >= 0 ? Math.floor(frame.since_rev) : null;
       // 带 since_rev 的新客户端：修订快照只重放 rev_seq 更大的那些（issue #33）；
@@ -1630,11 +2179,20 @@ export class ChannelDO extends Server<Env> {
             : this.ctx.storage.sql
                 .exec(backfillQuery, since, pageCursor, HELLO_BACKFILL_PAGE_SIZE)
                 .toArray();
-        for (const row of rows) this.sendFrame(connection, this.rowToFrame(row));
+        for (const row of rows) {
+          if (!this.sendPublicFrame(connection, publicMsgFrame(this.rowToFrame(row)), true)) return;
+        }
         if (rows.length < HELLO_BACKFILL_PAGE_SIZE) break;
         // 游标推进到本页最后一行的 seq；seq 唯一且升序，下一页严格取更大的 seq，保证前进、不重不漏。
         pageCursor = Number(rows[rows.length - 1]!.seq);
       }
+      // Message history alone cannot reconstruct durable delivery state after a Web reload. Replay
+      // every retained row (all states, not only active work) after messages so reducer upserts see
+      // their source first. Compound keyset pagination keeps each SQLite materialization bounded even
+      // when one source fans out to many agents.
+      this.replayDirectedDeliveryStates(connection);
+      // A connection may upgrade its declaration after an earlier legacy lease claim. Re-run the
+      // election only after backfill so a newly capable executor cannot receive work before history.
       return;
     }
     if (frame.type === "seen") {
@@ -1650,13 +2208,61 @@ export class ChannelDO extends Server<Env> {
       // 每任务进度/心跳（#228）：presence-only，不落 history、不占发送速率、不炸连接。
       // 脏值（负数/非整数/字段不齐）静默丢弃——心跳是自动流量，宁可漏一拍也别断流。
       const hb = parseHeartbeatFrame(frame);
-      if (hb !== null) this.applyTaskHeartbeat(st.name, connection.id, hb);
+      if (hb !== null) {
+        // A heartbeat queued on the socket just before a decision POST can arrive after the DO has
+        // already parked that work. Do not resurrect waiting/replied/failed work as busy presence;
+        // legacy heartbeats with no delivery row remain accepted.
+        if (hb.current_task === null || this.directedTaskAcceptsHeartbeat(st, hb.current_task)) {
+          this.applyTaskHeartbeat(st.name, connection.id, hb);
+        }
+        this.applyDirectedDeliveryHeartbeat(st, connection.id, hb, Date.now());
+      }
+      return;
+    }
+    if (frame.type === "delivery_adapter" && frame.adapter === "watch" && frame.op === "register") {
+      if (st.kind !== "agent") {
+        badRequest();
+        return;
+      }
+      if (!st.watchCandidate) {
+        st = connection.setState({
+          ...st,
+          watchCandidate: true,
+          watchClaimSeq: this.nextServeClaimSeq(),
+        }) ?? st;
+      }
+      this.sendFrame(connection, { type: "delivery_adapter", adapter: "watch", registered: true });
+      this.dispatchNextDirectedDelivery(st.name);
+      return;
+    }
+    if (frame.type === "delivery_update") {
+      const update = parseDeliveryUpdateFrame(frame);
+      if (update === null || !this.applyDirectedDeliveryUpdate(st, connection.id, update, Date.now())) {
+        badRequest();
+      } else {
+        // Explicit per-connection ACK. A broadcast alone is insufficient: idempotent retries do not
+        // change state, and the CLI must not advance durable work until it sees server confirmation.
+        const row = this.directedDeliveryRow(update.delivery_id);
+        if (row !== undefined) {
+          this.sendFrame(connection, { type: "delivery_state", delivery: this.deliveryStateForConnection(connection, row) });
+        }
+      }
       return;
     }
     if (frame.type === "serve_lease" && frame.op === "claim") {
       // 同名 serve 跨机租约（#99）：本连接声明它是一条 serve runner，想当唯一在跑的那个。
       // 首次 claim 定死一个单调序号（重复 claim 不改，避免重连者用更小序号抢回租约）；随后在同名候选里
       // 选最小序号者持租，回 serve_lease 告知各连接是否持租。断连/心跳超时由 onClose/scanPresence 触发改选。
+      if (
+        st.directedDeliveryV1 !== true &&
+        this.legacyServeConflictsWithV1(st, connection.id)
+      ) {
+        this.closeUpgradeRequired(
+          connection,
+          "a v1 executor already owns this principal; legacy serve cannot become standby",
+        );
+        return;
+      }
       if (!st.serveCandidate) {
         st = connection.setState({ ...st, serveCandidate: true, serveClaimSeq: this.nextServeClaimSeq() }) ?? st;
       }
@@ -1702,26 +2308,54 @@ export class ChannelDO extends Server<Env> {
         this.sendFrame(connection, { type: "error", code: out.code, message: out.message });
         return;
       }
-      // sent 先于广播到达发送方，客户端先推进游标再看到自己的回声
-      this.sendFrame(connection, { type: "sent", seq: out.seq });
       // 幂等去重命中（#98）：只回 sent（原 seq），不重复广播/唤醒。ws 发送目前不带 key，故常态为 false。
-      if (out.deduped) return;
+      if (out.deduped) {
+        this.sendFrame(connection, { type: "sent", seq: out.seq });
+        return;
+      }
+      const sent = out.frames[0] as MsgFrame;
+      // Dispatch the committed durable work before acknowledging success. A reset after `sent` must
+      // not leave a committed queued webhook waiting for unrelated future traffic to wake the DO.
+      this.flushAtomicDeliveryEffects(out.atomicEffects);
+      // sent 先于 raw self-echo 到达发送方，客户端先推进游标再看到自己的回声。
+      this.sendFrame(connection, { type: "sent", seq: out.seq });
       // 广播必须紧跟 INSERT，中间不能有任何 await（#114）：
       // 并发发送时 A 落库 seq=N 后若在这里等 D1，B 落库 N+1 先广播，watcher ack 了 N+1，
       // 后到的 N 就被客户端当作「已消费」永久丢弃（client.ts: seq <= cursor 静默丢），
       // 而重连 hello since=cursor 也不会补拉——append-only + 游标契约被静默违背。
       for (const f of out.frames) this.broadcastFrame(f);
       await this.closeInactiveConnections();
-      await this.afterSend(out.frames[0] as MsgFrame);
+      await this.afterSend(sent, undefined, true);
     }
   }
 
   onClose(connection: Connection<ConnState>) {
     const st = connection.state;
     if (!st || !st.name || st.archived) return;
+    // #551：work 租约属于具体连接，不属于模糊的在线身份。尚未启动的 v1 claim 可安全
+    // 回到 queued；legacy raw handoff 已可能执行外部副作用，断线必须按 unknown outcome 失败。
+    const affectedDeliveryTargets = this.requeueDirectedDeliveriesForConnection(
+      connection.id,
+      Date.now(),
+    );
     // 同名 serve 跨机租约（#99）：持租者/候选断连 → 重选，让下一条 standby 顶上（补发 held=true）。
     // 排除正在关闭的这条（getConnections 可能仍返回它）。非 serve 连接不触发。
-    if (st.serveCandidate) this.reconcileServeLease(st.name, connection.id);
+    if (st.serveCandidate) {
+      // The standby must learn held=true before it receives the retried delivery. Otherwise a real
+      // serve client can discard the delivery while it still believes it is standby.
+      this.reconcileServeLease(st.name, connection.id);
+      for (const targetName of affectedDeliveryTargets) {
+        if (targetName !== st.name) this.dispatchNextDirectedDelivery(targetName, connection.id);
+      }
+    } else if (st.kind === "agent") {
+      const targets = new Set(affectedDeliveryTargets);
+      // Also release a helloPending / legacy-watch dispatch barrier even when this connection did
+      // not yet own a durable row.
+      targets.add(st.name);
+      for (const targetName of targets) {
+        this.dispatchNextDirectedDelivery(targetName, connection.id);
+      }
+    }
     // 被移除成员的残连关闭去抖：窗口口径按 presence 新鲜度基准（60s），与 #487 拉长的扫描间隔无关，
     // 保持既有语义不变——避免把回收 alarm 的间隔耦合进「移除后多久内的残连关闭要抹掉 presence」。
     const removedAt = Number(this.getMeta(this.removedPresenceKey(st.name)) ?? "");
@@ -1737,6 +2371,7 @@ export class ChannelDO extends Server<Env> {
   // alarm 三件套（spec §6/§13）：presence 扫描 → webhook 重试 → temp 归档检查，最后按最近到期时间续排
   async onAlarm() {
     const now = Date.now();
+    this.requeueExpiredDirectedDeliveries(now);
     const scan = this.scanPresence(now);
     this.resumeDuePauses(now);
     await this.retryWebhooks(now);
@@ -1770,7 +2405,16 @@ export class ChannelDO extends Server<Env> {
     if (messageRetention !== null) {
       const cutoff = now - messageRetention;
       const expired = this.ctx.storage.sql
-        .exec("SELECT seq, attachments_json FROM messages WHERE ts <= ?", cutoff)
+        .exec(
+          `SELECT m.seq, m.attachments_json FROM messages m
+            WHERE m.ts <= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM directed_deliveries d
+                 WHERE d.message_seq = m.seq
+                   AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+              )`,
+          cutoff,
+        )
         .toArray();
       for (const row of expired) {
         for (const attachment of parseStoredAttachments(row.attachments_json) ?? []) {
@@ -1789,18 +2433,57 @@ export class ChannelDO extends Server<Env> {
             `DELETE FROM webhook_queue
               WHERE json_valid(payload)
                 AND CAST(json_extract(payload, '$.seq') AS INTEGER) IN
-                    (SELECT seq FROM messages WHERE ts <= ?)`,
+                    (SELECT m.seq FROM messages m WHERE m.ts <= ?
+                       AND NOT EXISTS (
+                         SELECT 1 FROM directed_deliveries d
+                          WHERE d.message_seq = m.seq
+                            AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+                       ))`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
-            "DELETE FROM webhook_dead_letters WHERE mention_seq IN (SELECT seq FROM messages WHERE ts <= ?)",
+            `DELETE FROM webhook_dead_letters
+              WHERE mention_seq IN (
+                SELECT m.seq FROM messages m WHERE m.ts <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM directed_deliveries d
+                     WHERE d.message_seq = m.seq
+                       AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+                  ))`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
-            "DELETE FROM wake_delivery_ledger WHERE mention_seq IN (SELECT seq FROM messages WHERE ts <= ?)",
+            `DELETE FROM wake_delivery_ledger
+              WHERE mention_seq IN (
+                SELECT m.seq FROM messages m WHERE m.ts <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM directed_deliveries d
+                     WHERE d.message_seq = m.seq
+                       AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+                  ))`,
             cutoff,
           );
-          this.ctx.storage.sql.exec("DELETE FROM messages WHERE ts <= ?", cutoff);
+          this.ctx.storage.sql.exec(
+            `DELETE FROM directed_deliveries
+              WHERE message_seq IN (
+                SELECT m.seq FROM messages m WHERE m.ts <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM directed_deliveries active
+                     WHERE active.message_seq = m.seq
+                       AND active.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+                  ))`,
+            cutoff,
+          );
+          this.ctx.storage.sql.exec(
+            `DELETE FROM messages AS m
+              WHERE m.ts <= ?
+                AND NOT EXISTS (
+                  SELECT 1 FROM directed_deliveries d
+                   WHERE d.message_seq = m.seq
+                     AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+                )`,
+            cutoff,
+          );
         });
       }
     }
@@ -1858,36 +2541,69 @@ export class ChannelDO extends Server<Env> {
   // #487：静默超过 PRESENCE_SCAN_MS（120s）的半开连接判 offline 并回收；ping 由 auto-response 盖时间戳、
   // 不唤醒 DO。返回存活连接数 + 最早一条存活连接的 last 活动时刻（earliestSeen），供 scheduleNextAlarm 按
   // 「最早到期」自适应重挂 alarm——只在真有连接可能超时的那一刻醒来，而非固定每分钟空转。
-  private scanPresence(now: number): { live: number; earliestSeen: number | null } {
-    const stale: Connection<ConnState>[] = [];
+  private scanPresence(now: number): {
+    live: number;
+    earliestSeen: number | null;
+    earliestHelloDeadline: number | null;
+  } {
+    const stale: Array<{ connection: Connection<ConnState>; helloTimeout: boolean }> = [];
     let live = 0;
     let earliestSeen: number | null = null;
+    let earliestHelloDeadline: number | null = null;
     for (const connection of this.getConnections<ConnState>()) {
       const st = connection.state;
       const pinged = this.ctx.getWebSocketAutoResponseTimestamp(connection)?.getTime() ?? 0;
       const last = Math.max(pinged, st?.lastSeen ?? 0);
-      if (now - last >= PRESENCE_SCAN_MS) {
-        stale.push(connection);
+      const helloDeadline = st?.helloPending === true && st.helloExpired !== true &&
+          typeof st.helloDeadlineAt === "number"
+        ? st.helloDeadlineAt
+        : null;
+      const helloTimeout = helloDeadline !== null && helloDeadline <= now;
+      if (helloTimeout || now - last >= PRESENCE_SCAN_MS) {
+        stale.push({ connection, helloTimeout });
       } else {
         live++;
         if (earliestSeen === null || last < earliestSeen) earliestSeen = last;
+        if (
+          helloDeadline !== null &&
+          (earliestHelloDeadline === null || helloDeadline < earliestHelloDeadline)
+        ) earliestHelloDeadline = helloDeadline;
       }
     }
     // 同名 serve 跨机租约（#99）：心跳超时的持租者，其连接在这里被关；关掉后要重选租约让 standby 顶上。
     const staleServeNames = new Set<string>();
-    for (const connection of stale) {
+    const expiredHelloNames = new Set<string>();
+    const affectedDeliveryTargets = new Set<string>();
+    for (const item of stale) {
+      const { connection, helloTimeout } = item;
       const name = connection.state?.name;
       if (connection.state?.serveCandidate && name) staleServeNames.add(name);
-      connection.close(1001, "heartbeat timeout");
+      for (const targetName of this.requeueDirectedDeliveriesForConnection(connection.id, now)) {
+        affectedDeliveryTargets.add(targetName);
+      }
+      if (helloTimeout) {
+        if (name) expiredHelloNames.add(name);
+        this.closeHelloExpired(connection);
+      } else {
+        connection.close(1001, "heartbeat timeout");
+      }
       if (!name) continue;
       this.cleanupPresenceSession(name, connection.id, now);
     }
     // 已 close 的陈旧连接不在 getConnections 里，直接重选：存活的候选里最早的顶上、补发 held=true。
     for (const name of staleServeNames) this.reconcileServeLease(name);
+    for (const targetName of affectedDeliveryTargets) {
+      if (!staleServeNames.has(targetName)) this.dispatchNextDirectedDelivery(targetName);
+    }
+    for (const name of expiredHelloNames) {
+      if (!staleServeNames.has(name) && !affectedDeliveryTargets.has(name)) {
+        this.dispatchNextDirectedDelivery(name);
+      }
+    }
     if (stale.length > 0) {
       this.broadcastFrame({ type: "participants", participants: this.participants() });
     }
-    return { live, earliestSeen };
+    return { live, earliestSeen, earliestHelloDeadline };
   }
 
   // 队列里到期的重投一轮：成功删行，失败退避 1/4/16 分钟，超过 3 次丢弃并向频道记一条 status
@@ -1895,8 +2611,9 @@ export class ChannelDO extends Server<Env> {
     if (this.isArchived()) return;
     const rows = this.ctx.storage.sql
       .exec(
-        `SELECT q.id, q.webhook_name, q.payload, q.attempts, w.url, w.secret
-         FROM webhook_queue q LEFT JOIN webhooks w ON w.name = q.webhook_name
+        `SELECT q.id, q.webhook_name, q.registration_id, q.webhook_mode, q.target_owner,
+                q.payload, q.attempts
+         FROM webhook_queue q
          WHERE q.next_retry_at <= ?
          ORDER BY q.next_retry_at, q.id
          LIMIT ?`,
@@ -1906,15 +2623,66 @@ export class ChannelDO extends Server<Env> {
       .toArray();
     for (const row of rows) {
       const id = Number(row.id);
-      // webhook 已被删除，队列残留直接清掉
-      if (row.url === null) {
-        this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
-        continue;
-      }
       const webhookName = String(row.webhook_name);
       const payload = String(row.payload);
       const attempt = Number(row.attempts) + 1;
-      const delivery = await this.deliverWebhook(String(row.url), String(row.secret), payload);
+      if (this.scrubRetractedWebhookArtifacts(payload)) continue;
+      const binding = this.storedWebhookBinding(row);
+      if (binding === null) {
+        const failure = { ok: false, status: null, error: "legacy retry has no immutable registration identity" };
+        this.recordDeadLetter(webhookName, payload, attempt, failure, now);
+        this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
+        continue;
+      }
+      const hook = this.currentWebhookForBinding(binding);
+      if (hook === null) {
+        const failure = {
+          ok: false,
+          status: null,
+          error: "webhook registration changed; refusing cross-registration retry",
+        };
+        this.recordDeadLetter(webhookName, payload, attempt, failure, now, binding);
+        this.failDirectedWebhookDelivery(payload, binding, failure.error, now);
+        this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
+        continue;
+      }
+      if (binding.mode === "agent") {
+        const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+        const directed = deliveryId === null ? undefined : this.directedDeliveryRow(deliveryId);
+        if (
+          directed === undefined ||
+          !this.directedWebhookPayloadMatchesBinding(payload, binding, directed)
+        ) {
+          const failure = {
+            ok: false,
+            status: null,
+            error: "agent webhook payload no longer matches its creation-time principal/work",
+          };
+          this.recordDeadLetter(webhookName, payload, attempt, failure, now, binding);
+          if (
+            directed !== undefined &&
+            String(directed.target_name) === binding.name &&
+            String(directed.target_owner ?? "") === binding.targetOwner &&
+            String(directed.lease_connection_id ?? "") === this.webhookHolderId(binding.registrationId)
+          ) {
+            this.transitionDirectedDeliveryTerminal(String(directed.id), "failed", now, {
+              error: failure.error,
+              terminalReason: "webhook_delivery_failed",
+              expectedStates: ["claimed"],
+              expectedLeaseAdapter: "webhook",
+              expectedLeaseConnectionId: this.webhookHolderId(binding.registrationId),
+            });
+          }
+          this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
+          continue;
+        }
+      }
+      if (!this.directedWebhookCanRetry(payload, binding)) {
+        this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
+        continue;
+      }
+      const delivery = await this.deliverWebhook(hook.url, hook.secret, payload);
+      if (this.scrubRetractedWebhookArtifacts(payload)) continue;
       this.recordWakeDelivery({
         mentionSeq: this.seqFromWebhookPayload(payload),
         targetName: webhookName,
@@ -1923,6 +2691,15 @@ export class ChannelDO extends Server<Env> {
         delivery,
       });
       if (delivery.ok) {
+        const directedId = this.directedDeliveryIdFromWebhookPayload(payload);
+        if (binding.mode === "agent" && directedId !== null) {
+          this.acceptDirectedWebhookDelivery(
+            payload,
+            binding,
+            now + DIRECTED_WEBHOOK_LEASE_MS,
+            now,
+          );
+        }
         this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
         continue;
       }
@@ -1930,16 +2707,31 @@ export class ChannelDO extends Server<Env> {
         this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE id = ?", id);
         // #105：不再静默永久丢弃——落死信表待 moderator 重投，
         // 并向频道插一条 system status（in-channel，不经 webhook 自身，见 dispatchWebhooks 对 system 帧的默认跳过）。
-        this.recordDeadLetter(webhookName, payload, attempt, delivery, now);
+        this.recordDeadLetter(webhookName, payload, attempt, delivery, now, binding);
+        this.failDirectedWebhookDelivery(
+          payload,
+          binding,
+          `agent webhook exhausted retries: ${delivery.error ?? `HTTP ${delivery.status ?? "unknown"}`}`,
+          now,
+        );
         this.insertSystemStatus(`webhook ${webhookName} 连续投递失败已转入死信，可 redeliver 重投`, now, false, { state: "blocked" });
         continue;
       }
+      const nextRetryAt = now + this.retryDelay(attempt);
       this.ctx.storage.sql.exec(
         "UPDATE webhook_queue SET attempts = ?, next_retry_at = ? WHERE id = ?",
         attempt,
-        now + this.retryDelay(attempt),
+        nextRetryAt,
         id,
       );
+      const directedId = this.directedDeliveryIdFromWebhookPayload(payload);
+      if (binding.mode === "agent" && directedId !== null) {
+        this.renewDirectedWebhookLease(
+          directedId,
+          binding,
+          nextRetryAt + DIRECTED_WEBHOOK_LEASE_MS,
+        );
+      }
     }
   }
 
@@ -1947,6 +2739,51 @@ export class ChannelDO extends Server<Env> {
     return WEBHOOK_RETRY_DELAYS_MS[
       Math.min(Math.max(attempts, 1), WEBHOOK_RETRY_DELAYS_MS.length) - 1
     ] as number;
+  }
+
+  private webhookHolderId(registrationId: string): string {
+    return `webhook:${registrationId}`;
+  }
+
+  private storedWebhookBinding(row: Record<string, unknown>): WebhookBinding | null {
+    const name = typeof row.webhook_name === "string" ? row.webhook_name : null;
+    const registrationId = typeof row.registration_id === "string" && row.registration_id.length > 0
+      ? row.registration_id
+      : null;
+    const mode = row.webhook_mode === "agent" ? "agent" : row.webhook_mode === "notify" ? "notify" : null;
+    const targetOwner = typeof row.target_owner === "string" && row.target_owner.length > 0
+      ? row.target_owner
+      : null;
+    if (name === null || registrationId === null || mode === null) return null;
+    if (mode === "agent" && targetOwner === null) return null;
+    if (mode === "notify" && targetOwner !== null) return null;
+    return { name, registrationId, mode, targetOwner };
+  }
+
+  private currentWebhookForBinding(binding: WebhookBinding): WebhookRow | null {
+    const row = this.ctx.storage.sql
+      .exec(
+        `SELECT name, registration_id, url, secret, filter, mode, target_owner
+           FROM webhooks WHERE name = ? AND registration_id = ?`,
+        binding.name,
+        binding.registrationId,
+      )
+      .toArray()[0];
+    if (row === undefined) return null;
+    const mode = String(row.mode) === "agent" ? "agent" : "notify";
+    const targetOwner = row.target_owner === null || row.target_owner === undefined
+      ? null
+      : String(row.target_owner);
+    if (mode !== binding.mode || targetOwner !== binding.targetOwner) return null;
+    return {
+      name: String(row.name),
+      registrationId: String(row.registration_id),
+      url: String(row.url),
+      secret: String(row.secret),
+      filter: String(row.filter) as WebhookFilter,
+      mode,
+      targetOwner,
+    };
   }
 
   // #105：把一条被永久放弃的投递落死信表。保留 payload 供 redeliver 原样重投；
@@ -1957,12 +2794,18 @@ export class ChannelDO extends Server<Env> {
     attempts: number,
     delivery: WebhookDeliveryResult,
     now: number,
+    binding: WebhookBinding | null = null,
   ) {
+    if (this.scrubRetractedWebhookArtifacts(payload)) return;
     this.ctx.storage.sql.exec(
       `INSERT INTO webhook_dead_letters (
-         webhook_name, mention_seq, payload, attempts, last_status, last_error, dead_lettered_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         webhook_name, registration_id, webhook_mode, target_owner,
+         mention_seq, payload, attempts, last_status, last_error, dead_lettered_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       webhookName,
+      binding?.registrationId ?? null,
+      binding?.mode ?? null,
+      binding?.targetOwner ?? null,
       this.seqFromWebhookPayload(payload),
       payload,
       attempts,
@@ -1995,8 +2838,9 @@ export class ChannelDO extends Server<Env> {
     const args: (string | number)[] = name === null ? [WEBHOOK_REDELIVER_BATCH_SIZE] : [name, WEBHOOK_REDELIVER_BATCH_SIZE];
     const rows = this.ctx.storage.sql
       .exec(
-        `SELECT dl.id, dl.webhook_name, dl.payload, dl.attempts, w.url, w.secret
-           FROM webhook_dead_letters dl LEFT JOIN webhooks w ON w.name = dl.webhook_name${where}
+        `SELECT dl.id, dl.webhook_name, dl.registration_id, dl.webhook_mode, dl.target_owner,
+                dl.payload, dl.attempts
+           FROM webhook_dead_letters dl${where}
           ORDER BY dl.id
           LIMIT ?`,
         ...args,
@@ -2010,19 +2854,37 @@ export class ChannelDO extends Server<Env> {
       const webhookName = String(row.webhook_name);
       const payload = String(row.payload);
       const attempt = Number(row.attempts) + 1;
-      // webhook 已被删除 → 无从投递，视为失败但留存，operator 需先重建同名 webhook 或清死信。
-      if (row.url === null) {
+      if (this.scrubRetractedWebhookArtifacts(payload)) continue;
+      const binding = this.storedWebhookBinding(row);
+      const hook = binding === null ? null : this.currentWebhookForBinding(binding);
+      // A dead letter belongs to one immutable registration. Re-creating the same name is a new
+      // endpoint and must never inherit old payload/work/ref data.
+      if (binding === null || hook === null) {
         failed++;
         this.ctx.storage.sql.exec(
           "UPDATE webhook_dead_letters SET attempts = ?, last_status = NULL, last_error = ?, dead_lettered_at = ? WHERE id = ?",
           attempt,
-          "webhook no longer registered",
+          binding === null
+            ? "dead letter has no immutable registration identity; redelivery refused"
+            : "webhook registration changed; cross-registration redelivery refused",
           now,
           id,
         );
         continue;
       }
-      const delivery = await this.deliverWebhook(String(row.url), String(row.secret), payload);
+      if (binding.mode === "agent" && !this.reclaimDirectedWebhookDeadLetter(payload, binding, now)) {
+        failed++;
+        this.ctx.storage.sql.exec(
+          "UPDATE webhook_dead_letters SET attempts = ?, last_status = NULL, last_error = ?, dead_lettered_at = ? WHERE id = ?",
+          attempt,
+          "agent delivery is not safely reclaimable for this registration and principal",
+          now,
+          id,
+        );
+        continue;
+      }
+      const delivery = await this.deliverWebhook(hook.url, hook.secret, payload);
+      if (this.scrubRetractedWebhookArtifacts(payload)) continue;
       this.recordWakeDelivery({
         mentionSeq: this.seqFromWebhookPayload(payload),
         targetName: webhookName,
@@ -2031,11 +2893,41 @@ export class ChannelDO extends Server<Env> {
         delivery,
       });
       if (delivery.ok) {
+        if (binding.mode === "agent") {
+          const acceptedAt = Date.now();
+          const accepted = this.acceptDirectedWebhookDelivery(
+            payload,
+            binding,
+            acceptedAt + DIRECTED_WEBHOOK_LEASE_MS,
+            acceptedAt,
+          );
+          const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+          const current = deliveryId === null ? undefined : this.directedDeliveryRow(deliveryId);
+          if (!accepted && String(current?.state ?? "") !== "replied") {
+            failed++;
+            this.ctx.storage.sql.exec(
+              "UPDATE webhook_dead_letters SET attempts = ?, last_status = NULL, last_error = ?, dead_lettered_at = ? WHERE id = ?",
+              attempt,
+              "agent webhook handoff lost its exact registration lease",
+              acceptedAt,
+              id,
+            );
+            continue;
+          }
+        }
         redelivered++;
         this.ctx.storage.sql.exec("DELETE FROM webhook_dead_letters WHERE id = ?", id);
         continue;
       }
       failed++;
+      if (binding.mode === "agent") {
+        this.failDirectedWebhookDelivery(
+          payload,
+          binding,
+          `agent webhook redelivery failed: ${delivery.error ?? `HTTP ${delivery.status ?? "unknown"}`}`,
+          Date.now(),
+        );
+      }
       this.ctx.storage.sql.exec(
         "UPDATE webhook_dead_letters SET attempts = ?, last_status = ?, last_error = ?, dead_lettered_at = ? WHERE id = ?",
         attempt,
@@ -2113,15 +3005,23 @@ export class ChannelDO extends Server<Env> {
   // 存活连接真正可能跨过静默阈值的时刻。健康连接每 25s ping、last 紧贴当下，到期约在 now+95~120s，等于把
   // 空转的每分钟唤醒拉到近两分钟一次（无连接则彻底不排，让 DO 睡到别的 candidate）。webhook/paused/temp/
   // retention 候选一律照旧，各自的 alarm 用途不受影响（#180 / #128 / temp 归档仍按点触发）。
-  private async scheduleNextAlarm(now: number, scan: { live: number; earliestSeen: number | null }) {
+  private async scheduleNextAlarm(
+    now: number,
+    scan: { live: number; earliestSeen: number | null; earliestHelloDeadline: number | null },
+  ) {
     const candidates: number[] = [];
     if (scan.live > 0 && scan.earliestSeen !== null) {
       candidates.push(scan.earliestSeen + PRESENCE_SCAN_MS);
     }
+    if (scan.earliestHelloDeadline !== null) candidates.push(scan.earliestHelloDeadline);
     const next = this.ctx.storage.sql
       .exec("SELECT MIN(next_retry_at) AS t FROM webhook_queue")
       .one();
     if (next.t !== null) candidates.push(Number(next.t));
+    const nextDeliveryLease = this.ctx.storage.sql
+      .exec("SELECT MIN(lease_until) AS t FROM directed_deliveries WHERE state IN ('claimed', 'running') AND lease_until IS NOT NULL")
+      .one();
+    if (nextDeliveryLease.t !== null) candidates.push(Number(nextDeliveryLease.t));
     // 暂停接待的定时恢复（issue #180）：取最近的一个未来恢复时刻作为候选，前移 alarm 到点自动恢复。
     const nextResume = this.ctx.storage.sql
       .exec("SELECT MIN(paused_resume_at) AS t FROM presence WHERE paused_resume_at IS NOT NULL")
@@ -2323,6 +3223,7 @@ export class ChannelDO extends Server<Env> {
     const entry = this.presenceFor(name);
     if (entry) this.broadcastFrame({ type: "presence", ...entry });
     this.insertSystemStatus(`${name} 已恢复接待`, now, false, { state: "waiting" });
+    this.dispatchNextDirectedDelivery(name);
     return true;
   }
 
@@ -2345,6 +3246,16 @@ export class ChannelDO extends Server<Env> {
   //     覆盖已有值——这样管理员刚关掉的 guard 不会被旧快照又打开。
   private cacheChannelMeta(h: Headers, host: string | null, opts?: { authoritative?: boolean }) {
     const authoritative = opts?.authoritative === true;
+    // Worker routes every request through the DO selected by this authoritative room slug. Keep a
+    // local copy so decision lineage can name its origin channel without trusting client payload.
+    const channelSlug = h.get("x-partykit-room");
+    if (
+      channelSlug !== null &&
+      channelSlug.length > 0 &&
+      byteLength(channelSlug) <= DELIVERY_ORIGIN_CHANNEL_LIMIT
+    ) {
+      this.setMeta("channel_slug", channelSlug);
+    }
     const mode = h.get("x-ap-mode");
     if (mode === "normal" || mode === "party") this.setMeta("mode", mode);
     const ckind = h.get("x-ap-channel-kind");
@@ -2411,7 +3322,31 @@ export class ChannelDO extends Server<Env> {
   }
 
   // 消息落库广播之后的副作用：serve/watch 唤醒审计 + webhook 投递 + temp 归档计时续排
-  private async afterSend(msg: MsgFrame) {
+  private async afterSend(
+    msg: MsgFrame,
+    deliveryTargets?: string[],
+    deliveriesAlreadyStaged = false,
+    deliveryTargetOwners?: Record<string, string>,
+  ) {
+    // #551：先把 @agent work 落到独立队列，再做网络型副作用。消息正文仍只在 messages；
+    // delivery 只引用 seq，因此断线、已读游标前移和 DO hibernate 都不会把 work 吞掉。
+    if (!deliveriesAlreadyStaged) {
+      this.ensureDirectedDeliveries(
+        msg,
+        deliveryTargets ?? await this.agentMentionTargets(msg),
+        deliveryTargetOwners ?? {},
+      );
+    }
+    // approval-mode decision requests have already atomically moved their source work to
+    // waiting_owner inside handleSend. Only after the request + delivery_state were broadcast may
+    // the same serve lease receive the next queued work; waiting rows deliberately do not serialize
+    // unrelated work behind a human response.
+    if (
+      msg.decision_request?.delivery_id !== undefined &&
+      msg.decision_resolution?.state === "pending"
+    ) {
+      this.dispatchNextDirectedDelivery(msg.sender.name);
+    }
     // #107：serve/watch 目标的 @ 广播即落 ledger（同步 SQL，不烧订阅、不发网络）——补齐它们缺失的服务端唤醒审计。
     this.recordServeWatchWakes(msg);
     // 首投移出发送关键路径：坏/慢端点不再让每条消息阻塞 N×10s 才返回 seq（DoS 频道）
@@ -2427,28 +3362,43 @@ export class ChannelDO extends Server<Env> {
   private async dispatchWebhooks(msg: MsgFrame) {
     // system 帧默认不触发 webhook，防止失败风暴自激；loop guard 例外，因为它需要唤醒人类。
     if (msg.sender.name === "system" && !this.isLoopGuardStatus(msg) && !this.isWorkflowGuardStatus(msg)) return;
+    if (this.isMessageRetracted(msg.seq)) return;
     const hooks = this.ctx.storage.sql
-      .exec("SELECT name, url, secret, filter FROM webhooks")
+      .exec("SELECT name, registration_id, url, secret, filter, mode, target_owner FROM webhooks")
       .toArray()
       .map((r) => ({
         name: String(r.name),
+        registrationId: String(r.registration_id),
         url: String(r.url),
         secret: String(r.secret),
         filter: String(r.filter) as WebhookFilter,
+        mode: String(r.mode) === "agent" ? "agent" : "notify",
+        targetOwner: r.target_owner === null || r.target_owner === undefined ? null : String(r.target_owner),
       })) as WebhookRow[];
     if (hooks.length === 0) return;
     const host = this.getMeta("host") ?? "agentparty";
     const now = Date.now();
-    // payload 对本条消息的所有 hook 都相同，循环外算一次（hook 不变量）
-    const payload = JSON.stringify({
-      ...msg,
-      channel: this.name,
-      permalink: `https://${host}/c/${this.name}`,
-    });
     // 暂停接待（issue #180）的抑制点：命中的 hook 里剔掉当前被人为暂停的目标——webhook 一律不投。
     // 这里在 afterSend 之后跑，消息早已落库+广播，历史/广播完全不受影响，只是不把「唤醒」推给暂停者。
     const targets = hooks.filter(
-      (h) => this.shouldDeliverWebhook(h.filter, h.name, msg) && !this.isPresencePaused(h.name),
+      (hook) => {
+        if (
+          hook.mode !== "notify" ||
+          !this.shouldDeliverWebhook(hook.filter, hook.name, msg) ||
+          this.isPresencePaused(hook.name)
+        ) return false;
+        const directed = this.ctx.storage.sql
+          .exec(
+            "SELECT state FROM directed_deliveries WHERE message_seq = ? AND target_name = ? LIMIT 1",
+            msg.seq,
+            hook.name,
+          )
+          .toArray()[0];
+        // Legacy notify hooks may still be used as agent wake accelerators. If serve/watch already
+        // claimed this exact work, suppress the parallel HTTP wake; when no executor is online the
+        // row stays queued and notify remains useful without owning correctness.
+        return directed === undefined || String(directed.state) === "queued";
+      },
     );
     if (targets.length === 0) return;
     // #108 per-agent wake 预算：在真正投递（烧订阅）之前判每个目标是否已超窗口内 wake 硬上限。
@@ -2466,13 +3416,31 @@ export class ChannelDO extends Server<Env> {
     if (firing.length === 0) return;
     // 并行投递：一个慢/坏端点不再拖累其余 hook（首投已由 afterSend 的 waitUntil 移出发送关键路径）
     const results = await Promise.all(
-      firing.map(async (hook) => ({
-        hook,
-        delivery: await this.deliverWebhook(hook.url, hook.secret, payload),
-      })),
+      firing.map(async (hook) => {
+        const directed = this.ctx.storage.sql
+          .exec(
+            "SELECT * FROM directed_deliveries WHERE message_seq = ? AND target_name = ? LIMIT 1",
+            msg.seq,
+            hook.name,
+          )
+          .toArray()[0];
+        const payload = JSON.stringify({
+          ...publicMsgFrame(msg),
+          channel: this.name,
+          permalink: `https://${host}/c/${this.name}`,
+          ...(directed === undefined
+            ? {}
+            : {
+                directed_delivery: this.rowToPublicDirectedDelivery(directed),
+                directed_delivery_adapter: "notify",
+              }),
+        });
+        return { hook, payload, delivery: await this.deliverWebhook(hook.url, hook.secret, payload) };
+      }),
     );
     let needAlarm = false;
-    for (const { hook, delivery } of results) {
+    for (const { hook, payload, delivery } of results) {
+      if (this.scrubRetractedWebhookArtifacts(payload)) continue;
       this.recordWakeDelivery({
         mentionSeq: msg.seq,
         targetName: hook.name,
@@ -2484,19 +3452,105 @@ export class ChannelDO extends Server<Env> {
       const queued = Number(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM webhook_queue").one().n);
       if (queued >= MAX_WEBHOOK_QUEUE_ROWS) {
         // #105：队列满不再直接丢——落死信表，operator 事后可查可重投。
-        this.recordDeadLetter(hook.name, payload, 1, delivery, now);
+        this.recordDeadLetter(hook.name, payload, 1, delivery, now, hook);
         await this.insertSystemStatus("webhook retry queue is full; delivery moved to dead-letters", now, false, { state: "blocked" });
         continue;
       }
       this.ctx.storage.sql.exec(
-        "INSERT INTO webhook_queue (webhook_name, payload, attempts, next_retry_at) VALUES (?, ?, 1, ?)",
+        `INSERT INTO webhook_queue (
+           webhook_name, registration_id, webhook_mode, target_owner, payload, attempts, next_retry_at
+         ) VALUES (?, ?, ?, ?, ?, 1, ?)`,
         hook.name,
+        hook.registrationId,
+        hook.mode,
+        hook.targetOwner,
         payload,
         now + this.retryDelay(1),
       );
       needAlarm = true;
     }
     if (needAlarm) await this.ensureAlarmAt(now + this.retryDelay(1));
+  }
+
+  /** An agent-mode webhook competes for the same durable work as serve/watch. */
+  private async dispatchDirectedWebhook(
+    hook: WebhookRow,
+    row: Record<string, unknown>,
+    msg: MsgFrame,
+  ) {
+    const delivery = this.rowToDirectedDelivery(row);
+    const payload = JSON.stringify({
+      ...msg,
+      channel: this.name,
+      permalink: `https://${this.getMeta("host") ?? "agentparty"}/c/${this.name}`,
+      directed_delivery: delivery,
+      directed_delivery_adapter: "agent",
+    });
+    if (this.scrubRetractedWebhookArtifacts(payload)) return;
+    const attemptedAt = Date.now();
+    const result = await this.deliverWebhook(
+      hook.url,
+      hook.secret,
+      payload,
+      `agentparty-delivery-${delivery.id}`,
+    );
+    if (this.scrubRetractedWebhookArtifacts(payload)) return;
+    this.recordWakeDelivery({
+      mentionSeq: delivery.message_seq,
+      targetName: delivery.target_name,
+      webhookName: hook.name,
+      attempt: delivery.attempt,
+      delivery: result,
+    });
+    if (!this.directedWebhookStillClaimed(payload, hook)) return;
+    if (result.ok) {
+      const acceptedAt = Date.now();
+      this.acceptDirectedWebhookDelivery(
+        payload,
+        hook,
+        acceptedAt + DIRECTED_WEBHOOK_LEASE_MS,
+        acceptedAt,
+      );
+      return;
+    }
+    if (this.currentWebhookForBinding(hook) === null) {
+      this.failDirectedWebhookDelivery(
+        payload,
+        hook,
+        "agent webhook registration changed before retry could be persisted",
+        Date.now(),
+      );
+      return;
+    }
+    const queued = Number(this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM webhook_queue").one().n);
+    if (queued >= MAX_WEBHOOK_QUEUE_ROWS) {
+      this.recordDeadLetter(hook.name, payload, delivery.attempt, result, attemptedAt, hook);
+      this.failDirectedWebhookDelivery(
+        payload,
+        hook,
+        "agent webhook retry queue is full; delivery moved to dead-letters",
+        attemptedAt,
+      );
+      return;
+    }
+    const nextRetryAt = attemptedAt + this.retryDelay(1);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO webhook_queue (
+         webhook_name, registration_id, webhook_mode, target_owner, payload, attempts, next_retry_at
+       ) VALUES (?, ?, ?, ?, ?, 1, ?)`,
+      hook.name,
+      hook.registrationId,
+      hook.mode,
+      hook.targetOwner,
+      payload,
+      nextRetryAt,
+    );
+    this.renewDirectedWebhookLease(
+      delivery.id,
+      hook,
+      nextRetryAt + DIRECTED_WEBHOOK_LEASE_MS,
+    );
+    await this.ensureAlarmAt(nextRetryAt);
   }
 
   private shouldDeliverWebhook(filter: WebhookFilter, hookName: string, msg: MsgFrame): boolean {
@@ -2533,10 +3587,208 @@ export class ChannelDO extends Server<Env> {
   }
 
   // 短超时 POST；Bearer = 注册时的 secret，HMAC 签 payload 供接收方校验（spec §15）
-  private async deliverWebhook(url: string, secret: string, payload: string): Promise<WebhookDeliveryResult> {
+  private directedDeliveryIdFromWebhookPayload(payload: string): string | null {
+    try {
+      const parsed = JSON.parse(payload) as { directed_delivery?: { id?: unknown } };
+      return typeof parsed.directed_delivery?.id === "string" && parsed.directed_delivery.id.length > 0
+        ? parsed.directed_delivery.id
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private directedWebhookPayloadMatchesBinding(
+    payload: string,
+    binding: WebhookBinding,
+    row: Record<string, unknown>,
+  ): boolean {
+    try {
+      const parsed = JSON.parse(payload) as {
+        directed_delivery_adapter?: unknown;
+        directed_delivery?: {
+          id?: unknown;
+          message_seq?: unknown;
+          target_name?: unknown;
+          work_id?: unknown;
+          continuation_ref?: unknown;
+        };
+      };
+      if (parsed.directed_delivery_adapter !== binding.mode) return false;
+      if (binding.mode === "notify") return true;
+      const delivery = parsed.directed_delivery;
+      return (
+        delivery !== undefined &&
+        delivery.id === String(row.id) &&
+        delivery.message_seq === Number(row.message_seq) &&
+        delivery.target_name === String(row.target_name) &&
+        delivery.work_id === String(row.work_id ?? "") &&
+        delivery.continuation_ref === String(row.continuation_ref ?? "") &&
+        binding.name === String(row.target_name) &&
+        binding.targetOwner === String(row.target_owner ?? "")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private directedWebhookStillClaimed(payload: string, binding: WebhookBinding): boolean {
+    const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+    if (deliveryId === null || binding.mode !== "agent") return false;
+    const row = this.directedDeliveryRow(deliveryId);
+    return (
+      row !== undefined &&
+      this.directedWebhookPayloadMatchesBinding(payload, binding, row) &&
+      String(row.state) === "claimed" &&
+      String(row.lease_adapter) === "webhook" &&
+      String(row.lease_connection_id) === this.webhookHolderId(binding.registrationId)
+    );
+  }
+
+  private directedWebhookCanRetry(payload: string, binding: WebhookBinding): boolean {
+    const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+    if (deliveryId === null) return true;
+    try {
+      const parsed = JSON.parse(payload) as { directed_delivery_adapter?: unknown };
+      if (parsed.directed_delivery_adapter === "notify") {
+        if (binding.mode !== "notify") return false;
+        const row = this.directedDeliveryRow(deliveryId);
+        return row !== undefined && String(row.state) === "queued";
+      }
+    } catch {
+      return false;
+    }
+    return this.directedWebhookStillClaimed(payload, binding);
+  }
+
+  private acceptDirectedWebhookDelivery(
+    payload: string,
+    binding: WebhookBinding,
+    leaseUntil: number,
+    now: number,
+  ): boolean {
+    const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+    if (deliveryId === null || binding.mode !== "agent") return false;
+    const before = this.directedDeliveryRow(deliveryId);
+    if (before === undefined || !this.directedWebhookPayloadMatchesBinding(payload, binding, before)) return false;
+    const holder = this.webhookHolderId(binding.registrationId);
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET state = 'running', lease_until = ?, last_error = NULL,
+              terminal_reason = NULL, updated_at = ?
+        WHERE id = ? AND state = 'claimed' AND lease_adapter = 'webhook'
+          AND lease_connection_id = ? AND target_owner = ?`,
+      leaseUntil,
+      now,
+      deliveryId,
+      holder,
+      binding.targetOwner,
+    );
+    const running = this.directedDeliveryRow(deliveryId);
+    if (running === undefined || String(running.state) !== "running") return false;
+    this.broadcastDirectedDelivery(running);
+    this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+    return true;
+  }
+
+  private reclaimDirectedWebhookDeadLetter(
+    payload: string,
+    binding: WebhookBinding,
+    now: number,
+  ): boolean {
+    const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+    if (deliveryId === null || binding.mode !== "agent") return false;
+    const row = this.directedDeliveryRow(deliveryId);
+    if (
+      row === undefined ||
+      !this.directedWebhookPayloadMatchesBinding(payload, binding, row) ||
+      String(row.state) !== "failed" ||
+      String(row.terminal_reason ?? "") !== "webhook_delivery_failed"
+    ) return false;
+    const holder = this.webhookHolderId(binding.registrationId);
+    const leaseUntil = now + DIRECTED_WEBHOOK_LEASE_MS;
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET state = 'claimed', attempt = attempt + 1,
+              lease_connection_id = ?, last_lease_connection_id = ?, lease_adapter = 'webhook',
+              lease_until = ?, last_error = NULL, terminal_reason = NULL, updated_at = ?
+        WHERE id = ? AND state = 'failed' AND terminal_reason = 'webhook_delivery_failed'
+          AND target_name = ? AND target_owner = ?`,
+      holder,
+      holder,
+      leaseUntil,
+      now,
+      deliveryId,
+      binding.name,
+      binding.targetOwner,
+    );
+    const claimed = this.directedDeliveryRow(deliveryId);
+    if (
+      claimed === undefined ||
+      String(claimed.state) !== "claimed" ||
+      String(claimed.lease_connection_id) !== holder
+    ) return false;
+    this.broadcastDirectedDelivery(claimed);
+    this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+    return true;
+  }
+
+  private renewDirectedWebhookLease(
+    deliveryId: string,
+    binding: WebhookBinding,
+    leaseUntil: number,
+  ) {
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET lease_until = MAX(COALESCE(lease_until, 0), ?), updated_at = MAX(updated_at, ?)
+        WHERE id = ? AND state = 'claimed' AND lease_adapter = 'webhook'
+          AND lease_connection_id = ? AND target_owner = ?`,
+      leaseUntil,
+      Date.now(),
+      deliveryId,
+      this.webhookHolderId(binding.registrationId),
+      binding.targetOwner,
+    );
+    this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+  }
+
+  private failDirectedWebhookDelivery(
+    payload: string,
+    binding: WebhookBinding | null,
+    error: string,
+    now: number,
+  ) {
+    const deliveryId = this.directedDeliveryIdFromWebhookPayload(payload);
+    if (deliveryId === null) return;
+    const row = this.directedDeliveryRow(deliveryId);
+    if (row === undefined) return;
+    if (binding !== null) {
+      if (binding.mode !== "agent" || !this.directedWebhookPayloadMatchesBinding(payload, binding, row)) return;
+      if (String(row.lease_connection_id) !== this.webhookHolderId(binding.registrationId)) return;
+    }
+    this.transitionDirectedDeliveryTerminal(deliveryId, "failed", now, {
+      error,
+      terminalReason: "webhook_delivery_failed",
+      expectedStates: ["claimed", "running"],
+      expectedLeaseAdapter: "webhook",
+      ...(binding === null
+        ? {}
+        : { expectedLeaseConnectionId: this.webhookHolderId(binding.registrationId) }),
+    });
+  }
+
+  private async deliverWebhook(
+    url: string,
+    secret: string,
+    payload: string,
+    stableRequestId?: string,
+  ): Promise<WebhookDeliveryResult> {
     try {
       const signature = await hmacSha256Hex(secret, payload);
-      const requestId = await sha256Hex(payload);
+      const directedId = this.directedDeliveryIdFromWebhookPayload(payload);
+      const requestId = stableRequestId ?? (directedId === null
+        ? `agentparty-${await sha256Hex(payload)}`
+        : `agentparty-delivery-${directedId}`);
       const res = await fetch(url, {
         method: "POST",
         body: payload,
@@ -2550,7 +3802,7 @@ export class ChannelDO extends Server<Env> {
           "x-webhook-signature": signature,
           // Derived only from the immutable payload: stable across retries and
           // webhook secret rotation, so Hermes starts at most one agent turn.
-          "x-request-id": `agentparty-${requestId}`,
+          "x-request-id": requestId,
         },
         redirect: "manual",
         signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
@@ -2788,6 +4040,33 @@ export class ChannelDO extends Server<Env> {
     }
   }
 
+  private isMessageRetracted(seq: number): boolean {
+    if (!Number.isSafeInteger(seq) || seq <= 0) return false;
+    const row = this.ctx.storage.sql
+      .exec("SELECT retracted_at FROM messages WHERE seq = ?", seq)
+      .toArray()[0];
+    return row !== undefined && row.retracted_at !== null && row.retracted_at !== undefined;
+  }
+
+  /**
+   * Retraction is a persistent webhook tombstone, including against stale async continuations that
+   * started before the retract transaction committed. This check and cleanup run synchronously with
+   * every post-network write, so no await can interleave between the barrier and persistence.
+   */
+  private scrubRetractedWebhookArtifacts(payload: string): boolean {
+    const seq = this.seqFromWebhookPayload(payload);
+    if (!this.isMessageRetracted(seq)) return false;
+    const payloadSeq =
+      "CASE WHEN json_valid(payload) THEN CAST(json_extract(payload, '$.seq') AS INTEGER) ELSE NULL END";
+    this.ctx.storage.sql.exec(`DELETE FROM webhook_queue WHERE ${payloadSeq} = ?`, seq);
+    this.ctx.storage.sql.exec(
+      `DELETE FROM webhook_dead_letters WHERE mention_seq = ? OR ${payloadSeq} = ?`,
+      seq,
+      seq,
+    );
+    return true;
+  }
+
   private messageUpdate(action: MessageUpdateFrame["action"], actor: Identity, message: MsgFrame, ts: number): MessageUpdateFrame {
     return {
       type: "message_update",
@@ -2880,7 +4159,7 @@ export class ChannelDO extends Server<Env> {
     );
     const row = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
     const frame = this.rowToFrame(row);
-    this.linkWakeResume(identity.name, frame, now);
+    this.linkWakeResume(identity, frame, now);
     return frame;
   }
 
@@ -2919,8 +4198,144 @@ export class ChannelDO extends Server<Env> {
     );
     const row = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
     const frame = this.rowToFrame(row);
-    this.linkWakeResume(identity.name, frame, now);
+    this.linkWakeResume(identity, frame, now);
     return frame;
+  }
+
+  /**
+   * Resolve server-owned decision lineage back to its exact parked work. A delivery id alone is not
+   * sufficient: retained/corrupted questions must not graft an owner answer onto another origin,
+   * work id, continuation, channel, or creation-time principal.
+   */
+  private exactDecisionSource(
+    question: Record<string, unknown>,
+    request: DecisionRequest,
+  ): Record<string, unknown> | undefined {
+    if (
+      request.delivery_id === undefined ||
+      request.origin_seq === undefined ||
+      request.origin_channel === undefined ||
+      request.work_id === undefined ||
+      request.continuation_ref === undefined
+    ) return undefined;
+    const source = this.directedDeliveryRow(request.delivery_id);
+    if (source === undefined) return undefined;
+    const senderOwner =
+      typeof question.sender_owner === "string" && question.sender_owner.length > 0
+        ? question.sender_owner
+        : null;
+    const sourceOwner =
+      typeof source.target_owner === "string" && source.target_owner.length > 0
+        ? source.target_owner
+        : null;
+    const originChannel = this.getMeta("channel_slug") ?? this.name;
+    const origin = this.ctx.storage.sql
+      .exec("SELECT retracted_at FROM messages WHERE seq = ?", request.origin_seq)
+      .toArray()[0];
+    if (
+      origin === undefined ||
+      (origin.retracted_at !== null && origin.retracted_at !== undefined) ||
+      String(source.target_name) !== String(question.sender_name) ||
+      sourceOwner === null ||
+      (senderOwner !== null && senderOwner !== sourceOwner) ||
+      Number(source.message_seq) !== request.origin_seq ||
+      Number(question.reply_to) !== request.origin_seq ||
+      request.origin_channel !== originChannel ||
+      String(source.work_id ?? "") !== request.work_id ||
+      String(source.continuation_ref ?? "") !== request.continuation_ref
+    ) return undefined;
+    return source;
+  }
+
+  /** Fail the retracted source plus every still-active owner-answer continuation below it. */
+  private failRetractedDeliveryTree(initial: Record<string, unknown>[], now: number): number[] {
+    const pending = initial.map((row) => String(row.id));
+    const visited = new Set<string>();
+    const invalidatedDecisionSeqs = new Set<number>();
+    // `visited` is the cycle guard; do not impose a depth/row cap that can leave an attacker-shaped
+    // continuation tail revivable after the retract transaction commits.
+    while (pending.length > 0) {
+      const id = pending.shift()!;
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const row = this.directedDeliveryRow(id);
+      if (row === undefined) continue;
+      for (const child of this.ctx.storage.sql
+        .exec(
+          `SELECT id FROM directed_deliveries
+            WHERE parent_delivery_id = ?
+            ORDER BY created_at, id`,
+          id,
+        )
+        .toArray()) {
+        pending.push(String(child.id));
+      }
+      // A parked question is a message, not a child delivery. Invalidate it while the source id is
+      // still available so retracting an origin cannot leave an actionable pending decision UI.
+      const questions = this.ctx.storage.sql
+        .exec(
+          `SELECT seq FROM messages
+            WHERE decision_state = 'pending'
+              AND decision_request_json IS NOT NULL
+              AND json_valid(decision_request_json)
+              AND json_extract(decision_request_json, '$.delivery_id') = ?`,
+          id,
+        )
+        .toArray();
+      for (const question of questions) {
+        const questionSeq = Number(question.seq);
+        this.ctx.storage.sql.exec(
+          `UPDATE messages
+              SET decision_request_json = NULL, decision_state = NULL,
+                  decision_resolution_json = NULL, decision_response_json = NULL,
+                  rev_seq = ?
+            WHERE seq = ? AND decision_state = 'pending'`,
+          this.nextRevSeq(),
+          questionSeq,
+        );
+        if (Number(this.ctx.storage.sql.exec("SELECT changes() AS count").one().count) === 1) {
+          invalidatedDecisionSeqs.add(questionSeq);
+        }
+      }
+      const state = String(row.state);
+      if (["queued", "claimed", "running", "waiting_owner"].includes(state)) {
+        this.transitionDirectedDeliveryTerminal(id, "failed", now, {
+          error: "source retracted, no retry",
+          terminalReason: "source_retracted",
+          expectedStates: [state],
+        });
+      } else if (state === "failed") {
+        // Failed rows can still be revivable (typed unknown_outcome or legacy NULL). Retraction is
+        // stronger than that recovery policy, so reclassify every failed descendant authoritatively.
+        this.ctx.storage.sql.exec(
+          `UPDATE directed_deliveries
+              SET last_error = 'source retracted, no retry', terminal_reason = 'source_retracted',
+                  updated_at = ?
+            WHERE id = ? AND state = 'failed'`,
+          now,
+          id,
+        );
+        const failed = this.directedDeliveryRow(id);
+        if (failed !== undefined) this.broadcastDirectedDelivery(failed);
+      } else if (state !== "replied") {
+        continue;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET work_id = NULL, continuation_ref = NULL, parent_delivery_id = NULL,
+                lease_connection_id = NULL, last_lease_connection_id = NULL,
+                lease_adapter = NULL, lease_until = NULL
+          WHERE id = ?`,
+        id,
+      );
+    }
+    return [...invalidatedDecisionSeqs];
+  }
+
+  private isFailedDeliveryRevivable(row: Record<string, unknown>): boolean {
+    if (String(row.state) !== "failed") return false;
+    if (row.terminal_reason === null || row.terminal_reason === undefined) return true;
+    return REVIVABLE_DELIVERY_FAILURES.has(String(row.terminal_reason) as DeliveryTerminalReason);
   }
 
   // 归档收口：写 meta + 广播 error:archived + 踢连接（手动归档与 temp 自动归档共用）
@@ -3051,7 +4466,7 @@ export class ChannelDO extends Server<Env> {
                 limit,
               )
               .toArray();
-      return Response.json({ messages: rows.map((r) => this.rowToFrame(r)) });
+      return Response.json({ messages: rows.map((r) => publicMsgFrame(this.rowToFrame(r))) });
     }
     if (url.pathname === "/internal/message-stats" && request.method === "GET") {
       const row = this.ctx.storage.sql
@@ -3251,10 +4666,15 @@ export class ChannelDO extends Server<Env> {
         const frame = this.rowToFrame(updated);
         this.broadcastFrame(this.messageUpdate("edit", identity, frame, now));
         await this.scheduleAuditRetention(now);
-        return Response.json({ message: frame });
+        return Response.json({ message: publicMsgFrame(frame) });
       }
       if (action === "retract") {
-        this.ctx.storage.transactionSync(() => {
+        // Preserve the server-owned lineage before the row is scrubbed. A pending question parks
+        // work on the origin message, so retracting only deliveries whose message_seq is the
+        // question would strand that continuation forever.
+        const retractedDecisionRequest = parseStoredDecisionRequest(row.decision_request_json);
+        const invalidatedDecisionSeqs: number[] = [];
+        const effects = this.captureAtomicDeliveryEffects(() => {
           this.ctx.storage.sql.exec(
             `INSERT INTO message_audit (
                target_seq, action, actor_name, actor_kind, old_body, new_body, original_byte_length, created_at
@@ -3279,6 +4699,8 @@ export class ChannelDO extends Server<Env> {
                     completion_reviewed_by = NULL, completion_reviewed_by_kind = NULL,
                     completion_reviewed_by_owner = NULL, completion_reviewed_at = NULL,
                     completion_review_reason = NULL,
+                    decision_request_json = NULL, decision_state = NULL,
+                    decision_resolution_json = NULL, decision_response_json = NULL,
                     retracted_at = ?, retracted_by = ?, rev_seq = ?
               WHERE seq = ?`,
             now,
@@ -3286,12 +4708,50 @@ export class ChannelDO extends Server<Env> {
             this.nextRevSeq(),
             seq,
           );
+
+          // A queued/dead webhook payload is an immutable copy of the original frame. Scrubbing the
+          // messages row alone would leave a retract bypass: alarm retry or moderator redeliver could
+          // still POST the private original body. Match the source from the JSON payload itself so
+          // notify and agent rows use the same deletion rule, including legacy-compatible JSON rows.
+          const payloadSeq =
+            "CASE WHEN json_valid(payload) THEN CAST(json_extract(payload, '$.seq') AS INTEGER) ELSE NULL END";
+          const deliveryRoots: Record<string, unknown>[] = this.ctx.storage.sql
+            .exec(
+              `SELECT * FROM directed_deliveries
+                WHERE message_seq = ?
+                ORDER BY created_at, id`,
+              seq,
+            )
+            .toArray();
+          if (retractedDecisionRequest?.delivery_id !== undefined) {
+            const source = this.exactDecisionSource(row, retractedDecisionRequest);
+            if (source !== undefined && String(source.state) === "waiting_owner") {
+              deliveryRoots.push(source);
+            }
+          }
+          // Retract is terminal for every active execution adapter, not just rows that still have a
+          // webhook retry payload. Descendant owner answers are part of the same continuation and
+          // must close in the same SQLite commit; broadcasts/dispatch remain deferred by capture.
+          invalidatedDecisionSeqs.push(...this.failRetractedDeliveryTree(deliveryRoots, now));
+          this.ctx.storage.sql.exec(`DELETE FROM webhook_queue WHERE ${payloadSeq} = ?`, seq);
+          this.ctx.storage.sql.exec(
+            `DELETE FROM webhook_dead_letters WHERE mention_seq = ? OR ${payloadSeq} = ?`,
+            seq,
+            seq,
+          );
         });
+        this.flushAtomicDeliveryEffects(effects);
+        for (const questionSeq of new Set(invalidatedDecisionSeqs)) {
+          const question = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", questionSeq).toArray()[0];
+          if (question !== undefined) {
+            this.broadcastFrame(this.messageUpdate("decision", identity, this.rowToFrame(question), now));
+          }
+        }
         const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
         const frame = this.rowToFrame(updated);
         this.broadcastFrame(this.messageUpdate("retract", identity, frame, now));
         await this.scheduleAuditRetention(now);
-        return Response.json({ message: frame });
+        return Response.json({ message: publicMsgFrame(frame) });
       }
 
       const mentions = Array.isArray(body!.mentions) ? body!.mentions.filter((m): m is string => typeof m === "string") : [];
@@ -3322,10 +4782,11 @@ export class ChannelDO extends Server<Env> {
         now,
       );
       this.broadcastFrame(this.messageUpdate("supersede", identity, oldFrame, now));
+      this.flushAtomicDeliveryEffects(out.atomicEffects);
       this.broadcastFrame(newFrame);
-      await this.afterSend(newFrame);
+      await this.afterSend(newFrame, undefined, true);
       await this.scheduleAuditRetention(now);
-      return Response.json({ message: newFrame, superseded: oldFrame });
+      return Response.json({ message: publicMsgFrame(newFrame), superseded: publicMsgFrame(oldFrame) });
     }
     const reviewMatch = url.pathname.match(/^\/internal\/messages\/([1-9]\d*)\/review$/);
     if (reviewMatch && request.method === "POST") {
@@ -3427,8 +4888,8 @@ export class ChannelDO extends Server<Env> {
       const mentions = action === "reject" ? [senderName] : [];
       const reply = this.insertReviewerReply(identity, replyBody, mentions, seq, now);
       this.broadcastFrame(reply);
-      await this.afterSend(reply);
-      return Response.json({ message, reply });
+      await this.afterSend(reply, String(row.sender_kind) === "agent" ? [senderName] : []);
+      return Response.json({ message: publicMsgFrame(message), reply: publicMsgFrame(reply) });
     }
     // 人类决策回应（#284）：镜像 completion review 的收口——resolve 请求 + 广播 message_update("decision")
     // + 落一条 decision_response 回复 @ 请求方。approval 用 action=approve/reject，choice 用 option=下标/文本。
@@ -3474,9 +4935,6 @@ export class ChannelDO extends Server<Env> {
         return Response.json({ error: { code: "bad_request", message: "retracted decision cannot be answered" } }, { status: 400 });
       }
       const currentState = row.decision_state === null || row.decision_state === undefined ? null : String(row.decision_state);
-      if (currentState !== "pending") {
-        return Response.json({ error: { code: "decision_already_final", message: "decision is not pending" } }, { status: 409 });
-      }
       const senderName = String(row.sender_name);
       if (identity.name === senderName) {
         return Response.json({ error: { code: "forbidden", message: "the requesting agent cannot answer its own decision" } }, { status: 403 });
@@ -3484,6 +4942,40 @@ export class ChannelDO extends Server<Env> {
       // 人在回路：只有人类或 moderator 能替频道拍板；普通 worker agent 不行。
       if (identity.kind !== "human" && !isModerator) {
         return Response.json({ error: { code: "forbidden", message: "only a human or moderator can respond to a decision" } }, { status: 403 });
+      }
+      const resolvedRetryResponse = (): Response | null => {
+        const resolvedRow = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
+        if (resolvedRow === undefined || String(resolvedRow.decision_state ?? "") !== "resolved") return null;
+        const originalResolution = parseStoredDecisionResolution(resolvedRow);
+        const originalResponder = originalResolution?.responder;
+        const originalOwner = originalResolution?.responder_owner ?? originalResponder?.owner;
+        const sameResponder =
+          originalResponder?.name === identity.name &&
+          originalResponder.kind === identity.kind &&
+          (originalOwner === undefined || originalOwner === identity.owner);
+        if (!sameResponder) return null;
+        const originalReplyRow = this.ctx.storage.sql
+          .exec(
+            `SELECT * FROM messages
+              WHERE decision_response_json IS NOT NULL
+                AND CAST(json_extract(decision_response_json, '$.request_seq') AS INTEGER) = ?
+              ORDER BY seq LIMIT 1`,
+            seq,
+          )
+          .toArray()[0];
+        return originalReplyRow === undefined
+          ? null
+          : Response.json({
+              message: publicMsgFrame(this.rowToFrame(resolvedRow)),
+              reply: publicMsgFrame(this.rowToFrame(originalReplyRow)),
+            });
+      };
+      if (currentState === "resolved") {
+        const retry = resolvedRetryResponse();
+        if (retry !== null) return retry;
+      }
+      if (currentState !== "pending") {
+        return Response.json({ error: { code: "decision_already_final", message: "decision is not pending" } }, { status: 409 });
       }
       const body = (await request.json().catch(() => null)) as { option?: unknown; action?: unknown; reason?: unknown } | null;
       let chosenIndex: number | null = null;
@@ -3508,6 +5000,61 @@ export class ChannelDO extends Server<Env> {
       if (byteLength(reason) > DECISION_REASON_LIMIT) {
         return Response.json({ error: { code: "too_large", message: `reason exceeds ${DECISION_REASON_LIMIT} bytes` } }, { status: 413 });
       }
+      // Bind the generated owner-answer work to the question sender's creation-time principal
+      // before finalizing the decision. A current same-name token must never inherit an old answer.
+      let replyTargetOwners: Record<string, string> = {};
+      if (String(row.sender_kind) === "agent") {
+        const senderPrincipal =
+          typeof row.sender_owner === "string" && row.sender_owner.length > 0
+            ? row.sender_owner
+            : undefined;
+        let principal = senderPrincipal;
+        if (decisionReq.delivery_id !== undefined) {
+          const sourceDelivery = this.exactDecisionSource(row, decisionReq);
+          if (sourceDelivery === undefined) {
+            return Response.json(
+              { error: { code: "unavailable", message: "decision response target lineage is no longer available" } },
+              { status: 503 },
+            );
+          }
+          if (String(sourceDelivery.state) !== "waiting_owner") {
+            return Response.json(
+              { error: { code: "decision_already_final", message: "decision source work is no longer waiting for owner" } },
+              { status: 409 },
+            );
+          }
+          principal = String(sourceDelivery.target_owner);
+        } else if (row.reply_to !== null && row.reply_to !== undefined) {
+          // A server-bound decision can only become "unbound" through retention/corruption. Fail
+          // closed if its replied-to origin has durable work for this agent, regardless of state.
+          const possibleSource = this.ctx.storage.sql
+            .exec(
+              `SELECT id FROM directed_deliveries
+                WHERE message_seq = ? AND target_name = ?
+                LIMIT 1`,
+              Number(row.reply_to),
+              senderName,
+            )
+            .toArray()[0];
+          if (possibleSource !== undefined) {
+            return Response.json(
+              { error: { code: "unavailable", message: "decision response is missing its source lineage" } },
+              { status: 503 },
+            );
+          }
+        }
+        if (principal === undefined) {
+          replyTargetOwners = (await this.agentOwnersForTargets([senderName])) ?? {};
+        } else {
+          replyTargetOwners = { [senderName]: principal };
+        }
+        if (!Object.prototype.hasOwnProperty.call(replyTargetOwners, senderName)) {
+          return Response.json(
+            { error: { code: "unavailable", message: "cannot bind decision response target identity" } },
+            { status: 503 },
+          );
+        }
+      }
       const now = Date.now();
       const chosenOption = decisionReq.options[chosenIndex];
       const resolution: DecisionResolution = {
@@ -3519,27 +5066,76 @@ export class ChannelDO extends Server<Env> {
         responded_at: now,
         ...(reason === "" ? {} : { reason }),
       };
-      this.ctx.storage.sql.exec(
-        `UPDATE messages SET decision_state = 'resolved', decision_resolution_json = ?, rev_seq = ? WHERE seq = ?`,
-        JSON.stringify(resolution),
-        this.nextRevSeq(),
-        seq,
-      );
-      const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
-      const message = this.rowToFrame(updated);
-      this.broadcastFrame(this.messageUpdate("decision", identity, message, now));
       const replyBody = `@${senderName} decision #${seq} → ${chosenOption}${reason === "" ? "" : `: ${reason}`}`;
-      const reply = this.insertDecisionResponse(
-        identity,
-        replyBody,
-        [senderName],
-        seq,
-        { request_seq: seq, chosen_index: chosenIndex, chosen_option: chosenOption },
-        now,
-      );
+      const response: DecisionResponse = {
+        request_seq: seq,
+        chosen_index: chosenIndex,
+        chosen_option: chosenOption,
+        prompt: decisionReq.prompt,
+        ...(reason === "" ? {} : { reason }),
+        ...(decisionReq.delivery_id === undefined
+          ? {}
+          : {
+              delivery_id: decisionReq.delivery_id,
+              origin_seq: decisionReq.origin_seq!,
+              origin_channel: decisionReq.origin_channel!,
+              work_id: decisionReq.work_id!,
+              continuation_ref: decisionReq.continuation_ref!,
+            }),
+      };
+      let message: MsgFrame | undefined;
+      let reply: MsgFrame | undefined;
+      const replyTargets = String(row.sender_kind) === "agent" ? [senderName] : [];
+      const casLost = new Error("decision request was finalized concurrently");
+      let effects: AtomicDeliveryEffects;
+      try {
+        effects = this.captureAtomicDeliveryEffects(() => {
+          const decisionRev = this.nextRevSeq();
+          this.ctx.storage.sql.exec(
+            `UPDATE messages
+                SET decision_state = 'resolved', decision_resolution_json = ?, rev_seq = ?
+              WHERE seq = ? AND decision_state = 'pending'`,
+            JSON.stringify(resolution),
+            decisionRev,
+            seq,
+          );
+          const changed = Number(this.ctx.storage.sql.exec("SELECT changes() AS count").one().count);
+          if (changed !== 1) throw casLost;
+          const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
+          if (updated === undefined) throw new Error("resolved decision request disappeared");
+          message = this.rowToFrame(updated);
+          reply = this.insertDecisionResponse(
+            identity,
+            replyBody,
+            [senderName],
+            seq,
+            response,
+            now,
+          );
+          this.ensureDirectedDeliveries(reply, replyTargets, replyTargetOwners);
+        });
+      } catch (error) {
+        if (error !== casLost) throw error;
+        const retry = resolvedRetryResponse();
+        if (retry !== null) return retry;
+        return Response.json(
+          { error: { code: "decision_already_final", message: "decision is not pending" } },
+          { status: 409 },
+        );
+      }
+      if (message === undefined || reply === undefined) {
+        throw new Error("atomic decision response produced no message");
+      }
+      this.broadcastFrame(this.messageUpdate("decision", identity, message, now));
+      this.flushAtomicDeliveryEffects(effects);
       this.broadcastFrame(reply);
-      await this.afterSend(reply);
-      return Response.json({ message, reply });
+      await this.afterSend(
+        reply,
+        replyTargets,
+        true,
+        replyTargetOwners,
+      );
+      return Response.json({ message: publicMsgFrame(message), reply: publicMsgFrame(reply) });
     }
     if (url.pathname === "/internal/search" && request.method === "GET") {
       const query = (url.searchParams.get("q") ?? "").trim();
@@ -3700,10 +5296,19 @@ export class ChannelDO extends Server<Env> {
       }
       // 幂等去重命中（#98）：首发时已广播/唤醒过，重发只回原 seq，绝不重复副作用
       if (!out.deduped) {
-        // 同 ws 路径（#114）：先广播，再做与本条消息无关的连接清理
+        const sent = out.frames[0] as MsgFrame;
+        const parksSourceWork =
+          sent.decision_request?.delivery_id !== undefined &&
+          sent.decision_resolution?.state === "pending";
+        // A legacy holder is selected by the committed delivery transition; publish that selection
+        // before raw broadcast or the legacy filter correctly suppresses the still-queued message.
+        // Decision asks are the inverse: expose the question before announcing that its source work
+        // is parked, preserving the question -> waiting_owner event contract.
+        if (!parksSourceWork) this.flushAtomicDeliveryEffects(out.atomicEffects);
         for (const f of out.frames) this.broadcastFrame(f);
+        if (parksSourceWork) this.flushAtomicDeliveryEffects(out.atomicEffects);
         await this.closeInactiveConnections();
-        await this.afterSend(out.frames[0] as MsgFrame);
+        await this.afterSend(sent, undefined, true);
       }
       const sent = out.frames[0] as MsgFrame;
       return Response.json({
@@ -3716,12 +5321,13 @@ export class ChannelDO extends Server<Env> {
     if (url.pathname === "/internal/webhooks" && request.method === "GET") {
       // 列表不回 secret 明文（spec §7）
       const webhooks = this.ctx.storage.sql
-        .exec("SELECT name, url, filter, created_at FROM webhooks ORDER BY name")
+        .exec("SELECT name, url, filter, mode, created_at FROM webhooks ORDER BY name")
         .toArray()
         .map((r) => ({
           name: String(r.name),
           url: String(r.url),
           filter: String(r.filter),
+          mode: String(r.mode) === "agent" ? "agent" : "notify",
           created_at: Number(r.created_at),
         }));
       return Response.json({ webhooks });
@@ -3733,12 +5339,17 @@ export class ChannelDO extends Server<Env> {
         url?: unknown;
         secret?: unknown;
         filter?: unknown;
+        mode?: unknown;
+        target_owner?: unknown;
       } | null;
+      const mode = body?.mode === undefined ? "notify" : body.mode;
       if (
         typeof body?.name !== "string" ||
         typeof body.url !== "string" ||
         typeof body.secret !== "string" ||
-        typeof body.filter !== "string"
+        typeof body.filter !== "string" ||
+        (mode !== "notify" && mode !== "agent") ||
+        (mode === "agent" && (typeof body.target_owner !== "string" || body.target_owner.length === 0))
       ) {
         return Response.json({ error: { code: "bad_request", message: "invalid webhook" } }, { status: 400 });
       }
@@ -3752,16 +5363,23 @@ export class ChannelDO extends Server<Env> {
           { status: 429 },
         );
       }
+      const registrationId = crypto.randomUUID();
       this.ctx.storage.sql.exec(
-        `INSERT INTO webhooks (name, url, secret, filter, created_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(name) DO UPDATE SET url = excluded.url, secret = excluded.secret, filter = excluded.filter`,
+        `INSERT INTO webhooks (name, registration_id, url, secret, filter, mode, target_owner, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, secret = excluded.secret,
+           registration_id = excluded.registration_id, filter = excluded.filter,
+           mode = excluded.mode, target_owner = excluded.target_owner, created_at = excluded.created_at`,
         body.name,
+        registrationId,
         body.url,
         body.secret,
         body.filter,
+        mode,
+        mode === "agent" ? body.target_owner : null,
         Date.now(),
       );
-      return Response.json({ name: body.name, url: body.url, filter: body.filter }, { status: 201 });
+      if (mode === "agent") this.dispatchNextDirectedDelivery(body.name);
+      return Response.json({ name: body.name, url: body.url, filter: body.filter, mode }, { status: 201 });
     }
     if (url.pathname === "/internal/roles" && request.method === "POST") {
       const body = (await request.json().catch(() => null)) as { name?: unknown; role?: unknown } | null;
@@ -3789,15 +5407,64 @@ export class ChannelDO extends Server<Env> {
     if (url.pathname === "/internal/webhooks" && request.method === "DELETE") {
       const name = url.searchParams.get("name") ?? "";
       const existed = this.ctx.storage.sql
-        .exec("SELECT name FROM webhooks WHERE name = ?", name)
-        .toArray();
-      if (existed.length === 0) {
+        .exec(
+          "SELECT name, registration_id, mode, target_owner FROM webhooks WHERE name = ?",
+          name,
+        )
+        .toArray()[0];
+      if (existed === undefined) {
         return Response.json({ error: { code: "not_found", message: "no such webhook" } }, { status: 404 });
       }
+      const currentBinding: WebhookBinding = {
+        name,
+        registrationId: String(existed.registration_id),
+        mode: String(existed.mode) === "agent" ? "agent" : "notify",
+        targetOwner: existed.target_owner === null || existed.target_owner === undefined
+          ? null
+          : String(existed.target_owner),
+      };
+      const active = this.ctx.storage.sql
+        .exec(
+          `SELECT * FROM directed_deliveries
+            WHERE lease_adapter = 'webhook' AND lease_connection_id = ?
+              AND state IN ('claimed', 'running')`,
+          this.webhookHolderId(currentBinding.registrationId),
+        )
+        .toArray();
+      const queued = this.ctx.storage.sql
+        .exec(
+          `SELECT webhook_name, registration_id, webhook_mode, target_owner, payload, attempts
+             FROM webhook_queue WHERE webhook_name = ?`,
+          name,
+        )
+        .toArray();
       this.ctx.storage.sql.exec("DELETE FROM webhooks WHERE name = ?", name);
+      const now = Date.now();
+      for (const row of queued) {
+        const binding = this.storedWebhookBinding(row);
+        const payload = String(row.payload);
+        const failure = {
+          ok: false,
+          status: null,
+          error: "webhook registration removed; queued delivery was not reassigned",
+        };
+        this.recordDeadLetter(name, payload, Number(row.attempts), failure, now, binding);
+        this.failDirectedWebhookDelivery(payload, binding, failure.error, now);
+      }
       this.ctx.storage.sql.exec("DELETE FROM webhook_queue WHERE webhook_name = ?", name);
-      // #105：webhook 删除后其死信已无从重投，一并清掉避免留下不可投递的孤儿。
-      this.ctx.storage.sql.exec("DELETE FROM webhook_dead_letters WHERE webhook_name = ?", name);
+      // Dead letters intentionally remain bound to the removed registration. A same-name webhook
+      // created later cannot redeliver them; operators still retain the explicit failure evidence.
+      for (const row of active) {
+        this.transitionDirectedDeliveryTerminal(String(row.id), "failed", now, {
+          error: String(row.state) === "running"
+            ? "agent webhook removed after accepted handoff; outcome unknown, not auto-retried"
+            : "agent webhook removed during handoff; outcome unknown, not auto-retried",
+          terminalReason: "unknown_outcome",
+          expectedStates: [String(row.state)],
+          expectedLeaseAdapter: "webhook",
+          expectedLeaseConnectionId: this.webhookHolderId(currentBinding.registrationId),
+        });
+      }
       return Response.json({ ok: true });
     }
     if (url.pathname === "/internal/reset-guard" && request.method === "POST") {
@@ -3919,22 +5586,31 @@ export class ChannelDO extends Server<Env> {
     return new Response("not found", { status: 404 });
   }
 
-  private async expandSquadMentions(frame: SendFrame): Promise<SendFrame> {
+  private async expandSquadMentions(frame: SendFrame): Promise<ResolvedMentionFrame | SendErrorOutcome> {
     const mentions = frame.mentions ?? [];
-    if (mentions.length === 0) return frame;
+    if (mentions.length === 0) return { frame, agentTargets: [] };
     const candidates = mentions.filter((name) => name !== "system" && MENTION_NAME_RE.test(name));
-    if (candidates.length === 0) return frame;
+    if (candidates.length === 0) return { frame, agentTargets: [] };
     const placeholders = candidates.map(() => "?").join(", ");
-    const rows = await this.env.DB.prepare(
-      `SELECT name, leader_name, members_json
-         FROM channel_squads
-        WHERE channel_slug = ? AND name IN (${placeholders})`,
-    )
-      .bind(this.name, ...candidates)
-      .all<{ name: string; leader_name: string | null; members_json: string | null }>()
-      .catch(() => ({ results: [] }));
-    if (rows.results.length === 0) return frame;
-    const routed = new Set(mentions);
+    let rows: { results: { name: string; leader_name: string | null; members_json: string | null }[] };
+    try {
+      rows = await this.env.DB.prepare(
+        `SELECT name, leader_name, members_json
+           FROM channel_squads
+          WHERE channel_slug = ? AND name IN (${placeholders})`,
+      )
+        .bind(this.name, ...candidates)
+        .all<{ name: string; leader_name: string | null; members_json: string | null }>();
+    } catch {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: "squad directory is temporarily unavailable; message was not stored",
+      };
+    }
+    if (rows.results.length === 0) return { frame, agentTargets: [] };
+    const requestedTargets: string[] = [];
+    const requestedSeen = new Set<string>();
     for (const row of rows.results) {
       const members = (() => {
         try {
@@ -3949,159 +5625,244 @@ export class ChannelDO extends Server<Env> {
       const targets = row.leader_name && MENTION_NAME_RE.test(row.leader_name) ? [row.leader_name] : members;
       for (const target of targets) {
         if (target === "system") continue;
-        routed.add(target);
-        if (routed.size >= MAX_MENTIONS) break;
+        const key = mentionMatchKey(target);
+        if (requestedSeen.has(key)) continue;
+        requestedSeen.add(key);
+        requestedTargets.push(target);
       }
-      if (routed.size >= MAX_MENTIONS) break;
     }
-    return withExpandedMentions(frame, [...routed]);
+    if (requestedTargets.length === 0) return { frame, agentTargets: [] };
+
+    // Squad JSON is configuration, not an authority for token spelling or liveness. Resolve every
+    // member through D1 and route only the canonical token name so case variants cannot create an
+    // unclaimable durable row.
+    let tokenRows: { results: { name: string }[] };
+    try {
+      const tokenPlaceholders = requestedTargets.map(() => "?").join(", ");
+      tokenRows = await this.env.DB.prepare(
+        `SELECT name FROM tokens
+          WHERE role = 'agent' AND revoked_at IS NULL
+            AND name COLLATE NOCASE IN (${tokenPlaceholders})`,
+      )
+        .bind(...requestedTargets)
+        .all<{ name: string }>();
+    } catch {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: "agent directory is temporarily unavailable; message was not stored",
+      };
+    }
+    const canonical = new Map(tokenRows.results.map((row) => [mentionMatchKey(row.name), row.name] as const));
+    const routed = [...mentions];
+    const routedSeen = new Set(routed.map(mentionMatchKey));
+    const agentTargets: string[] = [];
+    const agentSeen = new Set<string>();
+    for (const requested of requestedTargets) {
+      const target = canonical.get(mentionMatchKey(requested));
+      if (target === undefined) continue;
+      const key = mentionMatchKey(target);
+      if (!agentSeen.has(key)) {
+        agentSeen.add(key);
+        agentTargets.push(target);
+      }
+      if (routedSeen.has(key)) continue;
+      if (routed.length >= MAX_MENTIONS) {
+        return {
+          ok: false,
+          code: "too_large",
+          message: `squad expansion exceeds ${MAX_MENTIONS} mention targets`,
+        };
+      }
+      routedSeen.add(key);
+      routed.push(target);
+    }
+    return { frame: withExpandedMentions(frame, routed), agentTargets };
   }
 
-  // #165/#552：把正文/显式 mentions 的 token 解析成权威 target。agent name、昵称、human handle
-  // 与 squad 全部按 NOCASE 匹配；同一 alias 若指向多个 target 则 fail closed。不存在的 @ 也必须明确
-  // 拒绝，不能落一条看似成功、实际永远不会进入 wake/delivery 的消息。
-  private async resolveMentionTargets(frame: SendFrame): Promise<{ frame: SendFrame; error?: string }> {
-    const mentions = frame.mentions ?? [];
-    if (mentions.length === 0) return { frame };
-    if (mentions.some((mention) => mentionMatchKey(mention) === "system")) {
-      return { frame, error: "reserved mention @system" };
-    }
-    const candidates = mentions.filter((t) => t.length <= 64);
-    if (candidates.length === 0) return { frame };
-    const placeholders = candidates.map(() => "?").join(", ");
-    const asciiCandidates = candidates.filter((candidate) => /^[A-Za-z0-9._-]+$/.test(candidate));
-    const unicodeCandidates = candidates.filter((candidate) => !/^[A-Za-z0-9._-]+$/.test(candidate));
-    const aliasExactClause = (column: "nickname" | "display_name") => {
-      const clauses: string[] = [];
-      if (asciiCandidates.length > 0) {
-        clauses.push(`${column} COLLATE NOCASE IN (${asciiCandidates.map(() => "?").join(", ")})`);
-      }
-      if (unicodeCandidates.length > 0) {
-        clauses.push(`${column} IN (${unicodeCandidates.map(() => "?").join(", ")})`);
-      }
-      return clauses.join(" OR ");
-    };
-    // Pure-CJK aliases have no lexical boundary before following prose
-    // (`请@小明看一下`). Load aliases that are prefixes of the raw token; the
-    // resolver below applies longest-match and still fails closed on ties.
-    // ASCII names never need this fallback: accepting it would turn unknown
-    // `@bobcat` into the existing `bob` target.
-    const cjkPrefixCandidates = candidates.filter((candidate) =>
-      /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(candidate)
-    );
-    const nicknamePrefixClause = cjkPrefixCandidates.length === 0
-      ? ""
-      : ` OR (${cjkPrefixCandidates.map(() => "substr(?, 1, length(nickname)) = nickname").join(" OR ")})`;
-    const displayNamePrefixClause = cjkPrefixCandidates.length === 0
-      ? ""
-      : ` OR (${cjkPrefixCandidates.map(() => "substr(?, 1, length(display_name)) = display_name").join(" OR ")})`;
-    type AliasRow = { target: string; alias: string };
-    let remote: AliasRow[];
+  private async agentOwnersForTargets(targets: string[]): Promise<Record<string, string> | null> {
+    if (targets.length === 0) return {};
     try {
-      const [tokens, nicknames, handles, displayNames, squads] = await Promise.all([
-        this.env.DB.prepare(
-          `SELECT name AS target, name AS alias FROM tokens
-            WHERE revoked_at IS NULL AND name COLLATE NOCASE IN (${placeholders})`,
-        ).bind(...candidates).all<AliasRow>(),
-        this.env.DB.prepare(
-          `SELECT name AS target, nickname AS alias FROM agent_nicknames
-            WHERE ${aliasExactClause("nickname")}${nicknamePrefixClause}`,
-        ).bind(...asciiCandidates, ...unicodeCandidates, ...cjkPrefixCandidates).all<AliasRow>(),
-        this.env.DB.prepare(
-          `SELECT handle AS target, handle AS alias FROM account_profiles
-            WHERE handle COLLATE NOCASE IN (${placeholders})`,
-        ).bind(...candidates).all<AliasRow>(),
-        this.env.DB.prepare(
-          `SELECT handle AS target, display_name AS alias FROM account_profiles
-            WHERE display_name IS NOT NULL
-              AND (${aliasExactClause("display_name")}${displayNamePrefixClause})`,
-        ).bind(...asciiCandidates, ...unicodeCandidates, ...cjkPrefixCandidates).all<AliasRow>(),
-        this.env.DB.prepare(
-          `SELECT name AS target, name AS alias FROM channel_squads
-            WHERE channel_slug = ? AND name COLLATE NOCASE IN (${placeholders})`,
-        ).bind(this.name, ...candidates).all<AliasRow>(),
-      ]);
-      remote = [...tokens.results, ...nicknames.results, ...handles.results, ...displayNames.results, ...squads.results];
+      const placeholders = targets.map(() => "?").join(", ");
+      const rows = await this.env.DB.prepare(
+        `SELECT name, owner, hash FROM tokens
+          WHERE role = 'agent' AND revoked_at IS NULL
+            AND name COLLATE NOCASE IN (${placeholders})`,
+      )
+        .bind(...targets)
+        .all<{ name: string; owner: string | null; hash: string }>();
+      const byName = new Map(
+        rows.results
+          .filter((row) => typeof row.hash === "string" && row.hash.length > 0)
+          .map((row) => [
+            mentionMatchKey(row.name),
+            typeof row.owner === "string" && row.owner.length > 0
+              ? row.owner
+              : `token-sha256:${row.hash}`,
+          ] as const),
+      );
+      return Object.fromEntries(
+        targets.flatMap((target) => {
+          const owner = byName.get(mentionMatchKey(target));
+          return owner === undefined ? [] : [[target, owner]];
+        }),
+      );
     } catch {
-      return { frame, error: "mention validation unavailable; retry" };
+      // A durable row without a creation-time principal can later be captured by a different owner
+      // reusing the same agent name. handleSend therefore fails before INSERT when this lookup fails.
+      return null;
     }
+  }
 
-    // Recent channel identities remain valid routing targets even if their token was later rotated/revoked.
-    const local = this.ctx.storage.sql
+  private async mentionAliasDirectory(candidates: string[]): Promise<{ aliases: MentionAlias[]; agentTargets: Set<string> }> {
+    const aliases: MentionAlias[] = [];
+    const agentTargets = new Set<string>();
+    const seen = new Set<string>();
+    const add = (alias: unknown, target: unknown, kind: MentionAlias["kind"], agent = false) => {
+      if (typeof alias !== "string" || typeof target !== "string") return;
+      if (!isValidMentionToken(alias) || !isValidMentionToken(target) || target === "system") return;
+      const key = `${mentionMatchKey(alias)}\0${mentionMatchKey(target)}\0${kind}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      aliases.push({ alias, target, kind });
+      if (agent) agentTargets.add(mentionMatchKey(target));
+    };
+    if (candidates.length === 0) return { aliases, agentTargets };
+
+    // Candidate-bounded queries keep mention resolution off global full-table scans. The LIKE arm is
+    // only a coarse prefilter for no-space CJK prose ("@小明看一下"); the shared pure resolver below
+    // performs the literal prefix/uniqueness decision, so SQL wildcard semantics cannot route a target.
+    const whereFor = (column: string) => candidates
+      .map(() => `(? = ${column} COLLATE NOCASE OR ? LIKE (${column} || '%') COLLATE NOCASE)`)
+      .join(" OR ");
+    const binds = candidates.flatMap((candidate) => [candidate, candidate]);
+
+    const [tokens, nicknames, profiles, squads] = await Promise.all([
+      this.env.DB.prepare(
+        `SELECT name, role FROM tokens WHERE revoked_at IS NULL AND (${whereFor("name")})`,
+      ).bind(...binds).all<{ name: string; role: string }>(),
+      this.env.DB.prepare(
+        `SELECT n.name, n.nickname
+           FROM agent_nicknames n
+           JOIN tokens t ON t.name = n.name
+          WHERE t.revoked_at IS NULL AND (${whereFor("n.nickname")})`,
+      ).bind(...binds).all<{ name: string; nickname: string }>(),
+      this.env.DB.prepare(
+        `SELECT handle, display_name
+           FROM account_profiles
+          WHERE (${whereFor("handle")}) OR (${whereFor("display_name")})`,
+      ).bind(...binds, ...binds).all<{ handle: string; display_name: string | null }>(),
+      this.env.DB.prepare(
+        `SELECT name
+           FROM channel_squads
+          WHERE channel_slug = ? AND (${whereFor("name")})`,
+      ).bind(this.name, ...binds).all<{ name: string }>(),
+    ]);
+
+    for (const row of tokens.results) add(row.name, row.name, "canonical", row.role === "agent");
+    for (const row of nicknames.results) add(row.nickname, row.name, "nickname", true);
+    for (const row of profiles.results) {
+      // Human notification webhooks are registered under the globally unique handle, so the handle
+      // remains the delivery target. Readable OAuth display names are aliases only and may collide.
+      add(row.handle, row.handle, "nickname");
+      add(row.display_name, row.handle, "display");
+    }
+    for (const row of squads.results) add(row.name, row.name, "canonical");
+    // Preserve #555's visible-channel routing semantics: recent message and presence identities
+    // remain mentionable after a token rotation. They are aliases only, never proof that a durable
+    // agent target is claimable; only the live token query above can populate agentTargets.
+    const recentIdentities = this.ctx.storage.sql
       .exec(
-        `SELECT sender_name, sender_kind, sender_handle, sender_display_name FROM messages
-          WHERE sender_name IS NOT NULL ORDER BY seq DESC LIMIT 1000`,
+        `SELECT sender_name, sender_kind, sender_handle, sender_display_name
+           FROM messages
+          WHERE sender_name IS NOT NULL
+          ORDER BY seq DESC
+          LIMIT 1000`,
       )
       .toArray();
-    const localPresence = this.ctx.storage.sql
-      .exec("SELECT name, kind, handle, display_name FROM presence")
-      .toArray();
-    const localWebhooks = this.ctx.storage.sql
-      .exec("SELECT name FROM webhooks")
-      .toArray();
-    const aliases = new Map<string, Set<string>>();
-    const add = (alias: unknown, target: unknown) => {
-      if (typeof alias !== "string" || typeof target !== "string" || alias === "" || target === "") return;
-      const key = mentionMatchKey(alias);
-      const targets = aliases.get(key) ?? new Set<string>();
-      targets.add(target);
-      aliases.set(key, targets);
-    };
-    for (const row of remote) add(row.alias, row.target);
-    for (const row of local) {
+    for (const row of recentIdentities) {
       const name = String(row.sender_name);
-      add(name, name);
+      add(name, name, "canonical");
       if (String(row.sender_kind) === "human" && row.sender_handle !== null) {
-        add(String(row.sender_handle), String(row.sender_handle));
+        add(String(row.sender_handle), String(row.sender_handle), "canonical");
       }
       if (row.sender_display_name !== null) {
         const target = String(row.sender_kind) === "human" && row.sender_handle !== null
           ? String(row.sender_handle)
           : name;
-        add(String(row.sender_display_name), target);
+        add(String(row.sender_display_name), target, "display");
       }
     }
-    for (const row of localPresence) {
+    for (const row of this.ctx.storage.sql
+      .exec("SELECT name, kind, handle, display_name FROM presence")
+      .toArray()) {
       const name = String(row.name);
-      add(name, name);
-      if (String(row.kind) === "human" && row.handle !== null) add(String(row.handle), String(row.handle));
+      add(name, name, "canonical");
+      if (String(row.kind) === "human" && row.handle !== null) {
+        add(String(row.handle), String(row.handle), "canonical");
+      }
       if (row.display_name !== null) {
-        const target = String(row.kind) === "human" && row.handle !== null ? String(row.handle) : name;
-        add(String(row.display_name), target);
+        const target = String(row.kind) === "human" && row.handle !== null
+          ? String(row.handle)
+          : name;
+        add(String(row.display_name), target, "display");
       }
     }
-    for (const row of localWebhooks) add(String(row.name), String(row.name));
+    for (const row of this.ctx.storage.sql.exec("SELECT name FROM webhooks").toArray()) {
+      add(row.name, row.name, "canonical");
+    }
+    return { aliases, agentTargets };
+  }
 
-    const routed: string[] = [];
-    const seen = new Set<string>();
-    for (const raw of candidates) {
-      if (mentionMatchKey(raw) === "all" || raw.startsWith("全体")) {
-        return { frame, error: `unsupported mention @${raw.startsWith("全体") ? "全体" : raw}` };
-      }
-      const key = mentionMatchKey(raw);
-      let targets = aliases.get(key);
-      if (!targets && cjkPrefixCandidates.includes(raw)) {
-        let longest = 0;
-        for (const [alias, aliasTargets] of aliases) {
-          if (!key.startsWith(alias) || alias.length < longest) continue;
-          if (alias.length > longest) {
-            longest = alias.length;
-            targets = new Set(aliasTargets);
-          } else {
-            targets ??= new Set<string>();
-            for (const target of aliasTargets) targets.add(target);
-          }
-        }
-      }
-      if (!targets || targets.size === 0) return { frame, error: `unknown mention @${raw}` };
-      if (targets.size !== 1) return { frame, error: `ambiguous mention @${raw}` };
-      const target = [...targets][0]!;
-      if (target === "system" || seen.has(target)) continue;
-      seen.add(target);
-      routed.push(target);
-      if (routed.length >= MAX_MENTIONS) break;
+  // Resolve every body-derived and explicit mention before INSERT. Unknown/ambiguous explicit @ tokens
+  // are rejected to the sender instead of being stored as an ordinary, unwakeable message. This also
+  // canonicalizes case-insensitive agent names and agent nicknames for exact includes(self) consumers.
+  private async resolveMentions(frame: SendFrame): Promise<ResolvedMentionFrame | SendErrorOutcome> {
+    const mentions = frame.mentions ?? [];
+    if (mentions.length === 0) return { frame, agentTargets: [] };
+    let directory: Awaited<ReturnType<ChannelDO["mentionAliasDirectory"]>>;
+    try {
+      directory = await this.mentionAliasDirectory(mentions);
+    } catch {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: "mention directory is temporarily unavailable; message was not stored",
+      };
     }
-    return { frame: withExpandedMentions(frame, routed) };
+    const routed: string[] = [];
+    const agentTargets = new Set<string>();
+    const seen = new Set<string>();
+    for (const mention of mentions) {
+      if (["all", "everyone", "here", "system"].includes(mentionMatchKey(mention))) {
+        return {
+          ok: false,
+          code: "mention_not_found",
+          message: `mention target @${mention} is not a routable channel identity`,
+        };
+      }
+      const resolution = resolveMentionToken(mention, directory.aliases);
+      if (resolution.status === "unknown") {
+        return {
+          ok: false,
+          code: "mention_not_found",
+          message: `mention target @${mention} was not found; use an exact channel handle`,
+        };
+      }
+      if (resolution.status === "ambiguous") {
+        return {
+          ok: false,
+          code: "mention_ambiguous",
+          message: `mention target @${mention} is ambiguous; use an exact channel handle`,
+        };
+      }
+      const key = mentionMatchKey(resolution.target);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      routed.push(resolution.target);
+      if (directory.agentTargets.has(key)) agentTargets.add(resolution.target);
+    }
+    return { frame: withExpandedMentions(frame, routed), agentTargets: [...agentTargets] };
   }
 
   // #544：reply_to 本身就是一条明确的定向消息。若原消息作者是 agent，即使回复正文没有再写
@@ -4171,14 +5932,57 @@ export class ChannelDO extends Server<Env> {
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
     }
-    const resolvedMentions = await this.resolveMentionTargets(frame);
-    if (resolvedMentions.error !== undefined) {
-      return { ok: false, code: "bad_request", message: resolvedMentions.error };
+    const mentionResolution = await this.resolveMentions(frame);
+    if ("ok" in mentionResolution) return mentionResolution;
+    const beforeReplyKeys = new Set((mentionResolution.frame.mentions ?? []).map(mentionMatchKey));
+    frame = this.expandAgentReplyMention(mentionResolution.frame, identity.name);
+    const autoReplyTargets = (frame.mentions ?? []).filter(
+      (target) => !beforeReplyKeys.has(mentionMatchKey(target)),
+    );
+    const squadExpansion = await this.expandSquadMentions(frame);
+    if ("ok" in squadExpansion) return squadExpansion;
+    frame = squadExpansion.frame;
+    const requiredDeliveryTargets = [...new Set([
+      ...mentionResolution.agentTargets,
+      ...squadExpansion.agentTargets,
+    ])];
+    const candidateDeliveryTargets = [...new Set([...requiredDeliveryTargets, ...autoReplyTargets])];
+    const ownerLookup = await this.agentOwnersForTargets(candidateDeliveryTargets);
+    if (ownerLookup === null) {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: "agent ownership directory is temporarily unavailable; message was not stored",
+      };
     }
-    // reply_to author comes from this channel's authoritative message row and
-    // must not depend on the bounded recent-alias lookup above.
-    frame = this.expandAgentReplyMention(resolvedMentions.frame, identity.name);
-    frame = await this.expandSquadMentions(frame);
+    const unboundDeliveryTargets = requiredDeliveryTargets.filter(
+      (target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target),
+    );
+    if (unboundDeliveryTargets.length > 0) {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: `cannot bind delivery identity for @${unboundDeliveryTargets[0]}; retry shortly`,
+      };
+    }
+    // A reply to a historical/revoked agent must remain a valid channel reply, but it must not
+    // create a name-only wake that a future owner could capture. Drop only the server-added mention
+    // when no current creation-time principal exists; explicit mentions keep their own validation.
+    const unboundAutoKeys = new Set(
+      autoReplyTargets
+        .filter((target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target))
+        .map(mentionMatchKey),
+    );
+    if (unboundAutoKeys.size > 0) {
+      frame = withExpandedMentions(
+        frame,
+        (frame.mentions ?? []).filter((target) => !unboundAutoKeys.has(mentionMatchKey(target))),
+      );
+    }
+    const deliveryTargets = candidateDeliveryTargets.filter((target) =>
+      Object.prototype.hasOwnProperty.call(ownerLookup, target)
+    );
+    const deliveryTargetOwners = ownerLookup;
     const workflowGuard = this.workflowGuardDecision(identity, frame);
     if (workflowGuard !== null) {
       const row = this.workflowGuardRow(workflowGuard.workflow.workflow_id);
@@ -4202,10 +6006,6 @@ export class ChannelDO extends Server<Env> {
       };
     }
     const now = Date.now();
-    if (options.countRate !== false) {
-      const rate = this.consumeRate(identity.name, now);
-      if (rate !== null) return rate;
-    }
 
     const sql = this.ctx.storage.sql;
     const seq = this.lastSeq() + 1;
@@ -4238,8 +6038,28 @@ export class ChannelDO extends Server<Env> {
     const completionReviewPolicy = (this.getMeta("completion_review_policy") ?? "sender") as CompletionReviewPolicy;
     const completionArtifact = frame.kind === "message" ? frame.completion_artifact : undefined;
     const attachments = frame.kind === "message" ? frame.attachments : undefined;
-    // decision_request（#284）：parseSendFrame 已把它规整成完整 DecisionRequest（kind/options 齐全）。
-    const decisionRequest = frame.kind === "message" ? (frame.decision_request as DecisionRequest | undefined) : undefined;
+    // decision_request（#284/#548）：public parser 只保留 prompt/kind/options，并主动丢掉客户端
+    // 自称的 delivery/work/thread。仅 sender 恰好有一条 active durable work 时由服务端绑定血缘；
+    // 多条 active 说明 invariant 已破坏，fail closed，不能猜错 owner answer 应恢复哪一条。
+    const parsedDecisionRequest =
+      frame.kind === "message" ? (frame.decision_request as DecisionRequest | undefined) : undefined;
+    const activeDecision =
+      parsedDecisionRequest !== undefined && identity.kind === "agent"
+        ? this.activeDecisionDelivery(identity)
+        : undefined;
+    if (activeDecision !== undefined && "ambiguous" in activeDecision) {
+      return {
+        ok: false,
+        code: "bad_request",
+        message: "decision request cannot be bound: sender has multiple active directed deliveries",
+      };
+    }
+    const decisionRequest =
+      parsedDecisionRequest === undefined
+        ? undefined
+        : activeDecision === undefined
+          ? parsedDecisionRequest
+          : { ...parsedDecisionRequest, ...activeDecision.lineage };
     // 无人值守模式（unattended）：落库即自动放行第一项，agent 不必等人；approval 模式则挂起等人类。
     const decisionMode = (this.getMeta("decision_mode") ?? "approval") as DecisionMode;
     const decisionResolution: DecisionResolution | undefined =
@@ -4322,6 +6142,16 @@ export class ChannelDO extends Server<Env> {
             ...(roleSource === undefined ? {} : { role_source: roleSource }),
             ts: now,
           };
+    let stagedOutcome: SendSuccessOutcome | undefined;
+    let rateFailure: SendErrorOutcome | null = null;
+    const atomicEffects = this.captureAtomicDeliveryEffects(() => {
+      if (options.countRate !== false) {
+        const rate = this.consumeRate(identity.name, now);
+        if (rate !== null) {
+          rateFailure = rate;
+          return;
+        }
+      }
     sql.exec(
       `INSERT INTO messages (
          seq, sender_name, sender_kind, sender_owner, sender_handle, sender_display_name, sender_avatar_url, sender_avatar_thumb,
@@ -4373,6 +6203,47 @@ export class ChannelDO extends Server<Env> {
       identity.clientVersion ?? null,
       now,
     );
+    this.ensureDirectedDeliveries(msg, deliveryTargets, deliveryTargetOwners);
+    let waitingOwnerDelivery: Record<string, unknown> | undefined;
+    let waitingOwnerPresence: PresenceEntry | null = null;
+    if (
+      decisionResolution?.state === "pending" &&
+      activeDecision !== undefined &&
+      !("ambiguous" in activeDecision)
+    ) {
+      // The question is durably stored before the runner lease is released. Preserve the holder in
+      // a non-lease audit slot so its inevitable late "replied" receipt can be ACKed as a no-op.
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'waiting_owner',
+                last_lease_connection_id = lease_connection_id,
+                lease_connection_id = NULL, lease_adapter = NULL, lease_until = NULL,
+                terminal_reason = NULL,
+                updated_at = ?
+          WHERE id = ? AND target_name = ? AND target_owner = ? AND state IN ('claimed', 'running')`,
+        now,
+        activeDecision.lineage.delivery_id,
+        identity.name,
+        this.identityDeliveryPrincipal(identity),
+      );
+      const updatedDelivery = this.directedDeliveryRow(activeDecision.lineage.delivery_id);
+      if (updatedDelivery === undefined || String(updatedDelivery.state) !== "waiting_owner") {
+        throw new Error("failed to detach runner while waiting for owner");
+      }
+      waitingOwnerDelivery = updatedDelivery;
+      this.broadcastDirectedDelivery(updatedDelivery);
+      // waiting_owner is durable parked work, not a running/busy model task. Clear only the
+      // heartbeat that points at this exact origin; unrelated sessions/tasks for the same identity
+      // are left alone. The CLI's later clear heartbeat remains idempotent.
+      this.ctx.storage.sql.exec(
+        `UPDATE presence
+            SET busy = 0, current_task = NULL, task_started_at = NULL, heartbeat_at = NULL
+          WHERE name = ? AND (current_task = ? OR current_task IS NULL)`,
+        identity.name,
+        activeDecision.lineage.origin_seq,
+      );
+      waitingOwnerPresence = this.presenceFor(identity.name);
+    }
     let replacedUpdate: MessageUpdateFrame | undefined;
     if (replacesSeq !== undefined) {
       this.ctx.storage.sql.exec(
@@ -4387,7 +6258,7 @@ export class ChannelDO extends Server<Env> {
       const replacedRow = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", replacesSeq).one();
       if (replacedRow) replacedUpdate = this.messageUpdate("review", identity, this.rowToFrame(replacedRow), now);
     }
-    this.linkWakeResume(identity.name, msg, now);
+    this.linkWakeResume(identity, msg, now);
     const workflowGuardFrame = this.applyWorkflowGuardAfterSend(identity, msg, workflowGuard, now);
     if (frame.kind === "message") {
       if (identity.kind === "agent") {
@@ -4400,12 +6271,36 @@ export class ChannelDO extends Server<Env> {
     }
     if (seq % 100 === 0) {
       sql.exec(
-        "DELETE FROM messages WHERE seq <= ? AND (completion_review_state IS NULL OR completion_review_state != 'pending_review') AND (decision_state IS NULL OR decision_state != 'pending')",
+        `DELETE FROM directed_deliveries
+          WHERE message_seq IN (
+            SELECT m.seq FROM messages m
+             WHERE m.seq <= ?
+               AND (m.completion_review_state IS NULL OR m.completion_review_state != 'pending_review')
+               AND (m.decision_state IS NULL OR m.decision_state != 'pending')
+               AND NOT EXISTS (
+                 SELECT 1 FROM directed_deliveries active
+                  WHERE active.message_seq = m.seq
+                    AND active.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+               )
+          )`,
+        seq - RETAIN_N,
+      );
+      sql.exec(
+        `DELETE FROM messages AS m
+          WHERE m.seq <= ?
+            AND (m.completion_review_state IS NULL OR m.completion_review_state != 'pending_review')
+            AND (m.decision_state IS NULL OR m.decision_state != 'pending')
+            AND NOT EXISTS (
+              SELECT 1 FROM directed_deliveries d
+               WHERE d.message_seq = m.seq
+                 AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+            )`,
         seq - RETAIN_N,
       );
     }
 
     const frames: ServerFrame[] = replacedUpdate === undefined ? [msg] : [msg, replacedUpdate];
+    if (waitingOwnerPresence !== null) frames.push({ type: "presence", ...waitingOwnerPresence });
     if (workflowGuardFrame !== undefined) frames.push(workflowGuardFrame);
     if (frame.kind === "status") {
       const wakeProvided = frame.wake !== undefined ? 1 : 0;
@@ -4484,10 +6379,21 @@ export class ChannelDO extends Server<Env> {
       const entry = this.presenceFor(identity.name);
       frames.push(entry ? { type: "presence", ...entry } : { type: "presence", name: identity.name, state: frame.state, note: frame.note, ts: now });
     }
-    return { ok: true, seq, frames };
+    stagedOutcome = {
+      ok: true,
+      seq,
+      frames,
+      deliveryTargets,
+      deliveryTargetOwners,
+    };
+    });
+    if (rateFailure !== null) return rateFailure;
+    if (stagedOutcome === undefined) throw new Error("atomic send produced no outcome");
+    return { ...stagedOutcome, atomicEffects };
   }
 
-  private linkWakeResume(targetName: string, msg: MsgFrame, now: number) {
+  private linkWakeResume(identity: Identity, msg: MsgFrame, now: number) {
+    const targetName = identity.name;
     if (msg.reply_to !== null) {
       this.ctx.storage.sql.exec(
         // #107：serve/watch 的 broadcast 行在观测到 @->resume 时升级为 consumed（webhook 行 result 不动，
@@ -4500,6 +6406,13 @@ export class ChannelDO extends Server<Env> {
         msg.reply_to,
         targetName,
       );
+      // A bound decision_request is a question turn, not completion of the work that asked it. In
+      // approval mode its source is already waiting_owner; in unattended mode it intentionally stays
+      // claimed/running so the same runner can continue after auto-resolution. Neither may be closed
+      // merely because the question used reply_to=origin_seq.
+      if (msg.decision_request?.delivery_id === undefined) {
+        this.completeDirectedDelivery(identity, msg.reply_to, msg.seq, now);
+      }
       // #191：回复的正是一条 @ 了自己的消息 → 服务端亲眼看到「被 @ 后 resume」，据此盖 verified_at。
       if (this.messageMentions(msg.reply_to).includes(targetName)) this.markWakeVerified(targetName, now);
     }
@@ -4515,6 +6428,7 @@ export class ChannelDO extends Server<Env> {
         summarySeq,
         targetName,
       );
+      this.completeDirectedDelivery(identity, summarySeq, msg.seq, now);
       // 同理：status 帧 summary_seq 指向的那条消息若 @ 了自己，也是一次可验证的 resume。
       if (this.messageMentions(summarySeq).includes(targetName)) this.markWakeVerified(targetName, now);
     }
@@ -4853,8 +6767,117 @@ export class ChannelDO extends Server<Env> {
   }
 
   private broadcastFrame(frame: ServerFrame) {
+    if (frame.type === "delivery_state") {
+      const row = this.directedDeliveryRow(frame.delivery.id);
+      if (row !== undefined) this.broadcastDirectedDelivery(row);
+      return;
+    }
+    const publicFrame = publicServerFrame(frame);
     for (const connection of this.getConnections<ConnState>()) {
-      this.sendFrame(connection, frame);
+      if (
+        connection.state?.helloPending === true &&
+        (frame.type === "msg" || frame.type === "status" || frame.type === "message_update")
+      ) continue;
+      this.sendPublicFrame(connection, publicFrame, false);
+    }
+  }
+
+  /**
+   * Pre-v1 CLI sockets cannot declare whether they are watch --once, follow, or serve until a later
+   * serve_lease frame. Never put a durable source @ into such a socket's raw queue unless it is the
+   * already-elected legacy serve holder receiving that exact live handoff. Web agents omit
+   * client_version and remain ordinary observers; humans are never considered here.
+   */
+  private sendPublicFrame(
+    connection: Connection<ConnState>,
+    frame: ServerFrame,
+    replay: boolean,
+  ): boolean {
+    const st = connection.state;
+    const message = frame.type === "msg" || frame.type === "status"
+      ? frame
+      : frame.type === "message_update"
+        ? frame.message
+        : null;
+    if (
+      st?.kind === "agent" &&
+      // Hibernated pre-rollout states have no helloPending field. Their clientVersion proves an
+      // earlier legacy hello, so undefined must not bypass raw suppression during deployment.
+      st.helloPending !== true &&
+      st.directedDeliveryV1 !== true &&
+      typeof st.clientVersion === "string" &&
+      st.clientVersion.length > 0 &&
+      message?.kind === "message"
+    ) {
+      const row = this.ctx.storage.sql
+        .exec(
+          `SELECT * FROM directed_deliveries
+            WHERE message_seq = ? AND target_name = ?
+            LIMIT 1`,
+          message.seq,
+          st.name,
+        )
+        .toArray()[0];
+      if (row !== undefined) {
+        const isExactLiveLegacyServeHandoff =
+          !replay &&
+          frame.type === "msg" &&
+          st.serveCandidate === true &&
+          st.serveLeaseHeld === true &&
+          String(row.state) === "running" &&
+          String(row.lease_adapter) === "legacy_serve" &&
+          String(row.lease_connection_id) === connection.id &&
+          this.identityMatchesDeliveryTarget(st, row);
+        if (!isExactLiveLegacyServeHandoff) {
+          this.closeUpgradeRequired(
+            connection,
+            `durable @${st.name} delivery requires directed_delivery v1`,
+          );
+          return false;
+        }
+      }
+    }
+    this.sendFrame(connection, frame);
+    return true;
+  }
+
+  private closeUpgradeRequired(connection: Connection<ConnState>, detail: string) {
+    const st = connection.state;
+    if (st?.upgradeRequired === true) return;
+    if (st) connection.setState({ ...st, upgradeRequired: true });
+    // ErrorCode does not yet contain upgrade_required; preserve the wire-compatible code while the
+    // stable machine-readable marker leads the message and close reason.
+    this.sendFrame(connection, {
+      type: "error",
+      code: "unavailable",
+      message: `upgrade_required: ${detail}`,
+    });
+    connection.close(1008, "upgrade_required");
+  }
+
+  private closeHelloExpired(connection: Connection<ConnState>) {
+    const st = connection.state;
+    if (!st || st.helloExpired === true) return;
+    connection.setState({ ...st, helloExpired: true });
+    this.sendFrame(connection, {
+      type: "error",
+      code: "bad_request",
+      message: "hello_required: handshake deadline expired",
+    });
+    connection.close(1008, "hello timeout");
+  }
+
+  private closeExpiredHelloConnections(now: number, name?: string, excludeId?: string) {
+    for (const connection of this.getConnections<ConnState>()) {
+      if (connection.id === excludeId) continue;
+      const st = connection.state;
+      if (
+        st?.helloPending === true &&
+        st.helloExpired !== true &&
+        (name === undefined || st.name === name) &&
+        typeof st.helloDeadlineAt === "number" &&
+        st.helloDeadlineAt <= now
+      ) this.closeHelloExpired(connection);
     }
   }
 
@@ -4973,7 +6996,7 @@ export class ChannelDO extends Server<Env> {
       .exec("SELECT * FROM messages WHERE sender_name = ? AND seq > ? ORDER BY seq LIMIT ?", name, after.messages, pageSize + 1)
       .toArray();
     const messages = messageRows.slice(0, pageSize)
-      .map((r) => this.rowToFrame(r));
+      .map((r) => publicMsgFrame(this.rowToFrame(r)));
     // 审计：该身份作为 actor 的行 + 其发的消息被审计过的行（target_seq 命中）。撤回后正文已 NULL。
     const auditRows = sql
       .exec(
@@ -5107,13 +7130,35 @@ export class ChannelDO extends Server<Env> {
       wake_ledger_deleted = countOne("SELECT COUNT(*) AS n FROM wake_delivery_ledger WHERE target_name = ?", name);
       sql.exec("DELETE FROM wake_delivery_ledger WHERE target_name = ?", name);
       webhook_payloads_deleted = countOne(
-        `SELECT (SELECT COUNT(*) FROM webhook_queue WHERE json_extract(payload, '$.sender.name') = ?) +
-                (SELECT COUNT(*) FROM webhook_dead_letters WHERE json_extract(payload, '$.sender.name') = ?) AS n`,
+        `SELECT
+           (SELECT COUNT(*) FROM webhook_queue
+             WHERE json_extract(payload, '$.sender.name') = ?
+                OR json_extract(payload, '$.directed_delivery.target_name') = ?) +
+           (SELECT COUNT(*) FROM webhook_dead_letters
+             WHERE json_extract(payload, '$.sender.name') = ?
+                OR json_extract(payload, '$.directed_delivery.target_name') = ?) AS n`,
+        name,
+        name,
         name,
         name,
       );
-      sql.exec("DELETE FROM webhook_queue WHERE json_extract(payload, '$.sender.name') = ?", name);
-      sql.exec("DELETE FROM webhook_dead_letters WHERE json_extract(payload, '$.sender.name') = ?", name);
+      sql.exec(
+        `DELETE FROM webhook_queue
+          WHERE json_extract(payload, '$.sender.name') = ?
+             OR json_extract(payload, '$.directed_delivery.target_name') = ?`,
+        name,
+        name,
+      );
+      sql.exec(
+        `DELETE FROM webhook_dead_letters
+          WHERE json_extract(payload, '$.sender.name') = ?
+             OR json_extract(payload, '$.directed_delivery.target_name') = ?`,
+        name,
+        name,
+      );
+      // Durable work contains target identity plus private work/continuation capabilities. Erasing
+      // an identity must remove those rows before a same-name principal can ever reconnect.
+      sql.exec("DELETE FROM directed_deliveries WHERE target_name = ?", name);
       read_cursors_deleted = countOne("SELECT COUNT(*) AS n FROM read_cursor WHERE name = ?", name);
       sql.exec("DELETE FROM read_cursor WHERE name = ?", name);
       presence_deleted = countOne("SELECT COUNT(*) AS n FROM presence WHERE name = ?", name);
@@ -5289,6 +7334,989 @@ export class ChannelDO extends Server<Env> {
     return counts;
   }
 
+  // ---- 持久定向投递（issue #551）----
+
+  private rowToDirectedDelivery(row: Record<string, unknown>): DirectedDelivery {
+    const storedCause = String(row.cause) as DirectedDelivery["cause"];
+    const attempt = Number(row.attempt);
+    return {
+      id: String(row.id),
+      message_seq: Number(row.message_seq),
+      target_name: String(row.target_name),
+      cause: attempt > 1 && storedCause !== "owner_answer" ? "retry" : storedCause,
+      state: String(row.state) as DirectedDelivery["state"],
+      attempt,
+      lease_until: row.lease_until === null || row.lease_until === undefined ? null : Number(row.lease_until),
+      work_id: row.work_id === null || row.work_id === undefined ? null : String(row.work_id),
+      continuation_ref:
+        row.continuation_ref === null || row.continuation_ref === undefined ? null : String(row.continuation_ref),
+      reply_seq: row.reply_seq === null || row.reply_seq === undefined ? null : Number(row.reply_seq),
+      last_error: row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
+      created_at: Number(row.created_at),
+      updated_at: Number(row.updated_at),
+    };
+  }
+
+  private rowToPublicDirectedDelivery(
+    row: Record<string, unknown>,
+    detailedState = false,
+  ): PublicDirectedDelivery {
+    const delivery = this.rowToDirectedDelivery(row);
+    const state =
+      detailedState || delivery.state === "queued" || delivery.state === "replied" || delivery.state === "failed"
+        ? delivery.state
+        : "running";
+    return {
+      id: delivery.id,
+      message_seq: delivery.message_seq,
+      target_name: delivery.target_name,
+      state,
+      reply_seq: delivery.reply_seq,
+      created_at: delivery.created_at,
+      updated_at: delivery.updated_at,
+    };
+  }
+
+  /**
+   * The creation-time principal stored in target_owner is either an account owner or, for legacy
+   * owner-less tokens, the token hash prefixed with token-sha256:. Never infer it from current
+   * presence/messages: a revoked name may be registered by a different account later.
+   */
+  private identityDeliveryPrincipal(identity: Pick<Identity, "owner" | "tokenHash">): string {
+    return typeof identity.owner === "string" && identity.owner.length > 0
+      ? identity.owner
+      : `token-sha256:${identity.tokenHash}`;
+  }
+
+  private identityMatchesDeliveryTarget(
+    identity: Pick<Identity, "name" | "owner" | "tokenHash">,
+    row: Record<string, unknown>,
+  ): boolean {
+    const principal = typeof row.target_owner === "string" && row.target_owner.length > 0
+      ? row.target_owner
+      : null;
+    return (
+      principal !== null &&
+      identity.name === String(row.target_name) &&
+      this.identityDeliveryPrincipal(identity) === principal
+    );
+  }
+
+  private canViewDetailedDeliveryState(connection: Connection<ConnState>, row: Record<string, unknown>): boolean {
+    const viewer = connection.state;
+    if (!viewer) return false;
+    const owner = typeof row.target_owner === "string" && row.target_owner.length > 0
+      ? row.target_owner
+      : null;
+    if (owner === null) return false;
+    if (viewer.kind === "agent") {
+      return this.identityMatchesDeliveryTarget(viewer, row);
+    }
+    return viewer.kind === "human" && !owner.startsWith("token-sha256:") && viewer.owner === owner;
+  }
+
+  private deliveryStateForConnection(
+    connection: Connection<ConnState>,
+    row: Record<string, unknown>,
+  ): PublicDirectedDelivery {
+    return this.rowToPublicDirectedDelivery(row, this.canViewDetailedDeliveryState(connection, row));
+  }
+
+  private captureAtomicDeliveryEffects(run: () => void): AtomicDeliveryEffects {
+    if (this.atomicDeliveryEffects !== null) {
+      throw new Error("nested atomic delivery effect capture is not supported");
+    }
+    const effects: AtomicDeliveryEffects = {
+      deliveryStateIds: new Set<string>(),
+      presenceTargets: new Set<string>(),
+      dispatchTargets: new Set<string>(),
+    };
+    this.atomicDeliveryEffects = effects;
+    try {
+      this.ctx.storage.transactionSync(run);
+      return effects;
+    } finally {
+      this.atomicDeliveryEffects = null;
+    }
+  }
+
+  private flushAtomicDeliveryEffects(effects?: AtomicDeliveryEffects) {
+    if (effects === undefined) return;
+    for (const deliveryId of effects.deliveryStateIds) {
+      const row = this.directedDeliveryRow(deliveryId);
+      if (row !== undefined) this.broadcastDirectedDelivery(row);
+    }
+    for (const targetName of effects.presenceTargets) this.broadcastPresenceFor(targetName);
+    for (const targetName of effects.dispatchTargets) this.dispatchNextDirectedDelivery(targetName);
+  }
+
+  private broadcastDirectedDelivery(row: Record<string, unknown>) {
+    if (this.atomicDeliveryEffects !== null) {
+      this.atomicDeliveryEffects.deliveryStateIds.add(String(row.id));
+      return;
+    }
+    for (const connection of this.getConnections<ConnState>()) {
+      this.sendFrame(connection, {
+        type: "delivery_state",
+        delivery: this.deliveryStateForConnection(connection, row),
+      });
+    }
+  }
+
+  private replayDirectedDeliveryStates(connection: Connection<ConnState>) {
+    let messageSeq = -1;
+    let id = "";
+    for (;;) {
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT * FROM directed_deliveries
+            WHERE message_seq > ? OR (message_seq = ? AND id > ?)
+            ORDER BY message_seq, id LIMIT ?`,
+          messageSeq,
+          messageSeq,
+          id,
+          HELLO_BACKFILL_PAGE_SIZE,
+        )
+        .toArray();
+      for (const row of rows) {
+        this.sendFrame(connection, {
+          type: "delivery_state",
+          delivery: this.deliveryStateForConnection(connection, row),
+        });
+      }
+      if (rows.length < HELLO_BACKFILL_PAGE_SIZE) return;
+      const last = rows[rows.length - 1]!;
+      messageSeq = Number(last.message_seq);
+      id = String(last.id);
+    }
+  }
+
+  private directedDeliveryRow(id: string): Record<string, unknown> | undefined {
+    return this.ctx.storage.sql.exec("SELECT * FROM directed_deliveries WHERE id = ?", id).toArray()[0];
+  }
+
+  private activeDecisionDelivery(
+    identity: Pick<Identity, "name" | "owner" | "tokenHash">,
+  ):
+    | { row: Record<string, unknown>; lineage: Required<DecisionDeliveryLineage> }
+    | { ambiguous: true }
+    | undefined {
+    const principal = this.identityDeliveryPrincipal(identity);
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE target_name = ? AND target_owner = ? AND state IN ('claimed', 'running')
+          ORDER BY message_seq, created_at`,
+        identity.name,
+        principal,
+      )
+      .toArray();
+    if (rows.length === 0) return undefined;
+    // This should be prevented by dispatchNextDirectedDelivery, but fail closed if storage was
+    // imported/corrupted rather than attaching an owner's answer to the wrong concurrent work.
+    if (rows.length !== 1) return { ambiguous: true };
+
+    let row: Record<string, unknown> = rows[0]!;
+    const id = String(row.id);
+    const existingWork = row.work_id === null || row.work_id === undefined ? "" : String(row.work_id);
+    const existingContinuation =
+      row.continuation_ref === null || row.continuation_ref === undefined ? "" : String(row.continuation_ref);
+    const workId =
+      existingWork.length > 0 && existingWork.length <= DELIVERY_WORK_ID_LIMIT ? existingWork : crypto.randomUUID();
+    const continuationRef =
+      existingContinuation.length > 0 && existingContinuation.length <= DELIVERY_CONTINUATION_REF_LIMIT
+        ? existingContinuation
+        : crypto.randomUUID();
+    if (workId !== existingWork || continuationRef !== existingContinuation) {
+      this.ctx.storage.sql.exec(
+        "UPDATE directed_deliveries SET work_id = ?, continuation_ref = ? WHERE id = ?",
+        workId,
+        continuationRef,
+        id,
+      );
+      row = this.directedDeliveryRow(id) ?? row;
+    }
+    const originChannel = this.getMeta("channel_slug") ?? this.name;
+    return {
+      row,
+      lineage: {
+        delivery_id: id,
+        origin_seq: Number(row.message_seq),
+        origin_channel: originChannel,
+        work_id: workId,
+        continuation_ref: continuationRef,
+      },
+    };
+  }
+
+  private async agentMentionTargets(msg: MsgFrame): Promise<string[]> {
+    const candidates = [...new Set(msg.mentions.filter((name) => name !== "system"))];
+    if (candidates.length === 0) return [];
+    const authoritative = new Map<string, { name: string; role: string; active: boolean }>();
+    let authoritativeLookupSucceeded = false;
+    try {
+      const placeholders = candidates.map(() => "?").join(", ");
+      const rows = await this.env.DB.prepare(
+        `SELECT name, role, revoked_at FROM tokens WHERE name COLLATE NOCASE IN (${placeholders})`,
+      )
+        .bind(...candidates)
+        .all<{ name: string; role: string; revoked_at: number | null }>();
+      authoritativeLookupSucceeded = true;
+      for (const row of rows.results) {
+        authoritative.set(mentionMatchKey(row.name), {
+          name: row.name,
+          role: row.role,
+          active: row.revoked_at === null,
+        });
+      }
+    } catch {
+      // 老测试/自托管迁移瞬间可能没有可查的 D1 token 表；下面只用 DO 内已有的 agent 事实兜底。
+    }
+
+    const localAgents = new Set<string>();
+    const localNonAgents = new Set<string>();
+    const placeholders = candidates.map(() => "?").join(", ");
+    for (const row of this.ctx.storage.sql
+      .exec(`SELECT name, kind FROM presence WHERE name IN (${placeholders})`, ...candidates)
+      .toArray()) {
+      const key = mentionMatchKey(String(row.name));
+      if (String(row.kind) === "agent") localAgents.add(key);
+      else localNonAgents.add(key);
+    }
+    for (const row of this.ctx.storage.sql
+      .exec(`SELECT DISTINCT sender_name AS name, sender_kind AS kind FROM messages WHERE sender_name IN (${placeholders})`, ...candidates)
+      .toArray()) {
+      const key = mentionMatchKey(String(row.name));
+      if (String(row.kind) === "agent") localAgents.add(key);
+      else localNonAgents.add(key);
+    }
+    for (const row of this.ctx.storage.sql
+      .exec(`SELECT name FROM webhooks WHERE name IN (${placeholders})`, ...candidates)
+      .toArray()) {
+      localNonAgents.add(mentionMatchKey(String(row.name)));
+    }
+
+    const out: string[] = [];
+    for (const candidate of candidates) {
+      const key = mentionMatchKey(candidate);
+      const token = authoritative.get(key);
+      // D1 有记录时它是权威：human、readonly、已撤销 token 都不能被本地旧 presence 重新抬成 agent。
+      if (token !== undefined) {
+        if (token.role === "agent" && token.active) out.push(token.name);
+      } else if (localAgents.has(key)) {
+        out.push(candidate);
+      } else if (!authoritativeLookupSucceeded && !localNonAgents.has(key)) {
+        // resolveMentions already proved this canonical target existed before INSERT. If the second,
+        // classification-only D1 read fails during that narrow window, dropping an offline agent here
+        // would lose durable work forever. Fail open for identities with no local human/webhook fact;
+        // a mistakenly queued human/squad can never claim a serve lease, while a missed agent cannot
+        // be reconstructed after the request returns.
+        out.push(candidate);
+      }
+    }
+    return [...new Set(out)];
+  }
+
+  private directedDeliveryCause(msg: MsgFrame, targetName: string): DirectedDeliveryCause {
+    if (msg.decision_response !== undefined) return "owner_answer";
+    if (msg.reply_to !== null) {
+      const original = this.ctx.storage.sql
+        .exec("SELECT sender_name FROM messages WHERE seq = ?", msg.reply_to)
+        .toArray()[0];
+      if (original !== undefined && String(original.sender_name) === targetName) return "reply";
+    }
+    return "mention";
+  }
+
+  private ensureDirectedDeliveries(
+    msg: MsgFrame,
+    classifiedTargets: string[],
+    targetOwners: Record<string, string> = {},
+  ) {
+    // Status/presence frames are coordination metadata, not agent work. Self-mentions likewise must
+    // never claim a queue slot the CLI intentionally refuses to run, or one poison row blocks every
+    // later work item for that target until lease expiry.
+    if (msg.kind !== "message") return;
+    // Pause delays dispatch; it must not erase the durable wake debt. The queued row is created even
+    // while the target is paused and resumePresence() restarts adapter selection later.
+    const targets = [...new Set(classifiedTargets)].filter((targetName) => targetName !== msg.sender.name);
+    if (targets.length === 0) return;
+    const now = Date.now();
+    for (const targetName of targets) {
+      const existing = this.ctx.storage.sql
+        .exec("SELECT * FROM directed_deliveries WHERE message_seq = ? AND target_name = ?", msg.seq, targetName)
+        .toArray()[0];
+      if (existing !== undefined) continue;
+      const id = crypto.randomUUID();
+      // An owner's decision is a new delivery attempt/message but the same logical work and model
+      // continuation as the question that suspended it. Ordinary mentions start a fresh lineage.
+      const workId = msg.decision_response?.work_id ?? crypto.randomUUID();
+      const continuationRef = msg.decision_response?.continuation_ref ?? crypto.randomUUID();
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO directed_deliveries (
+           id, message_seq, target_name, target_owner, cause, state, attempt,
+           lease_connection_id, lease_until, work_id, continuation_ref,
+           parent_delivery_id, reply_seq, last_error, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 'queued', 0, NULL, NULL, ?, ?, ?, NULL, NULL, ?, ?)`,
+        id,
+        msg.seq,
+        targetName,
+        targetOwners[targetName] ?? null,
+        this.directedDeliveryCause(msg, targetName),
+        workId,
+        continuationRef,
+        msg.decision_response?.delivery_id ?? null,
+        now,
+        now,
+      );
+      const inserted = this.directedDeliveryRow(id);
+      if (inserted !== undefined) this.broadcastDirectedDelivery(inserted);
+    }
+    for (const targetName of targets) this.dispatchNextDirectedDelivery(targetName);
+  }
+
+  private dispatchNextDirectedDelivery(targetName: string, excludeConnectionId?: string) {
+    if (this.atomicDeliveryEffects !== null) {
+      this.atomicDeliveryEffects.dispatchTargets.add(targetName);
+      return;
+    }
+    this.closeExpiredHelloConnections(Date.now(), targetName, excludeConnectionId);
+    if (this.isPresencePaused(targetName)) return;
+    const serveCandidates = this.serveLeaseCandidates(targetName, excludeConnectionId).filter(
+      (candidate) => candidate.state?.serveLeaseHeld === true,
+    );
+    const legacyServeCandidates = this.claimedServeConnections(targetName, excludeConnectionId).filter(
+      (candidate) => candidate.state?.directedDeliveryV1 !== true && candidate.state?.serveLeaseHeld === true,
+    );
+    const watchCandidates = this.watchLeaseCandidates(targetName, excludeConnectionId);
+    const agentWebhooks = this.agentWebhookCandidates(targetName);
+
+    for (;;) {
+      const queued = this.ctx.storage.sql
+        .exec(
+          `SELECT * FROM directed_deliveries
+            WHERE target_name = ? AND state = 'queued'
+            ORDER BY message_seq, created_at LIMIT 1`,
+          targetName,
+        )
+        .toArray()[0];
+      if (queued === undefined) return;
+      const principal = typeof queued.target_owner === "string" && queued.target_owner.length > 0
+        ? queued.target_owner
+        : null;
+      if (principal === null) {
+        const now = Date.now();
+        this.transitionDirectedDeliveryTerminal(String(queued.id), "failed", now, {
+          error: "delivery has no creation-time target principal; refusing unsafe name-based dispatch",
+          expectedStates: ["queued"],
+          dispatchNext: false,
+        });
+        continue;
+      }
+      // A just-welcomed exact-principal socket has not yet identified itself as v1, legacy CLI, or
+      // Web. Hold the row queued until hello resolves that ambiguity; live actionable raw frames are
+      // withheld from that socket in the same window.
+      const helloPending = [...this.getConnections<ConnState>()].some((connection) => {
+        if (connection.id === excludeConnectionId) return false;
+        const state = connection.state;
+        return state?.helloPending === true && state.helloExpired !== true &&
+          state.kind === "agent" && state.name === targetName &&
+          this.identityDeliveryPrincipal(state) === principal;
+      });
+      if (helloPending) return;
+      const matchingServe = serveCandidates.filter((candidate) => {
+        const st = candidate.state;
+        return st != null && this.identityDeliveryPrincipal(st) === principal;
+      });
+      const matchingWatch = watchCandidates.filter((candidate) => {
+            const st = candidate.state;
+            return st != null && this.identityDeliveryPrincipal(st) === principal;
+      });
+      const samePrincipalLegacy = legacyServeCandidates.filter((candidate) => {
+        const st = candidate.state;
+        return st != null && this.identityDeliveryPrincipal(st) === principal;
+      });
+      const matchingLegacy = samePrincipalLegacy.filter((candidate) => {
+        const st = candidate.state;
+        return st != null &&
+          typeof st.helloSince === "number" &&
+          st.helloSince < Number(queued.message_seq);
+      });
+      const matchingWebhooks = agentWebhooks.filter((hook) => hook.targetOwner === principal);
+      if (
+        matchingServe.length === 0 &&
+        matchingWatch.length === 0 &&
+        matchingWebhooks.length === 0 &&
+        matchingLegacy.length === 0
+      ) {
+        // Explicit legacy serve can only consume a raw frame newer than its hello cursor. Older
+        // queued debt stays durable for v1; marking it running would create a silent lost handoff.
+        if (samePrincipalLegacy.length > 0) return;
+        // Legacy/imported rows without a bound principal must never be inferred from current
+        // presence. If a same-name but different-principal runner is online, the old work can no
+        // longer be delivered safely and must not head-of-line block that runner's new queue.
+        if (
+          serveCandidates.length === 0 &&
+          legacyServeCandidates.length === 0 &&
+          watchCandidates.length === 0 &&
+          agentWebhooks.length === 0
+        ) return;
+        const now = Date.now();
+        this.transitionDirectedDeliveryTerminal(String(queued.id), "failed", now, {
+          error: "target principal changed before delivery; refusing same-name reassignment",
+          expectedStates: ["queued"],
+          dispatchNext: false,
+        });
+        continue;
+      }
+      const active = this.ctx.storage.sql
+        .exec(
+          `SELECT id FROM directed_deliveries
+            WHERE target_name = ? AND target_owner = ? AND state IN ('claimed', 'running')
+            ORDER BY message_seq LIMIT 1`,
+          targetName,
+          principal,
+        )
+        .toArray()[0];
+      if (active !== undefined) return;
+      const now = Date.now();
+      if (
+        matchingServe.length === 0 &&
+        matchingWatch.length === 0 &&
+        matchingWebhooks.length === 0 &&
+        matchingLegacy.length > 0
+      ) {
+        // Rolling upgrade: an elected legacy serve receives the raw msg broadcast but cannot ACK a
+        // v1 delivery frame. Treat that raw handoff as already running/unknown, never as a queued row
+        // that a later v1 connection could replay. Reply/heartbeat still converge it normally.
+        const holderId = matchingLegacy[0]!.id;
+        const leaseUntil = now + DIRECTED_DELIVERY_LEASE_MS;
+        this.ctx.storage.sql.exec(
+          `UPDATE directed_deliveries
+              SET state = 'running', attempt = attempt + 1,
+                  lease_connection_id = ?, last_lease_connection_id = ?,
+                  lease_adapter = 'legacy_serve', lease_until = ?, last_error = NULL,
+                  terminal_reason = NULL, updated_at = ?
+            WHERE id = ? AND target_owner = ? AND state = 'queued'`,
+          holderId,
+          holderId,
+          leaseUntil,
+          now,
+          String(queued.id),
+          principal,
+        );
+        const running = this.directedDeliveryRow(String(queued.id));
+        if (running !== undefined && String(running.state) === "running") {
+          this.broadcastDirectedDelivery(running);
+          this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+        }
+        return;
+      }
+      const adapter = matchingServe.length > 0 ? "serve" : matchingWatch.length > 0 ? "watch" : "webhook";
+      const connectionHolder = adapter === "serve" ? matchingServe[0] : adapter === "watch" ? matchingWatch[0] : undefined;
+      const webhookHolder = adapter === "webhook" ? matchingWebhooks[0] : undefined;
+      const holderId = connectionHolder?.id ?? this.webhookHolderId(webhookHolder!.registrationId);
+      const leaseUntil = now + (adapter === "webhook" ? DIRECTED_WEBHOOK_LEASE_MS : DIRECTED_DELIVERY_LEASE_MS);
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'claimed', attempt = attempt + 1,
+                lease_connection_id = ?, last_lease_connection_id = ?,
+                lease_adapter = ?, lease_until = ?, last_error = NULL,
+                terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND target_owner = ? AND state = 'queued'`,
+        holderId,
+        holderId,
+        adapter,
+        leaseUntil,
+        now,
+        String(queued.id),
+        principal,
+      );
+      const claimed = this.directedDeliveryRow(String(queued.id));
+      if (claimed === undefined || String(claimed.state) !== "claimed") return;
+      const message = this.ctx.storage.sql
+        .exec("SELECT * FROM messages WHERE seq = ?", Number(claimed.message_seq))
+        .toArray()[0];
+      if (message === undefined) {
+        this.transitionDirectedDeliveryTerminal(String(claimed.id), "failed", now, {
+          error: "source message is no longer retained",
+          expectedStates: ["claimed"],
+          expectedLeaseConnectionId: holderId,
+          dispatchNext: false,
+        });
+        continue;
+      }
+      this.broadcastDirectedDelivery(claimed);
+      const messageFrame = this.rowToFrame(message);
+      if (connectionHolder !== undefined) {
+        this.sendFrame(connectionHolder, {
+          type: "delivery",
+          delivery: this.rowToDirectedDelivery(claimed),
+          message: messageFrame,
+        });
+      } else {
+        this.ctx.waitUntil(this.dispatchDirectedWebhook(webhookHolder!, claimed, messageFrame));
+      }
+      this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+      return;
+    }
+  }
+
+  private requeueDirectedDeliveriesForConnection(connectionId: string, now: number): string[] {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE lease_connection_id = ?
+            AND ((state = 'claimed' AND (lease_adapter IS NULL OR lease_adapter IN ('serve', 'watch')))
+              OR (state = 'running' AND lease_adapter = 'legacy_serve'))`,
+        connectionId,
+      )
+      .toArray();
+    const targets = new Set<string>();
+    for (const row of rows) {
+      const targetName = String(row.target_name);
+      targets.add(targetName);
+      if (
+        String(row.state) === "running" &&
+        String(row.lease_adapter) === "legacy_serve"
+      ) {
+        this.transitionDirectedDeliveryTerminal(String(row.id), "failed", now, {
+          error: "legacy runner disconnected after raw handoff; outcome unknown, not auto-retried",
+          terminalReason: "unknown_outcome",
+          expectedStates: ["running"],
+          expectedLeaseAdapter: "legacy_serve",
+          expectedLeaseConnectionId: connectionId,
+          dispatchNext: false,
+        });
+        continue;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'queued', lease_connection_id = NULL,
+                lease_adapter = NULL, lease_until = NULL,
+                last_error = NULL, terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND lease_connection_id = ? AND state = 'claimed'`,
+        now,
+        String(row.id),
+        connectionId,
+      );
+      const queued = this.directedDeliveryRow(String(row.id));
+      if (queued !== undefined && String(queued.state) === "queued") this.broadcastDirectedDelivery(queued);
+    }
+    return [...targets];
+  }
+
+  private requeueExpiredDirectedDeliveries(now: number) {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE state IN ('claimed', 'running') AND lease_until IS NOT NULL AND lease_until <= ?`,
+        now,
+      )
+      .toArray();
+    const expiredConnections = new Map<string, string>();
+    const targets = new Set<string>();
+    for (const row of rows) {
+      const targetName = String(row.target_name);
+      const state = String(row.state);
+      const connectionId = row.lease_connection_id === null ? null : String(row.lease_connection_id);
+      targets.add(targetName);
+      if (connectionId !== null) expiredConnections.set(targetName, connectionId);
+      if (state === "claimed") {
+        // No task heartbeat was ever observed, so the model is proven not to have started under this
+        // lease and automatic retry is safe.
+        this.ctx.storage.sql.exec(
+          `UPDATE directed_deliveries
+              SET state = 'queued', lease_connection_id = NULL,
+                  lease_adapter = NULL, lease_until = NULL,
+                  last_error = NULL, terminal_reason = NULL, updated_at = ?
+            WHERE id = ? AND state = 'claimed' AND lease_until <= ?`,
+          now,
+          String(row.id),
+          now,
+        );
+      } else {
+        // A running runner may survive a network partition. Starting the standby would duplicate
+        // model/external side effects, so fail visibly with an unknown outcome instead of auto-replay.
+        this.transitionDirectedDeliveryTerminal(String(row.id), "failed", now, {
+          error: "runner ownership lost after task start; outcome unknown, not auto-retried",
+          terminalReason: "unknown_outcome",
+          expectedStates: ["running"],
+          dispatchNext: false,
+        });
+      }
+      const updated = this.directedDeliveryRow(String(row.id));
+      if (updated !== undefined && (String(updated.state) === "queued" || String(updated.state) === "failed")) {
+        this.broadcastDirectedDelivery(updated);
+      }
+    }
+    for (const targetName of targets) {
+      const expiredConnectionId = expiredConnections.get(targetName);
+      if (expiredConnectionId !== undefined) {
+        for (const connection of this.getConnections<ConnState>()) {
+          if (connection.id === expiredConnectionId) connection.close(1012, "delivery lease expired");
+        }
+      }
+      // 明确排除超时 runner，让同名 standby 立即接棒；没有 standby 时 work 留在 queued 等重连。
+      this.reconcileServeLease(targetName, expiredConnectionId);
+      this.dispatchNextDirectedDelivery(targetName, expiredConnectionId);
+    }
+  }
+
+  private applyDirectedDeliveryHeartbeat(
+    identity: ConnState,
+    connectionId: string,
+    hb: ParsedTaskHeartbeat,
+    now: number,
+  ) {
+    if (hb.current_task === null) return;
+    const row = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE target_name = ? AND target_owner = ? AND message_seq = ? AND lease_connection_id = ?
+            AND state = 'running'
+          LIMIT 1`,
+        identity.name,
+        this.identityDeliveryPrincipal(identity),
+        hb.current_task,
+        connectionId,
+      )
+      .toArray()[0];
+    if (row === undefined) return;
+    const leaseUntil = now + DIRECTED_DELIVERY_LEASE_MS;
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET lease_until = ?, updated_at = ?
+        WHERE id = ? AND lease_connection_id = ? AND state = 'running'`,
+      leaseUntil,
+      now,
+      String(row.id),
+      connectionId,
+    );
+    this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+  }
+
+  private directedTaskAcceptsHeartbeat(identity: ConnState, messageSeq: number): boolean {
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT * FROM directed_deliveries WHERE target_name = ? AND message_seq = ? LIMIT 1",
+        identity.name,
+        messageSeq,
+      )
+      .toArray()[0];
+    if (row === undefined) return true;
+    return this.identityMatchesDeliveryTarget(identity, row) && String(row.state) === "running";
+  }
+
+  private applyDirectedDeliveryUpdate(
+    identity: ConnState,
+    connectionId: string,
+    update: DeliveryUpdateFrame,
+    now: number,
+  ): boolean {
+    const row = this.directedDeliveryRow(update.delivery_id);
+    if (row === undefined || !this.identityMatchesDeliveryTarget(identity, row)) return false;
+    if (update.work_id !== undefined && update.work_id !== String(row.work_id ?? "")) return false;
+    if (update.continuation_ref !== undefined && update.continuation_ref !== String(row.continuation_ref ?? "")) return false;
+    const oldState = String(row.state);
+    const ownsCurrentLease = String(row.lease_connection_id ?? "") === connectionId;
+    const ownsFormerLease = String(row.last_lease_connection_id ?? "") === connectionId;
+    // handleSend can persist the question and detach the lease before the runner's success receipt
+    // arrives. ACK that exact former holder as a no-op and return the authoritative waiting_owner
+    // row; never let the generic replied receipt erase the human handoff.
+    if (oldState === "waiting_owner") {
+      return ownsFormerLease && (update.state === "waiting_owner" || update.state === "replied");
+    }
+
+    // Terminal receipts detach the current lease but retain its last holder for idempotent ACKs.
+    // Only an explicitly typed unknown outcome (or a legacy untyped row) may converge on a late
+    // success. Policy/retract failures are final and must never be revived by a stale receipt.
+    if (oldState === "replied") return update.state === "replied" && (ownsCurrentLease || ownsFormerLease);
+    if (oldState === "failed") {
+      if (!(ownsCurrentLease || ownsFormerLease)) return false;
+      if (update.state === "failed") return true;
+      if (update.state !== "replied") return false;
+      if (!this.isFailedDeliveryRevivable(row)) return false;
+    } else if (!ownsCurrentLease) {
+      return false;
+    }
+
+    // A serve adapter must still be the elected holder. Watch connections are assigned the delivery
+    // directly and prove ownership with the exact connection-bound lease above.
+    if (
+      identity.serveCandidate &&
+      this.serveLeaseCandidates(
+        identity.name,
+        undefined,
+        this.identityDeliveryPrincipal(identity),
+      )[0]?.id !== connectionId
+    ) return false;
+
+    if (
+      oldState !== "claimed" &&
+      oldState !== "running" &&
+      !(oldState === "failed" && update.state === "replied")
+    ) return false;
+    if (update.reply_seq !== undefined) {
+      const reply = this.ctx.storage.sql
+        .exec("SELECT sender_name FROM messages WHERE seq = ?", update.reply_seq)
+        .toArray()[0];
+      if (reply === undefined || String(reply.sender_name) !== identity.name) return false;
+    }
+
+    if (update.state === "running") {
+      const leaseUntil = now + DIRECTED_DELIVERY_LEASE_MS;
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+          SET state = 'running', lease_until = ?, last_error = NULL, terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND target_name = ? AND target_owner = ? AND lease_connection_id = ?
+            AND state IN ('claimed', 'running')`,
+        leaseUntil,
+        now,
+        update.delivery_id,
+        identity.name,
+        this.identityDeliveryPrincipal(identity),
+        connectionId,
+      );
+      const running = this.directedDeliveryRow(update.delivery_id);
+      if (running === undefined || String(running.state) !== "running") return false;
+      this.broadcastDirectedDelivery(running);
+      this.ctx.waitUntil(this.ensureAlarmAt(leaseUntil));
+      return true;
+    }
+
+    if (update.state === "replied" || update.state === "failed") {
+      const terminal = this.transitionDirectedDeliveryTerminal(update.delivery_id, update.state, now, {
+        replySeq: update.reply_seq ?? null,
+        error: update.error ?? null,
+        expectedStates: [oldState],
+        ...(oldState === "failed" ? {} : { expectedLeaseConnectionId: connectionId }),
+      });
+      return terminal !== undefined && String(terminal.state) === update.state;
+    }
+
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET state = 'waiting_owner',
+              last_lease_connection_id = COALESCE(lease_connection_id, last_lease_connection_id),
+              lease_connection_id = NULL, lease_until = NULL, lease_adapter = NULL,
+              last_error = NULL, terminal_reason = NULL, updated_at = ?
+        WHERE id = ? AND target_name = ? AND target_owner = ?
+          AND lease_connection_id = ? AND state IN ('claimed', 'running')`,
+      now,
+      update.delivery_id,
+      identity.name,
+      this.identityDeliveryPrincipal(identity),
+      connectionId,
+    );
+    const updated = this.directedDeliveryRow(update.delivery_id);
+    if (updated === undefined || String(updated.state) !== "waiting_owner") return false;
+    this.broadcastDirectedDelivery(updated);
+    this.broadcastPresenceFor(identity.name);
+    this.dispatchNextDirectedDelivery(identity.name);
+    return true;
+  }
+
+  /**
+   * One terminal transition gate for durable work. Besides detaching the lease and broadcasting,
+   * this is the mandatory lineage hook: every terminal owner_answer closes its exact parked
+   * waiting_owner ancestor (and only that work/ref/principal chain).
+   */
+  private transitionDirectedDeliveryTerminal(
+    deliveryId: string,
+    terminalState: "replied" | "failed",
+    now: number,
+    options: {
+      replySeq?: number | null;
+      error?: string | null;
+      terminalReason?: DeliveryTerminalReason;
+      expectedStates: string[];
+      expectedLeaseAdapter?: string;
+      expectedLeaseConnectionId?: string;
+      dispatchNext?: boolean;
+    },
+  ): Record<string, unknown> | undefined {
+    const before = this.directedDeliveryRow(deliveryId);
+    if (before === undefined) return undefined;
+    const beforeState = String(before.state);
+    if (beforeState === "failed" && terminalState === "replied" && !this.isFailedDeliveryRevivable(before)) {
+      return undefined;
+    }
+    if (beforeState === terminalState) {
+      if (String(before.cause) === "owner_answer") {
+        this.settleWaitingOwnerAncestors(
+          before,
+          terminalState,
+          options.replySeq ?? (before.reply_seq === null ? null : Number(before.reply_seq)),
+          options.error ?? (before.last_error === null ? null : String(before.last_error)),
+          now,
+        );
+      }
+      return before;
+    }
+    if (!options.expectedStates.includes(beforeState)) return undefined;
+    if (
+      options.expectedLeaseAdapter !== undefined &&
+      String(before.lease_adapter ?? "") !== options.expectedLeaseAdapter
+    ) return undefined;
+    if (
+      options.expectedLeaseConnectionId !== undefined &&
+      String(before.lease_connection_id ?? "") !== options.expectedLeaseConnectionId
+    ) return undefined;
+
+    const clauses = ["id = ?", "state = ?"];
+    const whereArgs: (string | number | null)[] = [deliveryId, beforeState];
+    if (options.expectedLeaseAdapter !== undefined) {
+      clauses.push("lease_adapter = ?");
+      whereArgs.push(options.expectedLeaseAdapter);
+    }
+    if (options.expectedLeaseConnectionId !== undefined) {
+      clauses.push("lease_connection_id = ?");
+      whereArgs.push(options.expectedLeaseConnectionId);
+    }
+    const replySeq = options.replySeq ?? null;
+    const error = terminalState === "failed"
+      ? (options.error ?? "delivery failed").slice(0, DECISION_REASON_LIMIT)
+      : null;
+    const terminalReason: DeliveryTerminalReason | null = terminalState === "failed"
+      ? options.terminalReason ?? "delivery_failed"
+      : null;
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET state = ?,
+              last_lease_connection_id = COALESCE(lease_connection_id, last_lease_connection_id),
+              lease_connection_id = NULL, lease_adapter = NULL, lease_until = NULL,
+              reply_seq = COALESCE(?, reply_seq), last_error = ?, terminal_reason = ?, updated_at = ?
+        WHERE ${clauses.join(" AND ")}`,
+      terminalState,
+      replySeq,
+      error,
+      terminalReason,
+      now,
+      ...whereArgs,
+    );
+    const terminal = this.directedDeliveryRow(deliveryId);
+    if (terminal === undefined || String(terminal.state) !== terminalState) return undefined;
+    this.broadcastDirectedDelivery(terminal);
+    if (String(terminal.cause) === "owner_answer") {
+      this.settleWaitingOwnerAncestors(terminal, terminalState, replySeq, error, now);
+    }
+    if (beforeState === "waiting_owner") {
+      this.broadcastPresenceFor(String(terminal.target_name));
+    }
+    if (options.dispatchNext !== false) this.dispatchNextDirectedDelivery(String(terminal.target_name));
+    return terminal;
+  }
+
+  private completeDirectedDelivery(identity: Identity, messageSeq: number, replySeq: number, now: number) {
+    const row = this.ctx.storage.sql
+      .exec(
+        "SELECT * FROM directed_deliveries WHERE message_seq = ? AND target_name = ? LIMIT 1",
+        messageSeq,
+        identity.name,
+      )
+      .toArray()[0];
+    if (row === undefined || !this.identityMatchesDeliveryTarget(identity, row)) return;
+    const oldState = String(row.state);
+    // A notify webhook may wake the bound target while the durable row is still queued. A real
+    // reply from the exact creation-time principal is stronger evidence than adapter bookkeeping,
+    // so it may complete queued work and prevents a later serve from executing it again.
+    if (oldState !== "queued" && oldState !== "claimed" && oldState !== "running" && oldState !== "failed") return;
+    if (oldState === "failed" && !this.isFailedDeliveryRevivable(row)) return;
+    this.transitionDirectedDeliveryTerminal(String(row.id), "replied", now, {
+      replySeq,
+      expectedStates: [oldState],
+    });
+  }
+
+  private settleWaitingOwnerAncestors(
+    completedAnswer: Record<string, unknown>,
+    terminalState: "replied" | "failed",
+    replySeq: number | null,
+    error: string | null,
+    now: number,
+  ) {
+    let answer = completedAnswer;
+    const visited = new Set<string>();
+    const presenceTargets = new Set<string>();
+    for (let depth = 0; depth < 32 && String(answer.cause) === "owner_answer"; depth++) {
+      const answerId = String(answer.id);
+      if (visited.has(answerId)) break;
+      visited.add(answerId);
+      const message = this.ctx.storage.sql
+        .exec("SELECT decision_response_json FROM messages WHERE seq = ?", Number(answer.message_seq))
+        .toArray()[0];
+      const response = parseStoredDecisionResponse(message?.decision_response_json);
+      // New rows snapshot the server-validated parent id so retention/corruption of the answer
+      // message cannot strand waiting_owner forever. Legacy rows fall back to the stored response.
+      const parentDeliveryId =
+        typeof answer.parent_delivery_id === "string" && answer.parent_delivery_id.length > 0
+          ? answer.parent_delivery_id
+          : response?.delivery_id;
+      if (parentDeliveryId === undefined || parentDeliveryId === answerId) break;
+      if (
+        response !== undefined &&
+        (response.origin_seq === undefined ||
+          response.work_id === undefined ||
+          response.continuation_ref === undefined ||
+          response.delivery_id !== parentDeliveryId ||
+          response.work_id !== String(answer.work_id ?? "") ||
+          response.continuation_ref !== String(answer.continuation_ref ?? ""))
+      ) break;
+      const source = this.directedDeliveryRow(parentDeliveryId);
+      if (
+        source === undefined ||
+        String(source.target_name) !== String(answer.target_name) ||
+        String(source.target_owner ?? "") !== String(answer.target_owner ?? "") ||
+        (response?.origin_seq !== undefined && Number(source.message_seq) !== response.origin_seq) ||
+        String(source.continuation_ref ?? "") !== String(answer.continuation_ref ?? "") ||
+        String(source.work_id ?? "") !== String(answer.work_id ?? "")
+      ) {
+        break;
+      }
+      const sourceState = String(source.state);
+      if (terminalState === "replied") {
+        if (sourceState !== "replied") {
+          if (sourceState !== "waiting_owner") break;
+          this.ctx.storage.sql.exec(
+            `UPDATE directed_deliveries
+                SET state = 'replied', lease_connection_id = NULL, lease_adapter = NULL, lease_until = NULL,
+                    reply_seq = COALESCE(?, reply_seq), last_error = NULL,
+                    terminal_reason = NULL, updated_at = ?
+              WHERE id = ? AND state = 'waiting_owner'`,
+            replySeq,
+            now,
+            parentDeliveryId,
+          );
+        }
+      } else {
+        if (sourceState === "replied") break;
+        if (sourceState !== "failed") {
+          if (sourceState !== "waiting_owner") break;
+          const ancestorError = `owner answer failed: ${error ?? "runner reported failure"}`.slice(
+            0,
+            DECISION_REASON_LIMIT,
+          );
+          this.ctx.storage.sql.exec(
+            `UPDATE directed_deliveries
+                SET state = 'failed', lease_connection_id = NULL, lease_adapter = NULL, lease_until = NULL,
+                    last_error = ?, terminal_reason = 'owner_answer_failed', updated_at = ?
+              WHERE id = ? AND state = 'waiting_owner'`,
+            ancestorError,
+            now,
+            parentDeliveryId,
+          );
+        }
+      }
+      const closed = this.directedDeliveryRow(parentDeliveryId);
+      if (closed === undefined || String(closed.state) !== terminalState) break;
+      this.broadcastDirectedDelivery(closed);
+      presenceTargets.add(String(closed.target_name));
+      answer = closed;
+    }
+    for (const targetName of presenceTargets) this.broadcastPresenceFor(targetName);
+  }
+
   // ---- 同名 serve 跨机租约（issue #99）----
   // 同机单实例锁（CLI src/instance-lock.ts，#237）只挡本机；跨机器两台 serve 各连一条 WS，广播把每条 @
   // 发给同名所有连接 → 都跑完整 runner、双份副作用。这里在服务端做互斥：同名 serve 连接各自 claim，只有
@@ -5302,14 +8330,60 @@ export class ChannelDO extends Server<Env> {
     return next;
   }
 
+  private watchLeaseCandidates(name: string, excludeId?: string): Connection<ConnState>[] {
+    const list: Connection<ConnState>[] = [];
+    for (const connection of this.getConnections<ConnState>()) {
+      if (connection.id === excludeId) continue;
+      const state = connection.state;
+      if (state?.watchCandidate && state.kind === "agent" && state.name === name) list.push(connection);
+    }
+    list.sort((a, b) => {
+      const left = a.state?.watchClaimSeq ?? Number.MAX_SAFE_INTEGER;
+      const right = b.state?.watchClaimSeq ?? Number.MAX_SAFE_INTEGER;
+      return left !== right ? left - right : a.id.localeCompare(b.id);
+    });
+    return list;
+  }
+
+  private agentWebhookCandidates(name: string): WebhookRow[] {
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT name, registration_id, url, secret, filter, mode, target_owner
+           FROM webhooks
+          WHERE name = ? AND mode = 'agent' AND filter IN ('mentions', 'all')`,
+        name,
+      )
+      .toArray()
+      .map((row) => ({
+        name: String(row.name),
+        registrationId: String(row.registration_id),
+        url: String(row.url),
+        secret: String(row.secret),
+        filter: String(row.filter) as WebhookFilter,
+        mode: "agent" as const,
+        targetOwner: row.target_owner === null || row.target_owner === undefined
+          ? null
+          : String(row.target_owner),
+      }));
+  }
+
   // 同名的活 serve 候选连接，按 claim 序号升序（并列用 connection.id 兜底稳定）。excludeId 供 onClose 用：
   // 正在关闭的连接 getConnections 可能仍返回，但它已不该参与选举。
-  private serveLeaseCandidates(name: string, excludeId?: string): Connection<ConnState>[] {
+  private claimedServeConnections(
+    name: string,
+    excludeId?: string,
+    principal?: string,
+  ): Connection<ConnState>[] {
     const list: Connection<ConnState>[] = [];
     for (const c of this.getConnections<ConnState>()) {
       if (c.id === excludeId) continue;
       const st = c.state;
-      if (st?.serveCandidate && st.name === name) list.push(c);
+      if (
+        st?.serveCandidate &&
+        st.kind === "agent" &&
+        st.name === name &&
+        (principal === undefined || this.identityDeliveryPrincipal(st) === principal)
+      ) list.push(c);
     }
     list.sort((a, b) => {
       const sa = a.state?.serveClaimSeq ?? Number.MAX_SAFE_INTEGER;
@@ -5319,18 +8393,69 @@ export class ChannelDO extends Server<Env> {
     return list;
   }
 
-  // 选出唯一持租者（序号最小），给每条候选连接补发它此刻是否持租——只在 held 相对上次变化时才发（去重）。
+  /** Only an explicit v1 consumer may own a durable directed-delivery lease. */
+  private serveLeaseCandidates(
+    name: string,
+    excludeId?: string,
+    principal?: string,
+  ): Connection<ConnState>[] {
+    return this.claimedServeConnections(name, excludeId, principal).filter(
+      (connection) => connection.state?.directedDeliveryV1 === true,
+    );
+  }
+
+  private legacyServeConflictsWithV1(identity: ConnState, connectionId: string): boolean {
+    const principal = this.identityDeliveryPrincipal(identity);
+    const v1AlreadyHeld = this.serveLeaseCandidates(identity.name, connectionId, principal).some(
+      (connection) => connection.state?.serveLeaseHeld === true,
+    );
+    if (v1AlreadyHeld) return true;
+    const activeV1 = this.ctx.storage.sql
+      .exec(
+        `SELECT id FROM directed_deliveries
+          WHERE target_name = ? AND target_owner = ? AND state IN ('claimed', 'running')
+            AND (lease_adapter IS NULL OR lease_adapter <> 'legacy_serve')
+          LIMIT 1`,
+        identity.name,
+        principal,
+      )
+      .toArray()[0];
+    return activeV1 !== undefined;
+  }
+
+  // 同名 token 可以在撤销后被另一 owner 复用。租约按 creation-time principal 分组，避免新 owner
+  // 被旧 owner 的残连压成 standby，也避免旧 work 被同名新连接领取。
   private reconcileServeLease(name: string, excludeId?: string) {
-    const candidates = this.serveLeaseCandidates(name, excludeId);
-    const holderId = candidates[0]?.id;
+    const candidates = this.claimedServeConnections(name, excludeId);
+    const holderIds = new Set<string>();
+    const byPrincipal = new Map<string, Connection<ConnState>[]>();
+    for (const candidate of candidates) {
+      const st = candidate.state;
+      if (!st) continue;
+      const principal = this.identityDeliveryPrincipal(st);
+      const group = byPrincipal.get(principal) ?? [];
+      group.push(candidate);
+      byPrincipal.set(principal, group);
+    }
+    for (const group of byPrincipal.values()) {
+      // Never steal an already-announced lease during a rolling upgrade: a legacy holder may have
+      // accepted a raw @ that a newly connected v1 standby must not replay. With no incumbent, v1 is
+      // the safe failover choice; otherwise fall back to the oldest explicit legacy claim.
+      const incumbent = group.find((candidate) => candidate.state?.serveLeaseHeld === true);
+      const holder = incumbent ??
+        group.find((candidate) => candidate.state?.directedDeliveryV1 === true) ??
+        group[0];
+      if (holder) holderIds.add(holder.id);
+    }
     for (const c of candidates) {
       const st = c.state;
       if (!st) continue;
-      const held = c.id === holderId;
+      const held = holderIds.has(c.id);
       if (st.serveLeaseHeld === held) continue;
       c.setState({ ...st, serveLeaseHeld: held });
       this.sendFrame(c, { type: "serve_lease", name, held });
     }
+    if (holderIds.size > 0) this.dispatchNextDirectedDelivery(name, excludeId);
   }
 
   // 每个 name 的 serve 候选连接数（含持租者）。用于 presence 暴露 standby 数（候选数 - 1）。
@@ -5385,6 +8510,7 @@ export class ChannelDO extends Server<Env> {
   private presenceList(): PresenceEntry[] {
     const liveCounts = this.liveConnectionCounts();
     const serveCounts = this.serveCandidateCounts();
+    const waitingOwnerCounts = this.waitingOwnerCounts();
     const liveSessions = this.livePresenceSessions();
     const rows = this.ctx.storage.sql
       .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence ORDER BY name`)
@@ -5401,6 +8527,7 @@ export class ChannelDO extends Server<Env> {
         this.presenceRowToEntry(this.aggregatePresenceRow(name, group, liveSessions)),
         liveCounts,
         serveCounts,
+        waitingOwnerCounts,
       ),
     );
   }
@@ -5408,6 +8535,7 @@ export class ChannelDO extends Server<Env> {
   private presenceFor(name: string): PresenceEntry | null {
     const liveCounts = this.liveConnectionCounts();
     const serveCounts = this.serveCandidateCounts();
+    const waitingOwnerCounts = this.waitingOwnerCounts();
     const liveSessions = this.livePresenceSessions();
     const rows = this.ctx.storage.sql
       .exec(`SELECT ${ChannelDO.PRESENCE_COLUMNS} FROM presence WHERE name = ?`, name)
@@ -5417,8 +8545,18 @@ export class ChannelDO extends Server<Env> {
           this.presenceRowToEntry(this.aggregatePresenceRow(name, rows, liveSessions)),
           liveCounts,
           serveCounts,
+          waitingOwnerCounts,
         )
       : null;
+  }
+
+  private broadcastPresenceFor(name: string) {
+    if (this.atomicDeliveryEffects !== null) {
+      this.atomicDeliveryEffects.presenceTargets.add(name);
+      return;
+    }
+    const entry = this.presenceFor(name);
+    if (entry) this.broadcastFrame({ type: "presence", ...entry });
   }
 
   private livePresenceSessions(): Map<string, Set<string>> {
@@ -5465,6 +8603,7 @@ export class ChannelDO extends Server<Env> {
     entry: PresenceEntry,
     liveCounts: Map<string, number>,
     serveCounts?: Map<string, number>,
+    waitingOwnerCounts?: Map<string, number>,
   ): PresenceEntry {
     const count = liveCounts.get(entry.name) ?? 0;
     const live = applyLiveConnection(entry, count > 0);
@@ -5472,7 +8611,22 @@ export class ChannelDO extends Server<Env> {
     // 同名 serve standby 数（#99）：serve 候选连接数 - 1 持租者。>0 才下发（有几台在待命顶替），让 who/web
     // 一眼看出"重复 serve 但已被租约互斥、只有 1 台在跑"，而不是只能靠 connection_count x2 猜。
     const standbys = (serveCounts?.get(entry.name) ?? 0) - 1;
-    return standbys > 0 ? { ...withCount, serve_standbys: standbys } : withCount;
+    const withStandbys = standbys > 0 ? { ...withCount, serve_standbys: standbys } : withCount;
+    const waitingOwner = waitingOwnerCounts?.get(entry.name) ?? 0;
+    return waitingOwner > 0 ? { ...withStandbys, waiting_owner_count: waitingOwner } : withStandbys;
+  }
+
+  private waitingOwnerCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const row of this.ctx.storage.sql
+      .exec(
+        `SELECT target_name, COUNT(*) AS n FROM directed_deliveries
+          WHERE state = 'waiting_owner' GROUP BY target_name`,
+      )
+      .toArray()) {
+      counts.set(String(row.target_name), Number(row.n));
+    }
+    return counts;
   }
 
   private presenceRowToEntry(r: Record<string, unknown>): PresenceEntry {

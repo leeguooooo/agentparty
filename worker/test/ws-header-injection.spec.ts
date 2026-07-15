@@ -31,6 +31,9 @@ async function openRaw(
   const first = await new Promise<Record<string, unknown>>((resolve) => {
     ws.addEventListener("message", (e) => resolve(JSON.parse(e.data as string)), { once: true });
   });
+  if (first.type === "welcome") {
+    ws.send(JSON.stringify({ type: "hello", since: 0, directed_delivery: "v1" }));
+  }
   return { ws, first };
 }
 

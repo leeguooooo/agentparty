@@ -110,12 +110,19 @@ function isRetryableNetworkError(error: unknown): boolean {
 
 export interface ConnectOptions {
   onCursor?: (cursor: number) => void;
+  /** Declare that this connection consumes durable directed-delivery v1 frames. */
+  directedDelivery?: "v1";
   /** 修订游标：已见过的最大 rev_seq，随 hello.since_rev 上报，服务端据此限定修订重放（issue #33） */
   sinceRev?: number;
   onRevCursor?: (revCursor: number) => void;
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   pingIntervalMs?: number;
+  /**
+   * WebSocket 已 open、但连续多久没有收到任何入站 frame 后主动重连。
+   * 默认 3 个 ping 周期；主要暴露给测试注入较短阈值。
+   */
+  inboundIdleTimeoutMs?: number;
   /** 未确认消息缓存上限；超限时 fail-fast 且不推进 cursor，交给 supervisor 重启后安全补拉。 */
   maxUnackedFrames?: number;
   /**
@@ -129,7 +136,8 @@ export interface ConnectOptions {
 
 export interface Connection {
   frames: AsyncIterable<ServerFrame>;
-  send(frame: ClientFrame): void;
+  /** True only when the frame was handed to an OPEN socket; callers needing durability must await a server ack. */
+  send(frame: ClientFrame): boolean;
   /** 消费方处理完一条 msg 后调用，此时才推进并持久化游标 */
   ack(seq: number): void;
   close(): void;
@@ -183,6 +191,12 @@ export function connect(
   const base = opts.backoffBaseMs ?? 1000;
   const max = opts.backoffMaxMs ?? 30_000;
   const pingEvery = opts.pingIntervalMs ?? 25_000;
+  const defaultInboundIdleTimeoutMs = pingEvery * 3;
+  const requestedInboundIdleTimeoutMs = opts.inboundIdleTimeoutMs ?? defaultInboundIdleTimeoutMs;
+  const inboundIdleTimeoutMs =
+    Number.isFinite(requestedInboundIdleTimeoutMs) && requestedInboundIdleTimeoutMs > 0
+      ? Math.max(1, Math.floor(requestedInboundIdleTimeoutMs))
+      : defaultInboundIdleTimeoutMs;
   const requestedMaxUnackedFrames = opts.maxUnackedFrames ?? DEFAULT_MAX_UNACKED_FRAMES;
   const maxUnackedFrames = Number.isFinite(requestedMaxUnackedFrames)
     ? Math.max(1, Math.floor(requestedMaxUnackedFrames))
@@ -211,6 +225,7 @@ export function connect(
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let inboundWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
   const advance = (seq: number) => {
     if (seq > cursor) {
@@ -229,6 +244,13 @@ export function connect(
     if (pingTimer) {
       clearInterval(pingTimer);
       pingTimer = null;
+    }
+  };
+
+  const stopInboundWatchdog = () => {
+    if (inboundWatchdogTimer) {
+      clearTimeout(inboundWatchdogTimer);
+      inboundWatchdogTimer = null;
     }
   };
 
@@ -279,6 +301,7 @@ export function connect(
   };
 
   const scheduleReconnect = () => {
+    if (closed || reconnectTimer) return;
     const delay = Math.min(base * 2 ** attempt, max);
     attempt++;
     opts.onStatus?.("reconnecting");
@@ -296,20 +319,52 @@ export function connect(
     const sock = ws;
     let opened = false;
     let helloSince = 0;
+    const armInboundWatchdog = () => {
+      stopInboundWatchdog();
+      inboundWatchdogTimer = setTimeout(() => {
+        inboundWatchdogTimer = null;
+        if (closed || ws !== sock || sock.readyState !== WebSocket.OPEN) return;
+
+        // 半开连接未必会及时触发 onclose，不能把重连押在 close 事件上。先把旧 socket
+        // 从当前连接退役并进入现有 backoff，再尽力发起关闭；迟到的旧 socket 事件会被忽略。
+        ws = null;
+        stopPing();
+        try {
+          sock.close(1011, "inbound idle timeout");
+        } catch {
+          // The socket is already retired; reconnect scheduling below remains authoritative.
+        }
+        scheduleReconnect();
+      }, inboundIdleTimeoutMs);
+    };
     sock.onopen = () => {
+      if (closed || ws !== sock) {
+        sock.close();
+        return;
+      }
       opened = true;
       // #373：退避计数不在 TCP/WS 握手完成时清零——否则"accept 后立刻 close"（过载保护/
       // 拒绝/半坏实例）会退化成 ~1 次/秒的无限紧循环锤服务端。改到收到首个业务帧才清零
       // （见 onmessage：解析成功=连接真实可用）。
       helloSince = cursor;
       opts.onStatus?.("open");
-      sock.send(JSON.stringify({ type: "hello", since: cursor, since_rev: revCursor, client_version: pkg.version }));
+      armInboundWatchdog();
+      sock.send(JSON.stringify({
+        type: "hello",
+        since: cursor,
+        since_rev: revCursor,
+        client_version: pkg.version,
+        ...(opts.directedDelivery === "v1" ? { directed_delivery: "v1" as const } : {}),
+      }));
       stopPing();
       pingTimer = setInterval(() => {
         if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "ping" }));
       }, pingEvery);
     };
     sock.onmessage = (ev) => {
+      if (closed || ws !== sock) return;
+      // 活性定义是收到任意 WebSocket 入站 frame；即使内容随后无法解析，也说明链路仍可达。
+      armInboundWatchdog();
       for (const line of String(ev.data).split("\n")) {
         if (!line.trim()) continue;
         let frame: ServerFrame;
@@ -347,6 +402,7 @@ export function connect(
               );
               closed = true;
               stopPing();
+              stopInboundWatchdog();
               opts.onStatus?.("closed", { error: error.message });
               queue.fail(error);
               sock.close(1011, "unacked replay buffer exceeded");
@@ -362,7 +418,11 @@ export function connect(
       }
     };
     sock.onclose = (ev) => {
+      // watchdog 已主动退役的旧 socket 可能在新连接建立后才迟到 close；不得误杀新连接的 timer。
+      if (ws !== sock) return;
+      ws = null;
       stopPing();
+      stopInboundWatchdog();
       if (closed) {
         queue.end();
         return;
@@ -409,7 +469,9 @@ export function connect(
   return {
     frames: queue,
     send(frame: ClientFrame) {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify(frame));
+      return true;
     },
     ack(seq: number) {
       advance(seq);
@@ -418,6 +480,7 @@ export function connect(
       if (closed) return;
       closed = true;
       stopPing();
+      stopInboundWatchdog();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

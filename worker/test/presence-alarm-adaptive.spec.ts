@@ -19,6 +19,9 @@ describe("#487 presence 扫描 alarm 自适应降本", () => {
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
+    ws.raw('{"type":"ping","probe":"hello"}');
+    await ws.nextOfType("pong");
 
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
     const res = await runInDurableObject(stub, async (instance: ChannelDO, state) => {
@@ -44,6 +47,9 @@ describe("#487 presence 扫描 alarm 自适应降本", () => {
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
+    ws.raw('{"type":"ping","probe":"hello"}');
+    await ws.nextOfType("pong");
 
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
     const res = await runInDurableObject(stub, async (instance: ChannelDO, state) => {
@@ -82,8 +88,14 @@ describe("#487 presence 扫描 alarm 自适应降本", () => {
     const slug = await createChannel(agent.token);
     const silent = await WsClient.open(slug, agent.token);
     await silent.nextOfType("welcome");
+    silent.send({ type: "hello", since: 0 });
+    silent.raw('{"type":"ping","probe":"hello"}');
+    await silent.nextOfType("pong");
     const watcher = await WsClient.open(slug, human.token);
     await watcher.nextOfType("welcome");
+    watcher.send({ type: "hello", since: 0 });
+    watcher.raw('{"type":"ping","probe":"hello"}');
+    await watcher.nextOfType("pong");
 
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
 

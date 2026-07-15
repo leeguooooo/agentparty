@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import type { ServerFrame } from "@agentparty/shared";
 import pkg from "../package.json" with { type: "json" };
 import { connect, type Connection } from "../src/client";
@@ -18,6 +18,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   globalThis.WebSocket = OriginalWebSocket;
   console.debug = originalConsoleDebug;
+  jest.useRealTimers();
 });
 
 class ProbeWebSocket {
@@ -32,20 +33,39 @@ class ProbeWebSocket {
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
+  sent: string[] = [];
+  closeCalls: Array<{ code?: number; reason?: string }> = [];
 
   constructor() {
     ProbeWebSocket.instances.push(this);
   }
 
-  send(): void {}
+  send(data: string): void {
+    this.sent.push(data);
+  }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
+    this.closeCalls.push({ ...(code === undefined ? {} : { code }), ...(reason === undefined ? {} : { reason }) });
     this.readyState = ProbeWebSocket.CLOSED;
+  }
+
+  open(): void {
+    this.readyState = ProbeWebSocket.OPEN;
+    this.onopen?.({} as Event);
+  }
+
+  deliver(frame: unknown): void {
+    this.onmessage?.({ data: typeof frame === "string" ? frame : JSON.stringify(frame) } as MessageEvent);
   }
 
   failHandshake(): void {
     this.readyState = ProbeWebSocket.CLOSED;
     this.onclose?.({ code: 1006, reason: "" } as CloseEvent);
+  }
+
+  emitClose(code = 1006, reason = ""): void {
+    this.readyState = ProbeWebSocket.CLOSED;
+    this.onclose?.({ code, reason } as CloseEvent);
   }
 }
 
@@ -399,6 +419,113 @@ describe("ws client", () => {
     });
     await collect(conn, 2, 3000, false); // welcome + error
     expect(statuses).toEqual([{ status: "open" }, { status: "closed", error: "token revoked, re-run: party init" }]);
+  });
+
+  test("inbound watchdog retires a half-open socket and reconnects even without a close event", async () => {
+    jest.useFakeTimers();
+    useProbeWebSocket();
+    const statuses: string[] = [];
+    conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
+      backoffBaseMs: 5,
+      backoffMaxMs: 5,
+      pingIntervalMs: 10,
+      inboundIdleTimeoutMs: 30,
+      onStatus: (status) => statuses.push(status),
+    });
+    const first = ProbeWebSocket.instances[0]!;
+    first.open();
+
+    jest.advanceTimersByTime(30);
+
+    expect(first.readyState).toBe(ProbeWebSocket.CLOSED);
+    expect(first.closeCalls).toContainEqual({ code: 1011, reason: "inbound idle timeout" });
+    expect(statuses).toEqual(["open", "reconnecting"]);
+    expect(ProbeWebSocket.instances).toHaveLength(1);
+
+    jest.advanceTimersByTime(5);
+    expect(ProbeWebSocket.instances).toHaveLength(2);
+  });
+
+  test("any inbound frame resets the idle watchdog", async () => {
+    jest.useFakeTimers();
+    useProbeWebSocket();
+    conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
+      backoffBaseMs: 5,
+      pingIntervalMs: 10,
+      inboundIdleTimeoutMs: 60,
+    });
+    const first = ProbeWebSocket.instances[0]!;
+    first.open();
+
+    jest.advanceTimersByTime(40);
+    first.deliver({ type: "pong" });
+    jest.advanceTimersByTime(20);
+
+    // 已超过最初 open 后的 60ms，但距离最新入站 frame 仍未超时。
+    expect(ProbeWebSocket.instances).toHaveLength(1);
+    expect(first.readyState).toBe(ProbeWebSocket.OPEN);
+
+    jest.advanceTimersByTime(40);
+    expect(first.readyState).toBe(ProbeWebSocket.CLOSED);
+  });
+
+  test("explicit close clears the inbound watchdog and never reconnects", async () => {
+    jest.useFakeTimers();
+    useProbeWebSocket();
+    const statuses: string[] = [];
+    conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
+      backoffBaseMs: 5,
+      pingIntervalMs: 10,
+      inboundIdleTimeoutMs: 30,
+      onStatus: (status) => statuses.push(status),
+    });
+    const first = ProbeWebSocket.instances[0]!;
+    first.open();
+
+    conn.close();
+    jest.advanceTimersByTime(300);
+
+    expect(ProbeWebSocket.instances).toHaveLength(1);
+    expect(statuses).toEqual(["open"]);
+  });
+
+  test("late events from a watchdog-retired socket cannot corrupt its open replacement", async () => {
+    jest.useFakeTimers();
+    useProbeWebSocket();
+    const statuses: string[] = [];
+    conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
+      backoffBaseMs: 5,
+      backoffMaxMs: 5,
+      pingIntervalMs: 10,
+      inboundIdleTimeoutMs: 30,
+      onStatus: (status) => statuses.push(status),
+    });
+    const first = ProbeWebSocket.instances[0]!;
+    first.open();
+
+    // First socket times out without emitting close; backoff creates and opens its replacement.
+    jest.advanceTimersByTime(35);
+    const second = ProbeWebSocket.instances[1]!;
+    second.open();
+    expect(statuses).toEqual(["open", "reconnecting", "open"]);
+
+    conn.send({ type: "ping" });
+    expect(JSON.parse(second.sent.at(-1)!)).toEqual({ type: "ping" });
+
+    // Make the old events observably late. If either handler touches the shared watchdog/connection,
+    // it will clear/reset second's timer or treat the fatal frame as belonging to the replacement.
+    jest.advanceTimersByTime(10);
+    first.deliver({ type: "fatal", code: "token_revoked", message: "stale socket" });
+    first.emitClose();
+
+    conn.send({ type: "heartbeat", current_task: null, task_started_at: null, heartbeat_at: null });
+    expect(JSON.parse(second.sent.at(-1)!)).toMatchObject({ type: "heartbeat", current_task: null });
+    expect(statuses).toEqual(["open", "reconnecting", "open"]);
+
+    // Second's watchdog remains anchored to its own open at t=35 and therefore fires exactly at t=65.
+    jest.advanceTimersByTime(20);
+    expect(second.closeCalls).toContainEqual({ code: 1011, reason: "inbound idle timeout" });
+    expect(statuses).toEqual(["open", "reconnecting", "open", "reconnecting"]);
   });
 
   test("a known network error from the fatal probe is debugged and retried", async () => {

@@ -1,6 +1,6 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { api, createChannel, seedToken, uniq, WsClient } from "./helpers";
+import { api, completeCapabilityHello, createChannel, seedToken, uniq, WsClient } from "./helpers";
 
 const encoder = new TextEncoder();
 
@@ -269,7 +269,7 @@ describe("desktop sessions", () => {
     const paired = await pairedSession();
     const slug = await createChannel(paired.tokens.access_token);
     const ws = await WsClient.open(slug, paired.tokens.access_token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
 
     expect((await api(`/api/desktop/sessions/${paired.tokens.session_id}`, paired.humanToken, { method: "DELETE" })).status).toBe(204);
     ws.send({ type: "message", body: "after revoke", mentions: [] });

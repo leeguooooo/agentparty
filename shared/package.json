@@ -5,6 +5,7 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/protocol.ts"
+    ".": "./src/protocol.ts",
+    "./mentions": "./src/mentions.ts"
   }
 }

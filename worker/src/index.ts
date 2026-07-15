@@ -260,6 +260,8 @@ async function loadChannelRoleAssignment(db: D1Database, slug: string, name: str
   return row === null ? null : channelRoleAssignmentFromRow(row);
 }
 const WEBHOOK_FILTERS: readonly string[] = ["mentions", "status", "needs-human", "all"] satisfies WebhookFilter[];
+const WEBHOOK_MODES = ["notify", "agent"] as const;
+type WebhookMode = (typeof WEBHOOK_MODES)[number];
 const CAPTURE_KINDS: readonly string[] = ["decision", "requirement", "bug", "action-item"] satisfies CaptureKind[];
 const WEBHOOK_URL_MAX = 2048;
 // 附件文件名：单段、禁路径分隔符与控制符，用作 R2 key 末段和下载文件名
@@ -6083,21 +6085,42 @@ app.post("/api/channels/:slug/webhooks", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
-  // webhook 能窃取频道全部消息，属管理操作：仅 ap_ token（非只读）或房主可管理（spec §7/§15）。
-  // 前置于 archived 判定，避免向粉丝泄漏私有频道是否存在/是否已归档。
-  if (!isChannelModerator(c.get("identity"), channel)) {
-    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can manage webhooks"), 403);
-  }
-  if (channel.archived_at !== null) {
-    return c.json(errorBody("archived", "channel is archived"), 410);
-  }
   const body = (await c.req.json().catch(() => null)) as
-    | { name?: unknown; url?: unknown; secret?: unknown; filter?: unknown }
+    | { name?: unknown; url?: unknown; secret?: unknown; filter?: unknown; mode?: unknown }
     | null;
   const name = typeof body?.name === "string" ? body.name : "";
   const url = typeof body?.url === "string" ? body.url : "";
   const secret = typeof body?.secret === "string" ? body.secret : "";
   const filter = body?.filter === undefined ? "mentions" : body.filter;
+  const mode = body?.mode === undefined ? "notify" : body.mode;
+  if (typeof mode !== "string" || !WEBHOOK_MODES.includes(mode as WebhookMode)) {
+    return c.json(errorBody("bad_request", "mode must be notify or agent"), 400);
+  }
+  if (mode === "agent" && filter !== "mentions" && filter !== "all") {
+    return c.json(errorBody("bad_request", "agent webhook filter must be mentions or all"), 400);
+  }
+  const identity = c.get("identity");
+  // notify webhook 保持原管理权限。agent webhook 会参与 directed-delivery claim，因此只能由
+  // 对应 agent principal 自己绑定；不能让房主代绑，也不能把同名新 token 当成旧 principal。
+  if (mode === "agent") {
+    const sameCanonicalName =
+      NAME_RE.test(name) && identity.name.normalize("NFC").toLocaleLowerCase() === name.normalize("NFC").toLocaleLowerCase();
+    if (
+      identity.kind !== "agent" ||
+      identity.role !== "agent" ||
+      !sameCanonicalName ||
+      !(await canAccessLoadedChannel(c.env.DB, identity, channel))
+    ) {
+      return c.json(errorBody("forbidden", "agent webhooks can only be bound by the matching agent token"), 403);
+    }
+  } else if (!isChannelModerator(identity, channel)) {
+    // webhook 能窃取频道全部消息，属管理操作：仅 ap_ token（非只读）或房主可管理（spec §7/§15）。
+    // 前置于 archived 判定，避免向粉丝泄漏私有频道是否存在/是否已归档。
+    return c.json(errorBody("forbidden", "only the channel owner or an ap_ token can manage webhooks"), 403);
+  }
+  if (channel.archived_at !== null) {
+    return c.json(errorBody("archived", "channel is archived"), 410);
+  }
   let parsed: URL | null = null;
   try {
     parsed = new URL(url);
@@ -6123,22 +6146,33 @@ app.post("/api/channels/:slug/webhooks", async (c) => {
       400,
     );
   }
+  // Store the token's authoritative spelling so the DO's exact canonical target lookup cannot
+  // create duplicate case variants or leave an otherwise valid webhook permanently unreachable.
+  const storedName = mode === "agent" ? identity.name : name;
+  const targetOwner = mode === "agent" ? (identity.owner ?? `token-sha256:${identity.hash}`) : undefined;
   const response = await fetchChannelDO(
     c.env,
     slug,
     new Request("https://do/internal/webhooks", {
       method: "POST",
-      body: JSON.stringify({ name, url, secret, filter }),
+      body: JSON.stringify({
+        name: storedName,
+        url,
+        secret,
+        filter,
+        mode,
+        ...(targetOwner === undefined ? {} : { target_owner: targetOwner }),
+      }),
       headers: { "content-type": "application/json", "x-partykit-room": slug },
     }),
   );
   if (response.ok) {
     await bestEffortRecordManagementAudit(c.env.DB, {
-      actor: managementAuditActor(c.get("identity")),
+      actor: managementAuditActor(identity),
       action: "channel.webhook.add",
-      resource: `channel/${slug}/webhooks/${name}`,
+      resource: `channel/${slug}/webhooks/${storedName}`,
       channel: slug,
-      metadata: { webhook_filter: filter },
+      metadata: { webhook_filter: filter, webhook_mode: mode },
     });
   }
   return mutableFetchResponse(response);

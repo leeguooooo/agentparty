@@ -1,7 +1,8 @@
 // party serve — 常驻监听频道，每条 @你 的消息触发一次本地命令，把「跑完就停的 session agent」
 // 用外部 supervisor 唤醒（wake GOAL 的 session 型那半；有入站 URL 的 runtime 走 webhook）。
 // 复用 client.connect 的自动重连帧流，真正常驻；命令串行执行（一条处理完再下一条，不并发抢跑）。
-import { BODY_LIMIT, EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, EXIT_UPGRADED, type AgentSessionInfo, type Attachment, type MsgFrame, type ServerFrame } from "@agentparty/shared";
+import { BODY_LIMIT, EXIT_ARCHIVED, EXIT_AUTH, EXIT_STREAM_ENDED, EXIT_UPGRADED, type AgentSessionInfo, type Attachment, type DeliveryUpdateFrame, type DirectedDelivery, type MsgFrame, type PublicDirectedDelivery, type ServerFrame } from "@agentparty/shared";
+import { createHash, randomUUID } from "node:crypto";
 import { maybeReexecUpgrade, serverVersionUpgradeNotice, upgradeNotice, type CliUpgradeNotice, type UpgradeDeps } from "../upgrade";
 import {
   appendFileSync,
@@ -16,11 +17,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { readAccount } from "../account";
 import { connect } from "../client";
-import { readConfig, clearStuck, loadCursor, loadRevCursor, loadStuck, resolveChannel, saveCursor, saveRevCursor, saveStuck, type StuckWake } from "../config";
+import { clearStuck, loadCursor, loadRevCursor, loadStuck, resolveChannel, saveCursor, saveRevCursor, saveStuck, writeWorkspaceConfigOnly, type StuckWake } from "../config";
 import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../instance-lock";
 import { formatMsg } from "../format";
 import { clearHealthCache, writeHealthCache } from "../health-cache";
@@ -33,13 +34,20 @@ import {
   unreadFromCursor,
   writeStatuslineCache,
 } from "../statusline-cache";
-import { downloadAttachment, ensureProjectAgentChannelRuntime, fetchChannelCharter, fetchServerVersion, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
+import { downloadAttachment, ensureProjectAgentChannelRuntime, fetchChannelCharter, fetchMe, fetchServerVersion, listProjectAgentInvites, mintProjectAgentRuntimeToken, postMessage, RestError, uploadAttachment, type ChannelCharter, type ChannelProjectAgentInvite, type ProjectAgentChannelRuntime, type ProjectAgentProfile } from "../rest";
 import { isName, isSlug } from "../validation";
 import { buildContext } from "./status";
+import {
+  blockRunnerContinuation,
+  continuationPath,
+  mergeRunnerContinuation,
+  readRunnerContinuation,
+  type RunnerContinuationState,
+} from "../continuation";
 
 const PROTOCOL_REMINDER =
   "被 @ 唤起：先读本文件 charter 了解频道约定；若发现 charter 与频道现状矛盾，视为一个待办上报。需要更多上下文再 `party history <channel 字段的频道>`；需要产出结论时，先用 `party send --reply-to <seq>` 把 final synthesis 发回频道，再 status done；别只回本地。" +
-  " 需要 owner 补充信息或批准时，把问题用 `party send --reply-to <seq> --mention <sender 字段的名字>` 发回本频道，然后结束本轮，让 serve 立即恢复监听；不要把 account/email 当 mention 名。禁止在 runner 子进程里调用 AskUserQuestion、request_user_input 或停住等待人工输入，否则整个频道监听会被串行阻塞。" +
+  " 需要 owner 补充信息或批准时，必须用 `party decision ask` 在本频道创建结构化决策，不能用普通 `party send` 提问；approval 返回 pending 后结束本轮，让 serve 立即恢复监听，unattended 返回 auto_resolved 时可按返回选择继续。不要把 account/email 当 mention 名。禁止在 runner 子进程里调用 AskUserQuestion、request_user_input 或停住等待人工输入，否则整个频道监听会被串行阻塞。" +
   " 全程只用 party CLI 在【本频道】里协作：不要触发项目自带的其它频道/工作流机制（如 trellis 等 app-server 建频道流程）另建频道，也不要用 tmux/后台守护/子代理去接管这次唤醒——这一轮就在当前会话里用 party 回完即可。" +
   " 维护任务台账（#371）：认领活先 `party task claim <id>`（没有就 `party task create`），开工 `party status working --task <id>`，完成 `party status done --task <id>`（或 `party task done <id>`）——让台账反映真实进度，别和 GitHub issue/实际漂移。";
 
@@ -76,6 +84,28 @@ export class WakeBlockedError extends Error {
   }
 }
 
+/** runner 占用超过硬上限；模型可能已经执行过，所以绝不能自动重跑。 */
+export class RunnerTimeoutError extends WakeBlockedError {
+  readonly timeoutMs: number;
+  /** true only when the runner promise settled after abort; false means the process must exit before another wake. */
+  terminationConfirmed = false;
+  constructor(timeoutMs: number) {
+    super(`runner timed out after ${timeoutMs}ms`, false);
+    this.name = "RunnerTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** Process-level serve shutdown. This is terminal control flow, not a failed/retriable wake. */
+export class ServeShutdownError extends Error {
+  readonly exitCode: typeof EXIT_SIGNAL_INT | typeof EXIT_SIGNAL_TERM;
+  constructor(signal: "SIGINT" | "SIGTERM") {
+    super(`serve shutting down on ${signal}`);
+    this.name = "ServeShutdownError";
+    this.exitCode = signal === "SIGINT" ? EXIT_SIGNAL_INT : EXIT_SIGNAL_TERM;
+  }
+}
+
 // 放弃通告都发不出去（网络/loop guard 熔断）。此时既没送达也没宣告，继续跑就是静默丢 @。
 export const EXIT_WAKE_UNANNOUNCED = 1;
 
@@ -84,6 +114,10 @@ export const EXIT_WAKE_ABANDON_CIRCUIT = 11;
 
 /** 已有 serve 挂在同一 (server identity, channel, machine) 上：拒绝启动，避免重复执行（#99/#465）。 */
 export const EXIT_ALREADY_SERVING = 10;
+
+/** Conventional shell exit codes for an explicitly interrupted resident serve. */
+export const EXIT_SIGNAL_INT = 128 + 2;
+export const EXIT_SIGNAL_TERM = 128 + 15;
 
 /** 传给 builtin runner 的提示：只给路径，不给正文（#120）。 */
 function wakePrompt(contextFile: string): string {
@@ -96,12 +130,36 @@ function wakePrompt(contextFile: string): string {
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 // 有界重放（#198）：同一条 seq 连续送达失败到顶就响亮放弃，既不无限重放也不静默丢弃
 // env 里保留的正文上限。完整正文走 stdin 与 context file。
 const AP_BODY_MAX = 4_000;
 
 const DEFAULT_MAX_WAKE_ATTEMPTS = 3;
 const DEFAULT_WAKE_RETRY_DELAY_MS = 500;
+// 无人值守 runner 的硬上限。owner 问答必须走 decision/waiting_owner，不能靠一个
+// headless 子进程永久占住 serve。CLI 可按任务体量覆盖，测试直接注入毫秒值。
+export const DEFAULT_RUNNER_TIMEOUT_MS = 30 * 60_000;
 // 每任务心跳节奏（#228）：任务运行期间每隔这么久刷一次「还活着、正在处理 seq=X」。
 // 15s 足够让频道/本机在几分钟的长任务里持续看到新鲜度，又远比逐 tick 便宜（presence-only，不落 history）。
 const DEFAULT_TASK_HEARTBEAT_MS = 15_000;
@@ -145,6 +203,12 @@ const WAKE_AUX_BODY_MAX = 8_000;
 const WAKE_CHARTER_BODY_MAX = 4_000;
 const RUNNER_SESSION_FILE = "wake-session.json";
 const RUNNER_LOG_FILE = "serve-runner.log";
+const SERVE_LIFECYCLE_LOG_FILE = "serve-lifecycle.log";
+const DEFAULT_SUPERVISOR_RESTART_DELAY_MS = 1_000;
+const MAX_SUPERVISOR_RESTART_DELAY_MS = 30_000;
+const RUNNER_TERMINATION_GRACE_MS = 1_000;
+const RUNNER_TERMINATION_BARRIER_MS = RUNNER_TERMINATION_GRACE_MS + 500;
+const DELIVERY_UPDATE_ACK_TIMEOUT_MS = 5_000;
 
 export type RunnerHarness = "codex" | "claude";
 
@@ -157,6 +221,8 @@ export interface RunnerProcessResult {
 export interface RunnerProcessOptions {
   cwd: string;
   env: Record<string, string | undefined>;
+  /** serve runner 超时或退出时取消子进程；默认执行器会终止整个进程组。 */
+  signal?: AbortSignal;
 }
 
 export type RunnerProcess = (
@@ -187,7 +253,56 @@ export function forwardRunnerSignal(
   return "child";
 }
 
-interface WakeSessionState {
+/**
+ * Abort a detached runner and always execute the SIGKILL escalation after the grace period.
+ * The group leader may exit on SIGTERM while a grandchild ignores it; clearing the timer when
+ * the leader exits would orphan that grandchild and let it overlap the next wake.
+ */
+async function terminateRunnerProcess(proc: KillableRunnerProcess): Promise<void> {
+  if (process.platform === "win32") {
+    // Node/Bun's direct child kill is not a tree guarantee on Windows. taskkill /T keeps the same
+    // child+grandchild invariant as POSIX process groups; /F is the escalation barrier.
+    try {
+      await Bun.spawn(["taskkill", "/PID", String(proc.pid), "/T"], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    } catch {
+      try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+    }
+    await delay(RUNNER_TERMINATION_GRACE_MS);
+    try {
+      await Bun.spawn(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited;
+    } catch {
+      try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+    return;
+  }
+  try {
+    forwardRunnerSignal(proc, "SIGTERM");
+  } catch {
+    // The leader can disappear before the first signal; the process-group SIGKILL below is authoritative.
+  }
+  await delay(RUNNER_TERMINATION_GRACE_MS);
+  try {
+    process.kill(-proc.pid, "SIGKILL");
+    return;
+  } catch {
+    // Group is already gone; fall through to the direct-child best effort.
+  }
+  try {
+    proc.kill("SIGKILL");
+  } catch {
+    // Already reaped.
+  }
+}
+
+interface WakeSessionState extends RunnerContinuationState {
   harness: RunnerHarness;
   session_id: string;
   created_at: number;
@@ -195,9 +310,11 @@ interface WakeSessionState {
   wakes: number;
   cwd?: string;
   workdir?: string;
+  continuation_ref?: string;
+  work_id?: string;
 }
 
-interface SdkWakeSessionState {
+interface SdkWakeSessionState extends RunnerContinuationState {
   harness: "codex-sdk";
   thread_id: string;
   created_at: number;
@@ -205,6 +322,16 @@ interface SdkWakeSessionState {
   wakes: number;
   cwd?: string;
   workdir?: string;
+  continuation_ref?: string;
+  work_id?: string;
+}
+
+interface ContinuationScope {
+  ref: string | null;
+  workId: string | null;
+  path: string;
+  ownerAnswer: boolean;
+  directed: boolean;
 }
 
 export interface BuiltinRunnerOptions {
@@ -214,6 +341,8 @@ export interface BuiltinRunnerOptions {
   harness: RunnerHarness;
   workdir: string;
   cwd?: string;
+  /** Child-only CLI identity pinned into the model process (#548). */
+  agentpartyConfigPath?: string;
   repo?: string;
   runProcess?: RunnerProcess;
   runGit?: RunnerProcess;
@@ -229,12 +358,22 @@ export interface BuiltinRunnerOptions {
 export interface ThreadLike {
   id?: string | null;
   thread_id?: string | null;
-  run(prompt: string, opts: { sandbox: string }): Promise<unknown>;
+  run(prompt: string, opts: { sandbox: string; signal?: AbortSignal }): Promise<unknown>;
+}
+
+export interface CodexThreadOptions {
+  workingDirectory?: string;
+  skipGitRepoCheck?: boolean;
+  sandboxMode?: "read-only" | "workspace-write" | "danger-full-access";
+}
+
+export interface CodexClientOptions {
+  env?: Record<string, string>;
 }
 
 export interface CodexLike {
-  startThread(): ThreadLike | Promise<ThreadLike>;
-  resumeThread(threadId: string): ThreadLike | Promise<ThreadLike>;
+  startThread(options?: CodexThreadOptions): ThreadLike | Promise<ThreadLike>;
+  resumeThread(threadId: string, options?: CodexThreadOptions): ThreadLike | Promise<ThreadLike>;
 }
 
 export interface SdkRunnerOptions {
@@ -242,8 +381,11 @@ export interface SdkRunnerOptions {
   token: string;
   channel: string;
   workdir: string;
+  cwd?: string;
+  /** Child-only CLI identity pinned into the SDK-spawned Codex process (#548). */
+  agentpartyConfigPath?: string;
   sandbox?: string;
-  codexFactory?: () => CodexLike | Promise<CodexLike>;
+  codexFactory?: (options?: CodexClientOptions) => CodexLike | Promise<CodexLike>;
   now?: () => number;
   post?: typeof postMessage;
   /** 交付物上传（#109）；默认真 REST。测试注入 mock。 */
@@ -313,6 +455,7 @@ function buildWakeContext(
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
   attachments?: WakeContextAttachment[],
+  delivery: DirectedDelivery | null = null,
 ) {
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
   const rawCharter = charter?.charter ?? null;
@@ -369,6 +512,17 @@ function buildWakeContext(
     mentions: frame.mentions,
     reply_to: frame.seq, // 回这条就 --reply-to 它
     self,
+    delivery: delivery === null
+      ? null
+      : {
+          id: delivery.id,
+          work_id: delivery.work_id,
+          continuation_ref: delivery.continuation_ref,
+          cause: delivery.cause,
+          attempt: delivery.attempt,
+        },
+    decision_request: frame.decision_request ?? null,
+    decision_response: frame.decision_response ?? null,
     charter: boundedCharter,
     charter_rev: charter?.charter_rev ?? 0,
     project_agent: projectAgent,
@@ -413,13 +567,14 @@ export function writeContextFile(
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
   attachments?: WakeContextAttachment[],
+  delivery: DirectedDelivery | null = null,
 ): string {
   // dir 必须由调用方按运行实例隔离。文件名只需 seq：同一次唤醒重复写得到同一路径（幂等），
   // 而不同实例——不同身份 / 不同 server / 不同 profile——各在各的目录里。
   const path = join(dir, `${frame.seq}.json`);
   writeFileSync(
     path,
-    JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments), null, 2) + "\n",
+    JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments, delivery), null, 2) + "\n",
     { mode: 0o600 },
   );
   return path;
@@ -438,24 +593,25 @@ function builtinRunnerContextDir(workdir: string): string {
  * 它们共享同一个 wake-session.json：互相把对方的 codex/claude session id 覆盖掉，
  * 而 builtin runner 在 resume 失败时会 fork 出一个新 session——于是重复执行。
  *
- * 身份未知（还没连上服务端拿到 welcome.self）时退回按频道键，保持旧行为。
+ * namespace 必须先由 authoritative `/api/me` 身份计算，身份未知时不创建默认 workdir。
  */
-export function runnerWorkdir(root: string, channel: string, self: string | undefined): string {
+export function runnerWorkdir(root: string, channel: string, namespace: string): string {
   const safe = (part: string) => part.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/\.{2,}/g, "_") || "_";
-  if (self === undefined || self === "") return join(root, safe(channel));
-  return join(root, `${safe(channel)}-${safe(self)}`);
+  if (!/^[a-f0-9]{64}$/.test(namespace)) throw new Error("runner namespace must be a sha256 digest");
+  return join(root, namespace, safe(channel));
 }
 
 /**
- * 默认 runner workdir。身份取自本地 config（启动时就有；welcome.self 要等连上才有）。
- * 没有缓存身份时退回按频道键，保持旧行为。
+ * 默认 runner workdir。namespace 必须来自当前 server 的 authoritative `/api/me`，绝不读取
+ * 可能已切服/换身份的本地 config 快照。有 owner 的 token 按 owner 稳定续会；legacy
+ * owner-less token 按 token sha256 隔离，避免同名 token 撤销重铸后接管旧 session。
  */
-export function defaultRunnerWorkdir(channel: string, cwd: string = process.cwd()): string {
-  const self = readConfig(cwd)?.identity?.name;
-  return runnerWorkdir(join(homedir(), ".agentparty", "runners"), channel, self);
+export function defaultRunnerWorkdir(channel: string, namespace: string): string {
+  const stateRoot = process.env.AGENTPARTY_HOME ?? join(homedir(), ".agentparty");
+  return runnerWorkdir(join(stateRoot, "runners"), channel, namespace);
 }
 
-const SERVE_FLAGS = ["channel", "on-mention", "all", "runner", "workdir", "repo", "auto-upgrade", "replay-backlog", "profile", "profile-once", "profile-poll-interval"];
+const SERVE_FLAGS = ["channel", "on-mention", "all", "runner", "workdir", "repo", "auto-upgrade", "replay-backlog", "profile", "profile-once", "profile-poll-interval", "runner-timeout-seconds"];
 const HELP = `usage: party serve [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude|codex-sdk) [--all]
        party serve --profile <owner>/<handle>
 
@@ -464,11 +620,15 @@ The command can read the context JSON path from {file} or AP_CONTEXT_FILE.
 
 Options:
   --channel C          serve channel C instead of the bound channel
-  --on-mention "<cmd>" command to run for each wake
+  --on-mention "<cmd>" run a fresh custom process for each wake
+                       owner answers rerun it with the same AP_WORK_ID/AP_CONTINUATION_REF
+                       and decision_response in AP_CONTEXT_FILE; no model session is resumed
   --runner codex|claude|codex-sdk
                        use the built-in isolated wake runner instead of a custom command
-  --workdir DIR        runner workdir (default: ~/.agentparty/runners/<channel>)
+  --workdir DIR        runner workdir (default: ~/.agentparty/runners/<principal-sha256>/<channel>)
   --repo URL           clone into workdir/repo once, then git pull --ff-only before each wake
+  --runner-timeout-seconds N
+                       terminate one stuck runner after N seconds (default: ${DEFAULT_RUNNER_TIMEOUT_MS / 1000})
   --profile ref        run the reusable project-agent profile as one resident daemon across all invites
   --auto-upgrade       between wakes, if a newer party binary is on disk, re-exec it (issue #45)
   --replay-backlog     on attach, replay the offline backlog one wake per message
@@ -480,6 +640,30 @@ Options:
 
 Supervisor safety: after ${MAX_CONSECUTIVE_WAKE_ABANDONS} consecutive wakes are abandoned, serve posts a final
 blocked status and exits nonzero instead of consuming later messages.`;
+
+export interface ServeRunnerContext {
+  cmd: string;
+  channel: string;
+  self: string;
+  /** 本 serve 实例私有的上下文目录（createWakeContextDir）。 */
+  contextDir: string;
+  recent: MsgFrame[];
+  charter?: ChannelCharter | null;
+  projectAgent?: ProjectAgentRunContext | null;
+  cliUpgrade?: CliUpgradeNotice | null;
+  attachments?: WakeContextAttachment[];
+  /** 排在当前 wake 身后、尚未处理的 wake 数（#103）。 */
+  queueDepth?: number;
+  /** Worker 持久 work；存在时 read cursor 与 backlog 策略不得决定是否执行。 */
+  delivery?: DirectedDelivery | null;
+  /** runner hard-timeout / serve shutdown 的取消信号。 */
+  signal?: AbortSignal;
+}
+
+export type ServeRunner = ((frame: MsgFrame, ctx: ServeRunnerContext) => Promise<void>) & {
+  /** Everything that can fail before the model starts. Called before durable `running`. */
+  prepare?: (frame: MsgFrame, ctx: ServeRunnerContext) => Promise<void>;
+};
 
 export interface ServeOptions {
   server: string;
@@ -510,26 +694,16 @@ export interface ServeOptions {
   /** 入站附件下载注入点；默认走当前 server 的鉴权 REST 路径。 */
   downloadAttachment?: typeof downloadAttachment;
   // 测试注入点：默认用 sh -c 起子进程
-  runCommand?: (
-    frame: MsgFrame,
-    ctx: {
-      cmd: string;
-      channel: string;
-      self: string;
-      /** 本 serve 实例私有的上下文目录（createWakeContextDir）。 */
-      contextDir: string;
-      recent: MsgFrame[];
-      charter?: ChannelCharter | null;
-      projectAgent?: ProjectAgentRunContext | null;
-      cliUpgrade?: CliUpgradeNotice | null;
-      attachments?: WakeContextAttachment[];
-      /** 排在当前 wake 身后、尚未处理的 wake 数（#103）；runner 随 working 帧上报 busy+此值。 */
-      queueDepth?: number;
-    },
-  ) => Promise<void>;
+  runCommand?: ServeRunner;
   sdkRunner?: SdkRunnerOptions;
   // serve 挂上后声明自己「可被唤醒」的钩子；run() 注入真实实现，测试可省略/替换
   advertise?: () => Promise<void>;
+  /**
+   * 首个 welcome 已被本次 runServe 实际消费。外层 supervisor 只能在这个边界后
+   * 把后续连接视为「内部重启」；连 welcome 都没收到的失败仍必须保留用户的
+   * 首次 backlog 策略。
+   */
+  onWelcome?: () => void;
   charter?: ChannelCharter | null;
   projectAgent?: ProjectAgentRunContext | null;
   fetchCharter?: () => Promise<ChannelCharter>;
@@ -548,6 +722,8 @@ export interface ServeOptions {
   heartbeatIntervalMs?: number;
   /** 时钟注入（#228）：任务开始时刻与每次心跳时刻走它，便于测试断言心跳在推进。默认 Date.now。 */
   now?: () => number;
+  /** 单次 runner 的硬超时；默认 30 分钟。到点后恢复监听，不再让 task heartbeat 无限伪装健康。 */
+  runnerTimeoutMs?: number;
 }
 
 // serve 一挂上就把 presence 标成可唤醒：residency=supervised + wake.kind=serve。
@@ -571,22 +747,10 @@ export async function advertiseServeWake(auth: ResolvedAuthDetailed, channel: st
 // 非零退出：打印 exit code + context file 路径（便于排查），并保留文件；成功则清理。
 async function defaultRun(
   frame: MsgFrame,
-  ctx: {
-    cmd: string;
-    channel: string;
-    self: string;
-    contextDir: string;
-    recent: MsgFrame[];
-    charter?: ChannelCharter | null;
-    projectAgent?: ProjectAgentRunContext | null;
-    cliUpgrade?: CliUpgradeNotice | null;
-    attachments?: WakeContextAttachment[];
-    /** 排在当前 wake 身后、尚未处理的 wake 数（#103）。 */
-    queueDepth?: number;
-  },
+  ctx: ServeRunnerContext,
 ): Promise<void> {
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
-  const file = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments);
+  const file = writeContextFile(ctx.contextDir, frame, ctx.channel, ctx.self, ctx.recent, ctx.charter, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments, ctx.delivery ?? null);
   const cmd = ctx.cmd.includes("{file}") ? ctx.cmd.replaceAll("{file}", file) : ctx.cmd;
   const proc = Bun.spawn(["sh", "-c", cmd], {
     stdin: new TextEncoder().encode(body),
@@ -594,6 +758,9 @@ async function defaultRun(
     stderr: "inherit",
     env: {
       ...process.env,
+      // Nested party commands must stay on the served channel even when the workspace is bound to
+      // another one. AP_CHANNEL is informational; resolveChannel intentionally reads this binding.
+      AGENTPARTY_CHANNEL: ctx.channel,
       AP_CONTEXT_FILE: file,
       AP_CHANNEL: ctx.channel,
       AP_SEQ: String(frame.seq),
@@ -606,9 +773,36 @@ async function defaultRun(
       AP_MENTIONS: frame.mentions.join(","),
       AP_SELF: ctx.self,
       AP_REPLY_TO: String(frame.seq),
+      // Explicit custom continuation contract: an owner_answer starts this same command as a fresh
+      // process. The script recovers idempotently from AP_WORK_ID + AP_CONTEXT_FILE; party does not
+      // pretend an arbitrary shell command has a resumable model session.
+      AP_RUNNER_HARNESS: "custom",
+      AP_DELIVERY_ID: ctx.delivery?.id ?? "",
+      AP_WORK_ID: ctx.delivery?.work_id ?? "",
+      AP_CONTINUATION_REF: ctx.delivery?.continuation_ref ?? "",
+      AP_DELIVERY_ATTEMPT: ctx.delivery ? String(ctx.delivery.attempt) : "",
     },
+    detached: process.platform !== "win32",
   });
-  const code = await proc.exited;
+  let termination: Promise<void> | null = null;
+  const abort = () => {
+    termination ??= terminateRunnerProcess(proc);
+  };
+  ctx.signal?.addEventListener("abort", abort, { once: true });
+  if (ctx.signal?.aborted) abort();
+  let code: number;
+  try {
+    code = await proc.exited;
+  } finally {
+    ctx.signal?.removeEventListener("abort", abort);
+    // Do not let leader exit cancel the group escalation.  The next wake may start only after this barrier.
+    if (termination !== null) await termination;
+  }
+  if (ctx.signal?.aborted) {
+    throw ctx.signal.reason instanceof Error
+      ? ctx.signal.reason
+      : new WakeBlockedError("custom runner aborted", false);
+  }
   if (code !== 0) {
     // 保留 context file 供排查，抛错让 runServe 打印（不发频道）
     // POSIX shell 用 128 + signal 表示被信号终止；143 = 128 + SIGTERM(15)。
@@ -808,18 +1002,12 @@ async function defaultRunnerProcess(
     stderr: "pipe",
     detached: process.platform !== "win32",
   });
-  let terminatingSignal: NodeJS.Signals | null = null;
-  const forward = (signal: NodeJS.Signals) => {
-    if (terminatingSignal !== null) return;
-    terminatingSignal = signal;
-    forwardRunnerSignal(proc, signal);
-    const force = setTimeout(() => forwardRunnerSignal(proc, "SIGKILL"), 1_000);
-    force.unref();
+  let termination: Promise<void> | null = null;
+  const onAbort = () => {
+    termination ??= terminateRunnerProcess(proc);
   };
-  const onTerm = () => forward("SIGTERM");
-  const onInterrupt = () => forward("SIGINT");
-  process.once("SIGTERM", onTerm);
-  process.once("SIGINT", onInterrupt);
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  if (opts.signal?.aborted) onAbort();
   let stdout: string;
   let stderr: string;
   let code: number;
@@ -830,39 +1018,139 @@ async function defaultRunnerProcess(
       proc.exited,
     ]);
   } finally {
-    process.off("SIGTERM", onTerm);
-    process.off("SIGINT", onInterrupt);
+    opts.signal?.removeEventListener("abort", onAbort);
+    if (termination !== null) await termination;
   }
-  if (terminatingSignal !== null) {
-    process.exit(terminatingSignal === "SIGINT" ? 130 : 143);
+  if (opts.signal?.aborted) {
+    throw opts.signal.reason instanceof Error
+      ? opts.signal.reason
+      : new WakeBlockedError(`builtin runner aborted`, false);
   }
   return { code, stdout, stderr };
 }
 
 function readSession(path: string, harness: RunnerHarness): WakeSessionState | null {
-  try {
-    const state = JSON.parse(readFileSync(path, "utf8")) as WakeSessionState;
-    return state.harness === harness && typeof state.session_id === "string" ? state : null;
-  } catch {
-    return null;
-  }
+  const state = readRunnerContinuation(path);
+  return state?.harness === harness && typeof state.session_id === "string"
+    ? state as WakeSessionState
+    : null;
 }
 
-function writeSession(path: string, state: WakeSessionState): void {
-  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+function continuationScope(workdir: string, delivery: DirectedDelivery | null | undefined): ContinuationScope {
+  if (delivery === null || delivery === undefined) {
+    return {
+      ref: null,
+      workId: null,
+      path: join(workdir, RUNNER_SESSION_FILE),
+      ownerAnswer: false,
+      directed: false,
+    };
+  }
+  const workId = delivery.work_id;
+  const ref = delivery.continuation_ref;
+  if (typeof workId !== "string" || workId.trim().length === 0 || typeof ref !== "string" || ref.trim().length === 0) {
+    throw new WakeBlockedError(
+      `directed delivery ${delivery.id} is missing its durable work_id/continuation_ref`,
+      false,
+    );
+  }
+  return {
+    ref,
+    workId,
+    // continuation_ref is server data, not a path segment. The shared helper hashes the full opaque
+    // value, so both the runner and `party decision ask` commit to exactly the same collision-safe path.
+    path: continuationPath(workdir, ref),
+    ownerAnswer: delivery.cause === "owner_answer",
+    directed: true,
+  };
+}
+
+function scopedSession<T extends { work_id?: string; continuation_ref?: string }>(
+  scope: ContinuationScope,
+  read: (path: string) => T | null,
+  label: string,
+): T | null {
+  const state = read(scope.path);
+  if (!scope.directed) return state;
+  if (state === null) {
+    if (scope.ownerAnswer || existsSync(scope.path)) {
+      const reason = existsSync(scope.path) ? "invalid or mismatched" : "missing";
+      throw new WakeBlockedError(
+        `${label} owner continuation ${reason}: work_id=${scope.workId} continuation_ref=${scope.ref}`,
+        false,
+      );
+    }
+    return null;
+  }
+  if (state.work_id !== scope.workId || state.continuation_ref !== scope.ref) {
+    throw new WakeBlockedError(
+      `${label} continuation mapping mismatch: expected work_id=${scope.workId} continuation_ref=${scope.ref}`,
+      false,
+    );
+  }
+  const blockedReason = (state as T & { resume_blocked_reason?: unknown }).resume_blocked_reason;
+  if (typeof blockedReason === "string" && blockedReason.length > 0) {
+    throw new WakeBlockedError(
+      `${label} continuation resume blocked: ${blockedReason}; work_id=${scope.workId} continuation_ref=${scope.ref}`,
+      false,
+    );
+  }
+  return state;
+}
+
+function writeSession(path: string, state: WakeSessionState): WakeSessionState {
+  return mergeRunnerContinuation(path, state) as WakeSessionState;
 }
 
 function readSdkSession(path: string): SdkWakeSessionState | null {
-  try {
-    const state = JSON.parse(readFileSync(path, "utf8")) as SdkWakeSessionState;
-    return state.harness === "codex-sdk" && typeof state.thread_id === "string" ? state : null;
-  } catch {
-    return null;
-  }
+  const state = readRunnerContinuation(path);
+  return state?.harness === "codex-sdk" && typeof state.thread_id === "string"
+    ? state as SdkWakeSessionState
+    : null;
 }
 
-function writeSdkSession(path: string, state: SdkWakeSessionState): void {
-  writeFileSync(path, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+const INVALID_SESSION_CODES = new Set([
+  "conversation_not_found",
+  "invalid_session",
+  "invalid_session_id",
+  "resume_not_found",
+  "session_not_found",
+  "thread_not_found",
+]);
+
+function structuredErrorCode(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  for (const key of ["code", "type", "error_code"]) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && INVALID_SESSION_CODES.has(candidate.toLowerCase())) return candidate;
+  }
+  return record.error === value ? null : structuredErrorCode(record.error);
+}
+
+/**
+ * 只识别能证明 resume 在模型启动前就失败的 session/thread 不存在错误。
+ * 其它非零退出一律沿用 #206 的副作用安全边界：不可 cold-start 重跑。
+ */
+export function isInvalidPersistedSessionFailure(result: Pick<RunnerProcessResult, "stdout" | "stderr">): boolean {
+  for (const line of `${result.stderr}\n${result.stdout}`.split(/\r?\n/).reverse()) {
+    const text = line.trim();
+    if (!text) continue;
+    try {
+      if (structuredErrorCode(JSON.parse(text)) !== null) return true;
+    } catch {
+      // 自由文本可能来自模型输出或交付阶段，不能证明模型尚未启动；绝不据此重跑当前 wake。
+    }
+  }
+  return false;
+}
+
+function isInvalidPersistedSessionError(error: unknown): boolean {
+  return structuredErrorCode(error) !== null;
+}
+
+function writeSdkSession(path: string, state: SdkWakeSessionState): SdkWakeSessionState {
+  return mergeRunnerContinuation(path, state) as SdkWakeSessionState;
 }
 
 function persistedAgentSession(o: Pick<ServeOptions, "builtinRunner" | "sdkRunner">): AgentSessionInfo | null {
@@ -899,6 +1187,11 @@ function appendRunnerLog(workdir: string, line: string): void {
   appendFileSync(join(workdir, RUNNER_LOG_FILE), line + "\n");
 }
 
+function appendServeLifecycleLog(workdir: string, line: string): void {
+  mkdirSync(workdir, { recursive: true, mode: 0o700 });
+  appendFileSync(join(workdir, SERVE_LIFECYCLE_LOG_FILE), line + "\n");
+}
+
 function parseCodexSessionId(stdout: string): string | null {
   return stdout.match(/session id:\s*([0-9a-fA-F][0-9a-fA-F-]{7,})/i)?.[1] ?? null;
 }
@@ -912,8 +1205,9 @@ function sdkPrompt(
   projectAgent: ProjectAgentRunContext | null = null,
   cliUpgrade: CliUpgradeNotice | null = null,
   attachments?: WakeContextAttachment[],
+  delivery: DirectedDelivery | null = null,
 ): string {
-  return JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments), null, 2) + "\n";
+  return JSON.stringify(buildWakeContext(frame, channel, self, recent, charter, projectAgent, cliUpgrade, attachments, delivery), null, 2) + "\n";
 }
 
 function sdkThreadId(thread: ThreadLike): string | null {
@@ -923,7 +1217,7 @@ function sdkThreadId(thread: ThreadLike): string | null {
   return null;
 }
 
-async function defaultCodexFactory(): Promise<CodexLike> {
+async function defaultCodexFactory(options: CodexClientOptions = {}): Promise<CodexLike> {
   const specifier = "@openai/codex-sdk";
   let mod: unknown;
   try {
@@ -941,8 +1235,31 @@ async function defaultCodexFactory(): Promise<CodexLike> {
   if (typeof Codex !== "function") {
     throw new Error("@openai/codex-sdk did not export Codex");
   }
-  const CodexCtor = Codex as new () => CodexLike;
-  return new CodexCtor();
+  const CodexCtor = Codex as new (options?: CodexClientOptions) => CodexLike;
+  return new CodexCtor(options);
+}
+
+function sdkSandboxMode(value: string | undefined): CodexThreadOptions["sandboxMode"] {
+  switch (value) {
+    case "read_only":
+    case "read-only":
+      return "read-only";
+    case "workspace_write":
+    case "workspace-write":
+      return "workspace-write";
+    case "danger-full-access":
+    case "full_access":
+    case undefined:
+      return "danger-full-access";
+    default:
+      return "danger-full-access";
+  }
+}
+
+function definedEnv(env: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
 }
 
 export function finalText(result: unknown): string {
@@ -999,6 +1316,7 @@ function prepareCodexHome(workdir: string, authSourceFile?: string): Record<stri
 async function ensureRepo(
   opts: BuiltinRunnerOptions,
   env: Record<string, string | undefined>,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   if (!opts.repo) return null;
   const repoDir = join(opts.workdir, "repo");
@@ -1006,7 +1324,7 @@ async function ensureRepo(
   const args = existsSync(repoDir)
     ? ["git", "-C", repoDir, "pull", "--ff-only"]
     : ["git", "clone", opts.repo, repoDir];
-  const res = await runGit(args, { cwd: opts.workdir, env });
+  const res = await runGit(args, { cwd: opts.workdir, env, signal });
   if (res.code !== 0) {
     appendRunnerLog(
       opts.workdir,
@@ -1027,9 +1345,11 @@ async function runHarness(
   opts: BuiltinRunnerOptions,
   prompt: string,
   sid: string | null,
+  coldSessionId: string | null,
   cwd: string,
   env: Record<string, string | undefined>,
   seq: number,
+  signal?: AbortSignal,
 ): Promise<HarnessRun> {
   const rawRunProcess = opts.runProcess ?? defaultRunnerProcess;
   // runProcess 自己抛 = 进程根本没起来（spawn ENOENT / 权限），模型确定没跑过 → 重试安全。
@@ -1038,6 +1358,7 @@ async function runHarness(
     try {
       return await rawRunProcess(args, o2);
     } catch (e) {
+      if (e instanceof WakeBlockedError) throw e;
       throw new WakeBlockedError(
         `builtin ${opts.harness} runner did not start: ${e instanceof Error ? e.message : String(e)}`,
         true,
@@ -1048,36 +1369,116 @@ async function runHarness(
     const outFile = join(opts.workdir, `runner-${seq}-${Date.now()}.out`);
     const base = ["--skip-git-repo-check", "--sandbox", "workspace-write", "-o", outFile, prompt];
     const args = sid ? ["codex", "exec", "resume", sid, ...base] : ["codex", "exec", ...base];
-    const result = await runProcess(args, { cwd, env });
+    const result = await runProcess(args, { cwd, env, signal });
     const text = result.code === 0 && existsSync(outFile) ? readFileSync(outFile, "utf8").trimEnd() : "";
     return { result, text, sessionId: sid ? sid : parseCodexSessionId(result.stdout), outFile };
   }
 
+  // A resident unattended serve must never let Claude block its one serial consumer on an
+  // interactive tool prompt. Owner input goes through `party decision ask` and a later delivery.
+  if (sid === null && coldSessionId === null) {
+    throw new WakeBlockedError("builtin claude runner has no preallocated cold session id", true);
+  }
+  // Claude accepts an official UUID session handle on cold start. Allocate it during preflight so
+  // nested `party decision ask` can durably park the exact handle before this turn returns. Parsing
+  // a session id from stdout is too late: the Worker may already have released an owner_answer.
   const args = sid
-    ? ["claude", "-p", "--resume", sid, prompt]
-    : ["claude", "-p", "--output-format", "json", prompt];
-  const result = await runProcess(args, { cwd, env });
+    ? ["claude", "-p", "--disallowed-tools", "AskUserQuestion", "--resume", sid, prompt]
+    : [
+        "claude",
+        "-p",
+        "--disallowed-tools",
+        "AskUserQuestion",
+        "--session-id",
+        coldSessionId!,
+        "--output-format",
+        "json",
+        prompt,
+      ];
+  const result = await runProcess(args, { cwd, env, signal });
   if (sid) return { result, text: result.stdout.trimEnd(), sessionId: sid };
   const parsed = parseClaudeJson(result.stdout);
-  return { result, text: parsed.text.trimEnd(), sessionId: parsed.sessionId };
+  return { result, text: parsed.text.trimEnd(), sessionId: coldSessionId };
 }
 
 export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOptions["runCommand"]> {
-  let codexPromise: Promise<CodexLike> | null = null;
-  let thread: ThreadLike | null = null;
-  let session: SdkWakeSessionState | null = null;
+  interface SdkSlot {
+    thread: ThreadLike | null;
+    session: SdkWakeSessionState | null;
+    activeThreadFromPersistedSession: boolean;
+  }
+  // CodexClientOptions.env is fixed when the SDK client is created. Keep one client per continuation
+  // slot so shell tools spawned by work A can never inherit work B's decision/continuation identity.
+  const codexPromises = new Map<string, Promise<CodexLike>>();
+  const slots = new Map<string, SdkSlot>();
   let queue = Promise.resolve();
-
-  const codex = (): Promise<CodexLike> => {
-    codexPromise ??= Promise.resolve((opts.codexFactory ?? defaultCodexFactory)());
-    return codexPromise;
+  const clientOptions = (scope: ContinuationScope, sessionId: string | null): CodexClientOptions => ({
+    env: definedEnv({
+      ...process.env,
+      AGENTPARTY_CHANNEL: opts.channel,
+      ...(opts.agentpartyConfigPath ? { AGENTPARTY_CONFIG: opts.agentpartyConfigPath } : {}),
+      AP_RUNNER_WORKDIR: opts.workdir,
+      AP_RUNNER_HARNESS: "codex-sdk",
+      ...(sessionId === null ? {} : { AP_RUNNER_SESSION_ID: sessionId }),
+      ...(scope.directed
+        ? {
+            AP_WORK_ID: scope.workId!,
+            AP_CONTINUATION_REF: scope.ref!,
+          }
+        : {}),
+    }),
+  });
+  const threadOptions: CodexThreadOptions = {
+    workingDirectory: opts.cwd ?? opts.workdir,
+    skipGitRepoCheck: true,
+    sandboxMode: sdkSandboxMode(opts.sandbox),
   };
 
-  const ensureThread = async (started: number): Promise<{ thread: ThreadLike; session: SdkWakeSessionState | null }> => {
-    if (thread && session) return { thread, session };
+  const codex = (scope: ContinuationScope, sessionId: string | null): Promise<CodexLike> => {
+    let client = codexPromises.get(scope.path);
+    if (client === undefined) {
+      client = Promise.resolve((opts.codexFactory ?? defaultCodexFactory)(clientOptions(scope, sessionId)));
+      codexPromises.set(scope.path, client);
+    }
+    return client;
+  };
+
+  const slotFor = (scope: ContinuationScope): SdkSlot => {
+    let slot = slots.get(scope.path);
+    if (slot === undefined) {
+      slot = { thread: null, session: null, activeThreadFromPersistedSession: false };
+      slots.set(scope.path, slot);
+    }
+    return slot;
+  };
+
+  const resetSlot = (slot: SdkSlot) => {
+    slot.thread = null;
+    slot.session = null;
+    slot.activeThreadFromPersistedSession = false;
+  };
+
+  const ensureThread = async (
+    started: number,
+    scope: ContinuationScope,
+    slot: SdkSlot,
+  ): Promise<{ thread: ThreadLike; session: SdkWakeSessionState | null }> => {
+    // owner_answer is allowed to resume only a durable, exact mapping. Even a resident in-memory
+    // thread is rejected if its file disappeared or was replaced: silently cold-starting here would
+    // detach the answer from the work that asked the question.
+    if (scope.ownerAnswer) {
+      const durable = scopedSession(scope, readSdkSession, "builtin codex-sdk");
+      if (slot.session !== null && durable?.thread_id !== slot.session.thread_id) {
+        throw new WakeBlockedError(
+          `builtin codex-sdk continuation mapping mismatch for work_id=${scope.workId} continuation_ref=${scope.ref}`,
+          false,
+        );
+      }
+    }
+    if (slot.thread && slot.session) return { thread: slot.thread, session: slot.session };
     mkdirSync(opts.workdir, { recursive: true });
-    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
-    const prior = readSdkSession(sessionPath);
+    const sessionPath = scope.path;
+    const prior = scopedSession(scope, readSdkSession, "builtin codex-sdk");
     // 这一段全在 thread.run() **之前**：连不上 SDK、拿不到 thread —— 模型确定还没跑。
     // 这类失败标为可重试（EAI_AGAIN 这种瞬态抖动，第二次就成了）。
     // thread.run() 之后的任何失败都不可重试（模型可能已经跑过、已经产生副作用）。
@@ -1091,64 +1492,141 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
         );
       }
     };
-    const client = await beforeModel(() => codex());
+    const client = await beforeModel(() => codex(scope, prior?.thread_id ?? null));
     if (prior) {
-      thread = await beforeModel(() => client.resumeThread(prior.thread_id));
-      session = prior;
-      return { thread, session };
+      try {
+        slot.thread = await client.resumeThread(prior.thread_id, threadOptions);
+        slot.session = prior;
+        slot.activeThreadFromPersistedSession = true;
+        return { thread: slot.thread, session: slot.session };
+      } catch (error) {
+        if (!isInvalidPersistedSessionError(error)) {
+          throw new WakeBlockedError(
+            `builtin codex-sdk runner blocked before the model started: ${error instanceof Error ? error.message : String(error)}`,
+            true,
+          );
+        }
+        appendRunnerLog(
+          opts.workdir,
+          `${new Date(started).toISOString()} sid=${shortSid(prior.thread_id)} session_reset=invalid_before_model runner=codex-sdk`,
+        );
+        // A direct structured resume failure proves the model did not start. Legacy/initial work may
+        // safely replace the poison handle, but an owner answer must never fork away from its work.
+        if (scope.ownerAnswer) {
+          throw new WakeBlockedError(
+            `builtin codex-sdk owner continuation is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            false,
+          );
+        }
+        rmSync(sessionPath, { force: true });
+      }
     }
-    thread = await beforeModel(() => client.startThread());
-    const threadId = sdkThreadId(thread);
+    slot.thread = await beforeModel(() => client.startThread(threadOptions));
+    slot.activeThreadFromPersistedSession = false;
+    const threadId = sdkThreadId(slot.thread);
     // thread id 懒初始化：拿不到就先不落 session 文件，等首个 run() 之后补写
-    session = threadId
+    slot.session = threadId
       ? {
           harness: "codex-sdk",
           thread_id: threadId,
           created_at: started,
           last_wake_ts: started,
           wakes: 0,
+          ...(scope.directed ? { work_id: scope.workId!, continuation_ref: scope.ref! } : {}),
         }
       : null;
-    if (session) writeSdkSession(sessionPath, session);
-    return { thread, session };
+    if (slot.session) slot.session = writeSdkSession(sessionPath, slot.session);
+    return { thread: slot.thread, session: slot.session };
+  };
+
+  interface PreparedSdkRun {
+    started: number;
+    scope: ContinuationScope;
+    slot: SdkSlot;
+    active: { thread: ThreadLike; session: SdkWakeSessionState | null };
+  }
+  const prepared = new WeakMap<MsgFrame, PreparedSdkRun>();
+  const prepare = async (frame: MsgFrame, ctx: ServeRunnerContext): Promise<void> => {
+    if (prepared.has(frame)) return;
+    const started = opts.now?.() ?? Date.now();
+    mkdirSync(opts.workdir, { recursive: true });
+    const scope = continuationScope(opts.workdir, ctx.delivery);
+    const slot = slotFor(scope);
+    // Factory creation plus start/resume validation is model-free. Finish it before the Worker sees
+    // `running`, otherwise a crash here would manufacture an unknown model outcome.
+    const active = await ensureThread(started, scope, slot);
+    prepared.set(frame, { started, scope, slot, active });
   };
 
   const handle = async (
     frame: MsgFrame,
-    ctx: {
-      cmd: string;
-      channel: string;
-      self: string;
-      recent: MsgFrame[];
-      charter?: ChannelCharter | null;
-      projectAgent?: ProjectAgentRunContext | null;
-      cliUpgrade?: CliUpgradeNotice | null;
-      attachments?: WakeContextAttachment[];
-      /** 排在当前 wake 身后、尚未处理的 wake 数（#103）。 */
-      queueDepth?: number;
-    },
+    ctx: ServeRunnerContext,
   ): Promise<void> => {
-    const started = opts.now?.() ?? Date.now();
-    mkdirSync(opts.workdir, { recursive: true });
+    if (!prepared.has(frame)) await prepare(frame, ctx);
+    const ready = prepared.get(frame)!;
+    prepared.delete(frame);
+    const { started, scope, slot, active } = ready;
     const post = opts.post ?? postMessage;
-    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
+    const sessionPath = scope.path;
 
-    await post(opts.server, opts.token, opts.channel, {
-      kind: "status",
-      state: "working",
-      note: `wake ack: ${ctx.self} builtin codex-sdk runner handling seq=${frame.seq}`,
-      mentions: [],
-      // busy（#103）：串行处理这条 wake 期间自报「忙 + 身后队列深度」，让 who/reach/web 别谎报可即时响应。
-      busy: true,
-      queue_depth: ctx.queueDepth ?? 0,
-    });
-
-    let threadId = session?.thread_id ?? null;
     try {
-      const active = await ensureThread(started);
-      const result = await active.thread.run(sdkPrompt(frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments), {
+      void post(opts.server, opts.token, opts.channel, {
+        kind: "status",
+        state: "working",
+        note: `wake ack: ${ctx.self} builtin codex-sdk runner handling seq=${frame.seq}`,
+        mentions: [],
+        busy: true,
+        queue_depth: ctx.queueDepth ?? 0,
+      }).catch(() => {});
+    } catch {
+      // Presence is telemetry-only; do not delay the model boundary after durable `running`.
+    }
+
+    let threadId = slot.session?.thread_id ?? null;
+    const markTimedOutContinuation = (timeout: RunnerTimeoutError): void => {
+      const now = opts.now?.() ?? Date.now();
+      const blockedReason =
+        `codex-sdk runner timed out after ${timeout.timeoutMs}ms; previous turn outcome unknown, refusing resume`;
+      // Prefer the on-disk state: `party decision ask` may have crash-safely enriched it while the
+      // SDK run was active. Fall back to the in-memory handle for a turn that has not asked yet.
+      const durable = readSdkSession(sessionPath) ?? slot.session;
+      if (durable !== null) {
+        slot.session = writeSdkSession(sessionPath, {
+          ...durable,
+          last_wake_ts: now,
+          workdir: opts.workdir,
+          resume_blocked_reason: blockedReason,
+          resume_blocked_at: now,
+        });
+      } else {
+        // A lazy SDK may expose its id only inside the spawned runtime. `party decision ask` writes
+        // the same scoped file from CODEX_THREAD_ID before POST; pick that crash-safe mapping up.
+        blockRunnerContinuation(sessionPath, blockedReason, now);
+      }
+    };
+    const onAbort = (): void => {
+      const reason = ctx.signal?.reason;
+      if (reason instanceof RunnerTimeoutError) markTimedOutContinuation(reason);
+    };
+    ctx.signal?.addEventListener("abort", onAbort, { once: true });
+    if (ctx.signal?.aborted) onAbort();
+    try {
+      threadId = active.session?.thread_id ?? sdkThreadId(active.thread);
+      if (ctx.signal?.aborted) {
+        onAbort();
+        throw ctx.signal.reason instanceof Error
+          ? ctx.signal.reason
+          : new WakeBlockedError("builtin codex-sdk runner aborted", false);
+      }
+      // Await the SDK promise itself.  Racing it with AbortSignal would let an SDK implementation
+      // that ignores cancellation keep running in the background while serve starts the next wake.
+      const result = await active.thread.run(sdkPrompt(frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments, ctx.delivery ?? null), {
         sandbox: opts.sandbox ?? "full_access",
+        signal: ctx.signal,
       });
+      if (ctx.signal?.aborted) {
+        throw ctx.signal.reason instanceof Error ? ctx.signal.reason : new WakeBlockedError("builtin codex-sdk runner aborted", false);
+      }
       // run() 之后 thread id 一定就位；懒初始化的 session 在这里补建
       threadId = active.session?.thread_id ?? sdkThreadId(active.thread);
       if (!threadId) throw new Error("@openai/codex-sdk thread did not expose an id/thread_id after run");
@@ -1160,19 +1638,20 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
         created_at: started,
         last_wake_ts: started,
         wakes: 0,
+        ...(scope.directed ? { work_id: scope.workId!, continuation_ref: scope.ref! } : {}),
       };
-      session = {
+      slot.session = {
         ...baseSession,
         last_wake_ts: now,
         wakes: baseSession.wakes + 1,
         workdir: opts.workdir,
       };
-      writeSdkSession(sessionPath, session);
+      slot.session = writeSdkSession(sessionPath, slot.session);
       opts.onSession?.({
         harness: "codex-sdk",
-        session_id: session.thread_id,
+        session_id: slot.session.thread_id,
         updated_at: now,
-        cwd: session.cwd ?? opts.workdir,
+        cwd: slot.session.cwd ?? opts.workdir,
         workdir: opts.workdir,
       });
       // 交付走统一路径：超限正文改走 R2 附件（#109），不再 inline 撞 413。上传失败落进下面的 catch。
@@ -1193,15 +1672,53 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     } catch (err) {
       const now = opts.now?.() ?? Date.now();
       const message = err instanceof Error ? err.message : String(err);
-      if (session) {
-        session = { ...session, last_wake_ts: now, wakes: session.wakes + 1, workdir: opts.workdir };
-        writeSdkSession(sessionPath, session);
-        threadId = session.thread_id;
+      if (err instanceof RunnerTimeoutError || err instanceof ServeShutdownError) {
+        appendRunnerLog(
+          opts.workdir,
+          `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(threadId)} duration_ms=${now - started} status=${err instanceof RunnerTimeoutError ? "timeout" : "shutdown"}`,
+        );
+        // Do not erase the only work -> thread mapping. A decision may already have parked this work;
+        // deleting the file would make its owner_answer look like an unrelated cold start. Preserve the
+        // exact handle and mark it unsafe so the later answer terminates as an explicit failed delivery.
+        if (err instanceof RunnerTimeoutError) markTimedOutContinuation(err);
+        else {
+          const durable = readSdkSession(sessionPath) ?? slot.session;
+          if (durable !== null) {
+            slot.session = writeSdkSession(sessionPath, {
+              ...durable,
+              last_wake_ts: now,
+              workdir: opts.workdir,
+              resume_blocked_reason: "codex-sdk runner stopped during shutdown; previous turn outcome unknown, refusing resume",
+              resume_blocked_at: now,
+            });
+          }
+        }
+        resetSlot(slot);
+        throw err;
+      }
+      if (slot.activeThreadFromPersistedSession && isInvalidPersistedSessionError(err)) {
+        appendRunnerLog(
+          opts.workdir,
+          `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(threadId)} duration_ms=${now - started} session_reset=invalid_after_run runner=codex-sdk`,
+        );
+        const durable = readSdkSession(sessionPath);
+        if (durable?.resume_blocked_reason === undefined) rmSync(sessionPath, { force: true });
+        resetSlot(slot);
+        // resumeThread() in the production SDK is lazy: thread existence is first checked by run().
+        // At that point the model/side effects cannot be proven absent, so clear the handle only for
+        // the next independent delivery and never cold-start the current wake.
+        throw new WakeBlockedError(`builtin codex-sdk persisted session is invalid: ${message}`, false);
+      }
+      const errorSession = slot.session ?? readSdkSession(sessionPath);
+      if (errorSession) {
+        slot.session = { ...errorSession, last_wake_ts: now, wakes: errorSession.wakes + 1, workdir: opts.workdir };
+        slot.session = writeSdkSession(sessionPath, slot.session);
+        threadId = slot.session.thread_id;
         opts.onSession?.({
           harness: "codex-sdk",
-          session_id: session.thread_id,
+          session_id: slot.session.thread_id,
           updated_at: now,
-          cwd: session.cwd ?? opts.workdir,
+          cwd: slot.session.cwd ?? opts.workdir,
           workdir: opts.workdir,
         });
       }
@@ -1217,43 +1734,97 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
         `builtin codex-sdk runner blocked: ${message}; log: ${join(opts.workdir, RUNNER_LOG_FILE)}`,
         retriable,
       );
+    } finally {
+      ctx.signal?.removeEventListener("abort", onAbort);
     }
   };
 
-  return (frame, ctx) => {
+  const runner: NonNullable<ServeOptions["runCommand"]> = (frame, ctx) => {
     const next = queue.then(() => handle(frame, ctx));
     queue = next.catch(() => {});
     return next;
   };
+  runner.prepare = prepare;
+  return runner;
 }
 
 export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<ServeOptions["runCommand"]> {
-  return async (frame, ctx) => {
+  interface PreparedBuiltinRun {
+    started: number;
+    scope: ContinuationScope;
+    sessionPath: string;
+    prior: WakeSessionState | null;
+    coldSessionId: string | null;
+    env: Record<string, string | undefined>;
+    cwd: string;
+  }
+  const prepared = new WeakMap<MsgFrame, PreparedBuiltinRun>();
+  const prepare = async (frame: MsgFrame, ctx: ServeRunnerContext): Promise<void> => {
+    if (prepared.has(frame)) return;
     const started = opts.now?.() ?? Date.now();
     mkdirSync(opts.workdir, { recursive: true });
-    const env = opts.harness === "codex" ? prepareCodexHome(opts.workdir, opts.authSourceFile) : { ...process.env };
-    const sessionPath = join(opts.workdir, RUNNER_SESSION_FILE);
-    const prior = readSession(sessionPath, opts.harness);
+    const baseEnv = opts.harness === "codex" ? prepareCodexHome(opts.workdir, opts.authSourceFile) : { ...process.env };
+    const scope = continuationScope(opts.workdir, ctx.delivery);
+    const sessionPath = scope.path;
+    const prior = scopedSession(scope, (path) => readSession(path, opts.harness), `builtin ${opts.harness}`);
+    const coldSessionId = prior === null && opts.harness === "claude" ? randomUUID() : null;
+    const env = {
+      ...baseEnv,
+      AGENTPARTY_CHANNEL: opts.channel,
+      ...(opts.agentpartyConfigPath ? { AGENTPARTY_CONFIG: opts.agentpartyConfigPath } : {}),
+      // Nested `party decision ask` must be able to commit the current model handle before its POST
+      // parks the server-side work. Cold harnesses expose CODEX_THREAD_ID / CLAUDE_SESSION_ID to tool
+      // subprocesses; resumed turns additionally receive this explicit, runner-owned handle.
+      AP_RUNNER_WORKDIR: opts.workdir,
+      AP_RUNNER_HARNESS: opts.harness,
+      AP_RUNNER_SESSION_ID: prior?.session_id ?? coldSessionId ?? "",
+      AP_DELIVERY_ID: ctx.delivery?.id ?? "",
+      AP_WORK_ID: ctx.delivery?.work_id ?? "",
+      AP_CONTINUATION_REF: ctx.delivery?.continuation_ref ?? "",
+      AP_DELIVERY_ATTEMPT: ctx.delivery ? String(ctx.delivery.attempt) : "",
+    };
+    // Clone/pull and continuation validation are model-free and can be slow. They must finish while
+    // the durable delivery is still only `claimed`; a crash here is safe for the Worker to requeue.
+    const repoCwd = await ensureRepo(opts, env, ctx.signal);
+    prepared.set(frame, {
+      started,
+      scope,
+      sessionPath,
+      prior,
+      coldSessionId,
+      env,
+      cwd: opts.cwd ?? repoCwd ?? opts.workdir,
+    });
+  };
+
+  const runner: NonNullable<ServeOptions["runCommand"]> = async (frame, ctx) => {
+    if (!prepared.has(frame)) await prepare(frame, ctx);
+    const ready = prepared.get(frame)!;
+    prepared.delete(frame);
+    const { started, scope, sessionPath, coldSessionId, env, cwd } = ready;
+    let prior = ready.prior;
     let oldSid = prior?.session_id ?? null;
     let exitCode: number | null = null;
     let finalSid = oldSid;
     const post = opts.post ?? postMessage;
 
-    await post(opts.server, opts.token, opts.channel, {
-      kind: "status",
-      state: "working",
-      note: `wake ack: ${ctx.self} builtin ${opts.harness} runner handling seq=${frame.seq}`,
-      mentions: [],
-      // busy（#103）：串行处理这条 wake 期间自报「忙 + 身后队列深度」，让 who/reach/web 别谎报可即时响应。
-      busy: true,
-      queue_depth: ctx.queueDepth ?? 0,
-    });
-
-    const repoCwd = await ensureRepo(opts, env);
-    const cwd = opts.cwd ?? repoCwd ?? opts.workdir;
+    // Presence/audit must never sit between the authoritative running ACK and the model boundary.
+    // It is observable telemetry, not a prerequisite for executing the claimed work.
+    try {
+      void post(opts.server, opts.token, opts.channel, {
+        kind: "status",
+        state: "working",
+        note: `wake ack: ${ctx.self} builtin ${opts.harness} runner handling seq=${frame.seq}`,
+        mentions: [],
+        busy: true,
+        queue_depth: ctx.queueDepth ?? 0,
+      }).catch(() => {});
+    } catch {
+      // A synchronous test double / transport failure is still telemetry-only.
+    }
     // #479：builtin Claude/Codex 子进程在 runner workdir 内运行；把 context JSON 写到 workdir
     // 内，避免 Claude Code 默认权限模式因读取系统 tmpdir 文件而卡无人批准的权限弹窗。
-    const contextFile = writeContextFile(builtinRunnerContextDir(opts.workdir), frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments);
+    const contextFile = writeContextFile(builtinRunnerContextDir(opts.workdir), frame, ctx.channel, ctx.self, ctx.recent, ctx.charter ?? null, ctx.projectAgent ?? null, ctx.cliUpgrade ?? null, ctx.attachments, ctx.delivery ?? null);
     // 绝不把 context JSON 当 argv 传（#120）：argv 对同机任意用户可见（`ps -axww`），
     // 一条私有频道消息的正文、charter、最近 20 条上下文就全泄漏了。
     // 只传 0700 私有目录里的文件路径——protocol_reminder 本来就叫模型「先读本文件」。
@@ -1263,12 +1834,36 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
     // 当前限额下炸不了；真正当下就成立的是上面这条泄漏。
     const prompt = wakePrompt(contextFile);
 
-    // resume 非零退出**不能**再 cold-start 重跑（#206 门禁 P1②）：
-    // 那次 resume 可能已经执行了模型、push 过、开过 PR，只是最后一步非零。
-    // 内部 fallback 会绕过外层的 retriable=false，把副作用做第二遍。
-    // 只有能**结构化证明模型没启动**的错误才允许换新 session——目前没有这样的信号，
-    // 所以一律停在这里，由外层宣告放弃。
-    const run = await runHarness(opts, prompt, oldSid, cwd, env, frame.seq);
+    // resume 子进程一旦启动，任何非零都可能发生在模型或交付副作用之后；即使输出里带结构化
+    // session_not_found，也只能清理句柄供下一条独立 wake 使用，绝不能 cold-start 重跑当前 wake。
+    let run: HarnessRun;
+    try {
+      run = await runHarness(opts, prompt, oldSid, coldSessionId, cwd, env, frame.seq, ctx.signal);
+    } catch (error) {
+      if (error instanceof ServeShutdownError) {
+        if (prior !== null) {
+          blockRunnerContinuation(
+            sessionPath,
+            `${opts.harness} runner stopped during shutdown; previous turn outcome unknown, refusing resume`,
+            opts.now?.() ?? Date.now(),
+          );
+        }
+        try { unlinkSync(contextFile); } catch { /* best effort */ }
+      }
+      throw error;
+    }
+    if (oldSid !== null && run.result.code !== 0 && isInvalidPersistedSessionFailure(run.result)) {
+      const resetAt = opts.now?.() ?? Date.now();
+      appendRunnerLog(
+        opts.workdir,
+        `${new Date(resetAt).toISOString()} seq=${frame.seq} sid=${shortSid(oldSid)} session_reset=invalid_after_process exit=${run.result.code}`,
+      );
+      const durable = readSession(sessionPath, opts.harness);
+      if (durable?.resume_blocked_reason === undefined) rmSync(sessionPath, { force: true });
+      prior = null;
+      oldSid = null;
+      finalSid = null;
+    }
     exitCode = run.result.code;
 
     try {
@@ -1299,7 +1894,7 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
     }
 
     const wakes = prior ? prior.wakes + 1 : 1;
-    writeSession(sessionPath, {
+    const committed = writeSession(sessionPath, {
       harness: opts.harness,
       session_id: finalSid,
       created_at: prior ? prior.created_at : now,
@@ -1307,10 +1902,11 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
       wakes,
       cwd,
       workdir: opts.workdir,
+      ...(scope.directed ? { work_id: scope.workId!, continuation_ref: scope.ref! } : {}),
     });
     opts.onSession?.({
       harness: opts.harness,
-      session_id: finalSid,
+      session_id: committed.session_id,
       updated_at: now,
       cwd,
       workdir: opts.workdir,
@@ -1346,6 +1942,8 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
       `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(finalSid)} duration_ms=${now - started} exit=${exitCode ?? 0}`,
     );
   };
+  runner.prepare = prepare;
+  return runner;
 }
 
 function expandHomePath(path: string): string {
@@ -1356,6 +1954,14 @@ function expandHomePath(path: string): string {
 
 function safeSegment(input: string): string {
   return input.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "agent";
+}
+
+export function canonicalServerOrigin(server: string): string {
+  return new URL(server).origin;
+}
+
+function stableNamespace(parts: readonly unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(parts), "utf8").digest("hex");
 }
 
 function parseProfileRef(input: string | undefined): { owner: string; handle: string } | null {
@@ -1374,21 +1980,44 @@ export interface PreparedProfileWorkspace {
 }
 
 export interface PrepareProfileWorkspaceOptions {
+  server: string;
   profile: ProjectAgentProfile;
   channel: string;
+  child: Pick<ProjectAgentChannelRuntime, "name" | "owner" | "channel_scope">;
   runGit?: RunnerProcess;
   env?: Record<string, string | undefined>;
 }
 
 export async function prepareProfileChannelWorkspace(opts: PrepareProfileWorkspaceOptions): Promise<PreparedProfileWorkspace> {
+  const origin = canonicalServerOrigin(opts.server);
+  const serverNamespace = stableNamespace([origin]);
+  const profileNamespace = stableNamespace([
+    origin,
+    opts.profile.owner_account,
+    opts.profile.handle,
+    opts.profile.created_at,
+  ]);
   const root = join(
-    homedir(),
-    ".agentparty",
+    process.env.AGENTPARTY_HOME ?? join(homedir(), ".agentparty"),
     "project-agents",
+    serverNamespace,
     safeSegment(opts.profile.owner_account),
     safeSegment(opts.profile.handle),
+    profileNamespace,
   );
-  const runnerWorkdir = join(root, "sessions", safeSegment(opts.channel));
+  const childNamespace = stableNamespace([
+    origin,
+    opts.child.name,
+    "agent",
+    opts.child.owner ?? null,
+    opts.child.channel_scope,
+  ]);
+  const runnerWorkdir = join(
+    root,
+    "sessions",
+    childNamespace,
+    safeSegment(opts.child.channel_scope),
+  );
   mkdirSync(runnerWorkdir, { recursive: true });
   const runGit = opts.runGit ?? defaultRunnerProcess;
   const env = opts.env ?? process.env;
@@ -1466,6 +2095,7 @@ export interface ProfileServeOptions {
   upgradeProbeIntervalMs?: number;
   once?: boolean;
   pollIntervalMs?: number;
+  runnerTimeoutMs?: number;
   out?: (line: string) => void;
   runGit?: RunnerProcess;
   mintRuntime?: typeof mintProjectAgentRuntimeToken;
@@ -1559,13 +2189,12 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
     throw new Error(`profile token mismatch: requested ${opts.ownerAccount}/${opts.handle}, got ${profile.owner_account}/${profile.handle}`);
   }
   const running = new Map<string, Promise<number>>();
+  const terminalChannels = new Set<string>();
   out(`serving project agent ${profile.owner_account}/${profile.handle} — runner=${profile.runner}`);
 
   const startInvite = async (invite: ChannelProjectAgentInvite) => {
     const channel = invite.channel_slug;
-    if (running.has(channel)) return;
-    const prepared = await prepareProfileChannelWorkspace({ profile, channel, runGit: opts.runGit });
-    const ctx = profileContext(profile, prepared);
+    if (running.has(channel) || terminalChannels.has(channel)) return;
     const child: ProjectAgentChannelRuntime = await ensureChannelRuntime(
       opts.server,
       runtime.token,
@@ -1573,6 +2202,33 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
       profile.owner_account,
       profile.handle,
       projectAgentChildName(profile.handle, channel),
+    );
+    if (child.owner !== profile.owner_account || child.channel_scope !== channel) {
+      throw new Error(
+        `profile child identity mismatch for #${channel}: owner=${child.owner} scope=${child.channel_scope}`,
+      );
+    }
+    // The authoritative child principal/channel scope must exist before choosing any session path.
+    // Same-named profiles or children on another server therefore cannot share continuation files.
+    const prepared = await prepareProfileChannelWorkspace({
+      server: opts.server,
+      profile,
+      channel,
+      child,
+      runGit: opts.runGit,
+    });
+    const ctx = profileContext(profile, prepared);
+    // The resident profile daemon is authenticated as the owner/runtime token,
+    // while each invited channel has a distinct least-privilege child token.
+    // Persist the child identity under that channel's private runner state and
+    // pin the returned path into only its model process. Nested party CLI calls
+    // must never fall back to the daemon owner's AGENTPARTY_CONFIG/global config.
+    const childConfigPath = writeWorkspaceConfigOnly(
+      { server: opts.server, token: child.token },
+      // `shared` profiles intentionally reuse one model cwd across channels.  The
+      // runner state directory is channel-scoped, so key the nested CLI identity
+      // there instead of letting two children overwrite the same workspace config.
+      prepared.runnerWorkdir,
     );
     const serveOpts: ServeOptions = {
       ...profileChildServeOptions({
@@ -1597,6 +2253,7 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
       availableUpgrade: currentAvailableUpgrade,
       refreshAvailableUpgrade: sharedRefreshAvailableUpgrade,
       upgradeProbeIntervalMs,
+      runnerTimeoutMs: opts.runnerTimeoutMs,
       advertise: async () => {
         const note = projectAgentReadyNote(profile, channel, prepared);
         await post(opts.server, child.token, channel, {
@@ -1628,6 +2285,7 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
             harness: profile.runner,
             workdir: prepared.runnerWorkdir,
             cwd: prepared.channelWorkdir,
+            agentpartyConfigPath: childConfigPath,
           }
         : undefined,
       sdkRunner: profile.runner === "codex-sdk"
@@ -1636,13 +2294,46 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
             token: child.token,
             channel,
             workdir: prepared.runnerWorkdir,
+            cwd: prepared.channelWorkdir,
+            agentpartyConfigPath: childConfigPath,
           }
         : undefined,
     };
     if (profile.runner === "shell") {
       throw new Error("project agent runner shell is not supported by party serve --profile");
     }
-    const promise = runChannelServe(serveOpts).finally(() => running.delete(channel));
+    let firstChildAttach = true;
+    const promise = superviseServe({
+      runOnce: () => {
+        const skipBacklog = firstChildAttach ? serveOpts.skipBacklog : false;
+        return runChannelServe({
+          ...serveOpts,
+          since: loadCursor(channel),
+          stuck: loadStuck(channel),
+          sinceRev: loadRevCursor(channel),
+          skipBacklog,
+          // A failed TCP/WS attempt before welcome is still the initial attachment.  Keep the
+          // user's backlog policy until the child proves that it consumed a welcome frame.
+          onWelcome: () => { firstChildAttach = false; },
+        });
+      },
+      maxRestarts: opts.once ? 0 : undefined,
+      sleep,
+      onLifecycle: (line) => out(`profile child #${channel}: ${line}`),
+    })
+      .then((code) => {
+        if (isTerminalServeExit(code)) {
+          terminalChannels.add(channel);
+          out(`profile child #${channel} stopped terminally with code=${code}`);
+        }
+        return code;
+      })
+      .catch((error) => {
+        // Never leave a rejected child promise unobserved; the invite poll may attach it again.
+        out(`profile child #${channel} crashed: ${errText(error)} (will retry next poll)`);
+        return EXIT_STREAM_ENDED;
+      })
+      .finally(() => running.delete(channel));
     running.set(channel, promise);
     out(`attached project agent ${profile.owner_account}/${profile.handle} to #${channel}`);
   };
@@ -1695,16 +2386,115 @@ export function pendingWakeDepth(
   self: string,
   mentionsOnly: boolean,
   afterSeq: number,
+  directedDeliveryMode = false,
 ): number {
   let depth = 0;
   for (const f of pending) {
-    if (f.type !== "msg") continue;
-    if (f.seq <= afterSeq) continue;
-    if (f.sender.name === self) continue;
-    if (mentionsOnly && !f.mentions.includes(self)) continue;
+    if (directedDeliveryMode && f.type !== "delivery") continue;
+    const message = f.type === "delivery" ? f.message : f.type === "msg" ? f : null;
+    if (message === null) continue;
+    if (f.type === "delivery") {
+      if (f.delivery.target_name !== self || f.delivery.state !== "claimed") continue;
+    } else {
+      if (message.seq <= afterSeq) continue;
+      if (message.sender.name === self) continue;
+      if (mentionsOnly && !message.mentions.includes(self)) continue;
+    }
     depth += 1;
   }
   return depth;
+}
+
+/**
+ * A delivery transition is durable only after the Worker echoes the authoritative row.
+ * `WebSocket.send()` alone can silently lose the frame in a disconnect window; advancing the local
+ * cursor then would let the same work be replayed and execute model/external side effects twice.
+ */
+export async function confirmDeliveryUpdate(
+  conn: Pick<ReturnType<typeof connect>, "send" | "pendingFrames">,
+  update: DeliveryUpdateFrame,
+  timeoutMs = DELIVERY_UPDATE_ACK_TIMEOUT_MS,
+): Promise<PublicDirectedDelivery> {
+  if (!conn.send(update)) throw new Error("websocket is not open");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pending = conn.pendingFrames();
+    const ack = [...pending].reverse().find(
+      (frame): frame is Extract<ServerFrame, { type: "delivery_state" }> =>
+        frame.type === "delivery_state" && frame.delivery.id === update.delivery_id,
+    );
+    if (ack !== undefined) {
+      if (ack.delivery.state === update.state) return ack.delivery;
+      // A decision request can move the source to waiting_owner while its runner is winding down.
+      // The late generic `replied` receipt is intentionally a no-op; the authoritative suspended
+      // state is still a successful durable acknowledgement of this turn.
+      if (update.state === "replied" && ack.delivery.state === "waiting_owner") return ack.delivery;
+      if (ack.delivery.state === "waiting_owner" || ack.delivery.state === "replied" || ack.delivery.state === "failed") {
+        throw new Error(`delivery state is ${ack.delivery.state}, expected ${update.state}`);
+      }
+    }
+    const error = [...pending].reverse().find(
+      (frame): frame is Extract<ServerFrame, { type: "error" }> => frame.type === "error",
+    );
+    if (error !== undefined) throw new Error(`${error.code}: ${error.message}`);
+    if (Date.now() >= deadline) throw new Error(`delivery update acknowledgement timed out after ${timeoutMs}ms`);
+    await delay(10);
+  }
+}
+
+export async function runWithRunnerTimeout(
+  run: NonNullable<ServeOptions["runCommand"]>,
+  frame: MsgFrame,
+  ctx: Parameters<NonNullable<ServeOptions["runCommand"]>>[1],
+  requestedTimeoutMs: number = DEFAULT_RUNNER_TIMEOUT_MS,
+  lifecycleSignal?: AbortSignal,
+): Promise<void> {
+  const timeoutMs = Number.isFinite(requestedTimeoutMs)
+    ? Math.max(1, Math.floor(requestedTimeoutMs))
+    : DEFAULT_RUNNER_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeoutError = new RunnerTimeoutError(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let settled = false;
+  const onLifecycleAbort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(lifecycleSignal?.reason instanceof Error
+        ? lifecycleSignal.reason
+        : new ServeShutdownError("SIGTERM"));
+    }
+  };
+  lifecycleSignal?.addEventListener("abort", onLifecycleAbort, { once: true });
+  if (lifecycleSignal?.aborted) onLifecycleAbort();
+  const running = Promise.resolve()
+    .then(() => {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      return run(frame, { ...ctx, signal: controller.signal });
+    })
+    .finally(() => { settled = true; });
+  const aborted = new Promise<never>((_, reject) => {
+    const rejectAbort = () => reject(controller.signal.reason instanceof Error
+      ? controller.signal.reason
+      : new WakeBlockedError("runner aborted", false));
+    controller.signal.addEventListener("abort", rejectAbort, { once: true });
+    if (controller.signal.aborted) rejectAbort();
+  });
+  timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+  try {
+    await Promise.race([running, aborted]);
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    // Cancellation is a request, not proof of termination. No next wake or process exit may pass
+    // this barrier while a child/process group can still be alive.
+    if (!settled) await Promise.race([
+      running.then(() => undefined, () => undefined),
+      delay(RUNNER_TERMINATION_BARRIER_MS),
+    ]);
+    if (controller.signal.reason === timeoutError) timeoutError.terminationConfirmed = settled;
+    throw controller.signal.reason instanceof Error ? controller.signal.reason : error;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    lifecycleSignal?.removeEventListener("abort", onLifecycleAbort);
+  }
 }
 
 export async function runServe(o: ServeOptions): Promise<number> {
@@ -1730,14 +2520,23 @@ export async function runServe(o: ServeOptions): Promise<number> {
   // 让 watchdog 能问「这个 serve 此刻真的还在收帧吗」而不是只能 pgrep。reconnect_count 数的是
   // 本进程生命周期内进入过几次 reconnecting，不是每次退避重试都加一——那样一次掉线会看起来像刷屏。
   let reconnectCount = 0;
+  // health/statusline 是本地可观测性，不是消息交付的一部分。磁盘满、只读目录或
+  // 原子 rename 竞态都不能从 WS 回调 / 帧循环里把常驻 supervisor 打死。
+  const bestEffortLocalState = (write: () => void) => {
+    try {
+      write();
+    } catch {
+      // A later heartbeat/frame will retry naturally; delivery stays authoritative on the server.
+    }
+  };
   const onWsStatus = (status: "open" | "reconnecting" | "closed", detail?: { error?: string }) => {
     if (status === "open") {
-      writeHealthCache({ channel: o.channel, ws_connected: true, reconnecting: false, connected_since: Date.now(), last_error: null });
+      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: true, reconnecting: false, connected_since: Date.now(), last_error: null }));
     } else if (status === "reconnecting") {
       reconnectCount += 1;
-      writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: true, reconnect_count: reconnectCount, connected_since: null });
+      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: true, reconnect_count: reconnectCount, connected_since: null }));
     } else {
-      writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, connected_since: null, last_error: detail?.error ?? null });
+      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, connected_since: null, last_error: detail?.error ?? null }));
     }
   };
   const skipBacklog = o.skipBacklog !== false; // 默认跳过离线积压（#193）
@@ -1758,6 +2557,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
   try {
     conn = connect(o.server, o.token, o.channel, o.since, {
       onCursor: o.onCursor,
+      directedDelivery: "v1",
       sinceRev: o.sinceRev,
       onRevCursor: o.onRevCursor,
       onStatus: onWsStatus,
@@ -1766,6 +2566,20 @@ export async function runServe(o: ServeOptions): Promise<number> {
     lock?.release?.();
     throw error;
   }
+  const lifecycleController = new AbortController();
+  let shutdownError: ServeShutdownError | null = null;
+  const requestShutdown = (signal: "SIGINT" | "SIGTERM") => {
+    if (shutdownError !== null) return;
+    shutdownError = new ServeShutdownError(signal);
+    lifecycleController.abort(shutdownError);
+    // Wake an idle frame iterator. Active runners observe the same signal and finish their
+    // process-group TERM -> KILL barrier before runServe reaches its finally block.
+    conn.close();
+  };
+  const onInterrupt = () => requestShutdown("SIGINT");
+  const onTerminate = () => requestShutdown("SIGTERM");
+  process.once("SIGINT", onInterrupt);
+  process.once("SIGTERM", onTerminate);
   // issue #522：runner 的模型 session 是可恢复句柄，不是 websocket session。连接建立后把它作为
   // presence-only 元数据自报；每次 runner 冷起/续会并刷新本地 wake-session.json 后再覆盖一次。
   const reportAgentSession = (session: AgentSessionInfo) => {
@@ -1781,7 +2595,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
       // 重连 welcome 会从本地 wake-session.json 再报；一次 WS 窗口失败不阻断 runner。
     }
   };
-  const run = o.runCommand ?? (o.sdkRunner
+  const run: ServeRunner = o.runCommand ?? (o.sdkRunner
     ? createSdkRunner({
         ...o.sdkRunner,
         onSession: (session) => {
@@ -1800,13 +2614,14 @@ export async function runServe(o: ServeOptions): Promise<number> {
       : defaultRun);
   // 挂载之初就落一份 health 基线：即便还没收到第一帧，watchdog 也能看到「这个 pid 认领了这个频道」，
   // 而不是文件缺失时无法区分「serve 没起来」和「serve 起来了但还没写过健康数据」。
-  writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, reconnect_count: 0, last_frame_at: null, last_error: null, connected_since: null });
+  bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, reconnect_count: 0, last_frame_at: null, last_error: null, connected_since: null }));
   // 本实例私有的上下文命名空间（#197 / #208 门禁）。退出时整目录删除：
   // 失败的唤醒会把上下文留在盘上供本次排查，但它带着 charter / recent 正文，
   // 不能在进程结束后继续躺在共享 tmpdir 里。
   const contextDir = createWakeContextDir();
   // 挂载那一刻的频道水位（welcome.last_seq），只在首个 welcome 记一次。
   let attachHead: number | null = null;
+  let welcomeReported = false;
   let self = "";
   // 欠账（#198）：这条 @ 送达失败、从没进过模型。跨进程持久，重启后接着数重试次数。
   let stuck: StuckWake | null = o.stuck ?? null;
@@ -1829,6 +2644,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
   // held=false 转 standby（不跑 runner，且保留未确认 wake），held=true（持租/顶替）恢复并重放。
   let hasLease = true;
   let leaseKnown = false; // 是否至少收到过一次 serve_lease（用于只在真 standby 时打印提示）
+  // 新服务端把 agent work 作为独立 delivery 帧持久重放；普通 msg/read cursor 只负责阅读。
+  // 缺 capability 的旧服务端继续沿用 mentions + cursor 唤醒，保证滚动升级兼容。
+  let directedDeliveryMode = false;
   let pendingPersistedSession: AgentSessionInfo | null = null;
   const reportPendingPersistedSession = () => {
     if (pendingPersistedSession === null) return;
@@ -1859,20 +2677,27 @@ export async function runServe(o: ServeOptions): Promise<number> {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   if (o.statusline === true) {
     heartbeat = setInterval(() => {
-      writeStatuslineCache({
-        ...localStatuslineBase(o.channel),
-        ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
-      });
+      bestEffortLocalState(() => writeStatuslineCache({
+          ...localStatuslineBase(o.channel),
+          ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
+        }));
     }, 60_000);
     if (typeof heartbeat.unref === "function") heartbeat.unref();
   }
   try {
-    for await (const frame of conn.frames) {
+    frameLoop: for await (const incoming of conn.frames) {
+      const directedDelivery = incoming.type === "delivery" ? incoming.delivery : null;
+      const frame = incoming.type === "delivery" ? incoming.message : incoming;
       // 每收到一帧（含 ping 的 pong 回执）就刷新 last_frame_at——空闲频道也靠 ping 心跳（~25s）
       // 保持新鲜，watchdog 才能把"频道安静"和"连接僵死"分开（issue #254 证据边界）。
-      writeHealthCache({ channel: o.channel, last_frame_at: Date.now() });
+      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, last_frame_at: Date.now() }));
       if (frame.type === "welcome") {
         self = frame.self;
+        if (!welcomeReported) {
+          o.onWelcome?.();
+          welcomeReported = true;
+        }
+        directedDeliveryMode = frame.directed_delivery === "v1";
         // 挂上/重连即向服务端 claim serve 租约（#99）。best-effort：ws 此刻是 OPEN，claim 会送出；
         // 服务端在同名多条 serve 里选唯一持租者并回 serve_lease。老服务端不认识它、直接忽略（hasLease
         // 默认 true → 旧行为）。重连每次 welcome 都重新 claim（连接换了，租约候选身份也换了）。
@@ -1906,11 +2731,11 @@ export async function runServe(o: ServeOptions): Promise<number> {
           }
         }
         if (o.statusline === true) {
-          writeStatuslineCache({
-            ...localStatuslineBase(o.channel),
-            ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
-            unread: unreadFromCursor(frame.last_seq, o.channel),
-          });
+          bestEffortLocalState(() => writeStatuslineCache({
+              ...localStatuslineBase(o.channel),
+              ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
+              unread: unreadFromCursor(frame.last_seq, o.channel),
+            }));
         }
         if (typeof frame.charter_rev === "number") await refreshCharter("welcome", frame.charter_rev);
         // 挂上即声明可唤醒（best-effort，只做一次；重连再收 welcome 不重复刷）
@@ -1977,17 +2802,30 @@ export async function runServe(o: ServeOptions): Promise<number> {
         continue;
       }
       if (frame.type !== "msg") continue;
+      if (
+        directedDelivery !== null &&
+        (directedDelivery.target_name !== self || directedDelivery.state !== "claimed")
+      ) {
+        out(`serve: ignored invalid delivery ${directedDelivery.id} for target=${directedDelivery.target_name} state=${directedDelivery.state}`);
+        continue;
+      }
       const fromSelf = frame.sender.name === self;
       // fresh = 游标之上的新消息。历史修订快照会穿透去重被重放（seq 早已消费过），
       // 它们不是新唤醒——不 fresh 就绝不触发 runner（否则旧 @ 被编辑一次，每次重连都重跑一遍）
-      const fresh = frame.seq > conn.cursor;
+      // delivery 是独立 work cursor：即使普通 read cursor 已越过 message_seq，也必须执行。
+      const fresh = directedDelivery !== null || frame.seq > conn.cursor;
       // 欠账（#198）先于**一切**过滤条件。它送达失败过、从没进过模型——欠着就是欠着，
       // 与当前是不是 mentions-only、是不是积压无关。
       // 反例（190-codex-dev on PR #206）：--all 下一条非 mention 失败留下欠账，重启回默认
       // mentions-only 后 qualifies=false → 不重试、不清欠账、却无条件 ack 越过它。
       const isDebt = stuck !== null && frame.seq === stuck.seq;
-      const isBacklog = skipBacklog && attachHead !== null && frame.seq <= attachHead;
-      const passesFilter = !fromSelf && !isBacklog && (!o.mentionsOnly || frame.mentions.includes(self));
+      const isBacklog = directedDelivery === null && skipBacklog && attachHead !== null && frame.seq <= attachHead;
+      const mentionOwnedByDelivery =
+        directedDeliveryMode && directedDelivery === null && frame.mentions.includes(self);
+      const passesFilter =
+        directedDelivery !== null
+          ? !fromSelf
+          : !fromSelf && !isBacklog && !mentionOwnedByDelivery && (!o.mentionsOnly || frame.mentions.includes(self));
       // 欠账未了结时，**后续的任何消息都不许先跑**（#206 门禁 P1①）。
       // 反例：cursor=3、欠账 seq=4、head=6 未重放它、新 seq=7 进来 → 旧实现跑了 7、
       // 把游标推到 7，并在成功路径上无条件 setStuck(null)，把 seq=4 的欠账顺手清掉。
@@ -2011,32 +2849,156 @@ export async function runServe(o: ServeOptions): Promise<number> {
       // deferredLeaseSeq 只会在 !hasLease 时设置，held=true 分支会先清空再 replay；因此持租处理
       // 与 standby 冻结区互斥。不要在这里额外跳过，否则一旦状态漂移反而会把欠账永久冻住。
       const qualifies = wouldWake && !selfPaused && hasLease;
+      let stopAfterFrame = false;
       if (qualifies) {
         out(`▶ ${formatMsg(frame)}`);
         // 串行：本条命令跑完再消费下一帧（新帧此间缓冲在 FrameQueue），避免并发唤起互相抢
         // 有界重试（#198）：同一条 seq 最多 maxAttempts 次。前一个进程崩在第 k 次，这里从 k 接着数。
-        const priorAttempts = stuck?.seq === frame.seq ? stuck.attempts : 0;
+        let attemptFloor = stuck?.seq === frame.seq ? stuck.attempts : 0;
         // 崩溃在「最后一次失败落盘」与「最终通告」之间时，这里循环一次都不跑，
         // lastError 必须从盘上接手，否则最终通告里的错误原因是空字符串（门禁 P2）。
         let lastError = (stuck?.seq === frame.seq ? stuck.last_error : "") ?? "";
         let delivered = false;
-        let retriable = true;
+        // A crash can happen after a non-retriable model failure was persisted but before the final
+        // blocked announcement. Preserve that safety bit across supervisor restarts; old state files
+        // omit it and retain the historical retryable behavior for compatibility.
+        let retriable = stuck?.seq === frame.seq ? stuck.retriable !== false : true;
+        let runnerTerminationUnconfirmed = stuck?.seq === frame.seq && stuck.termination_unconfirmed === true;
         // custom/builtin runner 一旦可能已经执行过模型就不会重试；最终通告必须报告真实执行次数，
         // 不能把配置预算 maxAttempts 伪装成实际已跑次数（例如一次 SIGTERM 不能写成 3/3）。
-        let attemptsUsed = priorAttempts;
+        let attemptsUsed = attemptFloor;
         // 身后已缓冲的 wake 深度（#103）：内建 runner 随 working 帧上报，presence 显示「忙 + N 待处理」。
         // 本帧正在处理，故只数它 seq 之后、够格触发唤醒的缓冲帧。
-        const queueDepth = pendingWakeDepth(conn.pendingFrames(), self, o.mentionsOnly === true, frame.seq);
+        const queueDepth = pendingWakeDepth(
+          conn.pendingFrames(),
+          self,
+          o.mentionsOnly === true,
+          frame.seq,
+          directedDeliveryMode,
+        );
         // 先把入站附件放进本 serve 实例的 0700 临时目录。runner 只拿 0600 本地文件与
         // 鉴权端点元数据，context 中绝不出现 bearer token；单个下载失败也不吞掉整次唤醒。
-        const wakeAttachments = await materializeWakeAttachments(
-          o.server,
-          o.token,
-          o.channel,
-          frame,
-          contextDir,
-          o.downloadAttachment ?? downloadAttachment,
-        );
+        let wakeAttachments: WakeContextAttachment[] = [];
+        let cliUpgrade: CliUpgradeNotice | null = availableUpgrade;
+        let preflightFailed = false;
+        for (;;) {
+          try {
+            wakeAttachments = await awaitWithAbort(materializeWakeAttachments(
+              o.server,
+              o.token,
+              o.channel,
+              frame,
+              contextDir,
+              o.downloadAttachment ?? downloadAttachment,
+            ), lifecycleController.signal);
+            if (o.refreshAvailableUpgrade !== undefined && Date.now() >= nextUpgradeProbeAt) {
+              nextUpgradeProbeAt = Date.now() + (o.upgradeProbeIntervalMs ?? 5 * 60_000);
+              try {
+                availableUpgrade = await awaitWithAbort(
+                  o.refreshAvailableUpgrade(availableUpgrade),
+                  lifecycleController.signal,
+                );
+              } catch (error) {
+                if (lifecycleController.signal.aborted) throw error;
+                // A failed optional probe is a completed preflight with the previous known value.
+              }
+            }
+            cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps) ?? availableUpgrade;
+            const preflightContext: ServeRunnerContext = {
+              cmd: o.cmd,
+              channel: o.channel,
+              self,
+              contextDir,
+              recent: recent.slice(),
+              charter,
+              projectAgent: o.projectAgent ?? null,
+              cliUpgrade,
+              attachments: wakeAttachments,
+              queueDepth,
+              delivery: directedDelivery,
+              signal: lifecycleController.signal,
+            };
+            const preparation = run.prepare?.(frame, preflightContext);
+            if (preparation !== undefined) {
+              await awaitWithAbort(preparation, lifecycleController.signal);
+            }
+            if (lifecycleController.signal.aborted) throw lifecycleController.signal.reason;
+            break;
+          } catch (error) {
+            if (error instanceof ServeShutdownError) {
+              shutdownError = error;
+              break frameLoop;
+            }
+            attemptsUsed = attemptFloor + 1;
+            attemptFloor = attemptsUsed;
+            lastError = errText(error);
+            retriable = error instanceof WakeBlockedError && error.retriable;
+            out(`  runner 预处理失败 (${attemptsUsed}/${maxAttempts})，未发送 running、未启动模型: ${lastError}`);
+            if (directedDelivery === null) {
+              setStuck({ seq: frame.seq, attempts: attemptsUsed, last_error: lastError, retriable });
+            }
+            if (retriable && attemptsUsed < maxAttempts) {
+              if (retryDelayMs > 0) await delay(retryDelayMs);
+              continue;
+            }
+            preflightFailed = true;
+            break;
+          }
+        }
+        if (preflightFailed) {
+          const note =
+            `wake undelivered before model start, giving up: seq=${frame.seq}; ` +
+            `attempts=${attemptsUsed}/${maxAttempts}; retry_delay_ms=${retryDelayMs}; last error: ${lastError}`;
+          try {
+            await (o.post ?? postMessage)(o.server, o.token, o.channel, {
+              kind: "status",
+              state: "blocked",
+              note,
+              mentions: [],
+              blocked_reason: note,
+            });
+          } catch {
+            code = EXIT_WAKE_UNANNOUNCED;
+            break frameLoop;
+          }
+          if (directedDelivery !== null) {
+            try {
+              await confirmDeliveryUpdate(conn, {
+                type: "delivery_update",
+                delivery_id: directedDelivery.id,
+                state: "failed",
+                error: sanitizeBlockedError(lastError),
+              });
+            } catch (error) {
+              out(`  delivery ${directedDelivery.id} 预处理失败回执发送失败: ${errText(error)}`);
+              code = EXIT_STREAM_ENDED;
+              break frameLoop;
+            }
+          } else {
+            setStuck(null);
+            conn.ack(frame.seq);
+          }
+          continue frameLoop;
+        }
+
+        // `running` now means every slow, model-free prerequisite succeeded. Once acknowledged,
+        // only synchronous started telemetry remains before the runner crosses its model boundary.
+        if (directedDelivery !== null) {
+          try {
+            await confirmDeliveryUpdate(conn, {
+              type: "delivery_update",
+              delivery_id: directedDelivery.id,
+              state: "running",
+              ...(directedDelivery.work_id === null ? {} : { work_id: directedDelivery.work_id }),
+              ...(directedDelivery.continuation_ref === null ? {} : { continuation_ref: directedDelivery.continuation_ref }),
+            });
+          } catch (error) {
+            out(`  delivery ${directedDelivery.id} 启动确认失败，未启动 runner: ${errText(error)}`);
+            code = EXIT_STREAM_ENDED;
+            stopAfterFrame = true;
+            break frameLoop;
+          }
+        }
         if (reportsBusy) busyReported = true;
         // 每任务进度/心跳（#228，扩 #103 busy）：run() 会把这条串行循环阻塞数分钟——期间频道与本机都看不到
         // 「具体这条任务在跑、活着」。用一个 setInterval 侧信道在 run() 执行期间周期性刷新（阻塞的循环靠定时器
@@ -2051,7 +3013,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
             ? { current_task: frame.seq, task_started_at: taskStartedAt, heartbeat_at: at }
             : { current_task: null, task_started_at: null, heartbeat_at: null };
           try {
-            writeHealthCache({ channel: o.channel, ...fields });
+            bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ...fields }));
           } catch {
             /* 本机 health 落盘失败不影响唤醒 */
           }
@@ -2072,33 +3034,22 @@ export async function runServe(o: ServeOptions): Promise<number> {
         // builtin/sdk 的 wake-ack 帧与下方 idle 清除各管各的，这条纯审计不掺和（custom 不参与 busy）。
         // best-effort：审计发不出去不阻塞唤醒（主职是把 @ 送进模型），留痕即可。
         try {
-          await (o.post ?? postMessage)(o.server, o.token, o.channel, {
+          void (o.post ?? postMessage)(o.server, o.token, o.channel, {
             kind: "status",
             state: "working",
             note: `runner started for seq ${frame.seq}: ${self} runner=${runnerKind}`,
             mentions: [],
-          });
+          }).catch((e) => out(`  runner_started 审计发送失败（不影响送达）: ${errText(e)}`));
         } catch (e) {
           out(`  runner_started 审计发送失败（不影响送达）: ${errText(e)}`);
         }
         const taskBeat: ReturnType<typeof setInterval> = setInterval(() => emitTaskBeat(true, nowFn()), heartbeatIntervalMs);
         if (typeof taskBeat.unref === "function") taskBeat.unref();
         try {
-          for (let attempt = priorAttempts + 1; attempt <= maxAttempts && retriable; attempt++) {
+          for (let attempt = attemptFloor + 1; attempt <= maxAttempts && retriable; attempt++) {
             attemptsUsed = attempt;
             try {
-              // 磁盘已经装好的新版优先（可直接 re-exec）；否则把服务器发布版提示交给 runner，
-              // 让 agent 在频道里主动请 owner 升级。旧客户端不知道新协议时最需要这条提醒（#485）。
-              if (o.refreshAvailableUpgrade !== undefined && Date.now() >= nextUpgradeProbeAt) {
-                nextUpgradeProbeAt = Date.now() + (o.upgradeProbeIntervalMs ?? 5 * 60_000);
-                try {
-                  availableUpgrade = await o.refreshAvailableUpgrade(availableUpgrade);
-                } catch {
-                  // 断网或老部署没有 /api/version：保留上次结果，不阻断 wake。
-                }
-              }
-              const cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps) ?? availableUpgrade;
-              await run(frame, {
+              await runWithRunnerTimeout(run, frame, {
                 cmd: o.cmd,
                 channel: o.channel,
                 self,
@@ -2109,18 +3060,35 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 cliUpgrade,
                 attachments: wakeAttachments,
                 queueDepth,
-              });
+                delivery: directedDelivery,
+              }, o.runnerTimeoutMs ?? DEFAULT_RUNNER_TIMEOUT_MS, lifecycleController.signal);
               delivered = true;
               break;
             } catch (e) {
+              if (e instanceof ServeShutdownError) {
+                shutdownError = e;
+                break;
+              }
               lastError = e instanceof Error ? e.message : String(e);
+              runnerTerminationUnconfirmed = e instanceof RunnerTimeoutError && !e.terminationConfirmed;
               // 抛错不等于「模型没跑过」。只有 runner 明确声明可重试（spawn 都没成功）才重试；
               // 否则重跑会重复模型与外部副作用（git push / 开 PR）。见门禁 P1③。
               retriable = e instanceof WakeBlockedError ? e.retriable : false;
               if (!retriable) lastError += " (not retriable: model may have run)";
               out(`  命令失败 (${attempt}/${maxAttempts}): ${lastError}`);
               // 先落盘再重试：此刻进程崩掉，重启后不会把已经烧掉的次数忘干净
-              setStuck({ seq: frame.seq, attempts: attempt, last_error: lastError });
+              // Directed work has its own server-side lease/state machine. Mirroring it into the
+              // legacy seq debt would make a later ordinary backfill bypass delivery ownership and
+              // execute the same model turn again.
+              if (directedDelivery === null) {
+                setStuck({
+                  seq: frame.seq,
+                  attempts: attempt,
+                  last_error: lastError,
+                  retriable,
+                  ...(runnerTerminationUnconfirmed ? { termination_unconfirmed: true } : {}),
+                });
+              }
               if (retriable && attempt < maxAttempts && retryDelayMs > 0) await delay(retryDelayMs);
             }
           }
@@ -2129,7 +3097,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
           // 若身后还有排队的 wake，下一条自己的 started 拍会把 current_task 覆盖成新 seq。
           clearInterval(taskBeat);
           emitTaskBeat(false, nowFn());
+          // WebSocket.send 只把帧交给本地发送队列；若服务端的终局帧已在入站队列里，下一轮会
+          // 立刻 break 并 close socket。让出一拍，确保仍处于 OPEN 的连接有机会把 idle-clear
+          // 刷到服务端，避免频道永久显示一条已经结束的 current_task。
+          await delay(0);
         }
+        if (shutdownError !== null) break frameLoop;
         if (delivered) {
           // 一条真正送达的 wake 证明 runner 恢复了；此前连续失败不再代表当前健康状态。
           consecutiveWakeAbandons = 0;
@@ -2143,12 +3116,35 @@ export async function runServe(o: ServeOptions): Promise<number> {
           // 这里的 seq 校验在当前 blockedByDebt 守卫之下**不可达**（变异掉它零条测试变红）。
           // 它是第二道闸：一旦有人放宽 blockedByDebt，这行会挡住「A 的成功清掉 B 的欠账」。
           // 不删，理由写在这里。
-          if (stuck !== null && stuck.seq === frame.seq) setStuck(null);
+          let deliveryConfirmed = directedDelivery === null;
+          if (directedDelivery !== null) {
+            try {
+              await confirmDeliveryUpdate(conn, {
+                type: "delivery_update",
+                delivery_id: directedDelivery.id,
+                state: "replied",
+              });
+              deliveryConfirmed = true;
+            } catch (error) {
+              // 不伪称已确认：退出本轮。服务端仍保留 claimed/running，随后按明确的
+              // unknown-outcome 规则收口；绝不在本地把 fire-and-forget 当 durable ack。
+              out(`  delivery ${directedDelivery.id} 完成回执发送失败，重连核对: ${errText(error)}`);
+              code = EXIT_STREAM_ENDED;
+              stopAfterFrame = true;
+            }
+          }
+          if (deliveryConfirmed && stuck !== null && stuck.seq === frame.seq) setStuck(null);
           // busy 清除（#103）：这条 wake 处理完了。若身后已无待处理 wake（队列排空），补一条「空闲」把
           // 之前 working 帧上的 busy 清回 false——否则任务结束后 presence 会永远卡在「忙」（假忙）。
           // 只在真排空时补：还有 @ 排队就保持 busy=true，等下一条 wake 的 working 帧继续覆盖 queue_depth。
           if (busyReported) {
-            const remaining = pendingWakeDepth(conn.pendingFrames(), self, o.mentionsOnly === true, conn.cursor);
+            const remaining = pendingWakeDepth(
+              conn.pendingFrames(),
+              self,
+              o.mentionsOnly === true,
+              conn.cursor,
+              directedDeliveryMode,
+            );
             if (remaining === 0) {
               busyReported = false;
               try {
@@ -2190,11 +3186,30 @@ export async function runServe(o: ServeOptions): Promise<number> {
             code = EXIT_WAKE_UNANNOUNCED;
             break;
           }
-          setStuck(null); // 放弃也是一种「了结」：宣告过了，才允许推进游标
+          let failureConfirmed = directedDelivery === null;
+          if (directedDelivery !== null) {
+            try {
+              await confirmDeliveryUpdate(conn, {
+                type: "delivery_update",
+                delivery_id: directedDelivery.id,
+                state: "failed",
+                error: sanitizeBlockedError(lastError),
+              });
+              failureConfirmed = true;
+            } catch (error) {
+              out(`  delivery ${directedDelivery.id} 失败回执发送失败，重连重试: ${errText(error)}`);
+              code = EXIT_STREAM_ENDED;
+              stopAfterFrame = true;
+            }
+          }
+          if (failureConfirmed && directedDelivery === null) {
+            setStuck(null); // legacy 放弃只有在已宣告后才算了结
+          }
           consecutiveWakeAbandons += 1;
-          if (consecutiveWakeAbandons >= MAX_CONSECUTIVE_WAKE_ABANDONS) {
+          if (runnerTerminationUnconfirmed || consecutiveWakeAbandons >= MAX_CONSECUTIVE_WAKE_ABANDONS) {
             const finalNote =
-              `serve wake circuit breaker tripped: consecutive_abandons=${consecutiveWakeAbandons}/${MAX_CONSECUTIVE_WAKE_ABANDONS}; ` +
+              `serve wake circuit breaker tripped: reason=${runnerTerminationUnconfirmed ? "runner_termination_unconfirmed" : "consecutive_abandons"}; ` +
+              `consecutive_abandons=${consecutiveWakeAbandons}/${MAX_CONSECUTIVE_WAKE_ABANDONS}; ` +
               `last_seq=${frame.seq}; last_error=${sanitizeBlockedError(lastError)}`;
             out(`  ${finalNote}`);
             try {
@@ -2215,8 +3230,11 @@ export async function runServe(o: ServeOptions): Promise<number> {
         }
       }
       const heldForLease = deferredLeaseSeq !== null && frame.seq >= deferredLeaseSeq;
+      const awaitingDirectedDelivery =
+        directedDeliveryMode && directedDelivery === null && !fromSelf && frame.mentions.includes(self);
       // standby 冻结区会在接管时完整重放；首次经过时不提前塞进 recent，避免重放后上下文重复。
-      if (!heldForLease) {
+      // 新协议的普通 mention 广播也先不塞：紧随其后的 delivery 才是触发点，recent 必须仍只含触发前上下文。
+      if (!heldForLease && !awaitingDirectedDelivery) {
         recent.push(frame);
         if (recent.length > RECENT_MAX) recent.shift();
       }
@@ -2228,15 +3246,16 @@ export async function runServe(o: ServeOptions): Promise<number> {
       // stuck 就活着走到这里。守卫不是死的——是我的推理漏了过滤路径。
       if ((stuck === null || frame.seq < stuck.seq) && !heldForLease) conn.ack(frame.seq);
       if (o.statusline === true) {
-        writeStatuslineCache({
-          ...localStatuslineBase(o.channel),
-          ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
-          unread: unreadFromCursor(frame.seq, o.channel),
-          last_message: lastMessageFromFrame(frame),
-        });
+        bestEffortLocalState(() => writeStatuslineCache({
+            ...localStatuslineBase(o.channel),
+            ...heartbeatPatch("serve", Date.now(), { mentionsOnly: o.mentionsOnly }),
+            unread: unreadFromCursor(frame.seq, o.channel),
+            last_message: lastMessageFromFrame(frame),
+          }));
       }
 
       if (wakeAbandonCircuitTripped) break;
+      if (stopAfterFrame) break;
 
       // 唤醒间隙的安全点：磁盘上的 party 二进制被 install.sh 换新了吗（issue #45）？
       // 此刻上一轮已 ack、游标已落盘、无进行中的 runner——re-exec 干净。--auto-upgrade 直接换，
@@ -2258,11 +3277,17 @@ export async function runServe(o: ServeOptions): Promise<number> {
     rmSync(contextDir, { recursive: true, force: true });
     lock?.release?.();
     if (heartbeat) clearInterval(heartbeat);
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    if (!lifecycleController.signal.aborted) {
+      lifecycleController.abort(new ServeShutdownError("SIGTERM"));
+    }
     conn.close();
-    if (o.statusline === true) clearStatuslineListener();
+    if (o.statusline === true) bestEffortLocalState(() => clearStatuslineListener());
     // 进程真退出了：health.json 不该继续显示 ws_connected=true 骗 watchdog（只清自己写的记录）。
-    clearHealthCache();
+    bestEffortLocalState(() => clearHealthCache());
   }
+  if (shutdownError !== null) return shutdownError.exitCode;
   if (upgraded) return EXIT_UPGRADED;
   // 帧流意外结束（既非终局 error 也非用户 Ctrl-C）：常驻 supervisor 语义下这是异常终止。
   // 报机器可读原因 + 非零退出，否则 --on-mention supervisor 会像 watch --follow 一样静默消失（issue #29 同源）。
@@ -2271,6 +3296,165 @@ export async function runServe(o: ServeOptions): Promise<number> {
     return EXIT_STREAM_ENDED;
   }
   return code;
+}
+
+export interface ServeSupervisorOptions {
+  runOnce: () => Promise<number>;
+  sleep?: (ms: number) => Promise<void>;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  /** 测试/嵌入方的上限；CLI 默认无限自愈，直到终局退出。 */
+  maxRestarts?: number;
+  onLifecycle?: (line: string) => void;
+}
+
+export function isTerminalServeExit(code: number): boolean {
+  return code === 0 || code === EXIT_AUTH || code === EXIT_ARCHIVED || code === EXIT_UPGRADED ||
+    code === EXIT_ALREADY_SERVING || code === EXIT_WAKE_ABANDON_CIRCUIT ||
+    code === EXIT_SIGNAL_INT || code === EXIT_SIGNAL_TERM;
+}
+
+function reportServeLifecycle(opts: ServeSupervisorOptions, line: string): void {
+  try {
+    opts.onLifecycle?.(line);
+  } catch {
+    // Telemetry must never be the single point of failure for the self-healing supervisor
+    // (disk full / read-only workdir / log rotation races are all non-fatal here).
+  }
+}
+
+/**
+ * CLI 外层常驻 supervisor。runServe 自己负责一条 WS 生命周期；若它仍以瞬态错误结束，
+ * 这里从持久 cursor/stuck 重新构造下一轮，而不是把无人值守 agent 永久留在离线状态。
+ */
+export async function superviseServe(opts: ServeSupervisorOptions): Promise<number> {
+  const sleep = opts.sleep ?? delay;
+  const baseDelayMs = Math.max(0, opts.baseDelayMs ?? DEFAULT_SUPERVISOR_RESTART_DELAY_MS);
+  const maxDelayMs = Math.max(baseDelayMs, opts.maxDelayMs ?? MAX_SUPERVISOR_RESTART_DELAY_MS);
+  let restarts = 0;
+  for (;;) {
+    reportServeLifecycle(opts, `event=start attempt=${restarts + 1}`);
+    let code: number;
+    let error = "";
+    try {
+      code = await opts.runOnce();
+    } catch (cause) {
+      code = 1;
+      error = sanitizeBlockedError(cause instanceof Error ? cause.message : String(cause));
+    }
+    reportServeLifecycle(opts, `event=exit attempt=${restarts + 1} code=${code}${error ? ` error=${JSON.stringify(error)}` : ""}`);
+    if (isTerminalServeExit(code)) return code;
+    if (opts.maxRestarts !== undefined && restarts >= opts.maxRestarts) return code;
+    const waitMs = Math.min(baseDelayMs * 2 ** restarts, maxDelayMs);
+    restarts += 1;
+    reportServeLifecycle(opts, `event=restart next_attempt=${restarts + 1} delay_ms=${waitMs} previous_code=${code}`);
+    if (waitMs > 0) await sleep(waitMs);
+  }
+}
+
+export interface ServeIdentityBoundaryState {
+  expectedPrincipal: string | null;
+  rejectedAccountToken: string | null;
+}
+
+export interface ServePrincipal {
+  server_origin: string;
+  name: string;
+  kind: string;
+  owner: string | null;
+}
+
+export type ServeIdentityBoundaryResult =
+  | { ok: true; principal: ServePrincipal; namespace: string }
+  | { ok: false; code: typeof EXIT_AUTH; reason: string };
+
+/**
+ * Validate one supervisor attachment before it opens a WebSocket.
+ *
+ * The rejected-token check deliberately precedes `/api/me`: after a WS auth rejection an account
+ * session gets one chance to rotate its token, but returning the exact same token is terminal and
+ * must not issue the same doomed request forever.  `/api/me` 401/403 is terminal for both static and
+ * account credentials; only transport/5xx failures remain restartable.
+ */
+export async function verifyServeIdentityBoundary(
+  baseServer: string,
+  auth: ResolvedAuthDetailed,
+  state: ServeIdentityBoundaryState,
+  fetchIdentity: typeof fetchMe = fetchMe,
+): Promise<ServeIdentityBoundaryResult> {
+  if (!auth.server || !auth.token) {
+    return { ok: false, code: EXIT_AUTH, reason: "serve credentials are missing" };
+  }
+  const baseOrigin = canonicalServerOrigin(baseServer);
+  const authOrigin = canonicalServerOrigin(auth.server);
+  if (authOrigin !== baseOrigin) {
+    return {
+      ok: false,
+      code: EXIT_AUTH,
+      reason: `serve identity boundary changed: server ${baseOrigin} -> ${authOrigin}`,
+    };
+  }
+  if (auth.auth_source === "account_session" && state.rejectedAccountToken === auth.token) {
+    return {
+      ok: false,
+      code: EXIT_AUTH,
+      reason: "serve account session returned the same rejected token",
+    };
+  }
+
+  let me: Awaited<ReturnType<typeof fetchMe>>;
+  try {
+    me = await fetchIdentity(auth.server, auth.token);
+  } catch (error) {
+    if (error instanceof RestError && (error.status === 401 || error.status === 403)) {
+      return {
+        ok: false,
+        code: EXIT_AUTH,
+        reason: `serve authentication rejected by /api/me (${error.status})`,
+      };
+    }
+    throw error;
+  }
+
+  const principal: ServePrincipal = {
+    server_origin: authOrigin,
+    name: me.name,
+    kind: me.kind,
+    owner: me.owner ?? null,
+  };
+  // Match the Worker's durable delivery principal exactly. Account-owned credentials remain
+  // stable across rotation; owner-less legacy credentials are distinct capabilities even when a
+  // revoked token name is later reused. Only the token digest enters memory/disk namespace keys.
+  const deliveryPrincipal = typeof principal.owner === "string" && principal.owner.length > 0
+    ? principal.owner
+    : `token-sha256:${createHash("sha256").update(auth.token, "utf8").digest("hex")}`;
+  const currentPrincipal = JSON.stringify([
+    principal.server_origin,
+    principal.name,
+    principal.kind,
+    deliveryPrincipal,
+  ]);
+  if (state.expectedPrincipal === null) state.expectedPrincipal = currentPrincipal;
+  if (currentPrincipal !== state.expectedPrincipal) {
+    return {
+      ok: false,
+      code: EXIT_AUTH,
+      reason: `serve identity boundary changed: ${state.expectedPrincipal} -> ${currentPrincipal}`,
+    };
+  }
+  if (state.rejectedAccountToken !== null && state.rejectedAccountToken !== auth.token) {
+    state.rejectedAccountToken = null;
+  }
+  return {
+    ok: true,
+    principal,
+    namespace: stableNamespace([
+      principal.server_origin,
+      principal.name,
+      principal.kind,
+      deliveryPrincipal,
+    ]),
+  };
 }
 
 export async function run(argv: string[]): Promise<number> {
@@ -2285,19 +3469,25 @@ export async function run(argv: string[]): Promise<number> {
     return 1;
   }
   const server = auth.server;
-  const token = auth.token;
   const unknown = unknownFlagError(flags, SERVE_FLAGS);
   if (unknown !== null) {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["channel", "on-mention", "runner", "workdir", "repo", "profile", "profile-poll-interval"]);
+  const flagError = valueFlagError(flags, ["channel", "on-mention", "runner", "workdir", "repo", "profile", "profile-poll-interval", "runner-timeout-seconds"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
   }
   const cmd = str(flags["on-mention"]);
   const runner = str(flags.runner);
+  const runnerTimeoutSecondsRaw = str(flags["runner-timeout-seconds"]);
+  const runnerTimeoutSeconds = runnerTimeoutSecondsRaw === undefined ? DEFAULT_RUNNER_TIMEOUT_MS / 1000 : Number(runnerTimeoutSecondsRaw);
+  if (!Number.isInteger(runnerTimeoutSeconds) || runnerTimeoutSeconds < 1 || runnerTimeoutSeconds > 7 * 24 * 60 * 60) {
+    console.error("--runner-timeout-seconds must be an integer between 1 and 604800");
+    return 1;
+  }
+  const runnerTimeoutMs = runnerTimeoutSeconds * 1000;
   const profileRef = parseProfileRef(str(flags.profile));
   if (flags.profile !== undefined && !profileRef) {
     console.error("profile must be <owner>/<handle>");
@@ -2339,12 +3529,13 @@ export async function run(argv: string[]): Promise<number> {
       skipBacklog: flags["replay-backlog"] !== true,
       once: flags["profile-once"] === true,
       pollIntervalMs,
+      runnerTimeoutMs,
     });
   }
   if ((cmd ? 1 : 0) + (runner ? 1 : 0) !== 1) {
     console.error(
       'choose exactly one of --on-mention or --runner.\n' +
-        '  自定义：--on-mention "<command>"（{file}=context JSON，正文在 stdin，元信息在 AP_*）。\n' +
+        '  自定义：--on-mention "<command>"（每次 fresh process；owner 回答以同 work/ref + context JSON 再次调用；脚本须幂等）。\n' +
         "  内建：--runner codex|claude|codex-sdk（自动隔离 workdir、续接 session、外层发回频道）。",
     );
     return 1;
@@ -2366,42 +3557,99 @@ export async function run(argv: string[]): Promise<number> {
   }
   const availableUpgrade = await resolveAvailableUpgrade(server);
   if (availableUpgrade !== null) console.error(`serve: ${availableUpgrade.message}\n  ${availableUpgrade.command}`);
-  return runServe({
-    server,
-    token,
-    channel,
-    since: loadCursor(channel),
-    stuck: loadStuck(channel),
-    onStuck: (st) => (st === null ? clearStuck(channel) : saveStuck(channel, st)),
-    sinceRev: loadRevCursor(channel),
-    cmd: cmd ?? "",
-    mentionsOnly: flags.all !== true,
-    skipBacklog: flags["replay-backlog"] !== true, // 默认跳过积压；--replay-backlog 才重放（#193）
-    onCursor: (c) => saveCursor(channel, c),
-    onRevCursor: (r) => saveRevCursor(channel, r),
-    advertise: () => advertiseServeWake(auth, channel),
-    fetchCharter: () => fetchChannelCharter(server, token, channel),
-    autoUpgrade: flags["auto-upgrade"] === true,
-    availableUpgrade,
-    refreshAvailableUpgrade: (current) => resolveAvailableUpgrade(server, current),
-    statusline: true,
-    builtinRunner: harness
-      ? {
-          server,
-          token,
-          channel,
-          harness,
-          workdir: expandHomePath(str(flags.workdir) ?? defaultRunnerWorkdir(channel)),
-          repo: str(flags.repo),
-        }
-      : undefined,
-    sdkRunner: useSdkRunner
-      ? {
-          server,
-          token,
-          channel,
-          workdir: expandHomePath(str(flags.workdir) ?? defaultRunnerWorkdir(channel)),
-        }
-      : undefined,
+  const explicitRunnerWorkdir = str(flags.workdir);
+  let runnerWorkdirPath = explicitRunnerWorkdir === undefined
+    ? null
+    : expandHomePath(explicitRunnerWorkdir);
+  const identityState: ServeIdentityBoundaryState = {
+    expectedPrincipal: null,
+    rejectedAccountToken: null,
+  };
+  try {
+    const initialBoundary = await verifyServeIdentityBoundary(server, auth, identityState);
+    if (!initialBoundary.ok) {
+      console.error(initialBoundary.reason);
+      return initialBoundary.code;
+    }
+    if (runnerWorkdirPath === null) {
+      runnerWorkdirPath = defaultRunnerWorkdir(channel, initialBoundary.namespace);
+    }
+  } catch {
+    // A transient startup outage should not prevent the WS supervisor from doing its own retry.
+    // The first successful /api/me below establishes the immutable identity boundary.
+  }
+  let firstAttach = true;
+  const lifecycle = (line: string) => {
+    const record = `${new Date().toISOString()} ${line}`;
+    if (runnerWorkdirPath !== null) appendServeLifecycleLog(runnerWorkdirPath, record);
+    console.error(`serve supervisor: ${line}`);
+  };
+  return superviseServe({
+    onLifecycle: lifecycle,
+    runOnce: async () => {
+      // 每次自愈都重读本地凭据与 OIDC 状态，避免用启动时快照把一次可恢复的 token
+      // 刷新变成永久离线。终局 auth/archived 仍由 isTerminalServeExit 停止。
+      const currentAuth = await resolveAuthDetailed();
+      if (!currentAuth.server || !currentAuth.token) return EXIT_AUTH;
+      const currentServer = currentAuth.server;
+      const currentToken = currentAuth.token;
+      // Cursor, stuck debt and model session are scoped to the original server+principal.  Token
+      // rotation is safe only inside that boundary; config switching must start a new serve process.
+      const boundary = await verifyServeIdentityBoundary(server, currentAuth, identityState);
+      if (!boundary.ok) {
+        console.error(`${boundary.reason}; exiting`);
+        return boundary.code;
+      }
+      const currentRunnerWorkdir = runnerWorkdirPath ?? defaultRunnerWorkdir(channel, boundary.namespace);
+      runnerWorkdirPath = currentRunnerWorkdir;
+      const skipBacklogThisAttach = firstAttach ? flags["replay-backlog"] !== true : false;
+      const result = await runServe({
+        server: currentServer,
+        token: currentToken,
+        channel,
+        since: loadCursor(channel),
+        stuck: loadStuck(channel),
+        onStuck: (st) => (st === null ? clearStuck(channel) : saveStuck(channel, st)),
+        sinceRev: loadRevCursor(channel),
+        cmd: cmd ?? "",
+        mentionsOnly: flags.all !== true,
+        // Only the process's first attachment applies the user's backlog policy.  Internal recovery
+        // always resumes from the durable cursor, so mentions received during the restart gap survive.
+        skipBacklog: skipBacklogThisAttach,
+        onWelcome: () => { firstAttach = false; },
+        onCursor: (c) => saveCursor(channel, c),
+        onRevCursor: (r) => saveRevCursor(channel, r),
+        advertise: () => advertiseServeWake(currentAuth, channel),
+        fetchCharter: () => fetchChannelCharter(currentServer, currentToken, channel),
+        autoUpgrade: flags["auto-upgrade"] === true,
+        availableUpgrade,
+        refreshAvailableUpgrade: (current) => resolveAvailableUpgrade(currentServer, current),
+        statusline: true,
+        runnerTimeoutMs,
+        builtinRunner: harness
+          ? {
+              server: currentServer,
+              token: currentToken,
+              channel,
+              harness,
+              workdir: currentRunnerWorkdir,
+              repo: str(flags.repo),
+            }
+          : undefined,
+        sdkRunner: useSdkRunner
+          ? {
+              server: currentServer,
+              token: currentToken,
+              channel,
+              workdir: currentRunnerWorkdir,
+            }
+          : undefined,
+      });
+      if (result === EXIT_AUTH && currentAuth.auth_source === "account_session") {
+        identityState.rejectedAccountToken = currentToken;
+        return EXIT_STREAM_ENDED;
+      }
+      return result;
+    },
   });
 }

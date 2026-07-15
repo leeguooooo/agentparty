@@ -72,7 +72,7 @@ function sendStatus(slug: string, token: string, state: "working" | "waiting" | 
 function addWebhook(
   slug: string,
   token: string,
-  hook: { name: string; url: string; secret: string; filter?: string },
+  hook: { name: string; url: string; secret: string; filter?: string; mode?: string },
 ) {
   return api(`/api/channels/${slug}/webhooks`, token, {
     method: "POST",
@@ -87,6 +87,53 @@ async function queueRows(slug: string) {
       .exec("SELECT webhook_name, attempts, next_retry_at FROM webhook_queue")
       .toArray()
       .map((r) => ({ webhook_name: String(r.webhook_name), attempts: Number(r.attempts) })),
+  );
+}
+
+async function webhookPayloadRows(
+  slug: string,
+  table: "webhook_queue" | "webhook_dead_letters",
+  seq: number,
+) {
+  const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+  return runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+    state.storage.sql
+      .exec(
+        `SELECT webhook_name, webhook_mode, payload
+           FROM ${table}
+          WHERE CAST(json_extract(payload, '$.seq') AS INTEGER) = ?
+          ORDER BY id`,
+        seq,
+      )
+      .toArray()
+      .map((row) => ({
+        webhook_name: String(row.webhook_name),
+        webhook_mode: row.webhook_mode === null ? null : String(row.webhook_mode),
+        payload: String(row.payload),
+      })),
+  );
+}
+
+async function directedDeliveryRows(slug: string, seq: number) {
+  const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+  return runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+    state.storage.sql
+      .exec(
+        `SELECT id, state, attempt, lease_connection_id, lease_adapter, last_error
+           FROM directed_deliveries
+          WHERE message_seq = ?
+          ORDER BY id`,
+        seq,
+      )
+      .toArray()
+      .map((row) => ({
+        id: String(row.id),
+        state: String(row.state),
+        attempt: Number(row.attempt),
+        lease_connection_id: row.lease_connection_id === null ? null : String(row.lease_connection_id),
+        lease_adapter: row.lease_adapter === null ? null : String(row.lease_adapter),
+        last_error: row.last_error === null ? null : String(row.last_error),
+      })),
   );
 }
 
@@ -183,7 +230,12 @@ describe("webhooks", () => {
     expect(text).not.toContain("secret");
     const { webhooks } = JSON.parse(text) as { webhooks: Record<string, unknown>[] };
     expect(webhooks).toHaveLength(1);
-    expect(webhooks[0]).toMatchObject({ name: "hermes", url: "https://hooks.test/wake", filter: "mentions" });
+    expect(webhooks[0]).toMatchObject({
+      name: "hermes",
+      url: "https://hooks.test/wake",
+      filter: "mentions",
+      mode: "notify",
+    });
 
     const roList = await api(`/api/channels/${slug}/webhooks`, ro.token);
     expect(roList.status).toBe(403);
@@ -216,6 +268,100 @@ describe("webhooks", () => {
       secret: "s".repeat(4097),
     });
     expect(tooLong.status).toBe(400);
+  });
+
+  it("binds agent mode only to the matching agent principal and exposes mode without principal", async () => {
+    const account = `${uniq("webhook-owner")}@example.com`;
+    const owner = await seedToken("agent", uniq("owner"), { owner: account });
+    const slug = await createChannel(owner.token);
+    const target = await seedToken("agent", "ClaimBot", { owner: account, channelScope: slug });
+
+    const wrongName = await addWebhook(slug, target.token, {
+      name: "someone-else",
+      url: "https://hooks.test/wrong",
+      secret: "s",
+      mode: "agent",
+    });
+    expect(wrongName.status).toBe(403);
+
+    const moderatorCannotBindForTarget = await addWebhook(slug, owner.token, {
+      name: target.name,
+      url: "https://hooks.test/owner-bind",
+      secret: "s",
+      mode: "agent",
+    });
+    expect(moderatorCannotBindForTarget.status).toBe(403);
+
+    const created = await addWebhook(slug, target.token, {
+      // Canonical agent matching follows mention routing: ASCII case is not identity-significant.
+      name: "claimbot",
+      url: "https://hooks.test/claim",
+      secret: "agent-secret",
+      mode: "agent",
+    });
+    expect(created.status).toBe(201);
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    const stored = await runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+      state.storage.sql
+        .exec("SELECT name, mode, target_owner FROM webhooks ORDER BY name")
+        .toArray()
+        .map((row) => ({
+          name: String(row.name),
+          mode: String(row.mode),
+          target_owner: row.target_owner === null ? null : String(row.target_owner),
+        })),
+    );
+    expect(stored).toEqual([{ name: target.name, mode: "agent", target_owner: account }]);
+
+    const list = await api(`/api/channels/${slug}/webhooks`, owner.token);
+    const listed = (await list.json()) as { webhooks: Record<string, unknown>[] };
+    expect(listed.webhooks[0]).toMatchObject({ name: target.name, mode: "agent" });
+    expect(listed.webhooks[0]).not.toHaveProperty("target_owner");
+    expect(listed.webhooks[0]).not.toHaveProperty("secret");
+  });
+
+  it("uses the token hash as the immutable principal for a legacy agent webhook", async () => {
+    const legacy = await seedToken("agent", "legacy-hook");
+    const slug = await createChannel(legacy.token);
+    const created = await addWebhook(slug, legacy.token, {
+      name: legacy.name,
+      url: "https://hooks.test/legacy",
+      secret: "s",
+      mode: "agent",
+    });
+    expect(created.status).toBe(201);
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    const row = await runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+      state.storage.sql
+        .exec("SELECT mode, target_owner FROM webhooks WHERE name = ?", legacy.name)
+        .one(),
+    );
+    expect(row.mode).toBe("agent");
+    expect(row.target_owner).toBe(`token-sha256:${await sha256Hex(legacy.token)}`);
+  });
+
+  it("rejects invalid agent mode identities and invalid modes", async () => {
+    const owner = await seedToken("agent");
+    const slug = await createChannel(owner.token);
+    const readonly = await seedToken("readonly", "readonly-hook", { channelScope: slug });
+
+    const wrongKind = await addWebhook(slug, readonly.token, {
+      name: readonly.name,
+      url: "https://hooks.test/readonly",
+      secret: "s",
+      mode: "agent",
+    });
+    expect(wrongKind.status).toBe(403);
+
+    const badMode = await addWebhook(slug, owner.token, {
+      name: owner.name,
+      url: "https://hooks.test/bad-mode",
+      secret: "s",
+      mode: "claim-everything",
+    });
+    expect(badMode.status).toBe(400);
   });
 
   it("caps webhook registrations per channel", async () => {
@@ -476,7 +622,215 @@ describe("webhooks", () => {
     ).toBe("broadcast to all");
   });
 
-  it("failed delivery is queued and the alarm retry drains it on success", async () => {
+  it("retract scrubs an agent webhook retry before alarm can repost private source text or restart work", async () => {
+    const account = `${uniq("retract-agent-owner")}@example.com`;
+    const sender = await seedToken("human", uniq("retract-sender"), { owner: account });
+    const slug = await createChannel(sender.token);
+    const target = await seedToken("agent", uniq("retract-agent"), {
+      owner: account,
+      channelScope: slug,
+    });
+    const url = "https://retract-agent-retry.test/run";
+    expect((await addWebhook(slug, target.token, {
+      name: target.name,
+      url,
+      secret: "agent-retract-secret",
+      filter: "mentions",
+      mode: "agent",
+    })).status).toBe(201);
+
+    fetchMock
+      .get("https://retract-agent-retry.test")
+      .intercept({ path: "/run", method: "POST" })
+      .reply(503, "down");
+    const privateText = `@${target.name} bearer sk-retracted-agent-source`;
+    const sent = await sendMessage(slug, sender.token, privateText, [target.name]);
+    expect(sent.status).toBe(200);
+    const { seq } = (await sent.json()) as { seq: number };
+
+    const queued = await webhookPayloadRows(slug, "webhook_queue", seq);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ webhook_name: target.name, webhook_mode: "agent" });
+    expect(queued[0]!.payload).toContain("sk-retracted-agent-source");
+    expect(await directedDeliveryRows(slug, seq)).toMatchObject([
+      { state: "claimed", attempt: 1, lease_adapter: "webhook" },
+    ]);
+
+    expect((await api(`/api/channels/${slug}/messages/${seq}/retract`, sender.token, {
+      method: "POST",
+    })).status).toBe(200);
+    const queuedImmediatelyAfterRetract = await webhookPayloadRows(slug, "webhook_queue", seq);
+
+    const retriedBodies: string[] = [];
+    fetchMock
+      .get("https://retract-agent-retry.test")
+      .intercept({ path: "/run", method: "POST" })
+      .reply(200, (opts) => {
+        retriedBodies.push(normalize(opts as { headers?: unknown; body?: unknown }).body);
+        return "accepted";
+      });
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE webhook_queue SET next_retry_at = ? WHERE CAST(json_extract(payload, '$.seq') AS INTEGER) = ?",
+        Date.now() - 1,
+        seq,
+      );
+      await instance.onAlarm();
+    });
+    const bodiesPostedByAlarm = [...retriedBodies];
+    if (bodiesPostedByAlarm.length === 0) await fetch(url, { method: "POST" });
+
+    expect(bodiesPostedByAlarm).toEqual([]);
+    expect(bodiesPostedByAlarm.join("\n")).not.toContain("sk-retracted-agent-source");
+    expect(queuedImmediatelyAfterRetract).toHaveLength(0);
+    expect(await webhookPayloadRows(slug, "webhook_queue", seq)).toHaveLength(0);
+    expect(await webhookPayloadRows(slug, "webhook_dead_letters", seq)).toHaveLength(0);
+    expect(await directedDeliveryRows(slug, seq)).toMatchObject([
+      {
+        state: "failed",
+        lease_connection_id: null,
+        lease_adapter: null,
+        last_error: expect.any(String),
+      },
+    ]);
+  });
+
+  it("retract removes an agent dead-letter so moderator redeliver cannot repost or reclaim its work", async () => {
+    const account = `${uniq("retract-dead-owner")}@example.com`;
+    const sender = await seedToken("human", uniq("retract-dead-sender"), { owner: account });
+    const slug = await createChannel(sender.token);
+    const target = await seedToken("agent", uniq("retract-dead-agent"), {
+      owner: account,
+      channelScope: slug,
+    });
+    const origin = "https://retract-agent-dead.test";
+    const url = `${origin}/run`;
+    expect((await addWebhook(slug, target.token, {
+      name: target.name,
+      url,
+      secret: "agent-dead-secret",
+      filter: "mentions",
+      mode: "agent",
+    })).status).toBe(201);
+
+    fetchMock.get(origin).intercept({ path: "/run", method: "POST" }).reply(503, "down");
+    const privateText = `@${target.name} oauth=retracted-dead-letter-source`;
+    const sent = await sendMessage(slug, sender.token, privateText, [target.name]);
+    expect(sent.status).toBe(200);
+    const { seq } = (await sent.json()) as { seq: number };
+    expect((await webhookPayloadRows(slug, "webhook_queue", seq))[0]!.payload).toContain(
+      "retracted-dead-letter-source",
+    );
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        `UPDATE webhook_queue
+            SET attempts = ?, next_retry_at = ?
+          WHERE CAST(json_extract(payload, '$.seq') AS INTEGER) = ?`,
+        WEBHOOK_MAX_RETRIES,
+        Date.now() - 1,
+        seq,
+      );
+      await instance.onAlarm();
+    });
+    const deadBeforeRetract = await webhookPayloadRows(slug, "webhook_dead_letters", seq);
+    expect(deadBeforeRetract).toHaveLength(1);
+    expect(deadBeforeRetract[0]!.payload).toContain("retracted-dead-letter-source");
+    expect(await directedDeliveryRows(slug, seq)).toMatchObject([
+      { state: "failed", lease_connection_id: null, lease_adapter: null },
+    ]);
+
+    expect((await api(`/api/channels/${slug}/messages/${seq}/retract`, sender.token, {
+      method: "POST",
+    })).status).toBe(200);
+    const deadImmediatelyAfterRetract = await webhookPayloadRows(slug, "webhook_dead_letters", seq);
+
+    const redeliveredBodies: string[] = [];
+    fetchMock.get(origin).intercept({ path: "/run", method: "POST" }).reply(200, (opts) => {
+      redeliveredBodies.push(normalize(opts as { headers?: unknown; body?: unknown }).body);
+      return "accepted";
+    });
+    const redeliver = await api(
+      `/api/channels/${slug}/webhooks/${encodeURIComponent(target.name)}/redeliver`,
+      sender.token,
+      { method: "POST" },
+    );
+    expect(redeliver.status).toBe(200);
+    const redeliverResult = (await redeliver.json()) as {
+      redelivered: number;
+      failed: number;
+      remaining: number;
+    };
+    const bodiesPostedByRedeliver = [...redeliveredBodies];
+    if (bodiesPostedByRedeliver.length === 0) await fetch(url, { method: "POST" });
+
+    expect(bodiesPostedByRedeliver).toEqual([]);
+    expect(bodiesPostedByRedeliver.join("\n")).not.toContain("retracted-dead-letter-source");
+    expect(deadImmediatelyAfterRetract).toHaveLength(0);
+    expect(redeliverResult).toMatchObject({ redelivered: 0, failed: 0, remaining: 0 });
+    expect(await webhookPayloadRows(slug, "webhook_queue", seq)).toHaveLength(0);
+    expect(await webhookPayloadRows(slug, "webhook_dead_letters", seq)).toHaveLength(0);
+    expect(await directedDeliveryRows(slug, seq)).toMatchObject([
+      { state: "failed", lease_connection_id: null, lease_adapter: null },
+    ]);
+  });
+
+  it("retract scrubs a notify-mode webhook retry before alarm can repost the original body", async () => {
+    const sender = await seedToken("agent", uniq("notify-retract-sender"));
+    const slug = await createChannel(sender.token);
+    const hook = uniq("notify-retract-hook");
+    const origin = "https://retract-notify.test";
+    const url = `${origin}/wake`;
+    expect((await addWebhook(slug, sender.token, {
+      name: hook,
+      url,
+      secret: "notify-retract-secret",
+      filter: "mentions",
+      mode: "notify",
+    })).status).toBe(201);
+
+    fetchMock.get(origin).intercept({ path: "/wake", method: "POST" }).reply(503, "down");
+    const privateText = `@${hook} password=retracted-notify-source`;
+    const sent = await sendMessage(slug, sender.token, privateText, [hook]);
+    expect(sent.status).toBe(200);
+    const { seq } = (await sent.json()) as { seq: number };
+    const queued = await webhookPayloadRows(slug, "webhook_queue", seq);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ webhook_name: hook, webhook_mode: "notify" });
+    expect(queued[0]!.payload).toContain("retracted-notify-source");
+
+    expect((await api(`/api/channels/${slug}/messages/${seq}/retract`, sender.token, {
+      method: "POST",
+    })).status).toBe(200);
+    const queuedImmediatelyAfterRetract = await webhookPayloadRows(slug, "webhook_queue", seq);
+
+    const retriedBodies: string[] = [];
+    fetchMock.get(origin).intercept({ path: "/wake", method: "POST" }).reply(200, (opts) => {
+      retriedBodies.push(normalize(opts as { headers?: unknown; body?: unknown }).body);
+      return "ok";
+    });
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE webhook_queue SET next_retry_at = ? WHERE CAST(json_extract(payload, '$.seq') AS INTEGER) = ?",
+        Date.now() - 1,
+        seq,
+      );
+      await instance.onAlarm();
+    });
+    const bodiesPostedByAlarm = [...retriedBodies];
+    if (bodiesPostedByAlarm.length === 0) await fetch(url, { method: "POST" });
+
+    expect(bodiesPostedByAlarm).toEqual([]);
+    expect(bodiesPostedByAlarm.join("\n")).not.toContain("retracted-notify-source");
+    expect(queuedImmediatelyAfterRetract).toHaveLength(0);
+    expect(await webhookPayloadRows(slug, "webhook_queue", seq)).toHaveLength(0);
+    expect(await webhookPayloadRows(slug, "webhook_dead_letters", seq)).toHaveLength(0);
+  });
+
+  it("same-name re-registration cannot inherit an older notify retry payload", async () => {
     const { token } = await seedToken("agent");
     const slug = await createChannel(token);
     expect(
@@ -499,33 +853,31 @@ describe("webhooks", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ webhook_name: "hermes", attempts: 1 });
 
-    // 同名注册轮换 secret；同一 payload 的重试 ID 必须保持不变，HMAC/Bearer 则使用新 secret。
+    // Re-registering is a new immutable endpoint identity. The old payload must never be signed
+    // with the new secret or sent to the new URL, even when the public webhook name is unchanged.
     expect(
-      (await addWebhook(slug, token, { name: "hermes", url: "https://down.test/wake", secret: "rotated" }))
+      (await addWebhook(slug, token, { name: "hermes", url: "https://replacement.test/wake", secret: "rotated" }))
         .status,
     ).toBe(201);
-    fetchMock
-      .get("https://down.test")
-      .intercept({ path: "/wake", method: "POST" })
-      .reply(200, (opts) => {
-        captured.push(normalize(opts as { headers?: unknown; body?: unknown }));
-        return "ok";
-      });
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    let dead: Record<string, unknown>[] = [];
     await runInDurableObject(stub, async (instance: ChannelDO, state) => {
       state.storage.sql.exec("UPDATE webhook_queue SET next_retry_at = ?", Date.now() - 1);
       await instance.onAlarm();
+      dead = state.storage.sql
+        .exec("SELECT registration_id, webhook_mode, last_error FROM webhook_dead_letters")
+        .toArray();
     });
     rows = await queueRows(slug);
     expect(rows).toHaveLength(0);
-    expect(captured).toHaveLength(2);
-    expect(captured[1]!.body).toBe(captured[0]!.body);
-    expect(captured[1]!.headers["x-request-id"]).toBe(captured[0]!.headers["x-request-id"]);
+    expect(captured).toHaveLength(1);
     expect(captured[0]!.headers.authorization).toBe("Bearer s");
-    expect(captured[1]!.headers.authorization).toBe("Bearer rotated");
-    expect(captured[1]!.headers["x-webhook-signature"]).toBe(
-      await hmacHex("rotated", captured[1]!.body),
-    );
+    expect(dead).toHaveLength(1);
+    expect(dead[0]).toMatchObject({
+      webhook_mode: "notify",
+      last_error: "webhook registration changed; refusing cross-registration retry",
+    });
+    expect(String(dead[0]!.registration_id)).toBeTruthy();
   });
 
   it("drops after 3 failed retries and posts a system status to the channel", async () => {

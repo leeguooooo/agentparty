@@ -3,7 +3,7 @@
 // 不直接绕过 worker 给 do 发内部请求，因为权威 x-ap-handle 是 worker 层算出来再转发的（Task A6）。
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { api, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
+import { api, completeCapabilityHello, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
 
 // 带自定义头做 ws 升级（同 ws-header-injection.spec.ts 的 openRaw），用于模拟客户端在升级请求里
 // 夹带伪造 x-ap-handle。worker 会先剥离所有客户端注入的 x-ap-* 头，再按账号的真实 handle（若有）
@@ -22,6 +22,9 @@ async function openWithForgedHeader(
   const first = await new Promise<Record<string, unknown>>((resolve) => {
     ws.addEventListener("message", (e) => resolve(JSON.parse(e.data as string)), { once: true });
   });
+  if (first.type === "welcome") {
+    ws.send(JSON.stringify({ type: "hello", since: 0, directed_delivery: "v1" }));
+  }
   return { ws, first };
 }
 
@@ -48,7 +51,7 @@ describe("do consumes x-ap-handle (Task A7)", () => {
     const slug = await createChannel(human.token);
 
     const ws = await WsClient.open(slug, human.token);
-    const welcome = await ws.nextOfType("welcome");
+    const welcome = await completeCapabilityHello(ws);
     // welcome.participants 走 ConnState → senderFromIdentity 同一条镜像路径，顺手断言一次
     expect(welcome.participants).toContainEqual({ name: human.name, kind: "human", owner, handle });
 
@@ -70,8 +73,7 @@ describe("do consumes x-ap-handle (Task A7)", () => {
 
     // 历史补拉（hello since=0）：新连接读回同一条消息，sender.handle 仍在 —— 证明落库了，不是只在内存里现算
     const reader = await WsClient.open(slug, human.token);
-    await reader.nextOfType("welcome");
-    reader.send({ type: "hello", since: 0 });
+    await completeCapabilityHello(reader);
     const back = await reader.nextOfType("msg");
     expect(back.sender.handle).toBe(handle);
     reader.close();

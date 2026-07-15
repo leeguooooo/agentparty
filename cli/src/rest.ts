@@ -13,6 +13,8 @@ import {
   type CompletionReview,
   type CompletionReviewPolicy,
   type DecisionMode,
+  type DecisionRequest,
+  type DecisionResolution,
   type IdentityEraseSummary,
   type IdentityExportData,
   EXIT_ARCHIVED,
@@ -100,7 +102,10 @@ export interface WebhookInfo {
   name: string;
   url: string;
   filter: WebhookFilter;
+  mode?: WebhookMode;
 }
+
+export type WebhookMode = "notify" | "agent";
 
 export interface LarkNotifyStatus {
   enabled: boolean;
@@ -560,7 +565,7 @@ export async function addWebhook(
   server: string,
   token: string,
   slug: string,
-  body: { name: string; url: string; secret: string; filter: WebhookFilter },
+  body: { name: string; url: string; secret: string; filter: WebhookFilter; mode?: WebhookMode },
 ): Promise<void> {
   await req(server, `/api/channels/${encodeURIComponent(slug)}/webhooks`, {
     method: "POST",
@@ -1208,7 +1213,12 @@ export async function postMessage(
   token: string,
   slug: string,
   payload: MessagePayload,
-): Promise<{ seq: number; completion_review?: CompletionReview }> {
+): Promise<{
+  seq: number;
+  completion_review?: CompletionReview;
+  decision_request?: DecisionRequest;
+  decision_resolution?: DecisionResolution;
+}> {
   // 每次发送生成一个新的幂等键：调用方不必操心；重试（客户端超时重发 / 服务端 DO-reset clone 重发）
   // 携带同一 body 即同一 key，服务端据此去重。调用方若已带 key（少见）则尊重之。
   const body: MessagePayload = "idempotency_key" in payload && payload.idempotency_key !== undefined
@@ -1218,7 +1228,12 @@ export async function postMessage(
     method: "POST",
     headers: bearerJson(token),
     body: JSON.stringify(body),
-  })) as { seq: number; completion_review?: CompletionReview };
+  })) as {
+    seq: number;
+    completion_review?: CompletionReview;
+    decision_request?: DecisionRequest;
+    decision_resolution?: DecisionResolution;
+  };
 }
 
 // 附件上传（#176/#109）：blob 进 R2，返回引用元数据；随消息带在 attachments 字段里。

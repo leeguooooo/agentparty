@@ -151,6 +151,63 @@ describe("watch --once 落后量告知 (#199)", () => {
 });
 
 describe("watch --once pending wake replay (#508)", () => {
+  test("unconfirmed directed debt re-arms for a fresh claim and never uses blind REST replay", async () => {
+    home = mkdtempSync(join(tmpdir(), "ap-watch-directed-rearm-"));
+    let messageFetches = 0;
+    let adapterRegistrations = 0;
+    apiServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/channels/dev/messages" && req.method === "GET") {
+          messageFetches += 1;
+          return Response.json({ messages: [msgFrame(10, "must not replay", { mentions: ["me"] })] });
+        }
+        if (srv.upgrade(req, { data: undefined })) return;
+        return new Response("not found", { status: 404 });
+      },
+      websocket: {
+        message(ws, raw) {
+          const frame = JSON.parse(String(raw)) as { type: string };
+          if (frame.type === "hello") {
+            ws.send(JSON.stringify({ ...welcomeFrame(10, "me"), directed_delivery: "v1" }));
+          } else if (frame.type === "delivery_adapter") {
+            adapterRegistrations += 1;
+            ws.send(JSON.stringify({ type: "error", code: "archived", message: "stop after re-arm proof" }));
+          }
+        },
+      },
+    });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ server: `http://127.0.0.1:${apiServer.port}`, token: "ap_tok" }),
+    );
+    const dir = join(home, "state", workspaceId(process.cwd()));
+    mkdirSync(dir, { recursive: true });
+    const debt = {
+      seq: 10,
+      delivery_id: "delivery-10",
+      work_id: "work-10",
+      continuation_ref: "continuation-10",
+      delivery_acceptance: "unconfirmed",
+      attempts: 0,
+      source: "watch",
+    };
+    writeFileSync(
+      join(dir, "state.json"),
+      JSON.stringify({ channel: "dev", cursor: 10, cursors: { dev: { cursor: 10, stuck: debt } } }),
+    );
+
+    const result = await runCli(["watch", "dev", "--once", "--mentions-only", "--json"]);
+    expect(result.code).not.toBe(0);
+    expect(adapterRegistrations).toBe(1);
+    expect(messageFetches).toBe(0);
+    expect(result.stdout).not.toContain("watch_replay");
+    expect(result.stdout).not.toContain("must not replay");
+    expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).cursors.dev.stuck).toEqual(debt);
+  }, 15_000);
+
   test("重挂先从 REST 重放欠账，--latest 也不能越过，且不再建立 WS", async () => {
     home = mkdtempSync(join(tmpdir(), "ap-watch-pending-replay-"));
     const pending = msgFrame(10, "@me must survive reaper", { mentions: ["me"] });

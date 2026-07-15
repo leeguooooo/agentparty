@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SELF, env } from "cloudflare:test";
-import { api, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
+import { api, completeCapabilityHello, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
 
 describe("channels", () => {
   it("creates and lists a channel", async () => {
@@ -189,7 +189,7 @@ describe("channels", () => {
     expect(rejectedWs.status).toBe(403);
 
     const ws = await WsClient.open(slug, ro.token, "query");
-    expect((await ws.nextOfType("welcome")).type).toBe("welcome");
+    expect((await completeCapabilityHello(ws)).type).toBe("welcome");
     ws.send({ type: "send", kind: "message", body: "readonly", mentions: [], reply_to: null });
     expect((await ws.nextOfType("error")).code).toBe("unauthorized");
     ws.close();

@@ -77,6 +77,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
     for (let i = 1; i <= 3; i++) {
       ws.send({ type: "send", kind: "message", body: `m${i}`, mentions: [], reply_to: null });
       const sent = await ws.nextOfType("sent");
@@ -90,8 +91,8 @@ describe("websocket", () => {
 
   it("extracts @name from the body into mentions (bare send should wake the target)", async () => {
     const { token } = await seedToken("agent");
-    await seedToken("agent", "bob");
-    await seedToken("agent", "carol.dev");
+    const bob = await seedToken("agent", "bob");
+    const carol = await seedToken("agent", "carol.dev");
     await seedToken("agent", "agent-a");
     const nicknameTarget = await seedToken("agent");
     const unicodeCaseTarget = await seedToken("agent");
@@ -112,16 +113,17 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
     // 正文打 @bob，mentions 数组留空——服务端应把 bob 提取进 mentions
     ws.send({ type: "send", kind: "message", body: "hey @BOB and @carol.dev, ping", mentions: [], reply_to: null });
     await ws.nextOfType("sent");
     const echo = await ws.nextOfType("msg");
-    expect(echo.mentions).toEqual(["bob", "carol.dev"]);
+    expect(echo.mentions).toEqual([bob.name, carol.name]);
     // email 里的 @ 不算，显式 mention 与正文 @ 去重合并
-    ws.send({ type: "send", kind: "message", body: "mail me@x.com about @bob", mentions: ["bob"], reply_to: null });
+    ws.send({ type: "send", kind: "message", body: `mail me@x.com about @${bob.name}`, mentions: [bob.name], reply_to: null });
     await ws.nextOfType("sent");
     const echo2 = await ws.nextOfType("msg");
-    expect(echo2.mentions).toEqual(["bob"]); // 去重，且 me@x.com 不误提
+    expect(echo2.mentions).toEqual([bob.name]); // 去重，且 me@x.com 不误提
     ws.send({
       type: "send",
       kind: "message",
@@ -147,8 +149,8 @@ describe("websocket", () => {
     expect((await ws.nextOfType("msg")).mentions).toEqual([unicodeCaseTarget.name]);
     ws.send({ type: "send", kind: "message", body: "请 @éclair 确认", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "unknown mention @éclair",
+      code: "mention_not_found",
+      message: expect.stringContaining("@éclair"),
     });
     ws.send({ type: "send", kind: "message", body: "请 @casenick 确认", mentions: [], reply_to: null });
     await ws.nextOfType("sent");
@@ -161,43 +163,45 @@ describe("websocket", () => {
     ).bind(ambiguousTarget.name, "collision552", Date.now(), Date.now()).run();
     ws.send({ type: "send", kind: "message", body: "请@collision552看一下", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "ambiguous mention @collision552",
+      code: "mention_ambiguous",
+      message: expect.stringContaining("@collision552"),
     });
 
     ws.send({ type: "send", kind: "message", body: "请@ghost看一下", mentions: [], reply_to: null });
     const error = await ws.nextOfType("error");
-    expect(error).toMatchObject({ code: "bad_request", message: "unknown mention @ghost" });
+    expect(error).toMatchObject({ code: "mention_not_found", message: expect.stringContaining("@ghost") });
     ws.send({ type: "send", kind: "message", body: "请@bobcat看一下", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "unknown mention @bobcat",
+      code: "mention_not_found",
+      message: expect.stringContaining("@bobcat"),
     });
     ws.send({ type: "send", kind: "message", body: "请 @全体 看一下", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "unsupported mention @全体",
+      code: "mention_not_found",
+      message: expect.stringContaining("@全体"),
     });
     ws.send({ type: "send", kind: "message", body: "请@全体看一下", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "unsupported mention @全体",
+      code: "mention_not_found",
+      message: expect.stringContaining("@全体"),
     });
     ws.send({ type: "send", kind: "message", body: "reserved", mentions: ["SYSTEM"], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
-      code: "bad_request",
-      message: "reserved mention @system",
+      code: "mention_not_found",
+      message: expect.stringMatching(/@system/i),
     });
     ws.close();
   });
 
   it("hello since=1 backfills only seq 2 and 3", async () => {
     const { token } = await seedToken("agent");
+    const target = await seedToken("agent");
     const slug = await createChannel(token);
     const sender = await WsClient.open(slug, token);
     await sender.nextOfType("welcome");
+    sender.send({ type: "hello", since: 0 });
     for (let i = 1; i <= 3; i++) {
-      sender.send({ type: "send", kind: "message", body: `m${i}`, mentions: ["bob"], reply_to: null });
+      sender.send({ type: "send", kind: "message", body: `m${i}`, mentions: [target.name], reply_to: null });
       await sender.nextOfType("sent");
     }
     sender.close();
@@ -207,7 +211,7 @@ describe("websocket", () => {
     expect(welcome.last_seq).toBe(3);
     reader.send({ type: "hello", since: 1 });
     const first = await reader.nextOfType("msg");
-    expect(first).toMatchObject({ seq: 2, body: "m2", mentions: ["bob"], reply_to: null });
+    expect(first).toMatchObject({ seq: 2, body: "m2", mentions: [target.name], reply_to: null });
     const second = await reader.nextOfType("msg");
     expect(second).toMatchObject({ seq: 3, body: "m3" });
     reader.close();
@@ -218,6 +222,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const sender = await WsClient.open(slug, token);
     await sender.nextOfType("welcome");
+    sender.send({ type: "hello", since: 0 });
     for (let i = 1; i <= 3; i++) {
       sender.send({ type: "send", kind: "message", body: `m${i}`, mentions: [], reply_to: null });
       await sender.nextOfType("sent");
@@ -254,6 +259,7 @@ describe("websocket", () => {
     caughtUp.send({ type: "hello", since: 3, since_rev: 1 });
     const fence = await WsClient.open(slug, token);
     await fence.nextOfType("welcome");
+    fence.send({ type: "hello", since: 3, since_rev: 1 });
     fence.send({ type: "send", kind: "message", body: "fence", mentions: [], reply_to: null });
     await fence.nextOfType("sent");
     fence.close();
@@ -267,6 +273,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const sender = await WsClient.open(slug, token);
     await sender.nextOfType("welcome");
+    sender.send({ type: "hello", since: 0 });
     sender.send({ type: "send", kind: "message", body: "kickoff", mentions: [], reply_to: null });
     await sender.nextOfType("sent");
     await sender.nextOfType("msg");
@@ -316,9 +323,11 @@ describe("websocket", () => {
     const slug = await createChannel(agent.token);
     const watcher = await WsClient.open(slug, human.token);
     await watcher.nextOfType("welcome");
+    watcher.send({ type: "hello", since: 0 });
 
     const worker = await WsClient.open(slug, agent.token);
     await worker.nextOfType("welcome");
+    worker.send({ type: "hello", since: 0 });
     worker.send({
       type: "send",
       kind: "status",
@@ -553,6 +562,7 @@ describe("websocket", () => {
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, ro.token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
     ws.send({ type: "send", kind: "message", body: "hi", mentions: [], reply_to: null });
     const err = await ws.nextOfType("error");
     expect(err.code).toBe("unauthorized");
@@ -627,8 +637,10 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const victim = await WsClient.open(slug, token);
     await victim.nextOfType("welcome");
+    victim.send({ type: "hello", since: 0 });
     const bystander = await WsClient.open(slug, other.token);
     await bystander.nextOfType("welcome");
+    bystander.send({ type: "hello", since: 0 });
 
     const del = await SELF.fetch(`http://ap.test/api/tokens/${name}`, {
       method: "DELETE",
@@ -658,6 +670,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
 
     await env.DB.prepare("UPDATE tokens SET revoked_at = ? WHERE name = ?")
       .bind(Date.now(), name)
@@ -740,6 +753,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
     ws.send({ type: "send", kind: "status", state: "working", note: "x", mentions: [], role: "developer" });
     const err = await ws.nextOfType("error");
     expect(err).toMatchObject({ type: "error", code: "bad_request" });
@@ -753,6 +767,7 @@ describe("websocket", () => {
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
     await ws.nextOfType("welcome");
+    ws.send({ type: "hello", since: 0 });
     ws.send({ type: "send", kind: "status", state: "working", note: "handling backend", mentions: [], role: "worker" });
     const sent = await ws.nextOfType("sent");
     expect(sent.type).toBe("sent");

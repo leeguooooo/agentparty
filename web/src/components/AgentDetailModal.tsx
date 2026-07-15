@@ -53,6 +53,8 @@ export function AgentDetailModal({ name, display, kind, owner, online, presence,
   const wake = presence !== null ? wakeableState(presence, now) : null;
   const busy = presence?.busy === true;
   const queueDepth = busy && typeof presence?.queue_depth === "number" ? presence.queue_depth : null;
+  const waitingOwnerCount =
+    typeof presence?.waiting_owner_count === "number" && presence.waiting_owner_count > 0 ? presence.waiting_owner_count : 0;
   const currentTask = typeof presence?.current_task === "number" ? presence.current_task : null;
   const heartbeatAt = currentTask !== null && typeof presence?.heartbeat_at === "number" ? presence.heartbeat_at : null;
   const paused = presence?.paused === true;
@@ -92,6 +94,14 @@ export function AgentDetailModal({ name, display, kind, owner, online, presence,
               <div className="agent-detail-fact">
                 <dt>{t("AgentDetailModal.state")}</dt>
                 <dd className="t-mono">{state}</dd>
+              </div>
+              <div className="agent-detail-fact">
+                <dt>{t("AgentDetailModal.waitingOwner")}</dt>
+                <dd className="t-mono">
+                  {waitingOwnerCount > 0
+                    ? t("AgentDetailModal.waitingOwnerCount", { count: String(waitingOwnerCount) })
+                    : t("AgentDetailModal.waitingOwnerNone")}
+                </dd>
               </div>
               {presence?.note !== null && presence?.note !== undefined && presence.note !== "" && (
                 <div className="agent-detail-fact">

@@ -35,7 +35,7 @@ session name), so mention the "@handle" shown here — not a UUID session name.
 Options:
   --channel C   read channel C instead of the bound channel
   --json        emit one JSON object per line
-                (name/kind/tier/wake/wake_unverified/busy/queue_depth/current_task/task_started_at/heartbeat_at/agent_session/account/handle/display_name/age_ms/read_seq)`;
+                (name/kind/tier/wake/wake_unverified/busy/queue_depth/waiting_owner_count/current_task/task_started_at/heartbeat_at/agent_session/account/handle/display_name/age_ms/read_seq)`;
 
 const STALE_MS = 60_000; // 与 DO presence 扫描一致
 const DEAD_MS = 14 * 24 * 60 * 60 * 1000; // 14 天没露面视为幽灵，不再列
@@ -69,6 +69,8 @@ interface Row {
   // busy（#103）：serve 正串行处理一条 wake，回复会慢。让人别把「@ 了没立刻回」误判成失联、反复 @。
   busy?: true;
   queue_depth?: number; // 忙时排在身后、尚未处理的 wake 数；>0 才带出
+  // 等 owner 的 work 已释放 runner，不应冒充 busy/current_task；单独展示，避免“没在跑”被误判成已完成。
+  waiting_owner_count?: number;
   // 每任务进度/心跳（#228）：正在处理哪条 wake（触发 seq）、何时开始、最近心跳。让频道区分
   // 「还在干、活到 T」与「卡死」——比裸 busy 更细。仅在有活跃任务时带出。
   current_task?: number;
@@ -126,6 +128,9 @@ export function classify(e: PresenceEntry, now: number): Row | null {
     // busy/queue_depth（#103）：仅在服务端标了 busy（目标可达且自报忙）时带出；离线态服务端本就不下发 busy。
     ...(e.busy === true ? { busy: true as const } : {}),
     ...(e.busy === true && typeof e.queue_depth === "number" && e.queue_depth > 0 ? { queue_depth: e.queue_depth } : {}),
+    ...(typeof e.waiting_owner_count === "number" && e.waiting_owner_count > 0
+      ? { waiting_owner_count: e.waiting_owner_count }
+      : {}),
     // 每任务进度/心跳（#228）：服务端只在 state != offline 且有活跃任务时下发 current_task，原样带出。
     ...(typeof e.current_task === "number"
       ? {
@@ -183,6 +188,12 @@ export function busyNote(r: Row): string {
   if (r.busy !== true) return "";
   const queued = r.queue_depth !== undefined && r.queue_depth > 0 ? ` · ${r.queue_depth} queued` : "";
   return ` · ⏳ busy${queued}`;
+}
+
+// waiting_owner 是挂起的 work，不占 runner，也不等于 agent 失联；与 busy/queue 分开展示。
+export function waitingOwnerNote(r: Row): string {
+  const count = r.waiting_owner_count;
+  return typeof count === "number" && count > 0 ? ` · 💬 ${count} waiting owner` : "";
 }
 
 // 每任务进度/心跳标注（#228）：比 busy 更细——「▶ seq X」是正在处理哪条 wake，「♥ Ns」是心跳新鲜度。
@@ -293,7 +304,7 @@ export async function run(argv: string[]): Promise<number> {
           ? ` · ${r.wake_unverified === true ? "unverified" : "verified"}${r.wake ? ` (${r.wake})` : ""}`
           : "";
       const age = r.tier === "online" ? "" : ` (${humanAge(r.age_ms)})`;
-      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${identityNote(r)}${busyNote(r)}${taskNote(r, now)}${sessionNote(r)}${wake}${read}${duplicate}${age}`);
+      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${identityNote(r)}${busyNote(r)}${waitingOwnerNote(r)}${taskNote(r, now)}${sessionNote(r)}${wake}${read}${duplicate}${age}`);
     }
     return 0;
   } catch (e) {

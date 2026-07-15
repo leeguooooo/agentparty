@@ -155,6 +155,37 @@ describe("profile daemon resilience (#115)", () => {
     expect(logs.some((l) => l.includes("will retry next poll"))).toBe(true);
   });
 
+  test("a profile child keeps its initial backlog policy across failures before welcome", async () => {
+    let attempts = 0;
+    let invitePolls = 0;
+    const policies: Array<boolean | undefined> = [];
+    const { opts } = baseOpts({
+      once: false,
+      skipBacklog: true,
+      listInvites: async () => {
+        invitePolls += 1;
+        if (attempts >= 2) throw new RestError(401, "unauthorized", "stop after child retry");
+        // Keep returning the same invite while its child supervisor owns the running slot.
+        return [invite("alpha")];
+      },
+      runChannelServe: async (serveOpts) => {
+        policies.push(serveOpts.skipBacklog);
+        attempts += 1;
+        if (attempts === 1) throw new Error("pre-welcome child crash"); // no welcome callback
+        serveOpts.onWelcome?.();
+        return 0;
+      },
+      sleep: async () => { await Promise.resolve(); },
+    });
+
+    await withHome(async () => {
+      await expect(runProfileServe(opts)).rejects.toThrow("stop after child retry");
+    });
+
+    expect(invitePolls).toBeGreaterThanOrEqual(1);
+    expect(policies).toEqual([true, true]);
+  });
+
   test("projectAgentChildName stays stable (guard against fixture drift)", () => {
     expect(projectAgentChildName("herness-dev", "alpha")).toBe(projectAgentChildName("herness-dev", "alpha"));
   });

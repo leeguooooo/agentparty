@@ -109,6 +109,7 @@ describe("AgentDetailModal (#272)", () => {
       presence: presenceEntry({
         busy: true,
         queue_depth: 3,
+        waiting_owner_count: 2,
         current_task: 510,
         heartbeat_at: Date.now(),
         paused: true,
@@ -126,6 +127,7 @@ describe("AgentDetailModal (#272)", () => {
     });
     const text = JSON.stringify(renderer!.toJSON());
     expect(text).toContain("忙碌 · 排队 3 条");
+    expect(text).toContain("有2 项工作等待 owner");
     expect(text).toContain("510");
     expect(text).toContain("已暂停");
     expect(text).toContain("codex");

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_ARCHIVED } from "@agentparty/shared";
@@ -97,5 +97,30 @@ describe("serve writes local WS health (#254)", () => {
     expect(code).toBe(EXIT_ALREADY_SERVING);
     // No health record for our workspace should exist — the losing instance never claimed the channel.
     expect(readHealthCache()).toBeNull();
+  });
+
+  test("health/statusline filesystem failures never crash the WS callbacks or delivery loop", async () => {
+    // Point AGENTPARTY_HOME at a regular file: every health/statusline mkdir/write/clear operation
+    // deterministically fails with ENOTDIR, including onStatus callbacks and welcome/msg writes.
+    rmSync(home, { recursive: true, force: true });
+    writeFileSync(home, "not a directory");
+    const seen: number[] = [];
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "still deliver", { mentions: ["me"] })), 10);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 60);
+    });
+
+    const code = await runServe(opts({
+      server: server.url,
+      statusline: true,
+      advertise: async () => {},
+      post: async () => ({ seq: 99 }),
+      runCommand: async (frame) => { seen.push(frame.seq); },
+    }));
+
+    expect(code).toBe(EXIT_ARCHIVED);
+    expect(seen).toEqual([1]);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, postMessage, seedToken, uniq } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 interface MsgLike {
   seq: number;
@@ -79,7 +79,7 @@ describe("channel decision protocol (#284)", () => {
     const seq = ((await req.json()) as MsgLike).seq;
 
     const ws = await WsClient.open(slug, human.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     const resolved = await api(`/api/channels/${slug}/messages/${seq}/decision`, human.token, {
       method: "POST",
       body: JSON.stringify({ action: "approve" }),
@@ -101,12 +101,21 @@ describe("channel decision protocol (#284)", () => {
     expect(update).toMatchObject({ type: "message_update", target_seq: seq, action: "decision", message: { decision_resolution: { state: "resolved" } } });
     ws.close();
 
-    // second response is rejected — a decision resolves once
+    // A retried response is idempotent: return the original resolution/reply without inserting
+    // another decision_response, even if the stale retry carries a different action.
     const again = await api(`/api/channels/${slug}/messages/${seq}/decision`, human.token, {
       method: "POST",
       body: JSON.stringify({ action: "reject", reason: "changed my mind" }),
     });
-    expect(again.status).toBe(409);
+    expect(again.status).toBe(200);
+    const repeated = (await again.json()) as { message: MsgLike; reply: MsgLike };
+    expect(repeated.message.decision_resolution).toMatchObject({
+      state: "resolved",
+      chosen_index: 0,
+      chosen_option: "approve",
+    });
+    expect(repeated.reply.seq).toBe(payload.reply.seq);
+    expect((await history(slug, human.token)).filter((message) => message.decision_response?.request_seq === seq)).toHaveLength(1);
   });
 
   it("resolves a reject with a public reason mentioning the requester", async () => {

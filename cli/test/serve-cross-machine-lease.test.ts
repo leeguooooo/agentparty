@@ -156,7 +156,7 @@ describe("serve 跨机租约客户端互斥（#99）", () => {
     expect(ran).toBe(1);
   });
 
-  test("serve 挂上后向服务端 claim 租约（welcome 后发 serve_lease op=claim）", async () => {
+  test("serve 在 hello 声明 directed-delivery v1，并在 welcome 后 claim 租约", async () => {
     const clientFrames: ClientFrame[] = [];
     server = startMockServer((frame, sock) => {
       clientFrames.push(frame);
@@ -166,6 +166,8 @@ describe("serve 跨机租约客户端互斥（#99）", () => {
     });
     const o = opts({ server: server.url, runCommand: async () => {} });
     await runServe(o);
+    const hello = clientFrames.find((f) => f.type === "hello");
+    expect(hello).toMatchObject({ directed_delivery: "v1" });
     const claim = clientFrames.find((f) => (f as { type: string }).type === "serve_lease");
     expect(claim).toBeDefined();
     expect((claim as { op?: string }).op).toBe("claim");

@@ -10,7 +10,7 @@ import {
   type PresenceEntry,
 } from "@agentparty/shared";
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, seedToken } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken } from "./helpers";
 
 const NOW = 1_000_000_000;
 const STALE_SEEN = NOW - (PRESENCE_TIMEOUT_MS + 60_000); // 早已陈旧的 last_seen（>60s）
@@ -95,9 +95,9 @@ describe("DO presence wiring (issue #97 end-to-end)", () => {
     const human = await seedToken("human");
     const slug = await createChannel(agent.token);
     const observer = await WsClient.open(slug, human.token);
-    await observer.nextOfType("welcome");
+    await completeCapabilityHello(observer);
     const watch = await WsClient.open(slug, agent.token);
-    await watch.nextOfType("welcome");
+    await completeCapabilityHello(watch);
     watch.send({
       type: "send",
       kind: "status",
@@ -127,7 +127,7 @@ describe("DO presence wiring (issue #97 end-to-end)", () => {
     const agent = await seedToken("agent");
     const slug = await createChannel(agent.token);
     const ws = await WsClient.open(slug, agent.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
     ws.send({
       type: "send",
       kind: "status",
@@ -155,10 +155,10 @@ describe("DO presence wiring (issue #97 end-to-end)", () => {
 
     // 人类观察者常驻，用它的 presence 帧同步 markOffline 时机，避免 onClose 竞态
     const watcher = await WsClient.open(slug, human.token);
-    await watcher.nextOfType("welcome");
+    await completeCapabilityHello(watcher);
 
     const first = await WsClient.open(slug, agent.token);
-    await first.nextOfType("welcome");
+    await completeCapabilityHello(first);
     first.send({
       type: "send",
       kind: "status",
@@ -185,7 +185,7 @@ describe("DO presence wiring (issue #97 end-to-end)", () => {
 
     // 重连：presence 行仍是 offline（下次自报前不变），但活连接立即让它重新可达
     const second = await WsClient.open(slug, agent.token);
-    await second.nextOfType("welcome");
+    await completeCapabilityHello(second);
 
     const reconnList = await fetchPresence(slug, agent.token);
     const reconnMe = reconnList.find((p) => p.name === agent.name)!;

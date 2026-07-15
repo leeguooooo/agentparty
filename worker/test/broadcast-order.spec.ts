@@ -5,7 +5,7 @@
 // watcher ack 了 N+1；后到的 N 被客户端当作「已消费」永久丢弃（client.ts: seq<=cursor 静默丢），
 // 而重连 hello since=cursor 也不会补拉——append-only + 游标契约被静默违背。
 import { describe, expect, it } from "vitest";
-import { ADMIN_HEADERS, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
+import { ADMIN_HEADERS, completeCapabilityHello, createChannel, postMessage, seedToken, uniq, WsClient } from "./helpers";
 import { SELF } from "cloudflare:test";
 
 describe("broadcast ordering (#114)", () => {
@@ -16,7 +16,7 @@ describe("broadcast ordering (#114)", () => {
     const slug = await createChannel(watcher.token);
 
     const ws = await WsClient.open(slug, watcher.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
 
     // 并发发送：两条消息的 INSERT 与广播交错，若广播排在 D1 之后就可能乱序
     const sends = Array.from({ length: 8 }, (_, i) =>
@@ -48,7 +48,7 @@ describe("broadcast ordering (#114)", () => {
     const slug = await createChannel(other.token);
 
     const victim = await WsClient.open(slug, victimTok.token);
-    await victim.nextOfType("welcome");
+    await completeCapabilityHello(victim);
 
     const del = await SELF.fetch(`http://ap.test/api/tokens/${victimTok.name}`, {
       method: "DELETE",
@@ -74,7 +74,7 @@ describe("broadcast ordering (#114)", () => {
     const slug = await createChannel(sender.token);
 
     const ws = await WsClient.open(slug, bystander.token);
-    await ws.nextOfType("welcome");
+    await completeCapabilityHello(ws);
 
     expect((await postMessage(slug, sender.token, "hello")).status).toBe(200);
     const frame = (await ws.nextOfType("msg")) as { body: string };
@@ -97,7 +97,7 @@ describe("broadcast ordering (#114)", () => {
       WsClient.open(slug, shared.token),
       WsClient.open(slug, shared.token),
     ]);
-    for (const c of conns) await c.nextOfType("welcome");
+    for (const c of conns) await completeCapabilityHello(c);
 
     expect((await postMessage(slug, sender.token, "fan out")).status).toBe(200);
     for (const c of conns) {

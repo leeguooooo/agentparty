@@ -1,5 +1,12 @@
 // agentparty wire protocol — worker 与 cli 的单一事实来源
 
+import {
+  extractMentionTokens as extractMentionSpans,
+  mentionMatchKey as mentionKey,
+} from "./mentions";
+
+export { mentionMatchKey } from "./mentions";
+
 // ---- 常量 ----
 
 export const BODY_LIMIT = 100_000;
@@ -32,33 +39,17 @@ export const ROLE_RESPONSIBILITY_LIMIT = 500;
 export const RESERVED_NAMES: readonly string[] = ["system"];
 export const MAX_MENTIONS = 50;
 
-// Shared lexer for message bodies and the web composer. ASCII identifiers
-// win the alternation, so `请@agent-a看一下` stops at the Chinese prose after
-// the agent name. Mentions that start in CJK still accept full Unicode
-// nicknames. The left boundary rejects ASCII identifier/email characters but
-// accepts adjacent CJK prose and full-width punctuation.
-const BODY_MENTION_RE =
-  /(^|[^A-Za-z0-9._@-])@(?:([A-Za-z0-9][A-Za-z0-9._-]{0,63})|([\p{L}\p{N}][\p{L}\p{N}._-]{0,63}))/gu;
-
-// ASCII token names / human handles are case-insensitive. Unicode nickname
-// and display-name aliases stay exact (NFC), because SQLite NOCASE is
-// ASCII-only and must not silently disagree with client-side matching.
-export function mentionMatchKey(value: string): string {
-  const normalized = value.normalize("NFC");
-  return /^[A-Za-z0-9._-]+$/.test(normalized) ? normalized.toLowerCase() : normalized;
-}
-
+// Keep the root export used by older CLI callers, but delegate lexical rules to
+// the rich shared lexer so worker/web/CLI agree on URL, email, npm and code spans.
 export function extractMentionTokens(text: string, limit: number = MAX_MENTIONS): string[] {
   if (limit <= 0) return [];
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const match of text.matchAll(BODY_MENTION_RE)) {
-    const token = match[2] ?? match[3];
-    if (!token) continue;
-    const key = mentionMatchKey(token);
+  for (const token of extractMentionSpans(text)) {
+    const key = mentionKey(token.value);
     if (key === "system" || seen.has(key)) continue;
     seen.add(key);
-    out.push(token);
+    out.push(token.value);
     if (out.length >= limit) break;
   }
   return out;
@@ -110,6 +101,13 @@ export const MAX_MESSAGE_AUDIT_ROWS = 20_000;
 // 陈旧游标，绝不动在线身份（含刚 caught-up 未再推进）的活游标。断连超此窗仍未回来的身份，其读位对应的
 // 消息多半已过 RETAIN_N 被裁，游标失去意义；它再上线时 recordSeen 会重新建游标，无副作用。
 export const READ_CURSOR_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+
+// ---- 定向消息可恢复投递（#551）----
+// serve 每 25s ping/每 15s task heartbeat；90s 足够跨两三个心跳抖动，又能在进程/机器死亡后尽快交给 standby。
+export const DIRECTED_DELIVERY_LEASE_MS = 90_000;
+export const DELIVERY_WORK_ID_LIMIT = 128;
+export const DELIVERY_CONTINUATION_REF_LIMIT = 512;
+export const DELIVERY_ORIGIN_CHANNEL_LIMIT = 256;
 
 // ---- 会员分层（#277 骨架）----
 // 账号维度的 free/member 层：托管部署每月要成本，会员用于回收；自部署始终免费。
@@ -201,6 +199,8 @@ export type DecisionMode = "approval" | "unattended";
 export type DecisionKind = "approval" | "choice";
 // pending：等人类；resolved：人类已选；auto_resolved：无人值守模式自动放行。
 export type DecisionState = "pending" | "resolved" | "auto_resolved";
+export type DirectedDeliveryState = "queued" | "claimed" | "running" | "waiting_owner" | "replied" | "failed";
+export type DirectedDeliveryCause = "mention" | "reply" | "owner_answer" | "retry";
 // decision_request 上限（#284）：与 completion review 同量级，防把 prompt/选项当附加 payload 滥用。
 export const DECISION_PROMPT_LIMIT = 4_000;
 export const DECISION_OPTIONS_MAX = 10;
@@ -373,6 +373,9 @@ export interface SearchHit {
 
 export type ErrorCode =
   | "bad_request"
+  | "unavailable"
+  | "mention_not_found"
+  | "mention_ambiguous"
   | "unauthorized"
   | "rate_limited"
   | "too_large"
@@ -471,6 +474,12 @@ export interface PresenceEntry {
   busy?: boolean;
   /** 排在当前 wake 身后、尚未处理的 wake 数（issue #103）。仅 state != offline 且 >0 时下发。 */
   queue_depth?: number;
+  /**
+   * 已经把 agent runner 释放、正在等 owner 回答的 work 数（issue #548）。它来自服务端持久
+   * directed delivery 状态，不是客户端自报；仅 >0 时下发。与 queue_depth 分开，避免把“等人”
+   * 误显示成“agent 忙不过来”。旧客户端忽略。
+   */
+  waiting_owner_count?: number;
   /**
    * 同名多机 serve 里，除持租者外仍挂着、处于 standby 的 serve 连接数（issue #99）。DO 从活连接里的
    * serve 租约候选权威判定：候选数 N ≥ 2 时下发 N-1（有几台在待命顶替），否则省略。用途：who / web
@@ -628,6 +637,12 @@ export function evaluateHostLease(
 export interface HelloFrame {
   type: "hello";
   since: number;
+  /**
+   * This connection can consume and acknowledge durable directed-delivery v1 frames.
+   * Omitted by legacy clients: they may keep using raw message mentions, but must never
+   * be selected as the executor for a durable delivery lease.
+   */
+  directed_delivery?: "v1";
   /** CLI package version。可选以兼容旧客户端；服务端会忽略非法值。 */
   client_version?: string;
   /**
@@ -743,7 +758,38 @@ export interface ServeLeaseClaimFrame {
   op: "claim";
 }
 
-export type ClientFrame = HelloFrame | SendFrame | PingFrame | SeenFrame | HeartbeatFrame | ServeLeaseClaimFrame;
+/**
+ * watch 连接声明自己愿意承接 durable directed delivery。
+ *
+ * 这和普通消息游标完全分离：注册只选择 delivery adapter，`seen`/普通 seq ack
+ * 都不能完成或确认一条 delivery。
+ */
+export interface DeliveryAdapterRegisterFrame {
+  type: "delivery_adapter";
+  adapter: "watch";
+  op: "register";
+}
+
+/** 持租 serve 对当前定向 work 的权威启动/终态/挂起态回执；连接身份必须等于 delivery.target_name。 */
+export interface DeliveryUpdateFrame {
+  type: "delivery_update";
+  delivery_id: string;
+  state: "running" | "waiting_owner" | "replied" | "failed";
+  work_id?: string;
+  continuation_ref?: string;
+  reply_seq?: number;
+  error?: string;
+}
+
+export type ClientFrame =
+  | HelloFrame
+  | SendFrame
+  | PingFrame
+  | SeenFrame
+  | HeartbeatFrame
+  | ServeLeaseClaimFrame
+  | DeliveryAdapterRegisterFrame
+  | DeliveryUpdateFrame;
 
 // ---- 服务端 → 客户端帧 ----
 
@@ -778,6 +824,52 @@ export interface WelcomeFrame {
   presence: PresenceEntry[];
   /** 已读游标快照（Phase 2）；晚到的客户端据此初始化每身份读到第几条。旧客户端忽略即可。 */
   read_cursors?: ReadCursor[];
+  /** 服务端会把定向 @ 作为独立 delivery 帧重放；新 serve 应以它为唤醒真值，普通 read cursor 仅管阅读。 */
+  directed_delivery?: "v1";
+}
+
+export interface DirectedDelivery {
+  id: string;
+  message_seq: number;
+  target_name: string;
+  cause: DirectedDeliveryCause;
+  state: DirectedDeliveryState;
+  attempt: number;
+  lease_until: number | null;
+  work_id: string | null;
+  continuation_ref: string | null;
+  reply_seq: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * 频道状态投影。租约、attempt、cause、continuation/work 引用和内部错误永远不进
+ * `delivery_state`；完整对象只走目标 holder 专用的 `delivery` 帧。未授权连接还会把
+ * claimed/running/waiting_owner 都投影为 running，只暴露 queued/processing/replied/failed 四档。
+ */
+export interface PublicDirectedDelivery {
+  id: string;
+  message_seq: number;
+  target_name: string;
+  state: DirectedDeliveryState;
+  reply_seq: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** 只发给目标身份当前持有 serve lease 的连接；message 正文仍引用原 messages 行，不复制存储。 */
+export interface DirectedDeliveryFrame {
+  type: "delivery";
+  delivery: DirectedDelivery;
+  message: MsgFrame;
+}
+
+/** delivery 状态变化；无论观看者身份都不携带 runner/session 私有字段。 */
+export interface DeliveryStateFrame {
+  type: "delivery_state";
+  delivery: PublicDirectedDelivery;
 }
 
 export interface ParticipantsFrame {
@@ -821,7 +913,20 @@ export interface CompletionReview {
 // ---- 人类决策协议（#284）----
 // 一条 decision_request 消息携带一个待决问题：方案审批（approve/reject）或选项回答（1..N）。
 // 决策的落地状态挂在同一条消息上（DecisionResolution），像 completion_review 挂在 completion 上。
-export interface DecisionRequest {
+/**
+ * 决策与触发它的 durable work 的服务端血缘（#548）。客户端发来的同名字段一律不可信；只有
+ * Worker 观察到该 sender 恰好持有一条 claimed/running delivery 时才绑定。字段全为 optional，
+ * 保持普通 #284 决策和旧历史兼容。
+ */
+export interface DecisionDeliveryLineage {
+  delivery_id?: string;
+  origin_seq?: number;
+  origin_channel?: string;
+  work_id?: string;
+  continuation_ref?: string;
+}
+
+export interface DecisionRequest extends DecisionDeliveryLineage {
   kind: DecisionKind;
   /** 一句话问题 / 方案标题；方案正文走消息 body。 */
   prompt: string;
@@ -843,10 +948,14 @@ export interface DecisionResolution {
 }
 
 // decision_response 消息：回应挂到频道里成为一条独立可渲染/可消费的帧，反指 request 的 seq。
-export interface DecisionResponse {
+export interface DecisionResponse extends DecisionDeliveryLineage {
   request_seq: number;
   chosen_index: number;
   chosen_option: string;
+  /** 原问题快照，owner answer delivery 无需再反查已被裁剪的 request 才能恢复上下文。 */
+  prompt?: string;
+  /** owner 的可选说明；与 DecisionResolution.reason 同一份服务端校验后的文本。 */
+  reason?: string;
 }
 
 // 客户端发 decision_request 时的入参：kind/options 可省，服务端兜底 approval + approve/reject。
@@ -1418,6 +1527,8 @@ export interface PresenceFrame {
   busy?: boolean;
   /** 当前 wake 身后的排队深度。 */
   queue_depth?: number;
+  /** 已释放 runner、正在等待 owner 回答的持久 work 数；与 busy/queue_depth 分开。 */
+  waiting_owner_count?: number;
   /** 同名 serve 的待命实例数。 */
   serve_standbys?: number;
   /** 当前处理的触发消息 seq；仅活跃任务时下发。 */
@@ -1453,6 +1564,13 @@ export interface ServeLeaseFrame {
   held: boolean;
 }
 
+/** 服务端确认当前连接已注册为 watch delivery adapter。 */
+export interface DeliveryAdapterRegisteredFrame {
+  type: "delivery_adapter";
+  adapter: "watch";
+  registered: true;
+}
+
 export type ServerFrame =
   | WelcomeFrame
   | ParticipantsFrame
@@ -1463,4 +1581,7 @@ export type ServerFrame =
   | ReadCursorFrame
   | ErrorFrame
   | PongFrame
-  | ServeLeaseFrame;
+  | ServeLeaseFrame
+  | DeliveryAdapterRegisteredFrame
+  | DirectedDeliveryFrame
+  | DeliveryStateFrame;

@@ -10,9 +10,13 @@ import {
   projectAgentChildName,
   projectAgentReadyNote,
   pendingWakeDepth,
+  prepareProfileChannelWorkspace,
+  runWithRunnerTimeout,
   run as runServeCommand,
   runProfileServe,
   runServe,
+  RunnerTimeoutError,
+  WakeBlockedError,
   writeContextFile,
   type CodexLike,
   type RunnerProcess,
@@ -20,6 +24,7 @@ import {
   type ThreadLike,
 } from "../src/commands/serve";
 import type { MessagePayload } from "../src/rest";
+import { writeWorkspaceConfigOnly } from "../src/config";
 import type { CliUpgradeNotice } from "../src/upgrade";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
 
@@ -1042,6 +1047,41 @@ describe("builtin runner", () => {
     expect(posts.some((p) => (p.body as { kind?: string }).kind === "message")).toBe(false);
   });
 
+  test("an explicit session_not_found process error clears the poison session without replaying the wake (#550)", async () => {
+    const { posts, post } = postRecorder();
+    const workdir = tempDir();
+    writeFileSync(
+      join(workdir, "wake-session.json"),
+      JSON.stringify({ harness: "codex", session_id: uuid(1), created_at: 1, last_wake_ts: 1, wakes: 3 }),
+    );
+    const calls: string[][] = [];
+    const runProcess: RunnerProcess = async (args) => {
+      calls.push(args);
+      if (args.includes("resume")) {
+        return { code: 9, stdout: "", stderr: JSON.stringify({ error: { code: "session_not_found" } }) };
+      }
+      const out = args[args.indexOf("-o") + 1]!;
+      writeFileSync(out, "recovered answer\n");
+      return { code: 0, stdout: `session id: ${uuid(2)}\n`, stderr: "" };
+    };
+
+    await expect(createBuiltinRunner({
+        server: "http://agentparty.test",
+        token: "ap_tok",
+        channel: "dev",
+        harness: "codex",
+        workdir,
+        runProcess,
+        post,
+      })(triggerFrame(34), runnerCtx()),
+    ).rejects.toThrow(/exit code 9/);
+
+    expect(calls.filter((args) => args.includes("resume"))).toHaveLength(1);
+    expect(calls.filter((args) => !args.includes("resume"))).toHaveLength(0);
+    expect(posts.some((entry) => (entry.body as { kind?: string }).kind === "message")).toBe(false);
+    expect(existsSync(join(workdir, "wake-session.json"))).toBe(false);
+  });
+
   test("copies codex auth.json into the isolated CODEX_HOME before running", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
@@ -1106,14 +1146,16 @@ describe("builtin runner", () => {
     expect(existsSync(authDest)).toBe(false);
   });
 
-  test("claude cold-starts from json output and resumes the persisted session id", async () => {
+  test("claude cold-starts with a preallocated session id and resumes it", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
     const calls: string[][] = [];
+    let coldSessionId = "";
     const runProcess: RunnerProcess = async (args) => {
       calls.push(args);
       if (args.includes("--resume")) return { code: 0, stdout: "resumed text\n", stderr: "" };
-      return { code: 0, stdout: JSON.stringify({ session_id: uuid(4), result: "cold text" }), stderr: "" };
+      coldSessionId = args[args.indexOf("--session-id") + 1]!;
+      return { code: 0, stdout: JSON.stringify({ session_id: coldSessionId, result: "cold text" }), stderr: "" };
     };
     const run = createBuiltinRunner({
       server: "http://agentparty.test",
@@ -1128,9 +1170,12 @@ describe("builtin runner", () => {
     await run(triggerFrame(4), runnerCtx());
     await run(triggerFrame(5), runnerCtx());
 
-    expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8")).session_id).toBe(uuid(4));
+    expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8")).session_id).toBe(coldSessionId);
     expect(calls[0]).toContain("--output-format");
-    expect(calls[1]).toEqual(["claude", "-p", "--resume", uuid(4), expect.any(String)]);
+    expect(calls[0]).toContain("--session-id");
+    expect(calls[1]).toEqual([
+      "claude", "-p", "--disallowed-tools", "AskUserQuestion", "--resume", coldSessionId, expect.any(String),
+    ]);
   });
 
   test("builtin claude runner writes wake context inside the runner workdir (#479)", async () => {
@@ -1141,7 +1186,8 @@ describe("builtin runner", () => {
     const runProcess: RunnerProcess = async (args) => {
       prompt = String(args.at(-1));
       expect(JSON.parse(readFileSync(expectedContextPath, "utf8"))).toMatchObject({ channel: "dev", seq: 6 });
-      return { code: 0, stdout: JSON.stringify({ session_id: uuid(6), result: "ok" }), stderr: "" };
+      const sessionId = args[args.indexOf("--session-id") + 1]!;
+      return { code: 0, stdout: JSON.stringify({ session_id: sessionId, result: "ok" }), stderr: "" };
     };
 
     await createBuiltinRunner({
@@ -1312,6 +1358,61 @@ describe("builtin runner", () => {
 });
 
 describe("project profile daemon", () => {
+  test("profile sessions isolate server, stable profile identity, and authoritative child principal", async () => {
+    const home = tempDir();
+    const previous = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    const profile = {
+      owner_account: "fan@example.com",
+      handle: "same-handle",
+      name: "Same",
+      runner: "codex-sdk" as const,
+      repo_url: null,
+      workdir: null,
+      base_branch: "main",
+      worktree_strategy: "none" as const,
+      rules: null,
+      invitable_by: "anyone" as const,
+      created_at: 100,
+      updated_at: 200,
+    };
+    try {
+      const prod = await prepareProfileChannelWorkspace({
+        server: "https://prod.agentparty.test/api",
+        profile,
+        channel: "dev",
+        child: { name: "child", owner: profile.owner_account, channel_scope: "dev" },
+      });
+      const rotated = await prepareProfileChannelWorkspace({
+        server: "https://prod.agentparty.test",
+        profile: { ...profile, updated_at: 999 },
+        channel: "dev",
+        child: { name: "child", owner: profile.owner_account, channel_scope: "dev" },
+      });
+      const testServer = await prepareProfileChannelWorkspace({
+        server: "https://test.agentparty.test",
+        profile,
+        channel: "dev",
+        child: { name: "child", owner: profile.owner_account, channel_scope: "dev" },
+      });
+      const otherChild = await prepareProfileChannelWorkspace({
+        server: "https://prod.agentparty.test",
+        profile,
+        channel: "dev",
+        child: { name: "other-child", owner: profile.owner_account, channel_scope: "dev" },
+      });
+      expect(prod.runnerWorkdir).toBe(rotated.runnerWorkdir);
+      expect(prod.runnerWorkdir).not.toBe(testServer.runnerWorkdir);
+      expect(prod.runnerWorkdir).not.toBe(otherChild.runnerWorkdir);
+      expect(prod.runnerWorkdir).toContain("project-agents");
+      expect(prod.runnerWorkdir).toContain("fan_example.com");
+      expect(prod.runnerWorkdir).toContain("same-handle");
+    } finally {
+      if (previous === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = previous;
+    }
+  });
+
   test("shell-quotes cleanup branches and sanitizes user-visible ready fields", () => {
     expect(projectAgentCleanupCommand("main'; echo pwn")).toBe(
       "party worktree prune --base 'main'\\''; echo pwn' --remote --yes",
@@ -1343,7 +1444,11 @@ describe("project profile daemon", () => {
   test("one resident daemon fans out to invited channels with scoped child tokens and distinct sessions", async () => {
     const home = tempDir();
     const oldHome = process.env.AGENTPARTY_HOME;
+    const oldConfig = process.env.AGENTPARTY_CONFIG;
     process.env.AGENTPARTY_HOME = home;
+    const ownerConfig = join(home, "owner.json");
+    writeFileSync(ownerConfig, JSON.stringify({ server: "http://agentparty.test", token: "ap_owner" }));
+    process.env.AGENTPARTY_CONFIG = ownerConfig;
     const { posts, post } = postRecorder();
     const profile = {
       owner_account: "fan@example.com",
@@ -1411,11 +1516,27 @@ describe("project profile daemon", () => {
     } finally {
       if (oldHome === undefined) delete process.env.AGENTPARTY_HOME;
       else process.env.AGENTPARTY_HOME = oldHome;
+      if (oldConfig === undefined) delete process.env.AGENTPARTY_CONFIG;
+      else process.env.AGENTPARTY_CONFIG = oldConfig;
     }
 
     expect(served.map((o) => o.channel).sort()).toEqual(["alpha", "beta", "gamma"]);
     expect(served.map((o) => o.token).sort()).toEqual(["ap_child_alpha", "ap_child_beta", "ap_child_gamma"]);
     expect(new Set(served.map((o) => o.sdkRunner?.workdir)).size).toBe(3);
+    expect(new Set(served.map((o) => o.sdkRunner?.agentpartyConfigPath)).size).toBe(3);
+    expect(served.every((o) => o.sdkRunner?.cwd === o.projectAgent?.channel_workdir)).toBe(true);
+    for (const item of served) {
+      const path = item.sdkRunner?.agentpartyConfigPath;
+      expect(path).toBeTruthy();
+      expect(JSON.parse(readFileSync(path!, "utf8"))).toEqual({
+        server: "http://agentparty.test",
+        token: `ap_child_${item.channel}`,
+      });
+    }
+    expect(JSON.parse(readFileSync(ownerConfig, "utf8"))).toEqual({
+      server: "http://agentparty.test",
+      token: "ap_owner",
+    });
     await Promise.all(served.map((o) => o.refreshAvailableUpgrade?.(null)));
     expect(upgradeProbes).toBe(1);
     expect(new Set(served.map((o) => o.projectAgent?.channel_workdir)).size).toBe(3);
@@ -1441,6 +1562,85 @@ describe("project profile daemon", () => {
     expect(String((posts[0]!.body as { note: string }).note)).toContain("delivery=worktree->PR->channel-link->deploy-verify->safe-prune");
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("front agent"))).toBe(true);
     expect(joinPosts.every((p) => String((p.body as { body?: string }).body).includes("workers should spawn under team herness-dev"))).toBe(true);
+  });
+
+  test("shared profile channels keep distinct child identities without overwriting the shared workspace config", async () => {
+    const home = tempDir();
+    const sharedCwd = join(home, "shared-project");
+    mkdirSync(sharedCwd, { recursive: true });
+    const oldHome = process.env.AGENTPARTY_HOME;
+    process.env.AGENTPARTY_HOME = home;
+    const sharedConfigPath = writeWorkspaceConfigOnly(
+      { server: "http://agentparty.test", token: "ap_workspace_owner" },
+      sharedCwd,
+    );
+    const profile = {
+      owner_account: "fan@example.com",
+      handle: "shared-dev",
+      name: "Shared Dev",
+      runner: "codex-sdk" as const,
+      repo_url: null,
+      workdir: sharedCwd,
+      base_branch: "main",
+      worktree_strategy: "shared" as const,
+      rules: null,
+      invitable_by: "anyone" as const,
+      created_at: 1,
+      updated_at: 1,
+    };
+    const served: ServeOptions[] = [];
+    try {
+      expect(await runProfileServe({
+        server: "http://agentparty.test",
+        humanToken: "acc-human",
+        ownerAccount: profile.owner_account,
+        handle: profile.handle,
+        mentionsOnly: true,
+        once: true,
+        post: async () => ({ seq: 1 }),
+        mintRuntime: async () => ({ token: "ap_profile_runtime", profile }),
+        listInvites: async () => ["alpha", "beta"].map((channel_slug, index) => ({
+          id: index + 1,
+          channel_slug,
+          owner_account: profile.owner_account,
+          profile_handle: profile.handle,
+          invited_by: "owner@example.com",
+          invited_at: index + 1,
+          profile,
+        })),
+        ensureChannelRuntime: async (_server, _token, channel) => ({
+          token: `ap_child_${channel}`,
+          name: `child-${channel}`,
+          role: "agent",
+          owner: profile.owner_account,
+          channel_scope: channel,
+          lineage: { parent_agent: profile.handle, root_agent: profile.handle, team_id: profile.handle, depth: 1, expires_at: null },
+          profile,
+        }),
+        runChannelServe: async (options) => {
+          served.push(options);
+          return 0;
+        },
+      })).toBe(0);
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = oldHome;
+    }
+
+    expect(served).toHaveLength(2);
+    expect(new Set(served.map((item) => item.sdkRunner?.cwd))).toEqual(new Set([sharedCwd]));
+    const configPaths = served.map((item) => item.sdkRunner?.agentpartyConfigPath ?? "");
+    expect(new Set(configPaths).size).toBe(2);
+    for (const item of served) {
+      expect(JSON.parse(readFileSync(item.sdkRunner!.agentpartyConfigPath!, "utf8"))).toEqual({
+        server: "http://agentparty.test",
+        token: `ap_child_${item.channel}`,
+      });
+    }
+    expect(JSON.parse(readFileSync(sharedConfigPath, "utf8"))).toEqual({
+      server: "http://agentparty.test",
+      token: "ap_workspace_owner",
+    });
   });
 
   test("a cleared profile upgrade is not revived by a stale channel after a failed probe (#485)", async () => {
@@ -1684,6 +1884,77 @@ describe("codex-sdk runner", () => {
     expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8")).wakes).toBe(4);
   });
 
+  test("an SDK thread_not_found error clears the persisted handle before cold start (#550)", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    writeFileSync(
+      join(workdir, "wake-session.json"),
+      JSON.stringify({
+        harness: "codex-sdk",
+        thread_id: "thread_poison_12345678",
+        created_at: 1,
+        last_wake_ts: 1,
+        wakes: 3,
+      }),
+    );
+    let starts = 0;
+    let resumes = 0;
+    const freshThread: ThreadLike = {
+      id: "thread_fresh_12345678",
+      run: async () => ({ final_response: "recovered" }),
+    };
+
+    await sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => {
+          starts += 1;
+          return freshThread;
+        },
+        resumeThread: () => {
+          resumes += 1;
+          throw Object.assign(new Error("thread is gone"), { code: "thread_not_found" });
+        },
+      }),
+    })(triggerFrame(102), runnerCtx());
+
+    expect(resumes).toBe(1);
+    expect(starts).toBe(1);
+    expect(JSON.parse(readFileSync(join(workdir, "wake-session.json"), "utf8"))).toMatchObject({
+      thread_id: "thread_fresh_12345678",
+      wakes: 1,
+    });
+  });
+
+  test("a lazy SDK resume that fails inside run clears the handle but never cold-starts the current wake (#550)", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    writeFileSync(
+      join(workdir, "wake-session.json"),
+      JSON.stringify({ harness: "codex-sdk", thread_id: "thread_lazy_bad_12345678", created_at: 1, last_wake_ts: 1, wakes: 2 }),
+    );
+    let starts = 0;
+    const resumed: ThreadLike = {
+      id: "thread_lazy_bad_12345678",
+      run: async () => { throw Object.assign(new Error("gone"), { code: "thread_not_found" }); },
+    };
+
+    const error = await sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => { starts += 1; return resumed; },
+        resumeThread: () => resumed,
+      }),
+    })(triggerFrame(102), runnerCtx()).catch((cause) => cause);
+
+    expect(error).toBeInstanceOf(WakeBlockedError);
+    expect((error as WakeBlockedError).retriable).toBe(false);
+    expect(starts).toBe(0);
+    expect(existsSync(join(workdir, "wake-session.json"))).toBe(false);
+  });
+
   test("passes the full wake context prompt and full_access sandbox to thread.run", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
@@ -1824,6 +2095,55 @@ describe("codex-sdk runner", () => {
     await second;
     expect(JSON.parse(prompts[0]!).seq).toBe(107);
     expect(JSON.parse(prompts[1]!).seq).toBe(108);
+  });
+
+  test("an SDK that ignores AbortSignal forces an unconfirmed-termination timeout and no next wake (#550)", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    let starts = 0;
+    const hungThread: ThreadLike = {
+      id: "thread_hung_12345678",
+      run: async () => new Promise<never>(() => {}),
+    };
+    const run = sdkRunner({
+      workdir,
+      post,
+      codexFactory: () => ({
+        startThread: () => {
+          starts += 1;
+          return hungThread;
+        },
+        resumeThread: () => {
+          throw new Error("timed-out session must not be resumed");
+        },
+      }),
+    });
+
+    const error = await runWithRunnerTimeout(run, triggerFrame(109), runnerCtx(), 10).catch((cause) => cause);
+    expect(error).toBeInstanceOf(RunnerTimeoutError);
+    expect((error as RunnerTimeoutError).terminationConfirmed).toBe(false);
+    expect(starts).toBe(1);
+  });
+});
+
+describe("runner hard timeout (#550)", () => {
+  test("aborts the runner and rejects with a non-retriable timeout", async () => {
+    let observedAbort = false;
+    const run: NonNullable<ServeOptions["runCommand"]> = async (_frame, ctx) => {
+      await new Promise<void>((_resolve, reject) => {
+        ctx.signal?.addEventListener("abort", () => {
+          observedAbort = true;
+          reject(ctx.signal?.reason);
+        }, { once: true });
+      });
+    };
+
+    const promise = runWithRunnerTimeout(run, triggerFrame(201), runnerCtx(), 10);
+    await expect(promise).rejects.toBeInstanceOf(RunnerTimeoutError);
+    expect(observedAbort).toBe(true);
+    await promise.catch((error) => {
+      expect(error).toMatchObject({ retriable: false, timeoutMs: 10 });
+    });
   });
 });
 

@@ -1,11 +1,11 @@
 import type { Tokens, TokenizerAndRendererExtension } from "marked";
+import {
+  isMentionStart,
+  readMentionToken,
+  resolveMentionToken,
+  type MentionAlias,
+} from "@agentparty/shared/mentions";
 import type { IdentityDisplayMap } from "./identityDisplay";
-
-// mention 名字允许的字符：字母数字开头，后接 字母数字/._- 。
-const MENTION_RE = /^@([a-zA-Z0-9][a-zA-Z0-9._-]*)/;
-// mention 前必须是「边界」：非(字母数字/._@-)。用来排除 foo@bar 这类邮箱片段——
-// 只有像句首、空白、`/`、`*` 这种真实边界后的 @name 才算 mention。
-const NAME_CHAR_RE = /[a-zA-Z0-9._@-]/;
 
 function escapeHtmlAttr(value: string): string {
   return value
@@ -41,6 +41,11 @@ interface MentionToken extends Tokens.Generic {
 export function mentionExtension(
   identities: IdentityDisplayMap,
 ): TokenizerAndRendererExtension {
+  const aliases: MentionAlias[] = Object.keys(identities).map((name) => ({
+    alias: name,
+    target: name,
+    kind: "canonical",
+  }));
   return {
     name: "apMention",
     level: "inline",
@@ -49,23 +54,27 @@ export function mentionExtension(
       return i < 0 ? undefined : i;
     },
     tokenizer(src, tokens) {
-      // 边界校验：看紧挨在 @ 前面那个已产出 token 的最后一个字符。
-      // 若它是 name 允许字符（字母数字/._@-），说明这个 @ 处在词中间（如 foo@bar），
-      // 不当作 mention——与旧正则的前置字符类保持一致。
-      const prev = tokens[tokens.length - 1];
-      const prevRaw = typeof prev?.raw === "string" ? prev.raw : "";
-      const prevChar = prevRaw.slice(-1);
-      if (prevChar !== "" && NAME_CHAR_RE.test(prevChar)) return undefined;
+      // Reconstruct the consumed inline source so renderer and server run the
+      // same boundary/URL/email/package decision. Marked has already kept this
+      // tokenizer out of code tokens; the shared guard remains defence in depth.
+      const previousRaw = tokens
+        .map((token) => (typeof token.raw === "string" ? token.raw : ""))
+        .join("");
+      if (!isMentionStart(previousRaw + src, previousRaw.length)) return undefined;
 
-      const match = MENTION_RE.exec(src);
-      if (match === null) return undefined;
-      const name = match[1];
-      if (name === undefined) return undefined;
+      const parsed = readMentionToken(src, 0);
+      if (parsed === null) return undefined;
+      const resolution = resolveMentionToken(parsed.value, aliases);
+      if (resolution.status !== "resolved") return undefined;
+      const name = resolution.target;
       const display = identities[name]?.display;
       // 没有映射、或映射回自身，就不接管这个 token：让 @name 以字面文本渲染。
       if (display === undefined || display === name) return undefined;
 
-      const token: MentionToken = { type: "apMention", raw: match[0], name, display };
+      // CJK 无空格正文可能被词法层读成 "小明看一下"。只消费实际命中的 alias，
+      // 余下 "看一下" 继续交给 marked 渲染，不能吞进 mention span。
+      const raw = `@${parsed.value.slice(0, resolution.matchedAlias.length)}`;
+      const token: MentionToken = { type: "apMention", raw, name, display };
       return token;
     },
     renderer(token) {

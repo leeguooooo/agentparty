@@ -14,6 +14,7 @@ interface ExportShape {
     sender: { name: string; owner?: string; handle?: string; display_name?: string; avatar_url?: string };
     attachments?: unknown[];
     rev_seq?: number;
+    decision_response?: Record<string, unknown>;
   }[];
   audit: { target_seq: number; action: string; actor: { name: string } }[];
   wake_deliveries: { target_name: string }[];
@@ -56,6 +57,51 @@ async function seedIdentityRows(slug: string, name: string): Promise<void> {
       2,
       now,
     );
+    const deliveryId = crypto.randomUUID();
+    state.storage.sql.exec(
+      `INSERT INTO directed_deliveries (
+         id, message_seq, target_name, target_owner, cause, state, attempt,
+         lease_connection_id, last_lease_connection_id, lease_adapter, lease_until,
+         work_id, continuation_ref, reply_seq, last_error, created_at, updated_at
+       ) VALUES (?, 1, ?, ?, 'mention', 'queued', 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?)`,
+      deliveryId,
+      name,
+      `${name}@owner.test`,
+      `work-${deliveryId}`,
+      `continuation-${deliveryId}`,
+      now,
+      now,
+    );
+    const payload = JSON.stringify({
+      sender: { name: "another-sender" },
+      directed_delivery: {
+        id: deliveryId,
+        target_name: name,
+        work_id: `work-${deliveryId}`,
+        continuation_ref: `continuation-${deliveryId}`,
+      },
+    });
+    state.storage.sql.exec(
+      `INSERT INTO webhook_queue (
+         webhook_name, registration_id, webhook_mode, target_owner, payload, attempts, next_retry_at
+       ) VALUES (?, ?, 'agent', ?, ?, 1, ?)`,
+      name,
+      `registration-${deliveryId}`,
+      `${name}@owner.test`,
+      payload,
+      now + 86_400_000,
+    );
+    state.storage.sql.exec(
+      `INSERT INTO webhook_dead_letters (
+         webhook_name, registration_id, webhook_mode, target_owner, mention_seq, payload,
+         attempts, last_status, last_error, dead_lettered_at
+       ) VALUES (?, ?, 'agent', ?, 1, ?, 4, 500, 'down', ?)`,
+      name,
+      `registration-${deliveryId}`,
+      `${name}@owner.test`,
+      payload,
+      now,
+    );
   });
 }
 
@@ -73,6 +119,25 @@ describe("gdpr identity erasure + export (#421)", () => {
       body: JSON.stringify({ body: "edited body" }),
     });
     expect(edited.status).toBe(200);
+    // Stored lineage is required for exact executor continuation, but identity export is a public
+    // projection and must not turn work/ref capabilities into a moderator download side channel.
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE messages SET decision_response_json = ? WHERE seq = ?",
+        JSON.stringify({
+          request_seq: firstSeq,
+          chosen_index: 0,
+          chosen_option: "approve",
+          delivery_id: "private-delivery",
+          origin_seq: firstSeq,
+          origin_channel: slug,
+          work_id: "private-work",
+          continuation_ref: "private-continuation",
+        }),
+        firstSeq,
+      );
+    });
     await seedIdentityRows(slug, writer.name);
     await seedIdentityRows(slug, other.name);
 
@@ -87,6 +152,11 @@ describe("gdpr identity erasure + export (#421)", () => {
     expect(dump.wake_deliveries.length).toBe(1);
     expect(dump.read_cursor?.name).toBe(writer.name);
     expect(dump.presence.length).toBe(1);
+    const exportedDecision = dump.messages.find((message) => message.seq === firstSeq)?.decision_response;
+    expect(exportedDecision).toMatchObject({ request_seq: firstSeq, chosen_option: "approve" });
+    expect(exportedDecision).not.toHaveProperty("delivery_id");
+    expect(exportedDecision).not.toHaveProperty("work_id");
+    expect(exportedDecision).not.toHaveProperty("continuation_ref");
 
     // 擦除（moderator）：返回各表命中数。
     const eraseRes = await api(`/api/channels/${slug}/identity/${encodeURIComponent(writer.name)}/data`, owner.token, {
@@ -105,6 +175,27 @@ describe("gdpr identity erasure + export (#421)", () => {
     expect(summary.wake_ledger_deleted).toBe(1);
     expect(summary.read_cursors_deleted).toBe(1);
     expect(summary.presence_deleted).toBe(1);
+
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      expect(
+        Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM directed_deliveries WHERE target_name = ?", writer.name).one().n),
+      ).toBe(0);
+      expect(
+        Number(state.storage.sql.exec(
+          "SELECT COUNT(*) AS n FROM webhook_queue WHERE json_extract(payload, '$.directed_delivery.target_name') = ?",
+          writer.name,
+        ).one().n),
+      ).toBe(0);
+      expect(
+        Number(state.storage.sql.exec(
+          "SELECT COUNT(*) AS n FROM webhook_dead_letters WHERE json_extract(payload, '$.directed_delivery.target_name') = ?",
+          writer.name,
+        ).one().n),
+      ).toBe(0);
+      expect(
+        Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM directed_deliveries WHERE target_name = ?", other.name).one().n),
+      ).toBe(1);
+    });
 
     // 擦除后：该身份数据不可查——消息正文被抹成 [erased]，审计/账本/游标/presence 清零。
     const after = (await (

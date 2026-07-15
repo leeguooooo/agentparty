@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { MsgFrame, PresenceFrame } from "@agentparty/shared";
+import type { DirectedDelivery, MsgFrame, PresenceFrame } from "@agentparty/shared";
 import { channelReducer, initialChannelState } from "./state";
 
 const NOW_FOR_RETENTION = 1_725_000_000_000;
@@ -16,6 +16,25 @@ function msgFrame(seq: number, body: string, over: Partial<MsgFrame> = {}): MsgF
     state: null,
     note: null,
     ts: 1_725_000_000_000 + seq,
+    ...over,
+  };
+}
+
+function delivery(over: Partial<DirectedDelivery> = {}): DirectedDelivery {
+  return {
+    id: "delivery-1",
+    message_seq: 6,
+    target_name: "builder",
+    cause: "mention",
+    state: "queued",
+    attempt: 0,
+    lease_until: null,
+    work_id: "work-1",
+    continuation_ref: null,
+    reply_seq: null,
+    last_error: null,
+    created_at: 100,
+    updated_at: 100,
     ...over,
   };
 }
@@ -173,6 +192,162 @@ describe("channel state", () => {
     expect(s.readCursors.alice?.last_seen_seq).toBe(8);
   });
 
+  test("delivery_state is monotonic, accepts same-millisecond progress, and ignores exact replays", () => {
+    let s = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: delivery() },
+    });
+    expect(s.directedDeliveries["delivery-1"]).toMatchObject({ state: "queued", updated_at: 100 });
+
+    s = channelReducer(s, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: delivery({ state: "running", attempt: 1, updated_at: 200 }) },
+    });
+    expect(s.directedDeliveries["delivery-1"]).toMatchObject({ state: "running", updated_at: 200 });
+    expect(s.directedDeliveries["delivery-1"]).not.toHaveProperty("attempt");
+
+    const current = s;
+    s = channelReducer(s, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: delivery({ state: "failed", updated_at: 150 }) },
+    });
+    expect(s).toBe(current);
+    expect(s.directedDeliveries["delivery-1"]?.state).toBe("running");
+
+    const sameMillisecondProgress = channelReducer(s, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: delivery({ state: "replied", updated_at: 200 }) },
+    });
+    expect(sameMillisecondProgress.directedDeliveries["delivery-1"]?.state).toBe("replied");
+
+    const replay = channelReducer(sameMillisecondProgress, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: delivery({ state: "replied", updated_at: 200 }) },
+    });
+    expect(replay).toBe(sameMillisecondProgress);
+  });
+
+  test("projects delivery and delivery_state frames onto an exact public allow-list", () => {
+    const privateKeys = [
+      "cause",
+      "attempt",
+      "lease_until",
+      "work_id",
+      "continuation_ref",
+      "last_error",
+      "error",
+    ];
+    const maliciousStateDelivery = {
+      ...delivery({
+        id: "public-state",
+        state: "waiting_owner",
+        attempt: 7,
+        lease_until: 999,
+        work_id: "secret-work",
+        continuation_ref: "secret-thread",
+        last_error: "secret-stack",
+      }),
+      error: "secret-generic-error",
+    };
+
+    const fromStateFrame = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "delivery_state", delivery: maliciousStateDelivery },
+    });
+    expect(fromStateFrame.directedDeliveries["public-state"]).toEqual({
+      id: "public-state",
+      message_seq: 6,
+      target_name: "builder",
+      state: "waiting_owner",
+      reply_seq: null,
+      created_at: 100,
+      updated_at: 100,
+    });
+    for (const key of privateKeys) {
+      expect(fromStateFrame.directedDeliveries["public-state"]).not.toHaveProperty(key);
+    }
+
+    // A replay that changes only private fields is still an exact public replay and must not churn state.
+    const privateOnlyReplay = channelReducer(fromStateFrame, {
+      type: "frame",
+      frame: {
+        type: "delivery_state",
+        delivery: { ...maliciousStateDelivery, work_id: "different-secret", attempt: 99 },
+      },
+    });
+    expect(privateOnlyReplay).toBe(fromStateFrame);
+
+    const message = msgFrame(7, "@builder holder payload", { mentions: ["builder"] });
+    const maliciousHolderDelivery = {
+      ...delivery({
+        id: "holder-frame",
+        message_seq: 7,
+        state: "running",
+        cause: "retry",
+        attempt: 3,
+        lease_until: 1_000,
+        work_id: "holder-work",
+        continuation_ref: "holder-thread",
+        last_error: "holder-stack",
+      }),
+      error: "holder-generic-error",
+    };
+    const fromHolderFrame = channelReducer(fromStateFrame, {
+      type: "frame",
+      frame: { type: "delivery", delivery: maliciousHolderDelivery, message },
+    });
+    expect(fromHolderFrame.directedDeliveries["holder-frame"]).toEqual({
+      id: "holder-frame",
+      message_seq: 7,
+      target_name: "builder",
+      state: "running",
+      reply_seq: null,
+      created_at: 100,
+      updated_at: 100,
+    });
+    for (const key of privateKeys) {
+      expect(fromHolderFrame.directedDeliveries["holder-frame"]).not.toHaveProperty(key);
+    }
+  });
+
+  test("delivery frame stores its status and referenced message once", () => {
+    const message = msgFrame(6, "@builder please investigate", { mentions: ["builder"] });
+    const first = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "delivery", delivery: delivery({ state: "claimed", attempt: 1 }), message },
+    });
+    expect(first.messages.map((item) => item.seq)).toEqual([6]);
+    expect(first.directedDeliveries["delivery-1"]?.state).toBe("claimed");
+
+    const duplicate = channelReducer(first, {
+      type: "frame",
+      frame: { type: "delivery", delivery: delivery({ state: "claimed", attempt: 1 }), message },
+    });
+    expect(duplicate).toBe(first);
+
+    const revised = channelReducer(first, {
+      type: "frame",
+      frame: {
+        type: "message_update",
+        target_seq: 6,
+        action: "edit",
+        actor: { name: "bob", kind: "agent" },
+        ts: message.ts + 1,
+        message: msgFrame(6, "edited request", { edited: true, edited_at: message.ts + 1, edited_by: "bob" }),
+      },
+    });
+    const lateDeliverySnapshot = channelReducer(revised, {
+      type: "frame",
+      frame: {
+        type: "delivery",
+        delivery: delivery({ state: "running", attempt: 1, updated_at: 101 }),
+        message,
+      },
+    });
+    expect(lateDeliverySnapshot.messages[0]?.body).toBe("edited request");
+    expect(lateDeliverySnapshot.directedDeliveries["delivery-1"]?.state).toBe("running");
+  });
+
   test("preserves lineage on incremental presence frames", () => {
     const frame: PresenceFrame = {
       type: "presence",
@@ -240,6 +415,7 @@ describe("channel state", () => {
       live: true,
       busy: true,
       queue_depth: 2,
+      waiting_owner_count: 3,
       current_task: 45,
       task_started_at: 1_725_000_000_100,
       heartbeat_at: 1_725_000_001_000,
@@ -250,9 +426,16 @@ describe("channel state", () => {
       live: true,
       busy: true,
       queue_depth: 2,
+      waiting_owner_count: 3,
       current_task: 45,
       task_started_at: 1_725_000_000_100,
       heartbeat_at: 1_725_000_001_000,
     });
+
+    const cleared = channelReducer(next, {
+      type: "frame",
+      frame: { ...frame, ts: frame.ts + 1, waiting_owner_count: undefined },
+    });
+    expect(cleared.presence["runner-a"]?.waiting_owner_count).toBeUndefined();
   });
 });

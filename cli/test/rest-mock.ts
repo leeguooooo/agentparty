@@ -19,7 +19,7 @@ export type RestHandler = (req: RestRequest) => Response | undefined;
 export function startRestMock(handler?: RestHandler): RestMock {
   const requests: RestRequest[] = [];
   // 有状态 webhook 存储：add 后 list 能查到
-  const webhooks = new Map<string, { name: string; url: string; filter: string }[]>();
+  const webhooks = new Map<string, { name: string; url: string; filter: string; mode: string }[]>();
   const roles = new Map<string, { name: string; role: string; responsibility: string | null; assigned_by: string; assigned_at: number }[]>();
   const perms = new Map<string, {
     charter_write: string;
@@ -261,8 +261,8 @@ export function startRestMock(handler?: RestHandler): RestMock {
         const slug = decodeURIComponent(wh[1]!);
         const list = webhooks.get(slug) ?? [];
         if (r.method === "POST" && !wh[2]) {
-          const b = body as { name: string; url: string; filter: string };
-          list.push({ name: b.name, url: b.url, filter: b.filter });
+          const b = body as { name: string; url: string; filter: string; mode?: string };
+          list.push({ name: b.name, url: b.url, filter: b.filter, mode: b.mode ?? "notify" });
           webhooks.set(slug, list);
           return Response.json({ ok: true });
         }

@@ -6,7 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
-import { WsClient, api, createChannel, seedToken, uniq } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken, uniq } from "./helpers";
 
 function sendMessage(slug: string, token: string, body: string, mentions: string[] = []) {
   return api(`/api/channels/${slug}/messages`, token, {
@@ -69,7 +69,7 @@ async function messageMentions(slug: string, seq: number): Promise<string[]> {
 // 用真实 WS status 帧把某 agent 登记成 serve/watch（服务端据此盖 presence.wake_kind）。
 async function registerWakeAgent(slug: string, token: string, kind: "serve" | "watch"): Promise<WsClient> {
   const ws = await WsClient.open(slug, token);
-  await ws.nextOfType("welcome");
+  await completeCapabilityHello(ws);
   ws.send({ type: "send", kind: "status", state: "waiting", note: "standby", mentions: [], residency: "supervised", wake: { kind } });
   await ws.nextOfType("sent");
   return ws;
@@ -149,14 +149,25 @@ describe("#107 serve/watch wakes land in the server-side wake ledger", () => {
 
   it("rejects an unknown mention and does NOT record a serve/watch row", async () => {
     const sender = await seedToken("agent");
-    const ghost = uniq("ghost"); // never registered any presence
+    const ghost = uniq("ghost"); // no token or authoritative directory entry
     const slug = await createChannel(sender.token);
 
     const res = await sendMessage(slug, sender.token, `@${ghost} anybody?`, [ghost]);
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({
-      error: { code: "bad_request", message: `unknown mention @${ghost}` },
+      error: { code: "mention_not_found", message: expect.stringContaining(`@${ghost}`) },
     });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(await ledgerRows(slug)).toEqual([]);
+  });
+
+  it("accepts a known offline agent but does NOT record a serve/watch row", async () => {
+    const sender = await seedToken("agent");
+    const offline = await seedToken("agent", uniq("offline")); // known identity, no wakeable presence
+    const slug = await createChannel(sender.token);
+
+    expect((await sendMessage(slug, sender.token, `@${offline.name} anybody?`, [offline.name])).status).toBe(200);
     await new Promise((r) => setTimeout(r, 50));
 
     expect(await ledgerRows(slug)).toEqual([]);
@@ -167,7 +178,7 @@ describe("#107 serve/watch wakes land in the server-side wake ledger", () => {
     const bot = await seedToken("agent", uniq("none-bot"));
     const slug = await createChannel(sender.token);
     const botWs = await WsClient.open(slug, bot.token);
-    await botWs.nextOfType("welcome");
+    await completeCapabilityHello(botWs);
     botWs.send({ type: "send", kind: "status", state: "waiting", note: "no wake", mentions: [], wake: { kind: "none" } });
     await botWs.nextOfType("sent");
 

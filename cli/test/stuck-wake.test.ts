@@ -5,7 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearStuck, loadStuck, saveStuck, saveWatchStuck } from "../src/config";
+import {
+  clearStuck,
+  loadStuck,
+  markWatchDirectedStuckAccepted,
+  saveStuck,
+  saveWatchStuck,
+} from "../src/config";
 
 const cwd = () => mkdtempSync(join(tmpdir(), "ap-stuck-"));
 
@@ -49,6 +55,49 @@ describe("stuck wake persistence (#198 约束①：stuck 落盘)", () => {
     const prev = loadStuck("dev", d)!;
     saveStuck("dev", { ...prev, attempts: prev.attempts + 1, last_error: "again" }, d);
     expect(loadStuck("dev", d)).toEqual({ seq: 100, attempts: 2, last_error: "again" });
+  });
+
+  test("watch durable delivery 元数据与 seq 一起活过进程重启 (#551)", () => {
+    const d = cwd();
+    saveWatchStuck("dev", {
+      seq: 100,
+      delivery_id: "delivery-100",
+      work_id: "work-100",
+      continuation_ref: "codex:thread-100",
+      delivery_acceptance: "unconfirmed",
+      attempts: 0,
+      source: "watch",
+    }, d);
+    expect(loadStuck("dev", d)).toEqual({
+      seq: 100,
+      delivery_id: "delivery-100",
+      work_id: "work-100",
+      continuation_ref: "codex:thread-100",
+      delivery_acceptance: "unconfirmed",
+      attempts: 0,
+      source: "watch",
+    });
+  });
+
+  test("directed watch debt 仅能按同 delivery id 原子推进 accepted", () => {
+    const d = cwd();
+    saveWatchStuck("dev", {
+      seq: 100,
+      delivery_id: "delivery-100",
+      delivery_acceptance: "unconfirmed",
+      attempts: 0,
+      source: "watch",
+    }, d);
+
+    expect(markWatchDirectedStuckAccepted("dev", "wrong-delivery", d)).toBe(false);
+    expect(loadStuck("dev", d)?.delivery_acceptance).toBe("unconfirmed");
+    expect(markWatchDirectedStuckAccepted("dev", "delivery-100", d)).toBe(true);
+    expect(loadStuck("dev", d)).toMatchObject({
+      delivery_id: "delivery-100",
+      delivery_acceptance: "accepted",
+      last_error: "watch delivery accepted; awaiting agent acknowledgement",
+    });
+    expect(markWatchDirectedStuckAccepted("dev", "delivery-100", d)).toBe(false);
   });
 
   test("watch 原子写不能覆盖 serve 欠账，但可以创建或更新自己的欠账 (#508)", () => {

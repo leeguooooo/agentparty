@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { WsClient, api, createChannel, seedToken } from "./helpers";
 
 async function claimServeLease(ws: WsClient): Promise<ServeLeaseFrame> {
+  ws.send({ type: "hello", since: 0, directed_delivery: "v1" });
   ws.send({ type: "serve_lease", op: "claim" });
   return ws.nextOfType("serve_lease");
 }

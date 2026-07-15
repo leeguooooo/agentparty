@@ -4715,6 +4715,24 @@
 .msg-receipt--wake_failed .msg-receipt-label {
   color: #b3261e;
 }
+.msg-delivery--queued .msg-receipt-icon,
+.msg-delivery--queued .msg-receipt-label,
+.msg-delivery--claimed .msg-receipt-icon,
+.msg-delivery--claimed .msg-receipt-label,
+.msg-delivery--running .msg-receipt-icon,
+.msg-delivery--running .msg-receipt-label,
+.msg-delivery--waiting_owner .msg-receipt-icon,
+.msg-delivery--waiting_owner .msg-receipt-label {
+  color: var(--t-accent, #b4552d);
+}
+.msg-delivery--replied .msg-receipt-icon,
+.msg-delivery--replied .msg-receipt-label {
+  color: var(--t-green);
+}
+.msg-delivery--failed .msg-receipt-icon,
+.msg-delivery--failed .msg-receipt-label {
+  color: #b3261e;
+}
 /* 统一消息状态条（Phase 3）：已读摘要(可点开 Lark 式弹层) + 内联 @ 唤醒回执 */
 .msg-status-bar {
   margin-top: 4px;

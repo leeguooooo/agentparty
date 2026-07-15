@@ -2,7 +2,7 @@
 // 读门与 public 一致；写门在 worker（持 D1 成员表）算好 x-ap-can-write，DO handleSend 强制。
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { api, seedToken, uniq, WsClient } from "./helpers";
+import { api, completeCapabilityHello, seedToken, uniq, WsClient } from "./helpers";
 
 async function makeChannel(token: string, visibility: string): Promise<string> {
   const slug = uniq("ch");
@@ -65,7 +65,7 @@ describe("public_watch: anyone can watch, participating needs membership/invite 
 
     // WRITE gate (WS): stranger's send frame rejected even though the socket is open (they can watch)
     const ws = await WsClient.open(slug, stranger.token, "protocol");
-    expect((await ws.nextOfType("welcome")).type).toBe("welcome");
+    expect((await completeCapabilityHello(ws)).type).toBe("welcome");
     ws.send({ type: "send", kind: "message", body: "sneaking in", mentions: [], reply_to: null });
     expect((await ws.nextOfType("error")).code).toBe("unauthorized");
     ws.close();
@@ -78,7 +78,7 @@ describe("public_watch: anyone can watch, participating needs membership/invite 
     expect((await postMsg(slug, stranger.token, "now a member")).status).toBe(200);
     // …and over WS too
     const ws2 = await WsClient.open(slug, stranger.token, "protocol");
-    expect((await ws2.nextOfType("welcome")).type).toBe("welcome");
+    expect((await completeCapabilityHello(ws2)).type).toBe("welcome");
     ws2.send({ type: "send", kind: "message", body: "member ws send", mentions: [], reply_to: null });
     expect((await ws2.nextOfType("sent")).type).toBe("sent");
     ws2.close();
@@ -110,7 +110,7 @@ describe("public_watch: anyone can watch, participating needs membership/invite 
     const stranger = await seedToken("agent", uniq("stranger"), { owner: `${uniq("s")}@x.com` });
     expect((await postMsg(slug, stranger.token, "public is open to all")).status).toBe(200);
     const ws = await WsClient.open(slug, stranger.token, "protocol");
-    expect((await ws.nextOfType("welcome")).type).toBe("welcome");
+    expect((await completeCapabilityHello(ws)).type).toBe("welcome");
     ws.send({ type: "send", kind: "message", body: "ws in public", mentions: [], reply_to: null });
     expect((await ws.nextOfType("sent")).type).toBe("sent");
     ws.close();
@@ -153,7 +153,7 @@ describe("public_watch: anyone can watch, participating needs membership/invite 
 
     // stranger opens WS while public — can send now
     const ws = await WsClient.open(slug, stranger.token, "protocol");
-    expect((await ws.nextOfType("welcome")).type).toBe("welcome");
+    expect((await completeCapabilityHello(ws)).type).toBe("welcome");
     ws.send({ type: "send", kind: "message", body: "while public", mentions: [], reply_to: null });
     expect((await ws.nextOfType("sent")).type).toBe("sent");
 

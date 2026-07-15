@@ -54,9 +54,24 @@ export interface ConfigWithSource {
  */
 export interface StuckWake {
   seq: number;
+  /** durable directed-delivery identity; independent from the ordinary message cursor. */
+  delivery_id?: string;
+  /** Stable logical work identity, retained so JSON replay does not erase delivery context. */
+  work_id?: string;
+  /** Harness continuation selected for this work, when the server supplied one. */
+  continuation_ref?: string;
+  /**
+   * Directed watch 两阶段接单状态：running ACK 前为 unconfirmed，绝不能按 seq 本地回放；
+   * 服务端 ACK 后以 delivery id 原子转为 accepted，才允许把已确认接单但被 harness 吞掉的输出重放。
+   */
+  delivery_acceptance?: "unconfirmed" | "accepted";
   /** 连续送达失败次数。有界重放靠它：超过上限就响亮放弃，绝不静默丢弃。 */
   attempts: number;
   last_error?: string;
+  /** false means the model/process may already have run; restart must announce/close, never execute it again. */
+  retriable?: boolean;
+  /** Runner ignored cancellation; restart must trip the circuit before accepting any later wake. */
+  termination_unconfirmed?: boolean;
   /** 旧状态/serve 欠账没有该字段；watch 用它隔离两阶段确认语义，不能误清 serve delivery debt。 */
   source?: "serve" | "watch";
   /** watch 首次输出时看到的频道 head；重放时会再探测并取较新者。 */
@@ -123,6 +138,21 @@ export function workspaceConfigPath(cwd: string = process.cwd()): string {
 
 function defaultWorkspaceConfigPath(cwd: string): string {
   return join(agentpartyHome(), "state", workspaceId(cwd), "config.json");
+}
+
+/**
+ * Write one workspace identity without consulting `AGENTPARTY_CONFIG` and without
+ * replacing the process-wide fallback config.
+ *
+ * `party serve --profile` owns several child identities inside one resident
+ * process.  Calling `writeConfig()` there would either overwrite the owner's
+ * explicit config or race every child through the same global config.  The
+ * returned path is safe to pin into only that child's runner environment.
+ */
+export function writeWorkspaceConfigOnly(cfg: Config, cwd: string): string {
+  const path = defaultWorkspaceConfigPath(cwd);
+  writeConfigFile(path, cfg);
+  return path;
 }
 
 function canonicalPath(path: string): string {
@@ -517,6 +547,11 @@ export function writeState(st: WorkspaceState, cwd: string = process.cwd()): voi
 
 export function resolveChannel(explicit?: string, cwd?: string): string | null {
   if (explicit) return explicit;
+  // Resident profile runners cannot mutate process.env per child: several
+  // channels may execute concurrently in the same daemon.  Each spawned model
+  // process receives this immutable binding together with its child config, so
+  // nested `party decision ask` / `party send` calls stay in the wake's channel.
+  if (process.env.AGENTPARTY_CHANNEL) return process.env.AGENTPARTY_CHANNEL;
   return readState(cwd)?.channel ?? null;
 }
 
@@ -584,6 +619,34 @@ export function saveWatchStuck(channel: string, stuck: StuckWake, cwd?: string):
     return { ...cur, stuck: { ...stuck, source: "watch" } };
   }, cwd);
   return saved;
+}
+
+/**
+ * 将同一条 directed watch debt 从 unconfirmed 原子推进为 accepted。
+ * delivery id 不同、debt 被 serve/另一条 work 替换、或状态不是 unconfirmed 时均 fail closed。
+ */
+export function markWatchDirectedStuckAccepted(channel: string, deliveryId: string, cwd?: string): boolean {
+  let accepted = false;
+  updateChannelCursor(channel, (cur) => {
+    const stuck = cur.stuck;
+    if (
+      stuck?.source !== "watch" ||
+      stuck.delivery_id !== deliveryId ||
+      stuck.delivery_acceptance !== "unconfirmed"
+    ) {
+      return null;
+    }
+    accepted = true;
+    return {
+      ...cur,
+      stuck: {
+        ...stuck,
+        delivery_acceptance: "accepted",
+        last_error: "watch delivery accepted; awaiting agent acknowledgement",
+      },
+    };
+  }, cwd);
+  return accepted;
 }
 
 /** 了结欠账：送达成功，或有界重试耗尽后显式放弃。 */

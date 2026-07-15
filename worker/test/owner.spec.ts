@@ -2,7 +2,7 @@
 // 历史补拉）都带 owner；/api/me 回显登录身份的 owner。无 owner 的 token 保持旧形状（不带 owner 字段）。
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ADMIN_HEADERS, WsClient, createChannel, seedToken, uniq } from "./helpers";
+import { ADMIN_HEADERS, WsClient, completeCapabilityHello, createChannel, seedToken, uniq } from "./helpers";
 
 async function mintWithOwner(name: string, role: string, owner?: string) {
   const res = await SELF.fetch("http://ap.test/api/tokens", {
@@ -34,7 +34,7 @@ describe("token owner propagation", () => {
     const slug = await createChannel(body.token);
     const ws = await WsClient.open(slug, body.token);
 
-    const welcome = await ws.nextOfType("welcome");
+    const welcome = await completeCapabilityHello(ws);
     expect(welcome.participants).toContainEqual({ name, kind: "agent", owner: "leo" });
 
     ws.send({ type: "send", kind: "message", body: "hi", mentions: [], reply_to: null });
@@ -49,14 +49,13 @@ describe("token owner propagation", () => {
     const { body } = await mintWithOwner(name, "agent", "leo");
     const slug = await createChannel(body.token);
     const sender = await WsClient.open(slug, body.token);
-    await sender.nextOfType("welcome");
+    await completeCapabilityHello(sender);
     sender.send({ type: "send", kind: "message", body: "m1", mentions: [], reply_to: null });
     await sender.nextOfType("sent");
     sender.close();
 
     const reader = await WsClient.open(slug, body.token);
-    await reader.nextOfType("welcome");
-    reader.send({ type: "hello", since: 0 });
+    await completeCapabilityHello(reader);
     const back = await reader.nextOfType("msg");
     expect(back.sender).toEqual({ name, kind: "agent", owner: "leo" });
     reader.close();
@@ -67,7 +66,7 @@ describe("token owner propagation", () => {
     const { token, name } = await seedToken("agent");
     const slug = await createChannel(token);
     const ws = await WsClient.open(slug, token);
-    const welcome = await ws.nextOfType("welcome");
+    const welcome = await completeCapabilityHello(ws);
     expect(welcome.participants).toContainEqual({ name, kind: "agent" });
     expect(welcome.participants.find((p) => p.name === name)).not.toHaveProperty("owner");
     ws.close();

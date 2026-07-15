@@ -3,7 +3,7 @@
 // DO reset 后 clone 重发同一 body，命中已落库窗口即重复消息 + 重复唤醒。
 // 断言观测过程：重发后 messages 表只多一行、返回的 seq 与首发相同——不是只断言「没报错」。
 import { describe, expect, it } from "vitest";
-import { WsClient, api, createChannel, seedToken } from "./helpers";
+import { WsClient, api, completeCapabilityHello, createChannel, seedToken } from "./helpers";
 
 interface MsgLike {
   seq: number;
@@ -100,6 +100,7 @@ describe("message idempotency (#98)", () => {
     const slug = await createChannel(token);
     // 房主自己订阅：绕开私有频道 ACL；观测广播是否重复。
     const ws = await WsClient.open(slug, token);
+    await completeCapabilityHello(ws);
     const key = crypto.randomUUID();
 
     const first = await send(slug, token, "once", key);

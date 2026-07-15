@@ -2,7 +2,7 @@
 // App 用 key={slug} 挂载本组件，切频道即整体重建（socket/状态零残留）。
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { buildHostBoard, type Attachment, type ChannelSquad, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type ReadCursor, type SearchHit, type Sender, type TaskAssigneeKind, type TaskRecord, type TaskState, type TaskSummary, type WakeDelivery } from "@agentparty/shared";
+import { buildHostBoard, type Attachment, type ChannelSquad, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type PublicDirectedDelivery, type ReadCursor, type SearchHit, type Sender, type TaskAssigneeKind, type TaskRecord, type TaskState, type TaskSummary, type WakeDelivery } from "@agentparty/shared";
 import { AgentDetailModal } from "../components/AgentDetailModal";
 import { TeamTabs } from "../components/TeamTabs";
 import { AgentJoin } from "../components/AgentJoin";
@@ -2393,6 +2393,7 @@ function TeamThread({
   self,
   identityDisplay,
   receiptsBySeq,
+  deliveriesBySeq,
   readCursors,
   participants,
   canModerate,
@@ -2418,6 +2419,7 @@ function TeamThread({
   self: string | null;
   identityDisplay: IdentityDisplayMap;
   receiptsBySeq: Map<number, MentionReceipt[]>;
+  deliveriesBySeq: Map<number, PublicDirectedDelivery[]>;
   readCursors: Record<string, ReadCursor>;
   participants: Sender[];
   canModerate: boolean;
@@ -2477,6 +2479,7 @@ function TeamThread({
             self={self}
             identityDisplay={identityDisplay}
             receipts={receiptsBySeq.get(message.seq)}
+            deliveries={deliveriesBySeq.get(message.seq)}
             readCursors={readCursors}
             participants={participants}
             canModerate={canModerate}
@@ -3845,11 +3848,24 @@ export function ChannelPage({
       ),
     [state.messages, wakeDeliveries, state.participants, state.presence, teamNow, isAgentMention],
   );
+  // 可靠投递协议的服务端真值：按原消息 seq 分组，目标名排序保证卡片 props 稳定且展示顺序可预测。
+  const deliveriesBySeq = useMemo(() => {
+    const grouped = new Map<number, PublicDirectedDelivery[]>();
+    for (const delivery of Object.values(state.directedDeliveries)) {
+      const current = grouped.get(delivery.message_seq);
+      if (current === undefined) grouped.set(delivery.message_seq, [delivery]);
+      else current.push(delivery);
+    }
+    for (const deliveries of grouped.values()) {
+      deliveries.sort((left, right) => left.target_name.localeCompare(right.target_name) || left.id.localeCompare(right.id));
+    }
+    return grouped;
+  }, [state.directedDeliveries]);
   // 发送前状态条：草稿里已 @ 的、且在频道里认得的目标 + 当前存活档位。
   const draftMentionStatuses = useMemo<DraftMentionStatus[]>(() => {
     // 以补全菜单的最终结果为唯一身份集合：消息 sender、handle 与 squad 都不会再和状态条各算一套。
     const known = new Map(mentionOptions.map((candidate) => [candidate.name, candidate]));
-    return parseDraftMentions(draft)
+    return parseDraftMentions(draft, mentionOptions.map((candidate) => candidate.name))
       .filter((name) => known.has(name) && name !== state.self)
       .map((name) => {
         const candidate = known.get(name)!;
@@ -4422,6 +4438,7 @@ export function ChannelPage({
                   self={state.self}
                   identityDisplay={identityDisplay}
                   receipts={receiptsBySeq.get(item.message.seq)}
+                  deliveries={deliveriesBySeq.get(item.message.seq)}
                   readCursors={state.readCursors}
                   participants={state.participants}
                   canModerate={canModerate}
@@ -4454,6 +4471,7 @@ export function ChannelPage({
                   self={state.self}
                   identityDisplay={identityDisplay}
                   receiptsBySeq={receiptsBySeq}
+                  deliveriesBySeq={deliveriesBySeq}
                   readCursors={state.readCursors}
                   participants={state.participants}
                   canModerate={canModerate}

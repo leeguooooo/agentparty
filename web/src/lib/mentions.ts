@@ -1,7 +1,15 @@
 // @ 提及候选（issue #39）：把 participants（WS 连着）∪ presence（含 wake 信息）合成一个
 // 分档的候选列表，供 Composer 的 @ 补全下拉用。"可 @" ≠ "在线连接"——本产品最特别的一档是
 // 「可唤醒」：人不在但 @ 了会被 serve/watch/webhook 拉起来。
-import { autoWakeReachable, extractMentionTokens, type ChannelRoleAssignment, type ChannelSquad, type PresenceEntry, type Sender, type WakeKind } from "@agentparty/shared";
+import { autoWakeReachable, type ChannelRoleAssignment, type ChannelSquad, type PresenceEntry, type Sender, type WakeKind } from "@agentparty/shared";
+import {
+  extractMentionTokens,
+  isMentionStart,
+  mentionMatchKey,
+  readMentionToken,
+  resolveMentionToken,
+  type MentionAlias,
+} from "@agentparty/shared/mentions";
 import { MENTION_SENDER_RETENTION_MS, mergeSenderIdentity, type SenderIdentitySnapshot } from "./senderIdentity";
 
 export type MentionTier = "online" | "wakeable" | "recent";
@@ -194,13 +202,20 @@ export function mentionCandidates(
 }
 
 // Composer 用：光标前若正在打 @<prefix>，返回 { start, query }；否则 null。
-// prefix 允许 [a-zA-Z0-9._-]（与 name 字符集一致），@ 前须是行首或空白（不匹配 email 里的 @）。
+// 中文正文不强制 @ 前留空格；ASCII 单词/email 与 URL 仍由共享词法规则排除。
 export function activeMentionQuery(text: string, caret: number): { start: number; query: string } | null {
-  let i = caret - 1;
+  // React/DOM selection snapshots can briefly point one code unit past a freshly updated draft.
+  // Clamp that stale caret instead of letting an out-of-range character participate in the lexer.
+  const boundedCaret = Math.max(0, Math.min(caret, text.length));
+  let i = boundedCaret - 1;
   while (i >= 0 && /[\p{L}\p{N}._-]/u.test(text[i]!)) i--;
   if (i < 0 || text[i] !== "@") return null;
-  if (i > 0 && /[A-Za-z0-9._@-]/.test(text[i - 1]!)) return null;
-  return { start: i, query: text.slice(i + 1, caret) };
+  if (!isMentionStart(text, i)) return null;
+  if (boundedCaret === i + 1) return { start: i, query: "" };
+  const parsed = readMentionToken(text.slice(0, boundedCaret), i);
+  // `readMentionToken` leaves terminal sentence punctuation out of the token,
+  // so a caret after "@codex." is no longer treated as an active completion.
+  return parsed !== null && parsed.end === boundedCaret ? { start: i, query: parsed.value } : null;
 }
 
 // 单个 @ 目标的存活判断（发送前预览 + 发送后回执共用）。tier 复用候选逻辑，额外带出
@@ -230,11 +245,25 @@ export function mentionLiveness(
   return { tier, wakeKind, reachable: tier === "online" || tier === "wakeable" };
 }
 
-// 从草稿正文里提取 @name（与 shared/server 一致：允许 CJK 正文相邻，不吃 ASCII email 里的 @）。
-// 去重、保序，供发送前状态条渲染。
-// #165/#552：放开 unicode 昵称；ASCII token 分支优先，避免把紧跟 agent 名的中文正文吞进去。
-export function parseDraftMentions(text: string): string[] {
-  return extractMentionTokens(text);
+// 从草稿正文提取 mention。knownNames 来自最终补全候选；提供时可把无空格中文正文
+// "请@小明看一下" 唯一解析为 "小明"。未知或歧义 token 仍原样上报，让服务端返回明确错误。
+// #555：ASCII token 分支优先，避免把紧跟 agent 名的中文正文吞进去；URL/email/npm/code
+// 仍完全交给 rich lexer 判定，不能退回单一正则。
+export function parseDraftMentions(text: string, knownNames: readonly string[] = []): string[] {
+  const aliases: MentionAlias[] = knownNames.map((name) => ({ alias: name, target: name, kind: "canonical" }));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const mention of extractMentionTokens(text)) {
+    const ascii = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/.exec(mention.value)?.[0];
+    const lexicalValue = ascii ?? mention.value;
+    const resolution = aliases.length === 0 ? null : resolveMentionToken(lexicalValue, aliases);
+    const name = resolution?.status === "resolved" ? resolution.target : lexicalValue;
+    const key = mentionMatchKey(name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(name);
+  }
+  return out;
 }
 
 export function filterCandidates(cands: MentionCandidate[], query: string, limit = 8): MentionCandidate[] {

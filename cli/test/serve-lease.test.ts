@@ -11,6 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from "../src/instance-lock";
 import { defaultRunnerWorkdir, EXIT_ALREADY_SERVING, runnerWorkdir, runServe } from "../src/commands/serve";
 import { startMockServer, welcomeFrame } from "./mock-server";
@@ -24,6 +25,7 @@ function dir(): string {
   dirs.push(d);
   return d;
 }
+const ns = (value: string) => createHash("sha256").update(value).digest("hex");
 
 describe("serve 同机单实例 (#99 的同机那半)", () => {
   test("第二个 serve 被拒，并告知占锁的 pid", () => {
@@ -67,21 +69,20 @@ describe("serve 同机单实例 (#99 的同机那半)", () => {
 });
 
 describe("runner workdir 按身份隔离 (#99)", () => {
-  test("同频道、不同身份 → 不同 workdir（wake-session.json 不再互踩）", () => {
-    const a = runnerWorkdir("/home/x/.agentparty/runners", "dev", "alice");
-    const b = runnerWorkdir("/home/x/.agentparty/runners", "dev", "bob");
+  test("同频道、不同 authoritative namespace → 不同 workdir", () => {
+    const a = runnerWorkdir("/home/x/.agentparty/runners", "dev", ns("server-a/alice"));
+    const b = runnerWorkdir("/home/x/.agentparty/runners", "dev", ns("server-b/alice"));
     expect(a).not.toBe(b);
     expect(a).toContain("dev");
-    expect(a).toContain("alice");
+    expect(a).toContain(ns("server-a/alice"));
   });
 
-  test("身份未知（还没连上服务端）时退回按频道键，保持旧行为", () => {
-    const w = runnerWorkdir("/home/x/.agentparty/runners", "dev", undefined);
-    expect(w).toBe("/home/x/.agentparty/runners/dev");
+  test("未验证/非 sha256 namespace 会 fail closed", () => {
+    expect(() => runnerWorkdir("/home/x/.agentparty/runners", "dev", "stale-alice")).toThrow("sha256");
   });
 
-  test("身份里的路径分隔符不得逃逸出 runners 根目录", () => {
-    const w = runnerWorkdir("/home/x/.agentparty/runners", "dev", "../../etc/passwd");
+  test("频道里的路径分隔符不得逃逸出 runners 根目录", () => {
+    const w = runnerWorkdir("/home/x/.agentparty/runners", "../../etc/passwd", ns("principal"));
     expect(w).not.toContain("..");
     expect(w).not.toContain("/etc/passwd");
     expect(w.startsWith("/home/x/.agentparty/runners/")).toBe(true);
@@ -90,38 +91,17 @@ describe("runner workdir 按身份隔离 (#99)", () => {
 
 // 光有 runnerWorkdir、没接进默认值计算，等于没修。
 describe("defaultRunnerWorkdir 接线 (#99)", () => {
-  test("config 里有身份时，默认 workdir 带上身份", () => {
-    const d = dir();
-    const cfgPath = join(d, "cfg.json");
-    writeFileSync(
-      cfgPath,
-      JSON.stringify({
-        server: "https://x",
-        token: "ap_t",
-        identity: { name: "alice", email: null, kind: "agent", role: "agent", owner: null, channel_scope: null, verified_at: 1 },
-      }),
-    );
-    const prev = process.env.AGENTPARTY_CONFIG;
-    process.env.AGENTPARTY_CONFIG = cfgPath;
+  test("默认 workdir 只接受 /api/me 派生 namespace，不读取 AGENTPARTY_CONFIG", () => {
+    const namespace = ns("authoritative");
+    const previous = process.env.AGENTPARTY_CONFIG;
+    process.env.AGENTPARTY_CONFIG = "/tmp/stale-other-server.json";
     try {
-      expect(defaultRunnerWorkdir("dev")).toContain("dev-alice");
+      const path = defaultRunnerWorkdir("dev", namespace);
+      expect(path).toContain(namespace);
+      expect(path.endsWith("/dev")).toBe(true);
     } finally {
-      if (prev === undefined) delete process.env.AGENTPARTY_CONFIG;
-      else process.env.AGENTPARTY_CONFIG = prev;
-    }
-  });
-
-  test("没有缓存身份时退回按频道键（旧行为）", () => {
-    const d = dir();
-    const cfgPath = join(d, "cfg.json");
-    writeFileSync(cfgPath, JSON.stringify({ server: "https://x", token: "ap_t" }));
-    const prev = process.env.AGENTPARTY_CONFIG;
-    process.env.AGENTPARTY_CONFIG = cfgPath;
-    try {
-      expect(defaultRunnerWorkdir("dev").endsWith("/runners/dev")).toBe(true);
-    } finally {
-      if (prev === undefined) delete process.env.AGENTPARTY_CONFIG;
-      else process.env.AGENTPARTY_CONFIG = prev;
+      if (previous === undefined) delete process.env.AGENTPARTY_CONFIG;
+      else process.env.AGENTPARTY_CONFIG = previous;
     }
   });
 });

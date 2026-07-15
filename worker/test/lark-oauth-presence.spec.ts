@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { api, createChannel, seedToken, uniq, WsClient } from "./helpers";
+import { api, completeCapabilityHello, createChannel, seedToken, uniq, WsClient } from "./helpers";
 import { fetchMock } from "./fetch-mock";
 
 const LARK_ORIGIN = "https://open.larksuite.com";
@@ -70,10 +70,10 @@ describe("Lark OAuth human presence (#527)", () => {
     const firstSlug = await createChannel(session.access_token);
     const watcher = await seedToken("agent", uniq("watcher"), { channelScope: firstSlug });
     const watcherWs = await WsClient.open(firstSlug, watcher.token);
-    await watcherWs.nextOfType("welcome");
+    await completeCapabilityHello(watcherWs);
 
     const first = await WsClient.open(firstSlug, session.access_token);
-    const firstWelcome = await first.nextOfType("welcome");
+    const firstWelcome = await completeCapabilityHello(first);
     expect(firstWelcome.presence).toContainEqual(expect.objectContaining(expectedPresence));
 
     first.send({ type: "send", kind: "message", body: "profile snapshot", mentions: [], reply_to: null });
@@ -92,7 +92,7 @@ describe("Lark OAuth human presence (#527)", () => {
     expect(offline).toMatchObject({ name: firstWelcome.self, state: "offline", ...expectedPresence });
 
     const reconnected = await WsClient.open(firstSlug, session.access_token);
-    const reconnectWelcome = await reconnected.nextOfType("welcome");
+    const reconnectWelcome = await completeCapabilityHello(reconnected);
     expect(reconnectWelcome.presence).toContainEqual(expect.objectContaining(expectedPresence));
 
     fetchMock.get(LARK_ORIGIN)
@@ -122,7 +122,7 @@ describe("Lark OAuth human presence (#527)", () => {
     reconnected.close();
     await watcherWs.nextOfType("presence");
     const refreshed = await WsClient.open(firstSlug, refreshedSession.access_token);
-    const refreshedWelcome = await refreshed.nextOfType("welcome");
+    const refreshedWelcome = await completeCapabilityHello(refreshed);
     expect(refreshedWelcome.presence).toContainEqual(expect.objectContaining(expectedPresence));
 
     refreshed.send({ type: "send", kind: "message", body: "profile after refresh", mentions: [], reply_to: null });
@@ -138,7 +138,7 @@ describe("Lark OAuth human presence (#527)", () => {
 
     const secondSlug = await createChannel(refreshedSession.access_token);
     const second = await WsClient.open(secondSlug, refreshedSession.access_token);
-    const secondWelcome = await second.nextOfType("welcome");
+    const secondWelcome = await completeCapabilityHello(second);
     expect(secondWelcome.presence).toContainEqual(expect.objectContaining(expectedPresence));
 
     const restPresence = await api(`/api/channels/${secondSlug}/presence`, refreshedSession.access_token);

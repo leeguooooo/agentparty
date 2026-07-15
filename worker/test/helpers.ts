@@ -185,6 +185,13 @@ export class WsClient {
   }
 }
 
+/** Complete the mandatory capability handshake after the server welcome frame. */
+export async function completeCapabilityHello(ws: WsClient) {
+  const welcome = await ws.nextOfType("welcome");
+  ws.send({ type: "hello", since: 0, directed_delivery: "v1" });
+  return welcome;
+}
+
 // #96 起新频道默认开启 loop guard。测「关闭态」行为的用例必须显式关闭，
 // 不能再借用默认值——否则默认值一变，这些用例就在测别的东西。
 // #119 起「关闭 guard」是 human-only（削弱刹车），所以必须拿人类 token 来关。

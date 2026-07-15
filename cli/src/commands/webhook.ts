@@ -7,15 +7,17 @@ import {
   listWebhooks,
   removeWebhook,
   type WebhookFilter,
+  type WebhookMode,
 } from "../rest";
 import { isName, isSlug } from "../validation";
 
 const FILTERS: WebhookFilter[] = ["mentions", "status", "needs-human", "all"];
-const WEBHOOK_FLAGS = ["name", "url", "secret", "filter"];
+const MODES: WebhookMode[] = ["notify", "agent"];
+const WEBHOOK_FLAGS = ["name", "url", "secret", "filter", "mode"];
 const URL_MAX = 2048;
 const SECRET_MAX = 4096;
 const HEADER_VALUE_RE = /^[\x21-\x7e]+$/;
-const HELP = `usage: party webhook add <channel> --name n --url https://... --secret S [--filter mentions|status|needs-human|all]
+const HELP = `usage: party webhook add <channel> --name n --url https://... --secret S [--filter mentions|status|needs-human|all] [--mode notify|agent]
        party webhook remove <channel> --name n
        party webhook list <channel>
 
@@ -24,11 +26,17 @@ message mentions the webhook name. With --filter status, delivery fires for all
 status updates. With --filter needs-human, delivery fires for blocked/done and
 loop-guard status updates.
 
+The default --mode notify only sends notifications and never claims directed
+work. --mode agent binds the webhook to the matching agent token and lets that
+endpoint participate in directed-delivery claim/replay; agent mode accepts
+only the mentions/all filters.
+
 Options:
   --name n              webhook/agent name
   --url URL             HTTPS endpoint
   --secret S            bearer/HMAC secret
-  --filter mentions|status|needs-human|all delivery filter (default: mentions)`;
+  --filter mentions|status|needs-human|all delivery filter (default: mentions)
+  --mode notify|agent   delivery mode (default: notify)`;
 
 function isPrivateIpv4(host: string): boolean {
   const parts = host.split(".");
@@ -114,7 +122,7 @@ export async function run(argv: string[]): Promise<number> {
     console.error(unknown);
     return 1;
   }
-  const flagError = valueFlagError(flags, ["name", "url", "secret", "filter"]);
+  const flagError = valueFlagError(flags, ["name", "url", "secret", "filter", "mode"]);
   if (flagError !== null) {
     console.error(flagError);
     return 1;
@@ -141,6 +149,7 @@ export async function run(argv: string[]): Promise<number> {
         const url = str(flags.url);
         const secret = str(flags.secret);
         const filter = str(flags.filter) ?? "mentions";
+        const mode = str(flags.mode) ?? "notify";
         if (
           !name ||
           !isName(name) ||
@@ -149,10 +158,12 @@ export async function run(argv: string[]): Promise<number> {
           !secret ||
           secret.length > SECRET_MAX ||
           !HEADER_VALUE_RE.test(secret) ||
-          !FILTERS.includes(filter as WebhookFilter)
+          !FILTERS.includes(filter as WebhookFilter) ||
+          !MODES.includes(mode as WebhookMode) ||
+          (mode === "agent" && filter !== "mentions" && filter !== "all")
         ) {
           console.error(
-            "usage: party webhook add <channel> --name n --url https://... --secret S [--filter mentions|status|needs-human|all]",
+            "usage: party webhook add <channel> --name n --url https://... --secret S [--filter mentions|status|needs-human|all] [--mode notify|agent]",
           );
           return 1;
         }
@@ -161,8 +172,9 @@ export async function run(argv: string[]): Promise<number> {
           url,
           secret,
           filter: filter as WebhookFilter,
+          mode: mode as WebhookMode,
         });
-        console.log(`webhook ${name} added to ${channel} (filter: ${filter})`);
+        console.log(`webhook ${name} added to ${channel} (filter: ${filter}) [mode: ${mode}]`);
         return 0;
       }
       case "remove": {
@@ -178,7 +190,9 @@ export async function run(argv: string[]): Promise<number> {
       case "list": {
         const webhooks = await listWebhooks(cfg.server, cfg.token, channel!);
         for (const w of webhooks) {
-          console.log(`${w.name}\t${w.filter}\t${w.url}`);
+          // Preserve the established name/filter/url columns; append mode so existing parsers that
+          // consume the first three columns keep working while new clients can distinguish claims.
+          console.log(`${w.name}\t${w.filter}\t${w.url}\t${w.mode ?? "notify"}`);
         }
         return 0;
       }

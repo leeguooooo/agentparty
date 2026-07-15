@@ -22,6 +22,7 @@ import {
   workspaceConfigPath,
   writeConfig,
   writeState,
+  writeWorkspaceConfigOnly,
 } from "../src/config";
 
 let home: string;
@@ -36,6 +37,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.AGENTPARTY_HOME;
   delete process.env.AGENTPARTY_CONFIG;
+  delete process.env.AGENTPARTY_CHANNEL;
   for (const dir of volatileDirs) rmSync(dir, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
 });
@@ -90,6 +92,21 @@ describe("config", () => {
     expect(readConfig(b)).toEqual({ server: "s", token: "ap_b" });
     // 无 workspace 配置的目录回退到全局（= 最近一次 init 的 ap_b），保「init 一次跨目录可用」
     expect(readConfig("/tmp/proj-c")).toEqual({ server: "s", token: "ap_b" });
+  });
+
+  test("profile child config ignores owner explicit/global config and stays mode 0600 (#548)", () => {
+    const ownerPath = join(home, "owner.json");
+    process.env.AGENTPARTY_CONFIG = ownerPath;
+    writeConfig({ server: "s", token: "ap_OWNER" });
+
+    const childCwd = "/tmp/profile-child-alpha";
+    const childPath = writeWorkspaceConfigOnly({ server: "s", token: "ap_CHILD" }, childCwd);
+
+    expect(childPath).toBe(join(home, "state", workspaceId(childCwd), "config.json"));
+    expect(JSON.parse(readFileSync(childPath, "utf8"))).toEqual({ server: "s", token: "ap_CHILD" });
+    expect(JSON.parse(readFileSync(ownerPath, "utf8"))).toEqual({ server: "s", token: "ap_OWNER" });
+    expect(statSync(childPath).mode & 0o777).toBe(0o600);
+    expect(globalConfigPath()).toBe(ownerPath);
   });
 
   test("config precedence is explicit env > workspace > cwd breadcrumb > global (#359)", () => {
@@ -224,6 +241,13 @@ describe("workspace state", () => {
     expect(resolveChannel(undefined, cwd)).toBe("dev");
     expect(resolveChannel("ops", cwd)).toBe("ops");
     expect(resolveChannel(undefined, "/tmp/unbound")).toBeNull();
+  });
+
+  test("resolveChannel uses the immutable runner channel binding before workspace state (#548)", () => {
+    writeState({ channel: "owner-channel", cursor: 0 }, cwd);
+    process.env.AGENTPARTY_CHANNEL = "profile-child-channel";
+    expect(resolveChannel(undefined, cwd)).toBe("profile-child-channel");
+    expect(resolveChannel("explicit-channel", cwd)).toBe("explicit-channel");
   });
 
   test("breadcrumb recovers the agent config after AGENTPARTY_CONFIG is lost (issue #42)", () => {
