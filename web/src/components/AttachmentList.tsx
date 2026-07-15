@@ -64,30 +64,34 @@ function ImageThumb({ att }: { att: Attachment }) {
   );
 }
 
+export async function resolveAttachmentDownloadUrl(
+  token: string | null,
+  url: string,
+): Promise<{ href: string; revoke: boolean }> {
+  if (token) {
+    try {
+      return { href: await fetchAttachmentSignedUrl(token, url), revoke: false };
+    } catch {
+      // Rolling deploy / self-hosted old worker: use the authenticated blob path.
+    }
+  }
+  const blob = await fetchAttachmentBlob(token, url);
+  return { href: URL.createObjectURL(blob), revoke: true };
+}
+
 function FileLink({ att }: { att: Attachment }) {
   const onDownload = async () => {
     try {
       const token = getToken();
-      if (token) {
-        const signedUrl = await fetchAttachmentSignedUrl(token, att.url);
-        const a = document.createElement("a");
-        a.href = signedUrl;
-        a.download = att.filename;
-        a.rel = "noreferrer";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        return;
-      }
-      const blob = await fetchAttachmentBlob(null, att.url);
-      const objectUrl = URL.createObjectURL(blob);
+      const resolved = await resolveAttachmentDownloadUrl(token, att.url);
       const a = document.createElement("a");
-      a.href = objectUrl;
+      a.href = resolved.href;
       a.download = att.filename;
+      a.rel = "noreferrer";
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+      if (resolved.revoke) setTimeout(() => URL.revokeObjectURL(resolved.href), 10_000);
     } catch {
       // 静默失败：下载权限/网络问题在 UI 无 toast 约定下不打断阅读
     }

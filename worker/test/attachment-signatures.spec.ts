@@ -31,5 +31,9 @@ describe("attachment signed URLs (#521)", () => {
     expect(await verifySignedAttachmentRequest(signed!.url, env, (signed!.expiresAt + 1) * 1000)).toBe(false);
     expect(await createSignedAttachmentUrl(source, {}, now)).toBeNull();
     expect(await verifySignedAttachmentRequest(signed!.url, {}, now)).toBe(false);
+    expect(await createSignedAttachmentUrl(source, {
+      DESKTOP_PAIRING_SECRET: "must-not-cross-sign",
+      ADMIN_SECRET: "must-not-cross-sign",
+    } as Record<string, string>, now)).toBeNull();
   });
 });

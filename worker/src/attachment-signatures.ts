@@ -4,12 +4,10 @@ const ATTACHMENT_SIGNED_URL_MAX_FUTURE_SECONDS = ATTACHMENT_SIGNED_URL_TTL_SECON
 
 export type AttachmentSigningEnv = {
   ATTACHMENT_SIGNING_SECRET?: string;
-  DESKTOP_PAIRING_SECRET?: string;
-  ADMIN_SECRET?: string;
 };
 
 function signingSecret(env: AttachmentSigningEnv): string | null {
-  return env.ATTACHMENT_SIGNING_SECRET?.trim() || env.DESKTOP_PAIRING_SECRET?.trim() || env.ADMIN_SECRET?.trim() || null;
+  return env.ATTACHMENT_SIGNING_SECRET?.trim() || null;
 }
 
 function attachmentPath(pathname: string): boolean {

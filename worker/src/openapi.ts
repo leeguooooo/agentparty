@@ -748,7 +748,7 @@ export const openapiDocument = {
       post: {
         summary: "upload one attachment blob to R2 and get a ref",
         description:
-          "uploads the raw request body to R2 under <slug>/<uuid>/<filename>; returns the ref to carry in a message's attachments field. non-readonly token with channel access required. max 25MB.",
+          "uploads the raw request body to R2 under <slug>/<sha256>/<filename>; returns the ref to carry in a message's attachments field. non-readonly token with channel access required. max 25MB.",
         security: [{ bearer: [] }],
         parameters: [
           { name: "slug", in: "path", required: true, schema: { type: "string" } },

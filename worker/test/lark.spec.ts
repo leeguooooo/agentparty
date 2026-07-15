@@ -68,6 +68,34 @@ describe("lark notification integration", () => {
     expect(await verifyWebhookSignature("secret", body, `hmac-sha256=${sig.slice(0, -1)}0`)).toBe(false);
   });
 
+  it("escapes parentheses in attachment URLs before embedding them in Lark markdown", () => {
+    const card = buildMentionCard({
+      type: "msg",
+      seq: 1,
+      kind: "message",
+      body: "proof",
+      mentions: ["reviewer"],
+      reply_to: null,
+      state: null,
+      note: null,
+      status: null,
+      ts: 1_700_000_000_000,
+      channel: "qa",
+      permalink: "https://ap.test/c/qa",
+      sender: { name: "codex", kind: "agent" },
+      attachments: [{
+        key: "qa/hash/proof(1).png",
+        filename: "proof(1).png",
+        content_type: "image/png",
+        size: 3,
+        url: "https://ap.test/api/channels/qa/attachments/hash/proof(1).png?exp=1&sig=test",
+      }],
+    });
+    const markdown = String((card.elements as Array<Record<string, unknown>>)[0]?.content);
+    expect(markdown).toContain("proof%281%29.png?exp=1&sig=test");
+    expect(markdown).not.toContain("proof(1).png?exp=1&sig=test");
+  });
+
   it("enables a human subscription by registering a mentions webhook in the channel DO", async () => {
     const account = `lark-email:${uniq("owner")}@example.com`;
     const profile = await seedLarkProfile(account, "larkalice");

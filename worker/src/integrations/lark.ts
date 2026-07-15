@@ -595,8 +595,10 @@ export function buildMentionCard(payload: LarkWebhookPayload): Record<string, un
   const title = `AgentParty @${payload.mentions.join(", @")}`;
   const sender = payload.sender.display_name || payload.sender.handle || payload.sender.owner || payload.sender.name;
   const body = payload.kind === "status" ? payload.note || payload.body : payload.body;
-  const attachmentLinks = payload.attachments?.map((attachment) =>
-    `[${attachment.filename.replace(/[\\[\]]/g, "\\$&")}](${attachment.url})`).join(" · ");
+  const attachmentLinks = payload.attachments?.map((attachment) => {
+    const markdownSafeUrl = attachment.url.replace(/\(/g, "%28").replace(/\)/g, "%29");
+    return `[${attachment.filename.replace(/[\\[\]]/g, "\\$&")}](${markdownSafeUrl})`;
+  }).join(" · ");
   const content = attachmentLinks ? `${body}\n\n📎 ${attachmentLinks}` : body;
   return {
     config: { wide_screen_mode: true },

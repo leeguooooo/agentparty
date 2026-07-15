@@ -594,7 +594,7 @@ export interface HelloFrame {
  * 客户端先 POST /api/channels/:slug/attachments 上传拿到本结构，再随消息带上 N 个引用。
  */
 export interface Attachment {
-  /** R2 对象键：<slug>/<uuid>/<filename>，前缀锚定到频道 slug 以隔离跨频道读取 */
+  /** R2 对象键：<slug>/<sha256>/<filename>，前缀锚定到频道 slug 以隔离跨频道读取 */
   key: string;
   filename: string;
   content_type: string;
