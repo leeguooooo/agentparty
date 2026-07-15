@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
+import { clearApiBase, setApiBase } from "../lib/base";
 
 const savedAgents: Array<{ name: string; token: string; command: string }> = [];
 
@@ -71,6 +72,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearApiBase(); // #530：清掉测试里注入的 runtime apiBase，避免泄漏到后续用例/文件
   act(() => renderer?.unmount());
   renderer = null;
   Reflect.deleteProperty(globalThis, "window");
@@ -191,5 +193,26 @@ describe("AgentJoin dismiss behavior", () => {
     expect(command).toContain("party send \"need human confirmation: <question/options>\" --channel demo --mention host");
     expect(command).toContain("watch --once is only a current-turn standby");
     expect(command).toContain("prefer party serve or webhook delivery");
+  });
+});
+
+describe("AgentJoin 接入包 server 域名 (#530)", () => {
+  // 桌面版(Tauri)里 location.origin 是 tauri://localhost，接入包若用它拼 `party init --server`
+  // 会让 agent 报错/连不上。修复要求：apiBase() 非空(桌面注入了真后端)时用 apiBase()，
+  // 只有同源 web(apiBase 为空)才回退 location.origin。
+  // 本用例里 location.origin = https://party.test，代表「不该被用到的伪源」。
+  test("apiBase() 非空时，party init --server 用注入的真实后端而非 location.origin", async () => {
+    setApiBase("https://agentparty.leeguoo.com");
+    const r = render();
+    open(r);
+    await act(async () => {
+      await r.root.find((node) => node.props.className === "d-btn d-btn--primary" && node.props.onClick).props.onClick();
+    });
+
+    const command = savedAgents[0]!.command;
+    // 关键断言：--server 用的是 apiBase() 的真后端
+    expect(command).toContain("party init --server https://agentparty.leeguoo.com ");
+    // 绝不能回退到 location.origin(桌面端的伪源，此处以 https://party.test 代表)
+    expect(command).not.toContain("party init --server https://party.test");
   });
 });

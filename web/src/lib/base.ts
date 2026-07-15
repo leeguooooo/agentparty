@@ -40,6 +40,10 @@ export function apiUrl(path: string): string {
   return `${apiBase()}${path}`;
 }
 
+export function apiOrigin(fallbackOrigin = location.origin): string {
+  return apiBase() || fallbackOrigin;
+}
+
 export function wsUrl(path: string): string {
   const base = apiBase();
   if (base !== "") return `${base.replace(/^http/i, "ws")}${path}`;

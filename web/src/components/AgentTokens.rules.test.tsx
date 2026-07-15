@@ -31,6 +31,7 @@ mock.module("../lib/api", () => ({
   ConflictError: class ConflictError extends Error {},
   ForbiddenError: class ForbiddenError extends Error {},
   ValidationError: class ValidationError extends Error {},
+  createChannelAgent: async (_slug: string, name: string) => ({ name, token: "ap_created" }),
   createProjectAgentProfile: mock(async (token: string, body: Record<string, unknown>) => {
     createCalls.push({ token, body });
     // upsert：把新 rules 落回 fixture，模拟 worker 的 ON CONFLICT DO UPDATE
@@ -41,7 +42,10 @@ mock.module("../lib/api", () => ({
   inviteProjectAgent: async () => {},
   listChannelAgents: async () => agentsFixture,
   listProjectAgentProfiles: async () => profilesFixture,
-  rotateChannelAgent: async () => ({}),
+  rotateChannelAgent: async (_token: string, _slug: string, name: string) => ({
+    name,
+    token: "ap_rotated",
+  }),
   setChannelAgentNickname: mock(async (token: string, slug: string, name: string, nickname: string) => {
     nicknameCalls.push({ token, slug, name, nickname });
     const agent = agentsFixture.find((entry) => entry.name === name);

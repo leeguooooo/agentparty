@@ -11,6 +11,7 @@ import {
   ValidationError,
 } from "../lib/api";
 import { copyText, saveAgentToken } from "../lib/agentTokenVault";
+import { apiOrigin } from "../lib/base";
 import { useT, type TFunc } from "../i18n/useT";
 import { useDismissableLayer } from "./useDismissableLayer";
 import "../i18n/strings/AgentJoin";
@@ -110,7 +111,10 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
     setPhase({ kind: "loading" });
     try {
       const agent = await createChannelAgent(slug, wanted, token);
-      const server = location.origin;
+      // #530：接入包的 server 必须是真实后端。桌面版(Tauri)里 location.origin 是 tauri://localhost /
+      // http://tauri.localhost / dev 的 127.0.0.1:5173，agent 拿去 `party init --server` 会因非 http(s)
+      // 报错或连不上。优先用打包注入的 apiBase(VITE_API_BASE=真后端)，仅同源 web 部署(apiBase 为空)回退 location.origin。
+      const server = apiOrigin();
       // 复制的是完整接入脚本：init 只写配置不发消息，必须带「报到发言」，否则网页上看不到 agent。
       const command = [
         t("AgentJoin.cmd.header", { slug }),

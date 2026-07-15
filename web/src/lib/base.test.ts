@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { apiBase, apiUrl, clearApiBase, setApiBase, wsUrl } from "./base";
+import { apiBase, apiOrigin, apiUrl, clearApiBase, setApiBase, wsUrl } from "./base";
 
 beforeEach(() => {
   const values = new Map<string, string>();
@@ -38,7 +38,14 @@ describe("api base", () => {
     setApiBase("https://agentparty.pwtk-dev.work///");
 
     expect(apiBase()).toBe("https://agentparty.pwtk-dev.work");
+    expect(apiOrigin("tauri://localhost")).toBe("https://agentparty.pwtk-dev.work");
     expect(apiUrl("/api/channels")).toBe("https://agentparty.pwtk-dev.work/api/channels");
+  });
+
+  test("falls back to the supplied browser origin for same-origin web deployments", () => {
+    clearApiBase();
+
+    expect(apiOrigin("https://party.example.com")).toBe("https://party.example.com");
   });
 
   test("derives websocket URLs from the configured API base", () => {
