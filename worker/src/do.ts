@@ -1524,6 +1524,10 @@ export class ChannelDO extends Server<Env> {
       connection.close(1008, "channel_full");
       return;
     }
+    // #527：浏览器人类通常不会主动发 status。连接建立时就把 worker 从账号资料解析出的
+    // 权威 identity 落到本 session 的 presence，避免只在断线时由 markOffline 造出一个
+    // 没有 kind/profile 的占位行，进而让 who 把 lark-* 人类猜成 agent。
+    if (state.kind === "human") this.materializeConnectionPresence(state, connection.id, Date.now());
     const loopGuard = state.kind === "agent" ? this.loopGuardMessage(state.name) : this.globalLoopGuardMessage();
     this.sendFrame(connection, {
       type: "welcome",
@@ -1680,6 +1684,9 @@ export class ChannelDO extends Server<Env> {
           role: st.role,
           owner: st.owner,
           handle: st.handle,
+          displayName: st.displayName,
+          avatarUrl: st.avatarUrl,
+          avatarThumb: st.avatarThumb,
           lineage: st.lineage,
           tokenHash: st.tokenHash,
           collabRole: st.collabRole,
@@ -2158,6 +2165,64 @@ export class ChannelDO extends Server<Env> {
     const frame: PresenceFrame = { type: "presence", name, state: "offline", note: null, ts };
     const entry = this.presenceFor(name);
     this.broadcastFrame(entry ? { type: "presence", ...entry } : frame);
+  }
+
+  private materializeConnectionPresence(identity: ConnState, sessionId: string, ts: number) {
+    const previous = this.ctx.storage.sql
+      .exec(
+        `SELECT status_scope_json, status_summary_seq, status_blocked_reason, status_context_json,
+                status_decision_json, status_workflow_json, role, role_source, residency,
+                wake_kind, wake_verified_at, context_json, lineage_json, client_version,
+                paused_at, paused_resume_at
+           FROM presence WHERE name = ? AND session_id != ?
+          ORDER BY updated_at DESC LIMIT 1`,
+        identity.name,
+        sessionId,
+      )
+      .toArray()[0];
+    this.ctx.storage.sql.exec(
+      `INSERT INTO presence (
+         name, session_id, kind, account, handle, display_name, avatar_url, avatar_thumb,
+         state, note, updated_at,
+         status_scope_json, status_summary_seq, status_blocked_reason, status_context_json,
+         status_decision_json, status_workflow_json, role, role_source, residency,
+         wake_kind, wake_verified_at, context_json, lineage_json, client_version,
+         paused_at, paused_resume_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(name, session_id) DO UPDATE SET
+         kind = excluded.kind,
+         account = COALESCE(excluded.account, presence.account),
+         handle = COALESCE(excluded.handle, presence.handle),
+         display_name = COALESCE(excluded.display_name, presence.display_name),
+         avatar_url = COALESCE(excluded.avatar_url, presence.avatar_url),
+         avatar_thumb = COALESCE(excluded.avatar_thumb, presence.avatar_thumb),
+         lineage_json = COALESCE(excluded.lineage_json, presence.lineage_json)`,
+      identity.name,
+      sessionId,
+      identity.kind,
+      identity.owner ?? null,
+      identity.handle ?? null,
+      identity.displayName ?? null,
+      identity.avatarUrl ?? null,
+      identity.avatarThumb ?? null,
+      ts,
+      previous?.status_scope_json ?? null,
+      previous?.status_summary_seq ?? null,
+      previous?.status_blocked_reason ?? null,
+      previous?.status_context_json ?? null,
+      previous?.status_decision_json ?? null,
+      previous?.status_workflow_json ?? null,
+      previous?.role ?? null,
+      previous?.role_source ?? null,
+      previous?.residency ?? null,
+      previous?.wake_kind ?? null,
+      previous?.wake_verified_at ?? null,
+      previous?.context_json ?? null,
+      identity.lineage === undefined ? (previous?.lineage_json ?? null) : JSON.stringify(identity.lineage),
+      previous?.client_version ?? null,
+      previous?.paused_at ?? null,
+      previous?.paused_resume_at ?? null,
+    );
   }
 
   private cleanupPresenceSession(name: string, sessionId: string, ts: number) {
