@@ -57,20 +57,23 @@ describe("Composer Escape handling (#357)", () => {
   test("focuses and reveals the composer when reply mode starts", () => {
     const focus = mock(() => undefined);
     const scrollIntoView = mock(() => undefined);
+    const composer = (focusRequest: number | null) => (
+      <LocaleProvider>
+        <Composer
+          draft=""
+          setDraft={() => undefined}
+          onSend={() => undefined}
+          focusRequest={focusRequest}
+          ready
+          candidates={[]}
+          mentionStatuses={[]}
+        />
+      </LocaleProvider>
+    );
 
     act(() => {
       renderer = create(
-        <LocaleProvider>
-          <Composer
-            draft=""
-            setDraft={() => undefined}
-            onSend={() => undefined}
-            focusRequest={3}
-            ready
-            candidates={[]}
-            mentionStatuses={[]}
-          />
-        </LocaleProvider>,
+        composer(null),
         {
           createNodeMock: (element) =>
             element.type === "textarea"
@@ -80,6 +83,11 @@ describe("Composer Escape handling (#357)", () => {
         },
       );
     });
+
+    expect(focus).not.toHaveBeenCalled();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    act(() => renderer!.update(composer(3)));
 
     expect(focus).toHaveBeenCalledWith({ preventScroll: true });
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
