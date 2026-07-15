@@ -3968,8 +3968,17 @@ export class ChannelDO extends Server<Env> {
     // Pure-CJK aliases have no lexical boundary before following prose
     // (`请@小明看一下`). Load aliases that are prefixes of the raw token; the
     // resolver below applies longest-match and still fails closed on ties.
-    const nicknamePrefixes = candidates.map(() => "? LIKE nickname || '%'").join(" OR ");
-    const displayNamePrefixes = candidates.map(() => "? LIKE display_name || '%'").join(" OR ");
+    // ASCII names never need this fallback: accepting it would turn unknown
+    // `@bobcat` into the existing `bob` target.
+    const cjkPrefixCandidates = candidates.filter((candidate) =>
+      /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(candidate)
+    );
+    const nicknamePrefixClause = cjkPrefixCandidates.length === 0
+      ? ""
+      : ` OR (${cjkPrefixCandidates.map(() => "? LIKE nickname || '%'").join(" OR ")})`;
+    const displayNamePrefixClause = cjkPrefixCandidates.length === 0
+      ? ""
+      : ` OR (${cjkPrefixCandidates.map(() => "? LIKE display_name || '%'").join(" OR ")})`;
     type AliasRow = { target: string; alias: string };
     let remote: AliasRow[];
     try {
@@ -3980,8 +3989,8 @@ export class ChannelDO extends Server<Env> {
         ).bind(...candidates).all<AliasRow>(),
         this.env.DB.prepare(
           `SELECT name AS target, nickname AS alias FROM agent_nicknames
-            WHERE nickname COLLATE NOCASE IN (${placeholders}) OR (${nicknamePrefixes})`,
-        ).bind(...candidates, ...candidates).all<AliasRow>(),
+            WHERE nickname COLLATE NOCASE IN (${placeholders})${nicknamePrefixClause}`,
+        ).bind(...candidates, ...cjkPrefixCandidates).all<AliasRow>(),
         this.env.DB.prepare(
           `SELECT handle AS target, handle AS alias FROM account_profiles
             WHERE handle COLLATE NOCASE IN (${placeholders})`,
@@ -3989,8 +3998,8 @@ export class ChannelDO extends Server<Env> {
         this.env.DB.prepare(
           `SELECT handle AS target, display_name AS alias FROM account_profiles
             WHERE display_name IS NOT NULL
-              AND (display_name COLLATE NOCASE IN (${placeholders}) OR (${displayNamePrefixes}))`,
-        ).bind(...candidates, ...candidates).all<AliasRow>(),
+              AND (display_name COLLATE NOCASE IN (${placeholders})${displayNamePrefixClause})`,
+        ).bind(...candidates, ...cjkPrefixCandidates).all<AliasRow>(),
         this.env.DB.prepare(
           `SELECT name AS target, name AS alias FROM channel_squads
             WHERE channel_slug = ? AND name COLLATE NOCASE IN (${placeholders})`,
@@ -4050,12 +4059,12 @@ export class ChannelDO extends Server<Env> {
     const routed: string[] = [];
     const seen = new Set<string>();
     for (const raw of candidates) {
-      if (raw.toLocaleLowerCase("en-US") === "all" || raw === "全体") {
-        return { frame, error: `unsupported mention @${raw}` };
+      if (raw.toLocaleLowerCase("en-US") === "all" || raw.startsWith("全体")) {
+        return { frame, error: `unsupported mention @${raw.startsWith("全体") ? "全体" : raw}` };
       }
       const key = raw.toLocaleLowerCase("en-US");
       let targets = aliases.get(key);
-      if (!targets) {
+      if (!targets && cjkPrefixCandidates.includes(raw)) {
         let longest = 0;
         for (const [alias, aliasTargets] of aliases) {
           if (!key.startsWith(alias) || alias.length < longest) continue;

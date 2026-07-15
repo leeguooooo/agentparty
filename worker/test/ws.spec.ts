@@ -149,7 +149,17 @@ describe("websocket", () => {
     ws.send({ type: "send", kind: "message", body: "请@ghost看一下", mentions: [], reply_to: null });
     const error = await ws.nextOfType("error");
     expect(error).toMatchObject({ code: "bad_request", message: "unknown mention @ghost" });
+    ws.send({ type: "send", kind: "message", body: "请@bobcat看一下", mentions: [], reply_to: null });
+    expect(await ws.nextOfType("error")).toMatchObject({
+      code: "bad_request",
+      message: "unknown mention @bobcat",
+    });
     ws.send({ type: "send", kind: "message", body: "请 @全体 看一下", mentions: [], reply_to: null });
+    expect(await ws.nextOfType("error")).toMatchObject({
+      code: "bad_request",
+      message: "unsupported mention @全体",
+    });
+    ws.send({ type: "send", kind: "message", body: "请@全体看一下", mentions: [], reply_to: null });
     expect(await ws.nextOfType("error")).toMatchObject({
       code: "bad_request",
       message: "unsupported mention @全体",
