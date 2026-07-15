@@ -1,7 +1,7 @@
 // 消息渲染：message → doodle 卡片外壳 + mono 元信息 + markdown 正文；
 // status → 时间线分隔条（spec §9 第 2 块）。
 import type { AgentContext, ChannelRoleAssignment, MsgFrame, PresenceEntry, ReadCursor, Sender } from "@agentparty/shared";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { agentHue } from "../lib/agentColor";
 import { isClientVersionOutdated, useMinClientVersion } from "../lib/clientVersion";
@@ -322,6 +322,7 @@ function MessageCardImpl({
   const [decisionRejectDraft, setDecisionRejectDraft] = useState("");
   const menuRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
   // 每个 agent 一个确定性色相：CSS 用 --ah 套 hsl() 给头像点/名字/卡片左条上色
   const hueStyle = { "--ah": agentHue(msg.sender.name) } as CSSProperties;
   // 已读/未读名单（Phase 2）：只在有游标数据时算；status 分隔条不显示。
@@ -416,6 +417,14 @@ function MessageCardImpl({
     const timer = window.setTimeout(() => setCopied(false), 1400);
     return () => window.clearTimeout(timer);
   }, [copied]);
+
+  useLayoutEffect(() => {
+    if (!editing) return;
+    const input = editInputRef.current;
+    if (input === null) return;
+    input.focus({ preventScroll: true });
+    input.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [editing]);
 
   const openMenuAt = (x: number, y: number) => {
     const clampedX = Math.max(8, Math.min(x, window.innerWidth - 188));
@@ -537,110 +546,113 @@ function MessageCardImpl({
       }
     >
       <header className="d-meta msg-head">
-        {msg.sender.avatar_thumb || msg.sender.avatar_url ? (
-          <img className="msg-avatar msg-avatar--img" src={msg.sender.avatar_thumb ?? msg.sender.avatar_url} alt="" />
-        ) : (
-          <span className="msg-avatar" aria-hidden="true" />
-        )}
-        <AgentInfoPopover
-          id={`agent-info-${msg.seq}-${msg.sender.name}`}
-          label={senderLabel}
-          name={msg.sender.name}
-          kind={msg.sender.kind}
-          owner={msg.sender.owner ?? null}
-          entry={presence?.[msg.sender.name]}
-          assignment={agentRoles?.[msg.sender.name]}
-          recentMessages={recentMessages}
-          triggerClassName="msg-sender"
-        />
-        {/* owner(lark 长 id）不再每条平铺——它已在 senderTitle 里，悬停发送者名即见；
-           防冒充锚点保留在 tooltip + kind 徽章，行内只留重要内容（名字/类型/提及）。 */}
-        {lineageLabel !== null && (
-          <span className="t-mono msg-lineage" title={senderTitle}>
-            {lineageLabel}
+        <div className="msg-head-main">
+          {msg.sender.avatar_thumb || msg.sender.avatar_url ? (
+            <img className="msg-avatar msg-avatar--img" src={msg.sender.avatar_thumb ?? msg.sender.avatar_url} alt="" />
+          ) : (
+            <span className="msg-avatar" aria-hidden="true" />
+          )}
+          <AgentInfoPopover
+            id={`agent-info-${msg.seq}-${msg.sender.name}`}
+            label={senderLabel}
+            name={msg.sender.name}
+            kind={msg.sender.kind}
+            owner={msg.sender.owner ?? null}
+            entry={presence?.[msg.sender.name]}
+            assignment={agentRoles?.[msg.sender.name]}
+            recentMessages={recentMessages}
+            triggerClassName="msg-sender"
+          />
+          {/* owner(lark 长 id）不再每条平铺——它已在 senderTitle 里，悬停发送者名即见；
+             防冒充锚点保留在 tooltip + kind 徽章，行内只留重要内容（名字/类型/提及）。 */}
+          {lineageLabel !== null && (
+            <span className="t-mono msg-lineage" title={senderTitle}>
+              {lineageLabel}
+            </span>
+          )}
+          <span className={"msg-kind" + (msg.sender.kind === "human" ? " msg-kind--human" : "")}>
+            {msg.sender.kind}
           </span>
-        )}
-        <span className={"msg-kind" + (msg.sender.kind === "human" ? " msg-kind--human" : "")}>
-          {msg.sender.kind}
-        </span>
-        {clientVersion !== null && (
-          <span
-            className={"t-mono msg-client-version" + (clientOutdated ? " msg-client-version--outdated" : "")}
-            title={
-              clientOutdated
-                ? t("MessageCard.clientVersion.outdated", { version: clientVersion, min: minClientVersion ?? "" })
-                : t("MessageCard.clientVersion.title", { version: clientVersion })
-            }
-          >
-            cli v{clientVersion}
-            {clientOutdated && (
-              <span className="msg-client-version-warn" aria-hidden="true">
-                {" "}⚠
-              </span>
-            )}
-          </span>
-        )}
-        {msg.mentions.map((m) => {
-          const mentionedSender = participants?.find((participant) => participant.name === m);
-          const mentionedPresence = presence?.[m];
-          const mentionedIdentity = identityDisplay?.[m];
-          return (
-            <AgentInfoPopover
-              key={m}
-              id={`agent-info-${msg.seq}-mention-${m}`}
-              label={`@${displayForIdentity(m, identityDisplay)}`}
-              name={m}
-              kind={mentionedSender?.kind ?? mentionedPresence?.kind ?? mentionedIdentity?.kind ?? null}
-              owner={mentionedSender?.owner ?? mentionedPresence?.account ?? mentionedIdentity?.account ?? null}
-              entry={mentionedPresence}
-              assignment={agentRoles?.[m]}
-              recentMessages={recentMessagesByAgent?.get(m) ?? (m === msg.sender.name ? recentMessages : [])}
-              triggerClassName="msg-mention"
-            />
-          );
-        })}
-        {msg.reply_to !== null && quotedMessage === null && <span className="msg-reply">↩ #{msg.reply_to}</span>}
-        {revisionBadges.map((badge) => (
-          <span key={badge} className="msg-revision">
-            {badge}
-          </span>
-        ))}
-        {review !== undefined && reviewBadge !== null && (
-          <span className={`msg-review msg-review--${review.state}`} title={reviewTitleText}>
-            {reviewBadge}
-          </span>
-        )}
-        {decisionState !== undefined && (
-          <span className={`msg-decision-badge msg-decision-badge--${decisionState}`}>
-            {t(`MessageCard.decision.state.${decisionState}`)}
-          </span>
-        )}
-        {decisionResponse !== undefined && (
-          <span className="msg-decision-badge msg-decision-badge--response">
-            {t("MessageCard.decision.responseBadge")}
-          </span>
-        )}
-        <span className="msg-fill" />
-        {copied && <span className="msg-copy-feedback">{t("MessageCard.copied")}</span>}
-        {canShowActions && (
-          <button
-            ref={triggerRef}
-            type="button"
-            className="d-btn msg-menu-trigger"
-            aria-label={t("MessageCard.menu.more")}
-            aria-expanded={menu !== null}
-            title={t("MessageCard.menu.more")}
-            disabled={busy}
-            onClick={(event) => {
-              const rect = event.currentTarget.getBoundingClientRect();
-              openMenuAt(rect.right - 12, rect.bottom + 6);
-            }}
-          >
-            ⋯
-          </button>
-        )}
-        <span>#{msg.seq}</span>
-        <time>{fmtTime(msg.ts)}</time>
+          {clientVersion !== null && (
+            <span
+              className={"t-mono msg-client-version" + (clientOutdated ? " msg-client-version--outdated" : "")}
+              title={
+                clientOutdated
+                  ? t("MessageCard.clientVersion.outdated", { version: clientVersion, min: minClientVersion ?? "" })
+                  : t("MessageCard.clientVersion.title", { version: clientVersion })
+              }
+            >
+              cli v{clientVersion}
+              {clientOutdated && (
+                <span className="msg-client-version-warn" aria-hidden="true">
+                  {" "}⚠
+                </span>
+              )}
+            </span>
+          )}
+          {msg.mentions.map((m) => {
+            const mentionedSender = participants?.find((participant) => participant.name === m);
+            const mentionedPresence = presence?.[m];
+            const mentionedIdentity = identityDisplay?.[m];
+            return (
+              <AgentInfoPopover
+                key={m}
+                id={`agent-info-${msg.seq}-mention-${m}`}
+                label={`@${displayForIdentity(m, identityDisplay)}`}
+                name={m}
+                kind={mentionedSender?.kind ?? mentionedPresence?.kind ?? mentionedIdentity?.kind ?? null}
+                owner={mentionedSender?.owner ?? mentionedPresence?.account ?? mentionedIdentity?.account ?? null}
+                entry={mentionedPresence}
+                assignment={agentRoles?.[m]}
+                recentMessages={recentMessagesByAgent?.get(m) ?? (m === msg.sender.name ? recentMessages : [])}
+                triggerClassName="msg-mention"
+              />
+            );
+          })}
+          {msg.reply_to !== null && quotedMessage === null && <span className="msg-reply">↩ #{msg.reply_to}</span>}
+          {revisionBadges.map((badge) => (
+            <span key={badge} className="msg-revision">
+              {badge}
+            </span>
+          ))}
+          {review !== undefined && reviewBadge !== null && (
+            <span className={`msg-review msg-review--${review.state}`} title={reviewTitleText}>
+              {reviewBadge}
+            </span>
+          )}
+          {decisionState !== undefined && (
+            <span className={`msg-decision-badge msg-decision-badge--${decisionState}`}>
+              {t(`MessageCard.decision.state.${decisionState}`)}
+            </span>
+          )}
+          {decisionResponse !== undefined && (
+            <span className="msg-decision-badge msg-decision-badge--response">
+              {t("MessageCard.decision.responseBadge")}
+            </span>
+          )}
+        </div>
+        <div className="msg-head-meta">
+          {copied && <span className="msg-copy-feedback">{t("MessageCard.copied")}</span>}
+          {canShowActions && (
+            <button
+              ref={triggerRef}
+              type="button"
+              className="d-btn msg-menu-trigger"
+              aria-label={t("MessageCard.menu.more")}
+              aria-expanded={menu !== null}
+              title={t("MessageCard.menu.more")}
+              disabled={busy}
+              onClick={(event) => {
+                const rect = event.currentTarget.getBoundingClientRect();
+                openMenuAt(rect.right - 12, rect.bottom + 6);
+              }}
+            >
+              ⋯
+            </button>
+          )}
+          <span className="msg-seq">#{msg.seq}</span>
+          <time className="msg-time">{fmtTime(msg.ts)}</time>
+        </div>
       </header>
       {msg.reply_to !== null && quotedMessage !== null && (
         <button
@@ -829,6 +841,7 @@ function MessageCardImpl({
       {editing ? (
         <div className="msg-edit">
           <textarea
+            ref={editInputRef}
             className="msg-edit-input t-mono"
             rows={4}
             value={editDraft}

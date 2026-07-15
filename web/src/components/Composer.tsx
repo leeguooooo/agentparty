@@ -22,6 +22,7 @@ interface Props {
   setDraft(value: string): void;
   onSend(): void;
   onEscape?: () => void;
+  focusRequest?: number | null;
   ready: boolean; // ws open 才能发
   candidates: MentionCandidate[]; // @ 补全候选（participants ∪ presence，已分档排序）
   mentionStatuses: DraftMentionStatus[]; // 草稿里已 @ 的目标 + 当前存活档位（发送前提醒会不会白发）
@@ -122,6 +123,7 @@ export function Composer({
   setDraft,
   onSend,
   onEscape,
+  focusRequest = null,
   ready,
   candidates,
   mentionStatuses,
@@ -163,6 +165,14 @@ export function Composer({
     ta.style.height = "auto";
     ta.style.height = Math.min(ta.scrollHeight, Math.round(window.innerHeight * 0.4)) + "px";
   }, [draft]);
+
+  useLayoutEffect(() => {
+    if (focusRequest === null) return;
+    const ta = taRef.current;
+    if (ta === null) return;
+    ta.focus({ preventScroll: true });
+    ta.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [focusRequest]);
 
   useEffect(() => {
     if (menu === null) return;

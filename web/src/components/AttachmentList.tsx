@@ -53,13 +53,15 @@ export function useAttachmentBlobUrl(url: string): { src: string | null; failed:
 
 function ImageThumb({ att }: { att: Attachment }) {
   const { src, failed } = useAttachmentBlobUrl(att.url);
-  if (failed) return <FileLink att={att} />;
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [att.url]);
+  if (failed || imageFailed) return <FileLink att={att} />;
   if (src === null) {
     return <span className="msg-attachment-loading t-mono">{att.filename}…</span>;
   }
   return (
     <a href={src} target="_blank" rel="noreferrer" className="msg-attachment-img" title={att.filename}>
-      <img src={src} alt={att.filename} loading="lazy" />
+      <img src={src} alt={att.filename} loading="lazy" onError={() => setImageFailed(true)} />
     </a>
   );
 }
@@ -99,7 +101,7 @@ function FileLink({ att }: { att: Attachment }) {
       onClick={() => void onDownload()}
       title={`${att.filename} · ${formatSize(att.size)} · download`}
     >
-      <span aria-hidden="true">⬇</span>
+      <span className="msg-attachment-download-icon" aria-hidden="true">↓</span>
       <span className="msg-attachment-fname">{att.filename}</span>
       <span className="msg-attachment-size">{formatSize(att.size)}</span>
     </button>

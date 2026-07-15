@@ -96,6 +96,48 @@ afterEach(() => {
 });
 
 describe("message edit keyboard shortcuts (#343)", () => {
+  test("focuses and reveals the editor when editing starts", () => {
+    const focus = mock(() => undefined);
+    const scrollIntoView = mock(() => undefined);
+
+    localStorage.setItem("ap_locale", "en");
+    act(() => {
+      renderer = create(
+        <LocaleProvider>
+          <MessageCard
+            msg={baseMsg()}
+            self="planner"
+            quotedMessage={null}
+            canModerate={false}
+            onReply={noop}
+            onEdit={noop}
+            onRetract={noop}
+            canCreateTask={false}
+            onCreateTask={noop}
+            editing={true}
+            editDraft="changed"
+            editSaving={false}
+            actionError={null}
+            busy={false}
+            onEditDraftChange={noop}
+            onEditCancel={noop}
+            onEditSave={noop}
+          />
+        </LocaleProvider>,
+        {
+          createNodeMock: (element) =>
+            element.type === "textarea"
+              && (element.props as { className?: string }).className?.includes("msg-edit-input") === true
+              ? { focus, scrollIntoView }
+              : {},
+        },
+      );
+    });
+
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
+  });
+
   test("Escape cancels editing", () => {
     let cancelCalls = 0;
     const textarea = renderEditor({ onEditCancel: () => { cancelCalls += 1; } });

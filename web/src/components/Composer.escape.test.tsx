@@ -1,5 +1,5 @@
 // @ts-expect-error Bun executes this test, while the web tsconfig intentionally loads only Vite globals.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
 import { Composer } from "./Composer";
@@ -21,6 +21,7 @@ function memoryStorage(): Storage {
 beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage() });
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { innerHeight: 844 } });
 });
 
 afterEach(() => {
@@ -53,6 +54,37 @@ function keyEvent(key: string, isComposing = false) {
 }
 
 describe("Composer Escape handling (#357)", () => {
+  test("focuses and reveals the composer when reply mode starts", () => {
+    const focus = mock(() => undefined);
+    const scrollIntoView = mock(() => undefined);
+
+    act(() => {
+      renderer = create(
+        <LocaleProvider>
+          <Composer
+            draft=""
+            setDraft={() => undefined}
+            onSend={() => undefined}
+            focusRequest={3}
+            ready
+            candidates={[]}
+            mentionStatuses={[]}
+          />
+        </LocaleProvider>,
+        {
+          createNodeMock: (element) =>
+            element.type === "textarea"
+              && (element.props as { className?: string }).className?.includes("composer-input") === true
+              ? { focus, scrollIntoView, style: {}, scrollHeight: 80 }
+              : {},
+        },
+      );
+    });
+
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
+  });
+
   test("mention menu consumes the first Escape before reply cancellation", () => {
     let cancelled = 0;
     const { root, textarea } = render(() => { cancelled += 1; });

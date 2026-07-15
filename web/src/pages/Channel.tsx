@@ -4541,6 +4541,7 @@ export function ChannelPage({
           setDraft={setDraft}
           onSend={send}
           onEscape={replyTo !== null ? cancelReply : undefined}
+          focusRequest={replyTo}
           ready={state.status === "open"}
           candidates={mentionOptions}
           mentionStatuses={draftMentionStatuses}

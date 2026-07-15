@@ -40,7 +40,34 @@ function renderStatus(): ReturnType<ReactTestRenderer["root"]["findByProps"]> {
   return renderer!.root;
 }
 
+function renderMessage(): ReturnType<ReactTestRenderer["root"]["findByProps"]> {
+  const msg = {
+    type: "msg", seq: 10, sender: { name: "builder", kind: "agent", owner: "team@example.com" }, kind: "message",
+    body: "finished", mentions: [], reply_to: null, state: null, note: null, status: null,
+    ts: 1_700_000_000_000,
+  } as unknown as MsgFrame;
+  act(() => {
+    renderer = create(<LocaleProvider><MessageCard
+      msg={msg} self={null} quotedMessage={null} canModerate={false} onReply={noop} onEdit={noop}
+      onRetract={noop} canCreateTask={false} onCreateTask={noop} editing={false} editDraft=""
+      editSaving={false} actionError={null} busy={false} onEditDraftChange={noop} onEditCancel={noop} onEditSave={noop}
+    /></LocaleProvider>);
+  });
+  return renderer!.root;
+}
+
 describe("MessageCard touch and keyboard details (#357)", () => {
+  test("identity and stable action metadata render in separate header groups", () => {
+    const root = renderMessage();
+    const main = root.findByProps({ className: "msg-head-main" });
+    const meta = root.findByProps({ className: "msg-head-meta" });
+
+    expect(main.findByProps({ className: "msg-sender msg-agent-trigger" })).toBeDefined();
+    expect(meta.findByProps({ className: "d-btn msg-menu-trigger" })).toBeDefined();
+    expect(meta.findByProps({ className: "msg-seq" }).children).toEqual(["#", "10"]);
+    expect(meta.findByProps({ className: "msg-time" })).toBeDefined();
+  });
+
   test("status full detail expands by click and keyboard", () => {
     const root = renderStatus();
     const summary = root.findByProps({ className: "msg-status-summary" });
