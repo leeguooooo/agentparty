@@ -454,6 +454,17 @@ export function App() {
   // banner 关闭态只在本次会话内记，不落盘。
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [handleBannerDismissed, setHandleBannerDismissed] = useState(false);
+  const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const settingsReturnFocusRef = useRef<HTMLButtonElement | null>(null);
+  const openSettings = useCallback((event?: { currentTarget?: HTMLButtonElement }) => {
+    settingsReturnFocusRef.current = event?.currentTarget ?? settingsButtonRef.current;
+    setSettingsOpen(true);
+  }, []);
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    const target = settingsReturnFocusRef.current;
+    (target?.isConnected === false ? settingsButtonRef.current : target ?? settingsButtonRef.current)?.focus();
+  }, []);
 
   // oidc 配置存 ref，供 onAuthFailed/续期在稳定回调里读到最新值（避免进 effect 依赖引发重跑）
   const oidcRef = useRef<OidcConfig | null>(null);
@@ -1082,7 +1093,7 @@ export function App() {
           <button
             type="button"
             className="d-btn handlesetup-trigger handlesetup-trigger--cta"
-            onClick={() => setSettingsOpen(true)}
+            onClick={openSettings}
             title={t("App.handle.setCta")}
           >
             <span className="handlesetup-trigger-edit" aria-hidden="true">
@@ -1105,11 +1116,12 @@ export function App() {
         )}
         <DesktopUpdater />
         <button
+          ref={settingsButtonRef}
           type="button"
           className="app-settings-btn"
           aria-label={t("App.settings.title")}
           title={t("App.settings.title")}
-          onClick={() => setSettingsOpen(true)}
+          onClick={openSettings}
         >
           <span className="ap-sprite ap-sprite--settings" aria-hidden="true" />
         </button>
@@ -1118,7 +1130,7 @@ export function App() {
         <SettingsPanel
           me={me}
           canSetHandle={canSetHandle}
-          onClose={() => setSettingsOpen(false)}
+          onClose={closeSettings}
           onLogout={
             isShareMode() || desktopLogoutPending
               ? null
@@ -1142,7 +1154,7 @@ export function App() {
         <p className="banner banner--yellow handle-banner" role="status">
           <span className="handle-banner-text">{t("App.handle.banner")}</span>
           <span className="handle-banner-actions">
-            <button type="button" className="d-btn" onClick={() => setSettingsOpen(true)}>
+            <button type="button" className="d-btn" onClick={openSettings}>
               {t("App.handle.bannerAction")}
             </button>
             <button

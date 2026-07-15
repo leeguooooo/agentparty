@@ -197,9 +197,17 @@ beforeEach(() => {
 });
 
 test("desktop renders one settings entry and keeps desktop controls in the global panel", async () => {
+  const settingsFocus = mock(() => undefined);
   localStorage.setItem("ap_onboarded", "1");
   await act(async () => {
-    renderer = create(<LocaleProvider><App /></LocaleProvider>);
+    renderer = create(<LocaleProvider><App /></LocaleProvider>, {
+      createNodeMock: (element) => {
+        const props = element.props as { className?: string };
+        return element.type === "button" && props.className === "app-settings-btn"
+          ? { focus: settingsFocus, isConnected: true }
+          : {};
+      },
+    });
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
@@ -215,6 +223,12 @@ test("desktop renders one settings entry and keeps desktop controls in the globa
 
   expect(root.findByProps({ id: "desktop-settings-panel" })).toBeTruthy();
   expect(root.findByProps({ className: "desktop-agent" })).toBeTruthy();
+
+  await act(async () => root.findByProps({ className: "settings-close" }).props.onClick());
+  expect(root.findAllByProps({ className: "settings-panel" })).toHaveLength(0);
+  expect(settingsFocus).toHaveBeenCalledTimes(1);
+
+  await act(async () => root.findByProps({ className: "app-settings-btn" }).props.onClick());
 
   const onboardingButton = root.findAll((node) =>
     typeof node.props.className === "string" && node.props.className.split(/\s+/).includes("settings-onboarding"),
