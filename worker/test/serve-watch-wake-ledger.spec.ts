@@ -58,6 +58,14 @@ async function wakeVerifiedAt(slug: string, name: string): Promise<number | null
   });
 }
 
+async function messageMentions(slug: string, seq: number): Promise<string[]> {
+  const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+  return runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+    const row = state.storage.sql.exec("SELECT mentions_json FROM messages WHERE seq = ?", seq).toArray()[0];
+    return JSON.parse(String(row?.mentions_json ?? "[]")) as string[];
+  });
+}
+
 // 用真实 WS status 帧把某 agent 登记成 serve/watch（服务端据此盖 presence.wake_kind）。
 async function registerWakeAgent(slug: string, token: string, kind: "serve" | "watch"): Promise<WsClient> {
   const ws = await WsClient.open(slug, token);
@@ -114,6 +122,29 @@ describe("#107 serve/watch wakes land in the server-side wake ledger", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ target_name: bot.name, adapter_kind: "watch", result: "broadcast" });
     botWs.close();
+  });
+
+  it("treats a reply_to an agent as a durable wake target even without an explicit @ (#544)", async () => {
+    const sender = await seedToken("agent");
+    const bot = await seedToken("agent", uniq("reply-bot"));
+    const slug = await createChannel(sender.token);
+    const botWs = await registerWakeAgent(slug, bot.token, "watch");
+    try {
+      // seq 1 = watch registration; seq 2 = bot asks; seq 3 = peer replies without @.
+      expect((await sendMessage(slug, bot.token, "can you check this?")).status).toBe(200);
+      expect((await reply(slug, sender.token, "yes, checking", 2)).status).toBe(200);
+
+      // REST response waits for afterSend, so the durable wake ledger is already committed here.
+      expect(await messageMentions(slug, 3)).toEqual([bot.name]);
+      expect(await ledgerRows(slug)).toContainEqual(expect.objectContaining({
+        mention_seq: 3,
+        target_name: bot.name,
+        adapter_kind: "watch",
+        result: "broadcast",
+      }));
+    } finally {
+      botWs.close();
+    }
   });
 
   it("does NOT record a serve/watch row for a mention with no wakeable presence", async () => {

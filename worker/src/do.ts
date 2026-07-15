@@ -3982,6 +3982,27 @@ export class ChannelDO extends Server<Env> {
     return withExpandedMentions(frame, [...routed]);
   }
 
+  // #544：reply_to 本身就是一条明确的定向消息。若原消息作者是 agent，即使回复正文没有再写
+  // @name，也要把它加入 mentions，才能进入 watch/serve/webhook 的持久唤醒与断线重放路径。
+  // 只补 agent、排除自回，避免把普通人类楼中楼回复改造成额外 @ 通知。
+  private expandAgentReplyMention(frame: SendFrame, senderName: string): SendFrame {
+    if (frame.kind !== "message" || frame.reply_to === null) return frame;
+    const row = this.ctx.storage.sql
+      .exec("SELECT sender_name, sender_kind FROM messages WHERE seq = ?", frame.reply_to)
+      .toArray()[0];
+    if (row === undefined || String(row.sender_kind) !== "agent") return frame;
+    const target = String(row.sender_name);
+    const mentions = frame.mentions ?? [];
+    if (
+      target === senderName ||
+      target === "system" ||
+      !MENTION_NAME_RE.test(target) ||
+      mentions.includes(target) ||
+      mentions.length >= MAX_MENTIONS
+    ) return frame;
+    return withExpandedMentions(frame, [...mentions, target]);
+  }
+
   // 校验 → 分配 seq → 落库 → 修剪/presence，返回待广播帧
   private async handleSend(
     identity: Identity,
@@ -4028,6 +4049,7 @@ export class ChannelDO extends Server<Env> {
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
     }
+    frame = this.expandAgentReplyMention(frame, identity.name);
     frame = await this.expandSquadMentions(frame);
     frame = await this.resolveNicknameMentions(frame);
     const workflowGuard = this.workflowGuardDecision(identity, frame);
