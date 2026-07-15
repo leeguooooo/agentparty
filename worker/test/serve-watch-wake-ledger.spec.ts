@@ -129,20 +129,22 @@ describe("#107 serve/watch wakes land in the server-side wake ledger", () => {
     const bot = await seedToken("agent", uniq("reply-bot"));
     const slug = await createChannel(sender.token);
     const botWs = await registerWakeAgent(slug, bot.token, "watch");
+    try {
+      // seq 1 = watch registration; seq 2 = bot asks; seq 3 = peer replies without @.
+      expect((await sendMessage(slug, bot.token, "can you check this?")).status).toBe(200);
+      expect((await reply(slug, sender.token, "yes, checking", 2)).status).toBe(200);
 
-    // seq 1 = watch registration; seq 2 = bot asks; seq 3 = peer replies without @.
-    expect((await sendMessage(slug, bot.token, "can you check this?")).status).toBe(200);
-    expect((await reply(slug, sender.token, "yes, checking", 2)).status).toBe(200);
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(await messageMentions(slug, 3)).toEqual([bot.name]);
-    expect(await ledgerRows(slug)).toContainEqual(expect.objectContaining({
-      mention_seq: 3,
-      target_name: bot.name,
-      adapter_kind: "watch",
-      result: "broadcast",
-    }));
-    botWs.close();
+      // REST response waits for afterSend, so the durable wake ledger is already committed here.
+      expect(await messageMentions(slug, 3)).toEqual([bot.name]);
+      expect(await ledgerRows(slug)).toContainEqual(expect.objectContaining({
+        mention_seq: 3,
+        target_name: bot.name,
+        adapter_kind: "watch",
+        result: "broadcast",
+      }));
+    } finally {
+      botWs.close();
+    }
   });
 
   it("does NOT record a serve/watch row for a mention with no wakeable presence", async () => {
