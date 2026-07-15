@@ -42,7 +42,10 @@ mock.module("../lib/api", () => ({
   inviteProjectAgent: async () => {},
   listChannelAgents: async () => agentsFixture,
   listProjectAgentProfiles: async () => profilesFixture,
-  rotateChannelAgent: async () => ({}),
+  rotateChannelAgent: async (_token: string, _slug: string, name: string) => ({
+    name,
+    token: "ap_rotated",
+  }),
   setChannelAgentNickname: mock(async (token: string, slug: string, name: string, nickname: string) => {
     nicknameCalls.push({ token, slug, name, nickname });
     const agent = agentsFixture.find((entry) => entry.name === name);
