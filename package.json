@@ -6,7 +6,7 @@
     "check:scripts": "sh -n install.sh && sh -n install-desktop.sh && bun scripts/check-migration-numbering.ts && bun test scripts/review-ack-gate.test.ts scripts/release-version.test.ts scripts/desktop-update-manifest.test.ts scripts/desktop-ui-bundle.test.ts scripts/desktop-ui-manifest.test.ts scripts/desktop-ui-publication.test.ts scripts/desktop-ui-release-workflow.test.ts scripts/desktop-release-workflow.test.ts scripts/apple-signing-mode.test.ts scripts/configure-apple-release.test.ts scripts/prepare-desktop-sidecar.test.ts scripts/desktop-production-acceptance.test.ts scripts/desktop-adhoc-acceptance.test.ts scripts/desktop-pairing-smoke.test.ts scripts/install.test.ts scripts/install-desktop.test.ts scripts/check-aggregate.test.ts scripts/ci-paths-filter.test.ts scripts/check-migration-numbering.test.ts scripts/supply-chain-deps.test.ts scripts/deploy-ci.test.ts scripts/rollback-ci.test.ts && bunx tsc --project scripts/tsconfig.json",
     "check:cli": "cd cli && bun test && bunx tsc --noEmit",
     "check:shared": "cd shared && bunx tsc --noEmit",
-    "check:web": "cd web && bun test --max-concurrency 1 && bunx tsc --noEmit && bunx vite build",
+    "check:web": "cd web && bun test --isolate --max-concurrency 1 && bunx tsc --noEmit && bunx vite build",
     "check:worker": "cd worker && bun run verify:test-runtime && bunx vitest run && bunx tsc --noEmit",
     "check": "bun run check:scripts && bun run check:cli && bun run check:shared && bun run check:web && bun run check:worker",
     "desktop:dev": "cd desktop && bun run dev",

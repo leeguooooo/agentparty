@@ -191,6 +191,10 @@ beforeEach(() => {
       clearTimeout,
       setInterval,
       clearInterval,
+      requestAnimationFrame: (callback: FrameRequestCallback) => (
+        setTimeout(() => callback(performance.now()), 0)
+      ),
+      cancelAnimationFrame: clearTimeout,
       addEventListener: windowEvents.addEventListener.bind(windowEvents),
       removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
       dispatchEvent: windowEvents.dispatchEvent.bind(windowEvents),

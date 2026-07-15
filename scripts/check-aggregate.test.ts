@@ -41,4 +41,10 @@ describe("check 聚合完整性 (#247)", () => {
     expect(pkg.scripts["release:verify"]).toContain("run check");
     expect(pkg.scripts["release:deploy"]).toContain("run check");
   });
+
+  test("Web 测试按文件隔离，防止 mock.module / global 污染后续文件", () => {
+    const web = pkg.scripts["check:web"] ?? "";
+    expect(web).toContain("bun test --isolate");
+    expect(web).toContain("--max-concurrency 1");
+  });
 });
