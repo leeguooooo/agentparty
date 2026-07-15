@@ -99,31 +99,34 @@ describe("message edit keyboard shortcuts (#343)", () => {
   test("focuses and reveals the editor when editing starts", () => {
     const focus = mock(() => undefined);
     const scrollIntoView = mock(() => undefined);
+    const card = (editing: boolean) => (
+      <LocaleProvider>
+        <MessageCard
+          msg={baseMsg()}
+          self="planner"
+          quotedMessage={null}
+          canModerate={false}
+          onReply={noop}
+          onEdit={noop}
+          onRetract={noop}
+          canCreateTask={false}
+          onCreateTask={noop}
+          editing={editing}
+          editDraft="changed"
+          editSaving={false}
+          actionError={null}
+          busy={false}
+          onEditDraftChange={noop}
+          onEditCancel={noop}
+          onEditSave={noop}
+        />
+      </LocaleProvider>
+    );
 
     localStorage.setItem("ap_locale", "en");
     act(() => {
       renderer = create(
-        <LocaleProvider>
-          <MessageCard
-            msg={baseMsg()}
-            self="planner"
-            quotedMessage={null}
-            canModerate={false}
-            onReply={noop}
-            onEdit={noop}
-            onRetract={noop}
-            canCreateTask={false}
-            onCreateTask={noop}
-            editing={true}
-            editDraft="changed"
-            editSaving={false}
-            actionError={null}
-            busy={false}
-            onEditDraftChange={noop}
-            onEditCancel={noop}
-            onEditSave={noop}
-          />
-        </LocaleProvider>,
+        card(false),
         {
           createNodeMock: (element) =>
             element.type === "textarea"
@@ -133,6 +136,11 @@ describe("message edit keyboard shortcuts (#343)", () => {
         },
       );
     });
+
+    expect(focus).not.toHaveBeenCalled();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    act(() => renderer!.update(card(true)));
 
     expect(focus).toHaveBeenCalledWith({ preventScroll: true });
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
