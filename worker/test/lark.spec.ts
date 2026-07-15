@@ -73,7 +73,6 @@ describe("lark notification integration", () => {
     const profile = await seedLarkProfile(account, "larkalice");
     const human = await seedToken("human", uniq("human"), { owner: account });
     const slug = await createChannel(human.token);
-
     const agent = await seedToken("agent", uniq("agent"), { owner: account });
     expect((await api(`/api/channels/${slug}/lark-notify`, agent.token, { method: "POST" })).status).toBe(403);
 
@@ -104,6 +103,10 @@ describe("lark notification integration", () => {
     const profile = await seedLarkProfile(account, "larkrelay");
     const human = await seedToken("human", uniq("human"), { owner: account });
     const slug = await createChannel(human.token);
+    const attachmentPath = `hash-${uniq("image")}/proof.png`;
+    await env.ATTACHMENTS.put(`${slug}/${attachmentPath}`, new Uint8Array([1, 2, 3]), {
+      httpMetadata: { contentType: "image/png" },
+    });
     expect((await api(`/api/channels/${slug}/lark-notify`, human.token, { method: "POST" })).status).toBe(201);
     const sub = await env.DB.prepare("SELECT secret FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?")
       .bind(slug, account)
@@ -121,6 +124,19 @@ describe("lark notification integration", () => {
       channel: slug,
       permalink: `https://ap.test/c/${slug}`,
       sender: { name: "codex", kind: "agent", role: "agent", display: "Codex" },
+      attachments: [{
+        key: `${slug}/${attachmentPath}`,
+        filename: "proof.png",
+        content_type: "image/png",
+        size: 3,
+        url: `/api/channels/${slug}/attachments/${attachmentPath}`,
+      }, {
+        key: `other-private-channel/${attachmentPath}`,
+        filename: "must-not-sign.png",
+        content_type: "image/png",
+        size: 3,
+        url: `/api/channels/other-private-channel/attachments/${attachmentPath}`,
+      }],
     });
 
     let larkMessage: Record<string, unknown> | null = null;
@@ -153,7 +169,14 @@ describe("lark notification integration", () => {
       msg_type: "interactive",
     });
     const content = JSON.parse(String(sent.content)) as Record<string, unknown>;
-    expect(content).toMatchObject(buildMentionCard(JSON.parse(payload)));
+    const markdown = String((content.elements as Array<Record<string, unknown>>)[0]?.content);
+    const signedUrl = markdown.match(/\((http:\/\/ap\.test\/api\/channels\/[^)]+\?exp=\d+&sig=[A-Za-z0-9_-]+)\)/)?.[1];
+    expect(signedUrl).toBeTypeOf("string");
+    expect(markdown).toContain("proof.png");
+    expect(markdown).not.toContain("must-not-sign.png");
+    const image = await SELF.fetch(signedUrl!);
+    expect(image.status).toBe(200);
+    expect(image.headers.get("content-type")).toBe("image/png");
   });
 
   it("rejects bad relay auth/signature and turns Lark nonzero code into retryable 502", async () => {

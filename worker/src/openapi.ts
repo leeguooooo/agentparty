@@ -643,13 +643,13 @@ export const openapiDocument = {
                           type: "object",
                           required: ["key", "filename", "content_type", "size", "url"],
                           properties: {
-                            key: { type: "string", description: "<slug>/<uuid>/<filename> R2 object key" },
+                            key: { type: "string", description: "<slug>/<sha256>/<filename> R2 object key" },
                             filename: { type: "string", maxLength: 255 },
                             content_type: { type: "string" },
                             size: { type: "integer", minimum: 0 },
                             url: {
                               type: "string",
-                              description: "authenticated download path /api/channels/{slug}/attachments/{uuid}/{filename}",
+                              description: "private download path; authorized clients can exchange it for a short-lived signed URL",
                             },
                           },
                         },
@@ -777,10 +777,10 @@ export const openapiDocument = {
     },
     "/api/channels/{slug}/attachments/{path}": {
       get: {
-        summary: "download an attachment blob from R2 (authenticated)",
+        summary: "download an attachment blob or mint a short-lived signed URL",
         description:
-          "streams the R2 object back with its stored content-type and X-Content-Type-Options: nosniff. same read access as the channel; never a public R2 link. path is <uuid>/<filename>.",
-        security: [{ bearer: [] }],
+          "Bearer-authenticated callers may add signed-url=1 to receive a 15-minute path-bound URL. That URL can be fetched without Authorization and streams the R2 object with nosniff; the R2 bucket itself remains private.",
+        security: [{ bearer: [] }, {}],
         parameters: [
           { name: "slug", in: "path", required: true, schema: { type: "string" } },
           {
@@ -788,7 +788,14 @@ export const openapiDocument = {
             in: "path",
             required: true,
             schema: { type: "string" },
-            description: "<uuid>/<filename> object path (no .. or leading /)",
+            description: "<sha256>/<filename> object path (no .. or leading /)",
+          },
+          {
+            name: "signed-url",
+            in: "query",
+            required: false,
+            schema: { type: "string", enum: ["1"] },
+            description: "with Bearer auth, return {url,expires_at} instead of the object bytes",
           },
         ],
         responses: {

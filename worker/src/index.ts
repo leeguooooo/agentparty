@@ -41,6 +41,7 @@ import type {
   WebhookFilter,
 } from "@agentparty/shared";
 import { MAX_ATTACHMENTS, parseAttachment, parseAttachments, parseStoredAttachment, parseStoredAttachments } from "./attachments";
+import { createSignedAttachmentUrl, verifySignedAttachmentRequest } from "./attachment-signatures";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { createMiddleware } from "hono/factory";
@@ -119,6 +120,7 @@ type AppEnv = Env & {
   LARK_CLIENT_SECRET?: string;
   FEISHU_CLIENT_SECRET?: string;
   DESKTOP_PAIRING_SECRET?: string;
+  ATTACHMENT_SIGNING_SECRET?: string;
   // CLI↔worker 版本协商（#137）：声明的最低客户端版本 + 是否硬拒。缺省时用内置默认、默认只建言。
   MIN_CLIENT_VERSION?: string;
   MIN_CLIENT_ENFORCE?: string;
@@ -130,7 +132,7 @@ type AppEnv = Env & {
 
 type AppContext = {
   Bindings: AppEnv;
-  Variables: { identity: TokenIdentity };
+  Variables: { identity: TokenIdentity; attachmentSignatureVerified: boolean };
 };
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
@@ -1254,6 +1256,17 @@ async function loadMembership(db: D1Database, account: string | null | undefined
 
 const requireBearer = createMiddleware<AppContext>(async (c, next) => {
   if (!c.get("identity")) {
+    if (c.req.method === "GET" && await verifySignedAttachmentRequest(c.req.url, c.env)) {
+      c.set("attachmentSignatureVerified", true);
+      c.set("identity", {
+        name: "signed-attachment",
+        role: "readonly",
+        kind: "agent",
+        hash: "signed-attachment",
+      });
+      await next();
+      return;
+    }
     const bearer = extractBearer(c.req.raw, {
       allowQueryToken:
         c.req.method === "GET" &&
@@ -2145,7 +2158,22 @@ app.post("/api/integrations/lark/relay", async (c) => {
     return c.json(errorBody("unavailable", "lark provider is not configured"), 503);
   }
   try {
-    await sendLarkCard(c.env, provider, sub.receive_id, sub.receive_id_type, buildMentionCard(payload));
+    const origin = new URL(c.req.url).origin;
+    const signedAttachments = payload.attachments === undefined
+      ? undefined
+      : (await Promise.all(payload.attachments.map(async (attachment) => {
+          const channelPath = `/api/channels/${payload.channel}/attachments/`;
+          if (!attachment.key.startsWith(`${payload.channel}/`) || !attachment.url.startsWith(channelPath)) return null;
+          const signed = await createSignedAttachmentUrl(`${origin}${attachment.url}`, c.env);
+          return signed === null ? null : { ...attachment, url: signed.url };
+        }))).filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
+    await sendLarkCard(
+      c.env,
+      provider,
+      sub.receive_id,
+      sub.receive_id_type,
+      buildMentionCard({ ...payload, ...(signedAttachments === undefined ? {} : { attachments: signedAttachments }) }),
+    );
   } catch (e) {
     const message = e instanceof Error ? e.message : "lark delivery failed";
     return c.json(errorBody("unavailable", message), 502);
@@ -5962,13 +5990,20 @@ app.get("/api/channels/:slug/attachments/:path{.+}", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
   if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
-  if (!(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
+  const signedRequest = c.get("attachmentSignatureVerified") === true;
+  if (!signedRequest && !(await canAccessLoadedChannel(c.env.DB, c.get("identity"), channel))) {
     return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
   }
   const objectPath = c.req.param("path");
   // 只认 worker 权威 slug 前缀拼出的 key，客户端传的完整 key 一律不信任，防目录穿越
   if (!objectPath || objectPath.includes("..") || objectPath.startsWith("/")) {
     return c.json(errorBody("bad_request", "invalid attachment path"), 400);
+  }
+  if (c.req.query("signed-url") === "1") {
+    if (signedRequest) return c.json(errorBody("forbidden", "signed URLs cannot mint another signed URL"), 403);
+    const signed = await createSignedAttachmentUrl(c.req.url, c.env);
+    if (signed === null) return c.json(errorBody("unavailable", "attachment signing is not configured"), 503);
+    return c.json({ url: signed.url, expires_at: signed.expiresAt });
   }
   const object = await c.env.ATTACHMENTS.get(`${slug}/${objectPath}`);
   if (!object) return c.json(errorBody("not_found", "attachment not found"), 404);
@@ -5978,6 +6013,8 @@ app.get("/api/channels/:slug/attachments/:path{.+}", async (c) => {
   if (!headers.has("content-type")) headers.set("content-type", "application/octet-stream");
   // nosniff：即便 content-type 被伪造也不让浏览器嗅探成可执行类型，缓解存储型 XSS
   headers.set("x-content-type-options", "nosniff");
+  headers.set("referrer-policy", "no-referrer");
+  if (signedRequest) headers.set("cache-control", "private, max-age=900");
   return new Response(object.body, { headers });
 });
 

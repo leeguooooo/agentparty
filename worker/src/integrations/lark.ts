@@ -49,6 +49,7 @@ const DIRECTORY_PAGE_TOKEN_MAX = 512;
 const DIRECTORY_DEPARTMENT_BATCH = 4;
 const DIRECTORY_SCOPE_PAGE_SIZE = 100;
 const DIRECTORY_SCOPE_SCAN_LIMIT = 400;
+const DIRECTORY_EMPTY_PAGE_SCAN_LIMIT = 24;
 const DEPARTMENT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_\-@.]{0,63}$/;
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 const textEncoder = new TextEncoder();
@@ -459,38 +460,43 @@ export async function searchLarkDirectory(
     ? { v: DIRECTORY_CURSOR_VERSION, q: normalizedQuery, p: provider.id, d: "0", a: [], u: null, n: null, s: false } as DirectoryCursorState
     : await decodeDirectoryCursor(secret, cursor, normalizedQuery, provider.id);
   if (state.m === "scope") return scopedLarkDirectorySearch(env, provider, normalizedQuery, pageSize, state);
-  const params = new URLSearchParams({
-    user_id_type: "union_id",
-    department_id_type: "open_department_id",
-    department_id: state.d,
-    page_size: String(pageSize),
-  });
-  if (state.u !== null) params.set("page_token", state.u);
-  let data: Record<string, unknown>;
-  try {
-    data = await larkDirectoryRequest(
-      env,
-      provider,
-      `/open-apis/contact/v3/users/find_by_department?${params.toString()}`,
-    );
-  } catch (error) {
-    if (cursor === null && error instanceof LarkDirectoryError && error.kind === "permission") {
-      return scopedLarkDirectorySearch(env, provider, normalizedQuery, pageSize);
+  let currentState: DirectoryCursorState | null = state;
+  let emptyPagesScanned = 0;
+  while (currentState !== null && emptyPagesScanned < DIRECTORY_EMPTY_PAGE_SCAN_LIMIT) {
+    const params = new URLSearchParams({
+      user_id_type: "union_id",
+      department_id_type: "open_department_id",
+      department_id: currentState.d,
+      page_size: String(pageSize),
+    });
+    if (currentState.u !== null) params.set("page_token", currentState.u);
+    let data: Record<string, unknown>;
+    try {
+      data = await larkDirectoryRequest(
+        env,
+        provider,
+        `/open-apis/contact/v3/users/find_by_department?${params.toString()}`,
+      );
+    } catch (error) {
+      if (cursor === null && error instanceof LarkDirectoryError && error.kind === "permission") {
+        return scopedLarkDirectorySearch(env, provider, normalizedQuery, pageSize);
+      }
+      throw error;
     }
-    throw error;
+    const users = directoryUsers(data).filter((user) => user.name.toLocaleLowerCase().includes(normalizedQuery));
+    const payload = isRecord(data.data) ? data.data : {};
+    const hasMore = payload.has_more === true;
+    const pageToken = typeof payload.page_token === "string" && payload.page_token ? payload.page_token : null;
+    if (hasMore && pageToken === null) throw new LarkDirectoryError("upstream", "Lark omitted the next user cursor");
+    currentState = hasMore
+      ? { ...currentState, u: pageToken }
+      : await advanceLarkDepartment(env, provider, currentState);
+    if (users.length > 0) {
+      return { users, nextCursor: currentState === null ? null : await encodeDirectoryCursor(secret, currentState) };
+    }
+    emptyPagesScanned += 1;
   }
-  const users = directoryUsers(data).filter((user) => user.name.toLocaleLowerCase().includes(normalizedQuery));
-  const payload = isRecord(data.data) ? data.data : {};
-  const hasMore = payload.has_more === true;
-  const pageToken = typeof payload.page_token === "string" && payload.page_token ? payload.page_token : null;
-  if (hasMore && pageToken === null) throw new LarkDirectoryError("upstream", "Lark omitted the next user cursor");
-  let nextState: DirectoryCursorState | null = hasMore
-    ? { ...state, u: pageToken }
-    : null;
-  if (!hasMore) {
-    nextState = await advanceLarkDepartment(env, provider, state);
-  }
-  return { users, nextCursor: nextState === null ? null : await encodeDirectoryCursor(secret, nextState) };
+  return { users: [], nextCursor: currentState === null ? null : await encodeDirectoryCursor(secret, currentState) };
 }
 
 export async function getLarkDirectoryUser(
@@ -589,6 +595,9 @@ export function buildMentionCard(payload: LarkWebhookPayload): Record<string, un
   const title = `AgentParty @${payload.mentions.join(", @")}`;
   const sender = payload.sender.display_name || payload.sender.handle || payload.sender.owner || payload.sender.name;
   const body = payload.kind === "status" ? payload.note || payload.body : payload.body;
+  const attachmentLinks = payload.attachments?.map((attachment) =>
+    `[${attachment.filename.replace(/[\\[\]]/g, "\\$&")}](${attachment.url})`).join(" · ");
+  const content = attachmentLinks ? `${body}\n\n📎 ${attachmentLinks}` : body;
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -598,7 +607,7 @@ export function buildMentionCard(payload: LarkWebhookPayload): Record<string, un
     elements: [
       {
         tag: "markdown",
-        content: `**${sender}** mentioned you in **#${payload.channel}**\n\n${body}`,
+        content: `**${sender}** mentioned you in **#${payload.channel}**\n\n${content}`,
       },
       {
         tag: "action",

@@ -295,7 +295,22 @@ export async function uploadAttachment(token: string, slug: string, file: File):
   return (await res.json()) as Attachment;
 }
 
-// 附件下载（#176）：下载端点要 Bearer 鉴权，<img src>/<a href> 带不了头，所以取回 blob 再造 objectURL。
+// 为不能带 Authorization 的消费端换一个 15 分钟签名 URL（#521）。原始附件路径仍保持私有，
+// 签名只授予单个 pathname 的短时 GET 权限，不把 bearer 放进 query string。
+export async function fetchAttachmentSignedUrl(token: string, url: string): Promise<string> {
+  const separator = url.includes("?") ? "&" : "?";
+  const res = await fetchApi(`${url}${separator}signed-url=1`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("not allowed to read this attachment");
+  if (!res.ok) throw new Error(`sign attachment failed (${res.status})`);
+  const body = (await res.json()) as { url?: unknown };
+  if (typeof body.url !== "string" || body.url.length === 0) throw new Error("signed attachment URL missing");
+  return body.url;
+}
+
+// 兼容旧 worker / 非浏览器下载路径：仍可用 bearer 直接取 blob。
 export async function fetchAttachmentBlob(token: string | null, url: string): Promise<Blob> {
   const res = await fetchApi(url, {
     headers: token ? { authorization: `Bearer ${token}` } : {},

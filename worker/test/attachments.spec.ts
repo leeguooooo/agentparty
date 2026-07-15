@@ -85,6 +85,34 @@ describe("channel attachments (R2)", () => {
     expect((await download(slug, null, objectPath)).status).toBe(401);
   });
 
+  it("mints a short-lived path-bound URL that an img request can read without Bearer (#521)", async () => {
+    const { token } = await seedToken("agent", uniq("owner"), { owner: "owner@ap.test" });
+    const slug = await createChannel(token);
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    const meta = (await (await upload(slug, token, "signed.png", bytes, "image/png")).json()) as { url: string };
+
+    const minted = await SELF.fetch(`http://ap.test${meta.url}?signed-url=1`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(minted.status).toBe(200);
+    const body = (await minted.json()) as { url: string; expires_at: number };
+    expect(body.url).toMatch(new RegExp(`^http://ap\\.test${meta.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?exp=\\d+&sig=[A-Za-z0-9_-]+$`));
+    expect(body.expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+
+    const image = await SELF.fetch(body.url);
+    expect(image.status).toBe(200);
+    expect(image.headers.get("content-type")).toBe("image/png");
+    expect(image.headers.get("referrer-policy")).toBe("no-referrer");
+    expect([...new Uint8Array(await image.arrayBuffer())]).toEqual([...bytes]);
+
+    const tampered = new URL(body.url);
+    tampered.pathname = tampered.pathname.replace("signed.png", "other.png");
+    expect((await SELF.fetch(tampered)).status).toBe(401);
+    const extraQuery = new URL(body.url);
+    extraQuery.searchParams.set("signed-url", "1");
+    expect((await SELF.fetch(extraQuery)).status).toBe(401);
+  });
+
   it("rejects an oversize upload (413)", async () => {
     const { token } = await seedToken("agent", uniq("owner"), { owner: "owner@ap.test" });
     const slug = await createChannel(token);

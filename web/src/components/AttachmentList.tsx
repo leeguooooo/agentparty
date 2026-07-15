@@ -1,8 +1,7 @@
 // 消息附件渲染（#176）：图片内联缩略图，其它文件给下载按钮。
-// 下载端点要 Bearer 鉴权，<img src>/<a href> 带不了头，所以先 fetch 成 blob 再造 objectURL。
 import { useEffect, useState } from "react";
 import type { Attachment } from "@agentparty/shared";
-import { fetchAttachmentBlob, getToken } from "../lib/api";
+import { fetchAttachmentBlob, fetchAttachmentSignedUrl, getToken } from "../lib/api";
 
 export function isImageAttachment(contentType: string): boolean {
   return contentType.startsWith("image/");
@@ -14,7 +13,8 @@ export function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// 鉴权下载端点带不了 <img> 头，先 fetch 成 blob 再造 objectURL。消息缩略图与 composer 待发预览共用。
+// 先换短时签名 URL，让 <img src>、新标签页和 Lark 等不能带 Authorization 的消费端都能读取。
+// 老 worker 没有签名接口时回退 blob，保持滚动发布期间兼容。
 export function useAttachmentBlobUrl(url: string): { src: string | null; failed: boolean } {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -24,12 +24,22 @@ export function useAttachmentBlobUrl(url: string): { src: string | null; failed:
     setSrc(null);
     setFailed(false);
     if (url === "") return; // 非图片附件传空串 → 不发请求（hook 不能条件调用，用空串跳过）
-    fetchAttachmentBlob(getToken(), url)
-      .then((blob) => {
-        if (!alive) return;
-        objectUrl = URL.createObjectURL(blob);
-        setSrc(objectUrl);
-      })
+    const token = getToken();
+    void (async () => {
+      if (token) {
+        try {
+          const signedUrl = await fetchAttachmentSignedUrl(token, url);
+          if (alive) setSrc(signedUrl);
+          return;
+        } catch {
+          // Rolling deploy / self-hosted old worker: fall back to the authenticated blob path.
+        }
+      }
+      const blob = await fetchAttachmentBlob(token, url);
+      if (!alive) return;
+      objectUrl = URL.createObjectURL(blob);
+      setSrc(objectUrl);
+    })()
       .catch(() => {
         if (alive) setFailed(true);
       });
@@ -57,7 +67,19 @@ function ImageThumb({ att }: { att: Attachment }) {
 function FileLink({ att }: { att: Attachment }) {
   const onDownload = async () => {
     try {
-      const blob = await fetchAttachmentBlob(getToken(), att.url);
+      const token = getToken();
+      if (token) {
+        const signedUrl = await fetchAttachmentSignedUrl(token, att.url);
+        const a = document.createElement("a");
+        a.href = signedUrl;
+        a.download = att.filename;
+        a.rel = "noreferrer";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        return;
+      }
+      const blob = await fetchAttachmentBlob(null, att.url);
       const objectUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = objectUrl;

@@ -599,7 +599,7 @@ export interface Attachment {
   filename: string;
   content_type: string;
   size: number;
-  /** 回 worker 的鉴权下载路径 /api/channels/<slug>/attachments/<uuid>/<filename>；不是裸 R2 公链 */
+  /** 回 worker 的私有下载路径；授权客户端可为它换取短时签名 URL，不暴露裸 R2 公链。 */
   url: string;
 }
 
