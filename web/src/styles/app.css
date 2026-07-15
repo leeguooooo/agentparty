@@ -38,6 +38,7 @@
   font-size: 27px;
   /* marker 草书字体上伸很高，必须给足行高，否则标题顶部被容器上边缘裁掉 */
   line-height: 1.35;
+  white-space: nowrap;
   text-decoration: none;
   color: var(--d-ink);
 }
@@ -3263,10 +3264,53 @@
 .vis-seg-btn:disabled:not(.is-on) { opacity: 0.55; cursor: default; }
 .vis-help {
   flex: none;
+  max-width: min(300px, 15vw);
   margin: 0;
+  overflow: hidden;
   color: var(--t-dim);
   font-size: 11.5px;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 常规桌面宽度固定成“功能 / 管理”两行。视觉皮不变，只阻止嵌套 flex
+   因说明文字的固有宽度额外折出第三行。 */
+@media (min-width: 1360px) {
+  .chan-toolstrip {
+    display: block;
+  }
+  .chan-toolstrip-content {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .chan-tool-buttons,
+  .chan-tool-actions {
+    width: 100%;
+  }
+  .chan-tool-actions {
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
+  .chan-admin-actions,
+  .vis-toggle {
+    flex-wrap: nowrap;
+  }
+  .chan-admin-actions {
+    flex: 1 1 auto;
+  }
+  .vis-toggle {
+    min-width: 0;
+    margin-left: 0;
+  }
+}
+
+/* 中等桌面保留可见性帮助按钮，省去与其 tooltip 重复的长句，防止管理行折行。 */
+@media (min-width: 761px) and (max-width: 1359px) {
+  .vis-help {
+    display: none;
+  }
 }
 
 /* ---- 小图雪碧图（app 运行界面，替代散落 emoji/符号） ---- */
@@ -3299,7 +3343,10 @@
 .ap-sprite--failed,
 .ap-sprite--waiting { --ap-icon-x: 100%; --ap-icon-y: 100%; }
 .chan-tool-btn .ap-sprite {
-  --ap-icon-size: 26px;
+  --ap-icon-size: 28px;
+  /* The source artwork intentionally has breathing room inside each tile.
+     Zoom the tile slightly so the drawing remains legible at toolbar scale. */
+  background-size: 440% 330%;
   margin-left: -1px;
 }
 
@@ -5472,8 +5519,9 @@
   }
   .chan-toolstrip-toggle .ap-sprite { --ap-icon-size: 22px; }
   .chan-toolstrip-toggle-label {
-    font-size: 11px;
-    white-space: nowrap;
+    /* The button already has an accessible label and title. On a 390px viewport
+       this text used a third of the toolbar, leaving the actual tools clipped. */
+    display: none;
   }
   .chan-toolstrip-toggle-arrow {
     width: 7px;
@@ -6195,6 +6243,21 @@
   .desktop-agent-fields input,
   .desktop-agent-fields select {
     font-size: 16px;
+  }
+}
+
+/* 极窄屏把编辑区与命令分两行，避免附件、提示和发送按钮挤掉正文输入宽度。 */
+@media (max-width: 400px) {
+  .composer {
+    gap: 8px;
+  }
+  .composer-input {
+    flex: 0 0 100%;
+    width: 100%;
+    min-width: 0;
+  }
+  .composer-actions {
+    margin-left: auto;
   }
 }
 

@@ -16,6 +16,12 @@ function ruleBody(selector: string): string {
 }
 
 describe("issue #357 layout and touch CSS", () => {
+  test("the brand stays intact and the narrow composer keeps a full-width editor", () => {
+    expect(ruleBody(".app-logo")).toContain("white-space: nowrap");
+    expect(css).toMatch(/@media \(max-width: 400px\)[\s\S]*\.composer-input\s*{[^}]*flex:\s*0 0 100%;[^}]*width:\s*100%;/s);
+    expect(css).toMatch(/@media \(max-width: 400px\)[\s\S]*\.composer-actions\s*{[^}]*margin-left:\s*auto;/s);
+  });
+
   test("the charter modal delegates scrolling to the panel body", () => {
     const body = ruleBody(".channel-panel-body .charter-body .msg-body");
     expect(body).toContain("max-height: none");

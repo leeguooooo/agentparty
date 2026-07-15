@@ -67,7 +67,9 @@ export function VisibilityToggle({ slug, token, visibility, onChanged, onAuthFai
         ))}
       </div>
       <FeatureTip tip="Tips.visibility" />
-      <p className="vis-help t-mono">{t(`Visibility.opt.${visibility}.help`)}</p>
+      <p className="vis-help t-mono" title={t(`Visibility.opt.${visibility}.help`)}>
+        {t(`Visibility.opt.${visibility}.help`)}
+      </p>
       {confirm !== null && (
         <div className="vis-confirm" role="alertdialog" aria-label={t("Visibility.confirmDialogLabel")}>
           <span className="vis-confirm-text">

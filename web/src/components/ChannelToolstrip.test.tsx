@@ -101,7 +101,9 @@ describe("ChannelToolstrip discoverability (#355)", () => {
     const css = readFileSync(new URL("../styles/app.css", import.meta.url), "utf8");
     expect(css).toContain(".chan-toolstrip-toggle {\n  display: none;");
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.chan-toolstrip-toggle \{[\s\S]*display: inline-flex;/);
+    expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.chan-toolstrip-toggle-label \{[\s\S]*display: none;/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.chan-toolstrip--collapsed \.chan-toolstrip-content \{\s*display: none;/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.chan-toolstrip-content \{[\s\S]*overflow-x: auto;/);
+    expect(css).toMatch(/\.chan-tool-btn \.ap-sprite\s*{[^}]*--ap-icon-size:\s*28px;[^}]*background-size:\s*440% 330%;/s);
   });
 });
