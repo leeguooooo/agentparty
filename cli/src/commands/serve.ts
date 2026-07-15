@@ -2531,12 +2531,15 @@ export async function confirmDeliveryUpdate(
   conn: Pick<ReturnType<typeof connect>, "send" | "pendingFrames">,
   update: DeliveryUpdateFrame,
   timeoutMs = DELIVERY_UPDATE_ACK_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<PublicDirectedDelivery> {
   const requestId = randomUUID();
   const existingErrors = new Set(conn.pendingFrames().filter((frame) => frame.type === "error"));
+  if (signal?.aborted) throw signal.reason;
   if (!conn.send({ ...update, request_id: requestId })) throw new Error("websocket is not open");
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    if (signal?.aborted) throw signal.reason;
     const pending = conn.pendingFrames();
     const ack = [...pending].reverse().find(
       (frame): frame is Extract<ServerFrame, { type: "delivery_state" }> =>
@@ -2560,7 +2563,8 @@ export async function confirmDeliveryUpdate(
     );
     if (error !== undefined) throw new Error(`${error.code}: ${error.message}`);
     if (Date.now() >= deadline) throw new Error(`delivery update acknowledgement timed out after ${timeoutMs}ms`);
-    await delay(10);
+    if (signal === undefined) await delay(10);
+    else await delayWithAbort(10, signal);
   }
 }
 
@@ -3084,7 +3088,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
               setStuck({ seq: frame.seq, attempts: attemptsUsed, last_error: lastError, retriable });
             }
             if (retriable && attemptsUsed < maxAttempts) {
-              if (retryDelayMs > 0) await delay(retryDelayMs);
+              if (retryDelayMs > 0) await delayWithAbort(retryDelayMs, lifecycleController.signal);
               continue;
             }
             preflightFailed = true;
@@ -3102,7 +3106,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
               note,
               mentions: [],
               blocked_reason: note,
-            });
+            }, lifecycleController.signal);
           } catch {
             code = EXIT_WAKE_UNANNOUNCED;
             break frameLoop;
@@ -3114,7 +3118,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 delivery_id: directedDelivery.id,
                 state: "failed",
                 error: sanitizeBlockedError(lastError),
-              });
+              }, undefined, lifecycleController.signal);
             } catch (error) {
               out(`  delivery ${directedDelivery.id} 预处理失败回执发送失败: ${errText(error)}`);
               code = EXIT_STREAM_ENDED;
@@ -3137,7 +3141,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
               state: "running",
               ...(directedDelivery.work_id === null ? {} : { work_id: directedDelivery.work_id }),
               ...(directedDelivery.continuation_ref === null ? {} : { continuation_ref: directedDelivery.continuation_ref }),
-            });
+            }, undefined, lifecycleController.signal);
           } catch (error) {
             out(`  delivery ${directedDelivery.id} 启动确认失败，未启动 runner: ${errText(error)}`);
             code = EXIT_STREAM_ENDED;
@@ -3185,7 +3189,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
             state: "working",
             note: `runner started for seq ${frame.seq}: ${self} runner=${runnerKind}`,
             mentions: [],
-          }).catch((e) => out(`  runner_started 审计发送失败（不影响送达）: ${errText(e)}`));
+          }, lifecycleController.signal).catch((e) => out(`  runner_started 审计发送失败（不影响送达）: ${errText(e)}`));
         } catch (e) {
           out(`  runner_started 审计发送失败（不影响送达）: ${errText(e)}`);
         }
@@ -3235,7 +3239,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
                   ...(runnerTerminationUnconfirmed ? { termination_unconfirmed: true } : {}),
                 });
               }
-              if (retriable && attempt < maxAttempts && retryDelayMs > 0) await delay(retryDelayMs);
+              if (retriable && attempt < maxAttempts && retryDelayMs > 0) {
+                await delayWithAbort(retryDelayMs, lifecycleController.signal);
+              }
             }
           }
         } finally {
@@ -3269,7 +3275,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 type: "delivery_update",
                 delivery_id: directedDelivery.id,
                 state: "replied",
-              });
+              }, undefined, lifecycleController.signal);
               deliveryConfirmed = true;
             } catch (error) {
               // 不伪称已确认：退出本轮。服务端仍保留 claimed/running，随后按明确的
@@ -3301,7 +3307,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                   mentions: [],
                   busy: false,
                   queue_depth: 0,
-                });
+                }, lifecycleController.signal);
               } catch (e) {
                 // 清 busy 只是锦上添花：发不出去就下条 wake 的 working 帧会重置 queue_depth，
                 // 或下次排空再补。留痕但不影响主流程（wake 已成功送达）。
@@ -3324,7 +3330,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
               note,
               mentions: [],
               blocked_reason: note,
-            });
+            }, lifecycleController.signal);
           } catch (e) {
             // 通告发不出去 = 没宣告过 = 没了结。此时清欠账 + ack 就是恢复 #118 的静默丢失。
             // 一个连自己喊不出救命的 supervisor，没有任何理由继续消费消息队列：响亮地死，让人发现。
@@ -3340,7 +3346,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 delivery_id: directedDelivery.id,
                 state: "failed",
                 error: sanitizeBlockedError(lastError),
-              });
+              }, undefined, lifecycleController.signal);
               failureConfirmed = true;
             } catch (error) {
               out(`  delivery ${directedDelivery.id} 失败回执发送失败，重连重试: ${errText(error)}`);
@@ -3365,7 +3371,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 note: finalNote,
                 mentions: [],
                 blocked_reason: finalNote,
-              });
+              }, lifecycleController.signal);
             } catch (e) {
               out(`  熔断通告发送失败，立即退出: ${sanitizeBlockedError(e instanceof Error ? e.message : String(e))}`);
             }

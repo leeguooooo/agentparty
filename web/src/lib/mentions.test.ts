@@ -453,8 +453,12 @@ describe("parseDraftMentions", () => {
 
   test("known target 大小写唯一匹配；未知/歧义原样交给服务端报错", () => {
     expect(parseDraftMentions("@ALICE", ["alice"])).toEqual(["alice"]);
+    expect(parseDraftMentions("@ALICE看一下", ["alice"])).toEqual(["alice"]);
     expect(parseDraftMentions("@ghost", ["alice"])).toEqual(["ghost"]);
     expect(parseDraftMentions("@小明看一下", ["小", "小明"])).toEqual(["小明看一下"]);
+    expect(parseDraftMentions("@A小明", ["A小明"])).toEqual(["A小明"]);
+    expect(parseDraftMentions("@A小明看一下", ["A小明"])).toEqual(["A小明"]);
+    expect(parseDraftMentions("@A小明看一下", ["A小", "A小明"])).toEqual(["A小明看一下"]);
   });
 
   test("仅 ASCII alias 忽略大小写；Unicode alias 按 NFC 精确匹配", () => {

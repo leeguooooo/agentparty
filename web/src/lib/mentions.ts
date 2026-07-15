@@ -257,14 +257,21 @@ export function parseDraftMentions(text: string, knownNames: readonly string[] =
   const out: string[] = [];
   const seen = new Set<string>();
   for (const mention of extractMentionTokens(text)) {
+    const fullResolution = aliases.length === 0 ? null : resolveMentionToken(mention.value, aliases);
     const ascii = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/.exec(mention.value)?.[0];
     // A decomposed Unicode alias can begin with ASCII (A + combining diaeresis).
     // Do not apply the legacy ASCII-prefix shortcut across that combining mark.
     const lexicalValue = ascii !== undefined && !/^\p{M}/u.test(mention.value.slice(ascii.length))
       ? ascii
       : mention.value;
-    const resolution = aliases.length === 0 ? null : resolveMentionToken(lexicalValue, aliases);
-    const name = resolution?.status === "resolved" ? resolution.target : lexicalValue;
+    const fallbackResolution = aliases.length === 0 ? null : resolveMentionToken(lexicalValue, aliases);
+    const name = fullResolution?.status === "resolved"
+      ? fullResolution.target
+      : fullResolution?.status === "ambiguous"
+        ? mention.value
+        : fallbackResolution?.status === "resolved"
+          ? fallbackResolution.target
+          : lexicalValue;
     const key = mentionMatchKey(name);
     if (seen.has(key)) continue;
     seen.add(key);

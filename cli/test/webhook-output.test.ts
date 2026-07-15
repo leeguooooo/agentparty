@@ -6,7 +6,7 @@ describe("webhook list terminal output", () => {
     const row = formatWebhookListRow({
       name: "hook\u001b]52;c;clipboard\u0007",
       filter: "mentions\u001b[31m\u0000",
-      url: "https://example.test/path\nforged",
+      url: "https://example.test/path\nforged\tcolumn",
       mode: "agent\u001b[2J",
     });
 
@@ -14,7 +14,7 @@ describe("webhook list terminal output", () => {
     expect(row.split("\t")).toEqual([
       "hook]52;c;clipboard",
       "mentions",
-      "https://example.test/path forged",
+      "https://example.test/path forged column",
       "notify",
     ]);
   });

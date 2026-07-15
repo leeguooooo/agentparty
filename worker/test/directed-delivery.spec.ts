@@ -23,10 +23,15 @@ async function nextDeliveryState(
   ws: WsClient,
   deliveryId: string,
   state: DirectedDelivery["state"],
+  requestId?: string,
 ) {
   for (;;) {
     const frame = await ws.nextOfType("delivery_state");
-    if (frame.delivery.id === deliveryId && frame.delivery.state === state) return frame;
+    if (
+      frame.delivery.id === deliveryId &&
+      frame.delivery.state === state &&
+      (requestId === undefined || frame.request_id === requestId)
+    ) return frame;
   }
 }
 
@@ -420,20 +425,30 @@ describe("持久定向投递（issue #551）", () => {
     serve.send({
       type: "delivery_update",
       delivery_id: firstDelivery.delivery.id,
+      request_id: "first-failure",
       state: "failed",
       error: "runner exited",
     });
-    await nextDeliveryState(serve, firstDelivery.delivery.id, "failed");
+    const firstBroadcast = await nextDeliveryState(serve, firstDelivery.delivery.id, "failed");
+    expect(firstBroadcast.request_id).toBeUndefined();
     const secondDelivery = await serve.nextOfType("delivery");
     expect(secondDelivery.delivery).toMatchObject({ message_seq: second.seq, state: "claimed", attempt: 1 });
+    expect(await nextDeliveryState(serve, firstDelivery.delivery.id, "failed", "first-failure")).toMatchObject({
+      request_id: "first-failure",
+      delivery: { id: firstDelivery.delivery.id, state: "failed" },
+    });
     // 同一个终态帧重发只返回权威 ACK，不会再改写或重复释放队列。
     serve.send({
       type: "delivery_update",
       delivery_id: firstDelivery.delivery.id,
+      request_id: "retry-failure",
       state: "failed",
       error: "ignored retry",
     });
-    await nextDeliveryState(serve, firstDelivery.delivery.id, "failed");
+    expect(await nextDeliveryState(serve, firstDelivery.delivery.id, "failed", "retry-failure")).toMatchObject({
+      request_id: "retry-failure",
+      delivery: { id: firstDelivery.delivery.id, state: "failed" },
+    });
     expect(await deliveryRows(slug)).toMatchObject([
       { message_seq: first.seq, state: "failed", last_error: "runner exited" },
       { message_seq: second.seq, state: "claimed" },

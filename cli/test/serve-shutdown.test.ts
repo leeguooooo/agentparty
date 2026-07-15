@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EXIT_SIGNAL_TERM, runServe, ServeShutdownError } from "../src/commands/serve";
+import { EXIT_SIGNAL_TERM, runServe, ServeShutdownError, WakeBlockedError } from "../src/commands/serve";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
 
 const dirs: string[] = [];
@@ -108,6 +108,146 @@ describe("serve process shutdown barrier", () => {
     controller.abort(new ServeShutdownError("SIGTERM"));
     expect(await running).toBe(EXIT_SIGNAL_TERM);
     expect(receivedSignal?.aborted).toBe(true);
+    expect(existsSync(join(lockDir, "serve-dev.lock"))).toBe(false);
+  });
+
+  test("an inherited abort interrupts the durable running ACK before the runner starts", async () => {
+    const controller = new AbortController();
+    const lockDir = mkdtempSync(join(tmpdir(), "ap-delivery-ack-abort-lock-"));
+    dirs.push(lockDir);
+    let markWaiting!: () => void;
+    const waiting = new Promise<void>((resolve) => { markWaiting = resolve; });
+    const server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+      } else if (frame.type === "serve_lease") {
+        sock.send({ type: "serve_lease", name: "me", held: true });
+        sock.send({
+          type: "delivery",
+          delivery: {
+            id: "delivery-shutdown",
+            message_seq: 1,
+            target_name: "me",
+            cause: "mention",
+            state: "claimed",
+            attempt: 1,
+            lease_until: Date.now() + 60_000,
+            work_id: "work-shutdown",
+            continuation_ref: "ref-shutdown",
+            reply_seq: null,
+            last_error: null,
+            created_at: Date.now(),
+            updated_at: Date.now(),
+          },
+          message: msgFrame(1, "must not start", { mentions: ["me"] }),
+        });
+      } else if (frame.type === "delivery_update" && frame.state === "running") {
+        markWaiting();
+        // Deliberately never ACK: shutdown must cancel the wait instead of burning the 5s timeout.
+      }
+    });
+    servers.push(server);
+    let runnerCalls = 0;
+    const running = runServe({
+      server: server.url,
+      token: "ap_test",
+      channel: "dev",
+      since: 0,
+      cmd: "true",
+      mentionsOnly: true,
+      lockDir,
+      signal: controller.signal,
+      advertise: async () => {},
+      post: async () => ({ seq: 99 }),
+      runCommand: async () => { runnerCalls += 1; },
+      out: () => {},
+    });
+    await waiting;
+
+    controller.abort(new ServeShutdownError("SIGTERM"));
+    expect(await Promise.race([running, Bun.sleep(500).then(() => -999)])).toBe(EXIT_SIGNAL_TERM);
+    expect(runnerCalls).toBe(0);
+    expect(existsSync(join(lockDir, "serve-dev.lock"))).toBe(false);
+  });
+
+  test("an inherited abort interrupts a long runner retry delay", async () => {
+    const controller = new AbortController();
+    const lockDir = mkdtempSync(join(tmpdir(), "ap-retry-abort-lock-"));
+    dirs.push(lockDir);
+    const server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "retry later", { mentions: ["me"] })), 10);
+    });
+    servers.push(server);
+    let markRetrying!: () => void;
+    const retrying = new Promise<void>((resolve) => { markRetrying = resolve; });
+    const running = runServe({
+      server: server.url,
+      token: "ap_test",
+      channel: "dev",
+      since: 0,
+      cmd: "true",
+      mentionsOnly: true,
+      lockDir,
+      signal: controller.signal,
+      advertise: async () => {},
+      post: async () => ({ seq: 99 }),
+      runCommand: async () => { throw new WakeBlockedError("retry later", true); },
+      maxWakeAttempts: 3,
+      wakeRetryDelayMs: 60_000,
+      onStuck: (stuck) => { if (stuck !== null) markRetrying(); },
+      out: () => {},
+    });
+    await retrying;
+
+    controller.abort(new ServeShutdownError("SIGTERM"));
+    expect(await Promise.race([running, Bun.sleep(500).then(() => -999)])).toBe(EXIT_SIGNAL_TERM);
+    expect(existsSync(join(lockDir, "serve-dev.lock"))).toBe(false);
+  });
+
+  test("an inherited abort reaches an in-flight control-plane status POST", async () => {
+    const controller = new AbortController();
+    const lockDir = mkdtempSync(join(tmpdir(), "ap-post-abort-lock-"));
+    dirs.push(lockDir);
+    const server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      setTimeout(() => sock.send(msgFrame(1, "fail once", { mentions: ["me"] })), 10);
+    });
+    servers.push(server);
+    let postSignal: AbortSignal | undefined;
+    let markPosting!: () => void;
+    const posting = new Promise<void>((resolve) => { markPosting = resolve; });
+    const running = runServe({
+      server: server.url,
+      token: "ap_test",
+      channel: "dev",
+      since: 0,
+      cmd: "true",
+      mentionsOnly: true,
+      lockDir,
+      signal: controller.signal,
+      advertise: async () => {},
+      runCommand: async () => { throw new Error("runner failed"); },
+      maxWakeAttempts: 1,
+      post: async (_server, _token, _channel, payload, signal) => {
+        if (!("state" in payload) || payload.state !== "blocked") return { seq: 99 };
+        postSignal = signal;
+        markPosting();
+        return await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+      out: () => {},
+    });
+    await posting;
+    expect(postSignal).toBeDefined();
+    expect(postSignal?.aborted).toBe(false);
+
+    controller.abort(new ServeShutdownError("SIGTERM"));
+    expect(await Promise.race([running, Bun.sleep(500).then(() => -999)])).toBe(EXIT_SIGNAL_TERM);
+    expect(postSignal?.aborted).toBe(true);
     expect(existsSync(join(lockDir, "serve-dev.lock"))).toBe(false);
   });
 
