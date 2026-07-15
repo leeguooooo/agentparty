@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import {
   bindWorkspaceConfigPointer,
   cwdStatePath,
+  durableConfigPointerPath,
   globalConfigPath,
   loadCursor,
   readConfig,
@@ -24,15 +25,18 @@ import {
 } from "../src/config";
 
 let home: string;
+let volatileDirs: string[];
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ap-test-"));
+  volatileDirs = [];
   process.env.AGENTPARTY_HOME = home;
 });
 
 afterEach(() => {
   delete process.env.AGENTPARTY_HOME;
   delete process.env.AGENTPARTY_CONFIG;
+  for (const dir of volatileDirs) rmSync(dir, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -234,6 +238,49 @@ describe("workspace state", () => {
     expect(r.config?.token).toBe("ap_AGENT");
     expect(r.source.kind).toBe("explicit");
     expect(r.source.path).toBe(cfgPath);
+  });
+
+  test("TMPDIR config is mirrored persistently and recovers even while the explicit path stays missing (#518)", () => {
+    const volatile = mkdtempSync(join(tmpdir(), "ap-volatile-config-"));
+    volatileDirs.push(volatile);
+    const tempConfig = join(volatile, "agentparty-worker-dev.json");
+    const durable = join(home, "agents", "agentparty-worker-dev.json");
+
+    process.env.AGENTPARTY_CONFIG = tempConfig;
+    writeConfig({ server: "https://agentparty.example.com", token: "ap_DURABLE" }, cwd);
+    writeState({ channel: "dev", cursor: 9 }, cwd);
+    expect(durableConfigPointerPath(tempConfig)).toBe(durable);
+    expect(statSync(durable).mode & 0o777).toBe(0o600);
+    bindWorkspaceConfigPointer(durableConfigPointerPath(tempConfig), "dev", cwd);
+
+    rmSync(volatile, { recursive: true, force: true });
+    const recovered = readConfigWithSource(cwd);
+    expect(recovered).toMatchObject({
+      config: { server: "https://agentparty.example.com", token: "ap_DURABLE" },
+      source: { kind: "explicit", path: durable },
+    });
+    expect(readState(cwd)).toMatchObject({ channel: "dev", cursor: 9 });
+    const breadcrumbState = JSON.parse(readFileSync(cwdStatePath(cwd), "utf8"));
+    expect(breadcrumbState).toMatchObject({
+      config_path: durable,
+      bindings: { dev: durable },
+    });
+  });
+
+  test("a missing persistent explicit config fails closed instead of borrowing another workspace identity (#518)", () => {
+    writeConfig({ server: "s", token: "ap_global" }, "/tmp/global-identity");
+    const other = join(home, "agents", "other-agent.json");
+    process.env.AGENTPARTY_CONFIG = other;
+    writeConfig({ server: "s", token: "ap_OTHER" }, cwd);
+    bindWorkspaceConfigPointer(other, "dev", cwd);
+
+    const missing = join(home, "agents", "missing-agent.json");
+    process.env.AGENTPARTY_CONFIG = missing;
+    expect(readConfigWithSource(cwd)).toMatchObject({
+      config: null,
+      source: { kind: "explicit", path: missing },
+    });
+    expect(readState(cwd)).toBeNull();
   });
 
   test("channel bindings survive later init and channel follows the latest init (#360)", () => {

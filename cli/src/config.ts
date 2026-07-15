@@ -1,6 +1,6 @@
 // 全局配置与 workspace 游标状态
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -104,6 +104,10 @@ export function explicitConfigPath(): string | null {
 export function globalConfigPath(): string {
   const explicit = explicitConfigPath();
   if (explicit) return explicit;
+  return defaultGlobalConfigPath();
+}
+
+function defaultGlobalConfigPath(): string {
   return join(agentpartyHome(), "config.json");
 }
 
@@ -114,7 +118,65 @@ export function globalConfigPath(): string {
 export function workspaceConfigPath(cwd: string = process.cwd()): string {
   const explicit = explicitConfigPath();
   if (explicit) return explicit;
+  return defaultWorkspaceConfigPath(cwd);
+}
+
+function defaultWorkspaceConfigPath(cwd: string): string {
   return join(agentpartyHome(), "state", workspaceId(cwd), "config.json");
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    // TMPDIR 被整目录清掉后，直接 realpath(dirname(path)) 也会失败。向上找到最近仍存在的
+    // 祖先（macOS 通常是 /var/folders/.../T），先消解 /var → /private/var，再接回尾段。
+    let current = resolve(path);
+    const tail: string[] = [];
+    while (!existsSync(current)) {
+      const parent = dirname(current);
+      if (parent === current) return resolve(path);
+      tail.unshift(basename(current));
+      current = parent;
+    }
+    try {
+      return join(realpathSync(current), ...tail);
+    } catch {
+      return resolve(path);
+    }
+  }
+}
+
+function isWithin(path: string, root: string): boolean {
+  const candidate = canonicalPath(path);
+  const base = canonicalPath(root);
+  return candidate === base || candidate.startsWith(base.endsWith(sep) ? base : `${base}${sep}`);
+}
+
+/**
+ * 临时目录不能成为 agent token 的唯一存储（#518）。
+ *
+ * 保留调用方给出的文件名（spawn / invite 已含 agent+channel），但把副本放进
+ * ~/.agentparty/agents。AGENTPARTY_HOME 本身视为显式持久根，即使测试或高级用户把它
+ * 指到了系统临时目录，也不对它递归再镜像。
+ */
+export function durableConfigPointerPath(path: string): string {
+  if (isWithin(path, agentpartyHome())) return path;
+  const ephemeral = [tmpdir(), "/tmp", "/private/tmp"].some((root) => isWithin(path, root));
+  if (!ephemeral) return path;
+
+  const rawStem = basename(path).replace(/\.json$/i, "");
+  const stem = slugifyBasename(rawStem);
+  const stableStem = stem.startsWith("agentparty-")
+    ? stem
+    : `${stem}-${createHash("sha256").update(canonicalPath(path)).digest("hex").slice(0, 8)}`;
+  return join(agentpartyHome(), "agents", `${stableStem}.json`);
+}
+
+function writeConfigFile(path: string, cfg: Config): void {
+  atomicWriteJson(path, cfg);
+  const durable = durableConfigPointerPath(path);
+  if (durable !== path) atomicWriteJson(durable, cfg);
 }
 
 // 兼容旧调用：优先返回存在的 workspace 级路径，否则全局路径。
@@ -136,18 +198,56 @@ function sourceInfo(kind: ConfigSourceKind, path: string | null, cfg: Config | n
   };
 }
 
+function readBreadcrumbConfig(cwd: string): ConfigWithSource | null {
+  try {
+    const st = JSON.parse(readFileSync(cwdStatePath(cwd), "utf8")) as WorkspaceState;
+    const breadcrumb = st.bindings?.[st.channel] ?? st.config_path;
+    if (!breadcrumb) return null;
+    try {
+      const cfg = JSON.parse(readFileSync(breadcrumb, "utf8")) as Config;
+      return { config: cfg, source: sourceInfo("explicit", breadcrumb, cfg, cwd) };
+    } catch {
+      console.error(`warning: workspace config breadcrumb is unreadable: ${breadcrumb}; falling back to global config`);
+    }
+  } catch {
+    /* 无 cwd state */
+  }
+  return null;
+}
+
 export function readConfigWithSource(cwd: string = process.cwd()): ConfigWithSource {
   const explicit = explicitConfigPath();
+  let missingExplicit: ConfigSourceInfo | null = null;
   if (explicit) {
     try {
       const cfg = JSON.parse(readFileSync(explicit, "utf8")) as Config;
       return { config: cfg, source: sourceInfo("explicit", explicit, cfg, cwd) };
     } catch {
-      return { config: null, source: sourceInfo("explicit", explicit, null, cwd) };
+      // 显式路径若被 TMPDIR 清理，只尝试 workspace breadcrumb 的同身份持久镜像（#518）。
+      // 若镜像也失败，保留 explicit source 并失败关闭，诊断仍能指出真正丢失的路径。
+      missingExplicit = sourceInfo("explicit", explicit, null, cwd);
     }
   }
 
-  const ws = workspaceConfigPath(cwd);
+  // 显式路径丢失时，只接受由该路径确定性推导出的持久镜像；不能盲信 cwd 中可能属于
+  // 另一并发 agent 的 breadcrumb，否则会从“丢身份”变成更危险的静默串号。
+  if (missingExplicit) {
+    const durable = durableConfigPointerPath(explicit!);
+    if (durable !== explicit) {
+      try {
+        const cfg = JSON.parse(readFileSync(durable, "utf8")) as Config;
+        return { config: cfg, source: sourceInfo("explicit", durable, cfg, cwd) };
+      } catch {
+        /* 持久镜像同样不可读：下面失败关闭 */
+      }
+    }
+    // AGENTPARTY_CONFIG 是明确的身份选择；其本体和持久 breadcrumb 都不可读时必须失败关闭，
+    // 不能继续拿 workspace/global 的另一枚 token 冒充当前 agent。
+    return { config: null, source: missingExplicit };
+  }
+
+  // 走到这里说明没有 AGENTPARTY_CONFIG，按正常 workspace → breadcrumb → global 顺序读取。
+  const ws = defaultWorkspaceConfigPath(cwd);
   try {
     const cfg = JSON.parse(readFileSync(ws, "utf8")) as Config;
     return { config: cfg, source: sourceInfo("workspace", ws, cfg, cwd) };
@@ -156,22 +256,10 @@ export function readConfigWithSource(cwd: string = process.cwd()): ConfigWithSou
   }
 
   // cwd 绑定优先于全局兜底（#359）。bindings 是新格式；config_path 是旧状态兼容镜像。
-  try {
-    const st = JSON.parse(readFileSync(cwdStatePath(cwd), "utf8")) as WorkspaceState;
-    const breadcrumb = st.bindings?.[st.channel] ?? st.config_path;
-    if (breadcrumb) {
-      try {
-        const cfg = JSON.parse(readFileSync(breadcrumb, "utf8")) as Config;
-        return { config: cfg, source: sourceInfo("explicit", breadcrumb, cfg, cwd) };
-      } catch {
-        console.error(`warning: workspace config breadcrumb is unreadable: ${breadcrumb}; falling back to global config`);
-      }
-    }
-  } catch {
-    /* 无 cwd state */
-  }
+  const breadcrumb = readBreadcrumbConfig(cwd);
+  if (breadcrumb) return breadcrumb;
 
-  const global = globalConfigPath();
+  const global = defaultGlobalConfigPath();
   try {
     const cfg = JSON.parse(readFileSync(global, "utf8")) as Config;
     return { config: cfg, source: sourceInfo("global", global, cfg, cwd) };
@@ -188,7 +276,7 @@ export function readConfig(cwd: string = process.cwd()): Config | null {
 export function writeConfig(cfg: Config, cwd: string = process.cwd()): void {
   const explicit = explicitConfigPath();
   if (explicit) {
-    atomicWriteJson(explicit, cfg);
+    writeConfigFile(explicit, cfg);
     return;
   }
   // 配置里有 token 明文，收紧到仅属主可读写；对已存在的文件补 chmod
@@ -211,7 +299,7 @@ export function writeConfig(cfg: Config, cwd: string = process.cwd()): void {
 export function refreshConfigInPlace(cfg: Config, cwd: string = process.cwd()): void {
   const { source } = readConfigWithSource(cwd);
   if (source.kind === "none" || source.path === null) return; // 没有来源就没有该刷新的东西
-  atomicWriteJson(source.path, cfg);
+  writeConfigFile(source.path, cfg);
 }
 
 export function slugifyBasename(name: string): string {
@@ -298,8 +386,19 @@ function migrateLegacyWorkspaceState(cwd: string): void {
 
 export function statePath(cwd: string = process.cwd()): string {
   const explicit = explicitConfigPath();
-  if (explicit) return join(dirname(explicit), `${basename(explicit)}.state`, "state.json");
+  if (explicit) return configScopedStatePath(explicit);
   return join(agentpartyHome(), "state", workspaceId(cwd), "state.json");
+}
+
+function configScopedStatePath(configPath: string): string {
+  return join(dirname(configPath), `${basename(configPath)}.state`, "state.json");
+}
+
+function durableStatePath(): string | null {
+  const explicit = explicitConfigPath();
+  if (!explicit) return null;
+  const durable = durableConfigPointerPath(explicit);
+  return durable === explicit ? null : configScopedStatePath(durable);
 }
 
 // cwd 基准的 state 路径，永远无视 AGENTPARTY_CONFIG——面包屑指针写这里，回复轮（无 env）才找得到。
@@ -392,18 +491,28 @@ export function bindWorkspaceConfigPointer(configPath: string, channel: string, 
 
 export function readState(cwd: string = process.cwd()): WorkspaceState | null {
   migrateLegacyWorkspaceState(cwd);
-  try {
-    return JSON.parse(readFileSync(statePath(cwd), "utf8")) as WorkspaceState;
-  } catch {
-    return null;
+  const durable = durableStatePath();
+  const paths = [statePath(cwd), durable, explicitConfigPath() && !durable ? null : cwdStatePath(cwd)].filter(
+    (path, index, all): path is string => path !== null && all.indexOf(path) === index,
+  );
+  for (const path of paths) {
+    const state = readStateFile(path);
+    if (state) return state;
   }
+  return null;
+}
+
+function writeStateCopies(primary: string, st: WorkspaceState): void {
+  atomicWriteJson(primary, st);
+  const durable = durableStatePath();
+  if (durable && durable !== primary) atomicWriteJson(durable, st);
 }
 
 // tmp + rename 原子替换（#113）：裸 writeFileSync 在崩溃/并发下会留下截断的 JSON，
 // readState 随即返回 null → 游标退回 0 → 整个保留窗口的 @ 被重放。范本同 statusline-cache.ts。
 export function writeState(st: WorkspaceState, cwd: string = process.cwd()): void {
   const p = statePath(cwd);
-  withStateLock(p, () => atomicWriteJson(p, st));
+  withStateLock(p, () => writeStateCopies(p, st));
 }
 
 export function resolveChannel(explicit?: string, cwd?: string): string | null {
@@ -429,7 +538,7 @@ function updateChannelCursor(
   migrateLegacyWorkspaceState(cwd);
   const p = statePath(cwd);
   withStateLock(p, () => {
-    const st = readStateFile(p) ?? { channel, cursor: 0 };
+    const st = readStateFile(p) ?? readState(cwd) ?? { channel, cursor: 0 };
     const next = update(channelCursor(st, channel));
     if (next === null) return;
     const merged: WorkspaceState = {
@@ -441,7 +550,7 @@ function updateChannelCursor(
       if (next.rev_cursor === undefined) delete merged.rev_cursor;
       else merged.rev_cursor = next.rev_cursor;
     }
-    atomicWriteJson(p, merged);
+    writeStateCopies(p, merged);
   });
 }
 

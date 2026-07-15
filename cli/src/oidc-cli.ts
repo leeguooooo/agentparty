@@ -10,12 +10,13 @@ import { readFileSync } from "node:fs";
 function orphanedAgentPointer(): string | null {
   try {
     const st = JSON.parse(readFileSync(cwdStatePath(), "utf8")) as WorkspaceState;
-    if (!st.config_path) return null;
+    const pointer = st.bindings?.[st.channel] ?? st.config_path;
+    if (!pointer) return null;
     try {
-      readFileSync(st.config_path, "utf8");
+      readFileSync(pointer, "utf8");
       return null; // 文件还在，readConfigWithSource 的面包屑回落已经用它了，不是孤儿
     } catch {
-      return st.config_path;
+      return pointer;
     }
   } catch {
     return null;
@@ -379,8 +380,15 @@ export async function resolveAuthDetailed(): Promise<ResolvedAuthDetailed> {
     if (orphan) {
       console.error(
         `⚠ identity would resolve to human account (${sess.email ?? "logged-in user"}), but this workspace was bound to an agent config at ${orphan} which is now missing. ` +
-          `if you are the agent, restore that file or run every command with AGENTPARTY_CONFIG=<path> (issue #42).`,
+          `refusing human-account fallback; restore that file or run every command with AGENTPARTY_CONFIG=<path> (issues #42/#518).`,
       );
+      return {
+        server,
+        token: null,
+        auth_source: "none",
+        config: source,
+        account: accountInfo(sess),
+      };
     }
     const { token } = await ensureFreshAccess(sess);
     return {

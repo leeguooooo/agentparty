@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { accountPath, readAccount, writeAccount, clearAccount } from "../src/account";
-import { writeConfig } from "../src/config";
+import { writeConfig, writeState } from "../src/config";
 import {
   challengeFor,
   decodeJwtPayload,
@@ -30,6 +30,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.AGENTPARTY_HOME;
+  delete process.env.AGENTPARTY_CONFIG;
   rmSync(home, { recursive: true, force: true });
   mock?.stop();
   mock = null;
@@ -188,6 +189,29 @@ describe("resolveAuth precedence", () => {
     });
     const auth = await resolveAuth();
     expect(auth).toEqual({ server: "https://issuer.example.com", token: "acc-live" });
+  });
+
+  test("missing bound agent config fails closed instead of falling back to a human account (#518)", async () => {
+    const missing = join(home, "agents", "missing-agent.json");
+    writeState({ channel: "dev", cursor: 0, config_path: missing, bindings: { dev: missing } });
+    writeAccount({
+      server: "https://issuer.example.com",
+      refresh_token: "ref",
+      access_token: "acc-live",
+      expires_at: nowSec() + 3600,
+      email: "human@example.com",
+    });
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => errors.push(args.join(" "));
+    try {
+      const auth = await resolveAuthDetailed();
+      expect(auth).toMatchObject({ server: "https://issuer.example.com", token: null, auth_source: "none" });
+    } finally {
+      console.error = originalError;
+    }
+    expect(errors.join("\n")).toContain("refusing human-account fallback");
+    expect(errors.join("\n")).toContain(missing);
   });
 
   test("null when neither present", async () => {

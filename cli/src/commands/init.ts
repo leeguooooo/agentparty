@@ -2,6 +2,7 @@
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import {
   bindWorkspaceConfigPointer,
+  durableConfigPointerPath,
   explicitConfigPath,
   readConfig,
   readConfigWithSource,
@@ -124,7 +125,7 @@ export async function run(argv: string[]): Promise<number> {
     // 用了 AGENTPARTY_CONFIG 隔离时，往 cwd-state 记面包屑：被唤醒回复轮丢了 env 也能找回本 agent
     // 的 config，不回落到人类账号会话（issue #42）。同 cwd 多 agent 仍会撞指针——那种要用不同 cwd。
     const explicit = explicitConfigPath();
-    if (explicit) bindWorkspaceConfigPointer(explicit, channel);
+    if (explicit) bindWorkspaceConfigPointer(durableConfigPointerPath(explicit), channel);
     console.log(`bound channel ${channel}`);
   } else {
     writeConfig(cfg);

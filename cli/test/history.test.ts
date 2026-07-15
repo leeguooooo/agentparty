@@ -7,6 +7,8 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { run } from "../src/commands/history";
+import { writeAccount } from "../src/account";
+import { writeState } from "../src/config";
 import { messagesQuery, TAIL_BEFORE } from "../src/rest";
 
 let home: string;
@@ -94,6 +96,26 @@ function captureSearch(): { get: () => string } {
 }
 
 describe("party history 参数解析（#151）", () => {
+  test("missing bound agent config is loud and exits non-zero instead of using a human account (#518)", async () => {
+    rmSync(join(home, "config.json"), { force: true });
+    const missing = join(home, "agents", "missing-agent.json");
+    writeState({ channel: "dev", cursor: 0, config_path: missing, bindings: { dev: missing } });
+    writeAccount({
+      server: "https://issuer.example.com",
+      refresh_token: "ref",
+      access_token: "acc-live",
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      email: "human@example.com",
+    });
+    globalThis.fetch = (async () => {
+      throw new Error("history must fail before making a request with the human token");
+    }) as unknown as typeof fetch;
+
+    expect(await run(["dev"])).toBe(1);
+    expect(stderr.join("\n")).toContain("refusing human-account fallback");
+    expect(stderr.join("\n")).toContain("no config");
+  });
+
   test("attachment-only history output contains actionable metadata (#362)", async () => {
     globalThis.fetch = (async () => Response.json({
       messages: [{
