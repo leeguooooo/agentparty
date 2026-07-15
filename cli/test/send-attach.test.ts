@@ -84,6 +84,17 @@ describe("send --attach parsing", () => {
     const input = await resolveSendInput(parsed);
     expect(input?.mentions).toEqual(["all"]);
   });
+
+  test("显式和正文 mention 的总数不超过共享上限", async () => {
+    const flags = Array.from({ length: 50 }, (_, i) => ["--mention", `agent-${i}`]).flat();
+    const parsed = parseArgs(["正文 @overflow", "--channel", "c", ...flags], sendSpec);
+    const input = await resolveSendInput(parsed);
+    expect(input?.mentions).toHaveLength(50);
+    expect(input?.mentions).not.toContain("overflow");
+
+    const tooMany = parseArgs(["正文", "--channel", "c", ...flags, "--mention", "agent-50"], sendSpec);
+    expect(await resolveSendInput(tooMany)).toBeNull();
+  });
 });
 
 describe("resolveAttachments", () => {

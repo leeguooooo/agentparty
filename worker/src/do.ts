@@ -4146,12 +4146,14 @@ export class ChannelDO extends Server<Env> {
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
     }
-    frame = this.expandAgentReplyMention(frame, identity.name);
     const resolvedMentions = await this.resolveMentionTargets(frame);
     if (resolvedMentions.error !== undefined) {
       return { ok: false, code: "bad_request", message: resolvedMentions.error };
     }
-    frame = await this.expandSquadMentions(resolvedMentions.frame);
+    // reply_to author comes from this channel's authoritative message row and
+    // must not depend on the bounded recent-alias lookup above.
+    frame = this.expandAgentReplyMention(resolvedMentions.frame, identity.name);
+    frame = await this.expandSquadMentions(frame);
     const workflowGuard = this.workflowGuardDecision(identity, frame);
     if (workflowGuard !== null) {
       const row = this.workflowGuardRow(workflowGuard.workflow.workflow_id);
