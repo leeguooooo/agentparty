@@ -22,7 +22,11 @@ beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage() });
 });
-afterEach(() => { act(() => renderer?.unmount()); renderer = null; });
+afterEach(() => {
+  act(() => renderer?.unmount());
+  renderer = null;
+  Reflect.deleteProperty(globalThis, "confirm");
+});
 
 test("searches and directly invites a Lark organization user", async () => {
   const invited: string[] = [];
@@ -44,7 +48,57 @@ test("searches and directly invites a Lark organization user", async () => {
   const button = renderer!.root.findByProps({ "data-lark-user-id": "on_alice" });
   await act(async () => button.props.onClick());
   expect(invited).toEqual(["on_alice"]);
-  expect(JSON.stringify(renderer!.toJSON())).toContain("Added");
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Remove");
+});
+
+test("keeps the added member visible and reports a bot notification failure", async () => {
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          search={async () => ({ users: [{ id: "on_alice", name: "Alice", avatar_url: null, already_member: false }], next_cursor: null })}
+          invite={async (_token, _slug, id) => ({
+            id,
+            name: "Alice",
+            avatar_url: null,
+            already_member: false,
+            notification_status: "failed",
+          })}
+        />
+      </LocaleProvider>,
+    );
+  });
+  const input = renderer!.root.findByProps({ "aria-label": "Search Lark organization" });
+  act(() => input.props.onChange({ target: { value: "Alice" } }));
+  await act(async () => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+  await act(async () => renderer!.root.findByProps({ "data-lark-user-id": "on_alice" }).props.onClick());
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Remove");
+  expect(renderer!.root.findByProps({ role: "alert" }).children.join(" ")).toContain("bot could not send");
+});
+
+test("removes an existing member after confirmation and makes them inviteable again", async () => {
+  const removed: string[] = [];
+  Object.defineProperty(globalThis, "confirm", { configurable: true, value: () => true });
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          search={async () => ({ users: [{ id: "on_alice", name: "Alice", avatar_url: null, already_member: true }], next_cursor: null })}
+          remove={async (_token, _slug, id) => { removed.push(id); }}
+        />
+      </LocaleProvider>,
+    );
+  });
+  const input = renderer!.root.findByProps({ "aria-label": "Search Lark organization" });
+  act(() => input.props.onChange({ target: { value: "Alice" } }));
+  await act(async () => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+  await act(async () => renderer!.root.findByProps({ "data-lark-user-id": "on_alice" }).props.onClick());
+  expect(removed).toEqual(["on_alice"]);
+  expect(renderer!.root.findByProps({ "data-lark-user-id": "on_alice" }).children.join(" ")).toContain("Invite");
 });
 
 test("serializes invitations until the active request finishes", async () => {
@@ -131,7 +185,7 @@ test("browses departments and directly invites a selected organization user", as
   await act(async () => renderer!.root.findByProps({ "data-lark-user-id": "on_evan" }).props.onClick());
   expect(browsed).toEqual(["0", "od_app"]);
   expect(invited).toEqual(["on_evan"]);
-  expect(JSON.stringify(renderer!.toJSON())).toContain("Added");
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Remove");
 });
 
 test("keeps name search available when department-name permission is missing", async () => {
@@ -150,6 +204,38 @@ test("keeps name search available when department-name permission is missing", a
   expect(renderer!.root.findAllByType("form")).toHaveLength(1);
   expect(renderer!.root.findByProps({ role: "status" }).children.join("")).toContain("Department names are not enabled");
   expect(renderer!.root.findByProps({ className: "d-btn lark-org-toggle" }).props.disabled).toBe(true);
+});
+
+test("shows visible employees and keeps flat pagination usable while department names await approval", async () => {
+  const flatModes: boolean[] = [];
+  let calls = 0;
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          browse={async (_token, _slug, _departmentId, _limit, _departmentCursor, _userCursor, _departments, _users, flat) => {
+            flatModes.push(flat ?? false);
+            calls += 1;
+            return {
+              departments: [],
+              users: [{ id: calls === 1 ? "on_evan" : "on_alice", name: calls === 1 ? "陈文捷" : "Alice", avatar_url: null, already_member: false }],
+              next_department_cursor: null,
+              next_user_cursor: calls === 1 ? "next" : null,
+              department_names_available: false,
+            };
+          }}
+        />
+      </LocaleProvider>,
+    );
+  });
+  await act(async () => renderer!.root.findByProps({ className: "d-btn lark-org-toggle" }).props.onClick());
+  expect(renderer!.root.findByProps({ role: "status" }).children.join(" ")).toContain("awaiting admin approval");
+  expect(renderer!.root.findByProps({ "data-lark-user-id": "on_evan" })).toBeTruthy();
+  await act(async () => renderer!.root.findByProps({ className: "d-btn lark-invite-more" }).props.onClick());
+  expect(renderer!.root.findByProps({ "data-lark-user-id": "on_alice" })).toBeTruthy();
+  expect(flatModes).toEqual([false, true]);
 });
 
 test("renders Chinese labels and a contact-permission error", async () => {

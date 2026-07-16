@@ -495,7 +495,7 @@ async function scopedLarkDirectorySearch(
       continue;
     }
     if (state.d !== "0") {
-      const page = await directDepartmentUsersPage(env, provider, state.d, pageSize, state.u);
+      const page = await directDepartmentUsersPage(env, provider, state.d, pageSize - users.length, state.u);
       state.u = page.nextPageToken;
       if (state.u === null) state.d = state.a.shift() ?? "0";
       for (const user of page.users) {
@@ -527,6 +527,19 @@ async function scopedLarkDirectorySearch(
     state.n !== null
   );
   return { users, nextCursor: hasMore ? await encodeDirectoryCursor(secret, state) : null };
+}
+
+export async function browseScopedLarkUsers(
+  env: EnvLike,
+  provider: LarkProviderConfig,
+  cursor: string | null,
+  pageSize: number,
+): Promise<{ users: LarkDirectoryUser[]; nextCursor: string | null }> {
+  const normalizedQuery = "";
+  const state = cursor === null
+    ? null
+    : await decodeDirectoryCursor(providerSecret(env, provider), cursor, normalizedQuery, provider.id);
+  return scopedLarkDirectorySearch(env, provider, normalizedQuery, pageSize, state);
 }
 
 export async function searchLarkDirectory(
@@ -703,6 +716,31 @@ export function buildMentionCard(payload: LarkWebhookPayload): Record<string, un
             url: payload.permalink,
           },
         ],
+      },
+    ],
+  };
+}
+
+export function buildChannelInviteCard(channel: string, permalink: string): Record<string, unknown> {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: "blue",
+      title: { tag: "plain_text", content: "AgentParty 频道邀请" },
+    },
+    elements: [
+      {
+        tag: "markdown",
+        content: `你已被邀请加入 AgentParty 私有频道 **#${channel}**。\n\nYou've been invited to a private AgentParty channel.`,
+      },
+      {
+        tag: "action",
+        actions: [{
+          tag: "button",
+          text: { tag: "plain_text", content: "打开频道 / Open channel" },
+          type: "primary",
+          url: permalink,
+        }],
       },
     ],
   };

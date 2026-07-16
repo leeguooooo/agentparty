@@ -3,6 +3,7 @@ import {
   browseLarkOrganization,
   inviteLarkMember,
   LarkDirectoryApiError,
+  removeLarkMember,
   searchLarkDirectory,
   type LarkDirectoryPage,
   type LarkDirectoryUser,
@@ -18,7 +19,9 @@ interface Props {
   search?: typeof searchLarkDirectory;
   browse?: typeof browseLarkOrganization;
   invite?: typeof inviteLarkMember;
+  remove?: typeof removeLarkMember;
   onInvited?(user: LarkDirectoryUser): void;
+  onRemoved?(user: LarkDirectoryUser): void;
 }
 
 export function LarkMemberInvite({
@@ -27,7 +30,9 @@ export function LarkMemberInvite({
   search = searchLarkDirectory,
   browse = browseLarkOrganization,
   invite = inviteLarkMember,
+  remove = removeLarkMember,
   onInvited,
+  onRemoved,
 }: Props) {
   const t = useT();
   const [query, setQuery] = useState("");
@@ -51,6 +56,7 @@ export function LarkMemberInvite({
   const [userCursor, setUserCursor] = useState<string | null>(null);
   const [organizationBusy, setOrganizationBusy] = useState(false);
   const [organizationUnavailable, setOrganizationUnavailable] = useState(false);
+  const [organizationLimited, setOrganizationLimited] = useState(false);
   const organizationVersion = useRef(0);
 
   function isDirectoryPermissionError(cause: unknown): boolean {
@@ -77,6 +83,7 @@ export function LarkMemberInvite({
     setDepartmentCursor(null);
     setUserCursor(null);
     setOrganizationUnavailable(false);
+    setOrganizationLimited(false);
   }
 
   function errorLabel(cause: unknown, fallbackKey: string): string {
@@ -146,9 +153,30 @@ export function LarkMemberInvite({
       setUsers((current) => current.map((item) => item.id === user.id ? { ...item, already_member: true } : item));
       setOrganizationUsers((current) => current.map((item) => item.id === user.id ? { ...item, already_member: true } : item));
       onInvited?.(added);
+      if (added.notification_status === "failed") setError(t("LarkInvite.error.notification"));
     } catch (cause) {
       if (isDirectoryPermissionError(cause)) disableDirectoryActions();
       else setError(errorLabel(cause, "LarkInvite.error.invite"));
+    } finally {
+      if (invitingUser.current === user.id) invitingUser.current = null;
+      setInviting((current) => current === user.id ? null : current);
+    }
+  }
+
+  async function removeUser(user: LarkDirectoryUser) {
+    if (invitingUser.current !== null) return;
+    if (!globalThis.confirm(t("LarkInvite.removeConfirm", { name: user.name }))) return;
+    invitingUser.current = user.id;
+    setInviting(user.id);
+    setError(null);
+    try {
+      await remove(token, slug, user.id);
+      setUsers((current) => current.map((item) => item.id === user.id ? { ...item, already_member: false } : item));
+      setOrganizationUsers((current) => current.map((item) => item.id === user.id ? { ...item, already_member: false } : item));
+      onRemoved?.(user);
+    } catch (cause) {
+      if (isDirectoryPermissionError(cause)) disableDirectoryActions();
+      else setError(errorLabel(cause, "LarkInvite.error.remove"));
     } finally {
       if (invitingUser.current === user.id) invitingUser.current = null;
       setInviting((current) => current === user.id ? null : current);
@@ -177,6 +205,7 @@ export function LarkMemberInvite({
       setOrganizationUsers([]);
       setDepartmentCursor(null);
       setUserCursor(null);
+      setOrganizationLimited(false);
     }
     try {
       const page = await browse(
@@ -188,6 +217,7 @@ export function LarkMemberInvite({
         mode === "users" ? userCursor : null,
         mode !== "users",
         mode !== "departments",
+        organizationLimited && mode !== "replace",
       );
       if (version !== organizationVersion.current) return;
       if (mode !== "users") {
@@ -198,6 +228,7 @@ export function LarkMemberInvite({
         setOrganizationUsers((current) => mode === "replace" ? page.users : mergeUsers(current, page.users));
         setUserCursor(page.next_user_cursor);
       }
+      if (mode === "replace") setOrganizationLimited(page.department_names_available === false);
     } catch (cause) {
       if (version !== organizationVersion.current) return;
       if (isDirectoryPermissionError(cause)) disableDirectoryActions();
@@ -246,16 +277,14 @@ export function LarkMemberInvite({
             <span className="lark-invite-name">{user.name}</span>
             <button
               type="button"
-              className="d-btn"
+              className={`d-btn${user.already_member ? " lark-remove" : ""}`}
               data-lark-user-id={user.id}
-              disabled={user.already_member || inviting !== null}
-              onClick={() => add(user)}
+              disabled={inviting !== null}
+              onClick={() => user.already_member ? removeUser(user) : add(user)}
             >
-              {user.already_member
-                ? t("LarkInvite.added")
-                : inviting === user.id
-                  ? t("LarkInvite.inviting")
-                  : t("LarkInvite.invite")}
+              {inviting === user.id
+                ? t(user.already_member ? "LarkInvite.removing" : "LarkInvite.inviting")
+                : t(user.already_member ? "LarkInvite.remove" : "LarkInvite.invite")}
             </button>
           </li>
         ))}
@@ -285,6 +314,9 @@ export function LarkMemberInvite({
                   <button type="button" key={department.id} onClick={() => selectBreadcrumb(index)}>{department.name}</button>
                 ))}
               </nav>
+              {organizationLimited && (
+                <p className="lark-invite-unavailable" role="status">{t("LarkInvite.organization.limited")}</p>
+              )}
               {organizationBusy && departments.length === 0 && organizationUsers.length === 0 && (
                 <p className="lark-invite-empty" role="status">{t("LarkInvite.organization.loading")}</p>
               )}

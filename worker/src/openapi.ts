@@ -364,18 +364,19 @@ export const openapiDocument = {
       get: {
         summary: "browse same-tenant Lark departments and direct members",
         security: [{ bearer: [] }],
-        description: "Returns the direct child departments and direct users of one department so the channel moderator can navigate the organization tree and select a person without knowing their searchable name.",
+        description: "Returns the direct child departments and direct users of one department so the channel moderator can navigate the organization tree and select a person without knowing their searchable name. If department-name permission is pending, the root request falls back to the app-visible employee directory and marks department_names_available=false.",
         parameters: [
           { name: "slug", in: "path", required: true, schema: { type: "string" } },
           { name: "department_id", in: "query", schema: { type: "string", default: "0", maxLength: 64 } },
           { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 50, default: 50 } },
           { name: "department_cursor", in: "query", schema: { type: "string", maxLength: 512 } },
-          { name: "user_cursor", in: "query", schema: { type: "string", maxLength: 512 } },
+          { name: "user_cursor", in: "query", description: "opaque pagination cursor", schema: { type: "string", maxLength: 1024 } },
           { name: "departments", in: "query", description: "set to 0 when paginating only users", schema: { type: "string", enum: ["0"] } },
           { name: "users", in: "query", description: "set to 0 when paginating only departments", schema: { type: "string", enum: ["0"] } },
+          { name: "flat", in: "query", description: "set to 1 with departments=0 to continue a permission-limited employee listing", schema: { type: "string", enum: ["1"] } },
         ],
         responses: {
-          "200": { description: "{departments:[{id,name,parent_id}],users:[{id,name,avatar_url,already_member}],next_department_cursor,next_user_cursor}" },
+          "200": { description: "{departments:[{id,name,parent_id}],users:[{id,name,avatar_url,already_member}],next_department_cursor,next_user_cursor,department_names_available}" },
           "400": { description: "invalid department id, limit, or cursor" },
           "403": { description: "not a same-tenant Lark human moderator" },
           "404": { description: "channel not found" },
@@ -388,7 +389,7 @@ export const openapiDocument = {
       post: {
         summary: "directly invite a same-tenant Lark user as a channel member",
         security: [{ bearer: [] }],
-        description: "Available only to human channel moderators signed in through Lark or Feishu. The server revalidates the selected union id against the configured tenant, inserts channel_members idempotently, and writes management audit on the first add.",
+        description: "Available only to human channel moderators signed in through Lark or Feishu. The server revalidates the selected union id against the configured tenant, inserts channel_members idempotently, writes management audit, and asks the Lark bot to send the new member a channel card on the first add. A notification failure does not roll back membership.",
         parameters: [{ name: "slug", in: "path", required: true, schema: { type: "string" } }],
         requestBody: {
           required: true,
@@ -403,12 +404,29 @@ export const openapiDocument = {
           },
         },
         responses: {
-          "200": { description: "user was already a channel member" },
-          "201": { description: "user added to channel_members" },
+          "200": { description: "user was already a channel member; notification_status=skipped_already_member" },
+          "201": { description: "user added to channel_members; notification_status is sent or failed" },
           "400": { description: "invalid user id" },
           "403": { description: "not a same-tenant Lark human moderator" },
           "404": { description: "channel or Lark user not found" },
           "503": { description: "Lark contact permission is missing or the directory is unavailable" },
+        },
+      },
+    },
+    "/api/channels/{slug}/lark-members/{userId}": {
+      delete: {
+        summary: "remove a same-tenant Lark member and block their agents from this channel",
+        security: [{ bearer: [] }],
+        description: "Removes channel membership, creates a channel-level account ban, revokes every active agent token scoped to this channel, revokes active project-agent invitations owned by the account, and disconnects all of that account's active identities. Global agents remain usable elsewhere but cannot re-enter this channel, even if it is public, until a moderator explicitly re-invites the account.",
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "userId", in: "path", required: true, schema: { type: "string", minLength: 1, maxLength: 128 } },
+        ],
+        responses: {
+          "200": { description: "member removed and channel agent access revoked" },
+          "400": { description: "invalid user id or attempted owner removal" },
+          "403": { description: "not a same-tenant Lark human moderator" },
+          "404": { description: "channel not found" },
         },
       },
     },

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { clearLarkTokenCache } from "../src/integrations/lark";
 import { api, createChannel, seedToken, uniq } from "./helpers";
 import { fetchMock } from "./fetch-mock";
@@ -14,6 +14,7 @@ beforeAll(() => {
 afterEach(() => {
   clearLarkTokenCache();
   fetchMock.assertNoPendingInterceptors();
+  vi.restoreAllMocks();
 });
 
 afterAll(() => fetchMock.deactivate());
@@ -78,6 +79,7 @@ describe("Lark organization member invitations (#358)", () => {
     expect(document.paths["/api/channels/{slug}/lark-directory"]).toBeDefined();
     expect(document.paths["/api/channels/{slug}/lark-organization"]).toBeDefined();
     expect(document.paths["/api/channels/{slug}/lark-members"]).toBeDefined();
+    expect(document.paths["/api/channels/{slug}/lark-members/{userId}"]).toBeDefined();
     expect(JSON.stringify({
       search: document.paths["/api/channels/{slug}/lark-directory"],
       organization: document.paths["/api/channels/{slug}/lark-organization"],
@@ -111,6 +113,7 @@ describe("Lark organization member invitations (#358)", () => {
         data: { has_more: false, items: [{ union_id: "on_evan", name: "陈文捷" }] },
       });
 
+    const prepare = vi.spyOn(env.DB, "prepare");
     const response = await api(`/api/channels/${slug}/lark-organization?department_id=0&limit=50`, owner.token);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -118,6 +121,55 @@ describe("Lark organization member invitations (#358)", () => {
       users: [{ id: "on_evan", name: "陈文捷", avatar_url: null, already_member: false }],
       next_department_cursor: null,
       next_user_cursor: null,
+      department_names_available: true,
+    });
+    const queries = prepare.mock.calls.map(([query]) => query.replace(/\s+/g, " ").trim());
+    expect(queries).toContainEqual(expect.stringMatching(/account_profiles .*provider_user_id IN \(\?\)/));
+    expect(queries).toContainEqual(expect.stringMatching(/channel_members .*account IN \(\?\)/));
+    expect(queries).not.toContain("SELECT account, provider_user_id FROM account_profiles WHERE provider = ? AND tenant_key = ?");
+    expect(queries).not.toContain("SELECT account FROM channel_members WHERE channel_slug = ?");
+  });
+
+  it("falls back to the visible employee directory while department names await approval", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=false&page_size=50",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ open_department_id: "od_app" }] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/scopes?user_id_type=union_id&department_id_type=open_department_id&page_size=100",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, department_ids: ["od_app"], user_ids: [] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od_app&page_size=50",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ union_id: "on_evan", name: "陈文捷" }] },
+      });
+
+    const response = await api(`/api/channels/${slug}/lark-organization?department_id=0&limit=50`, owner.token);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      departments: [],
+      users: [{ id: "on_evan", name: "陈文捷", avatar_url: null, already_member: false }],
+      next_department_cursor: null,
+      next_user_cursor: null,
+      department_names_available: false,
     });
   });
 
@@ -140,6 +192,71 @@ describe("Lark organization member invitations (#358)", () => {
     expect(await response.json()).toMatchObject({
       error: { code: "lark_department_permission_required" },
     });
+  });
+
+  it("rejects flat organization pagination when users are disabled", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+
+    const response = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=50&departments=0&users=0&flat=1`,
+      owner.token,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "bad_request" } });
+  });
+
+  it("preserves department users across flat pages after direct users consume part of a page", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/scopes?user_id_type=union_id&department_id_type=open_department_id&page_size=100",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, department_ids: ["od_app"], user_ids: ["on_direct"] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/contact/v3/users/on_direct?user_id_type=union_id", method: "GET" })
+      .reply(200, { code: 0, data: { user: { union_id: "on_direct", name: "Direct User" } } });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od_app&page_size=1",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: true, page_token: "department-next", items: [{ union_id: "on_first", name: "First" }] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od_app&page_size=2&page_token=department-next",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ union_id: "on_second", name: "Second" }] },
+      });
+
+    const first = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=2&departments=0&flat=1`,
+      owner.token,
+    );
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { users: Array<{ id: string }>; next_user_cursor: string };
+    expect(firstBody.users.map((user) => user.id)).toEqual(["on_direct", "on_first"]);
+    expect(firstBody.next_user_cursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    const second = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=2&departments=0&flat=1&user_cursor=${encodeURIComponent(firstBody.next_user_cursor)}`,
+      owner.token,
+    );
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as { users: Array<{ id: string }> }).users.map((user) => user.id)).toEqual(["on_second"]);
   });
 
   it("matches English names and email aliases without returning them", async () => {
@@ -434,6 +551,13 @@ describe("Lark organization member invitations (#358)", () => {
         data: { user: { union_id: "on_alice", name: "Alice Zhang", avatar: { avatar_72: "https://cdn.example/alice.png" } } },
       })
       .times(2);
+    let sentMessage: Record<string, unknown> | null = null;
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/im/v1/messages?receive_id_type=union_id", method: "POST" })
+      .reply(200, (options) => {
+        sentMessage = JSON.parse(String(options.body)) as Record<string, unknown>;
+        return { code: 0, data: { message_id: "om_invite" } };
+      });
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const invited = await api(`/api/channels/${slug}/lark-members`, owner.token, {
@@ -441,8 +565,17 @@ describe("Lark organization member invitations (#358)", () => {
         body: JSON.stringify({ user_id: "on_alice" }),
       });
       expect(invited.status).toBe(attempt === 0 ? 201 : 200);
-      expect(await invited.json()).toMatchObject({ name: "Alice Zhang", already_member: attempt === 1 });
+      expect(await invited.json()).toMatchObject({
+        name: "Alice Zhang",
+        already_member: attempt === 1,
+        notification_status: attempt === 0 ? "sent" : "skipped_already_member",
+      });
     }
+
+    expect(sentMessage).toMatchObject({ receive_id: "on_alice", msg_type: "interactive" });
+    const inviteCard = JSON.parse(String((sentMessage as unknown as Record<string, unknown>).content)) as Record<string, unknown>;
+    expect(JSON.stringify(inviteCard)).toContain(`#${slug}`);
+    expect(JSON.stringify(inviteCard)).toContain(`/c/${slug}`);
 
     const members = await env.DB.prepare(
       "SELECT account, added_by FROM channel_members WHERE channel_slug = ? AND account = ?",
@@ -452,6 +585,78 @@ describe("Lark organization member invitations (#358)", () => {
     const audit = await api(`/api/channels/${slug}/management-audit?limit=100`, owner.token);
     const entries = ((await audit.json()) as { audit: Array<{ action: string; resource: string }> }).audit;
     expect(entries.filter((entry) => entry.action === "channel.member.add" && entry.resource === `channel/${slug}/members/lark-main:on_alice`)).toHaveLength(1);
+  });
+
+  it("keeps the member addition when the Lark bot notification fails", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/contact/v3/users/on_bob?user_id_type=union_id", method: "GET" })
+      .reply(200, { code: 0, data: { user: { union_id: "on_bob", name: "Bob" } } });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/im/v1/messages?receive_id_type=union_id", method: "POST" })
+      .reply(200, { code: 999, msg: "permission denied" });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const response = await api(`/api/channels/${slug}/lark-members`, owner.token, {
+      method: "POST",
+      body: JSON.stringify({ user_id: "on_bob" }),
+    });
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ already_member: false, notification_status: "failed" });
+    expect(await env.DB.prepare(
+      "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, "lark-main:on_bob").first()).not.toBeNull();
+    expect(warning).toHaveBeenCalledOnce();
+    warning.mockRestore();
+  });
+
+  it("removes a Lark member, revokes all channel-scoped agents, and blocks global agents from the channel", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    const account = "lark-main:on_remove";
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO account_profiles (
+         account, handle, display_name, provider, provider_user_id, tenant_key, created_at, updated_at
+       ) VALUES (?, ?, 'Remove Me', 'lark-main', 'on_remove', 'tenant-test', ?, ?)`,
+    ).bind(account, uniq("remove_me"), now, now).run();
+    await env.DB.prepare(
+      "INSERT INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, ?, ?)",
+    ).bind(slug, account, owner.account, now).run();
+    const scoped = await seedToken("agent", uniq("scoped_remove"), { owner: account, channelScope: slug });
+    const global = await seedToken("agent", uniq("global_remove"), { owner: account });
+    const other = await seedToken("agent", uniq("other_remove"), { owner: account, channelScope: uniq("other") });
+
+    const response = await api(`/api/channels/${slug}/lark-members/on_remove`, owner.token, { method: "DELETE" });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ memberRemoved: true, revokedAgents: 1 });
+    expect(await env.DB.prepare(
+      "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, account).first()).toBeNull();
+    const tokens = await env.DB.prepare(
+      "SELECT name, revoked_at FROM tokens WHERE name IN (?, ?, ?) ORDER BY name",
+    ).bind(scoped.name, global.name, other.name).all<{ name: string; revoked_at: number | null }>();
+    expect(tokens.results.find((token) => token.name === scoped.name)?.revoked_at).not.toBeNull();
+    expect(tokens.results.find((token) => token.name === global.name)?.revoked_at).toBeNull();
+    expect(tokens.results.find((token) => token.name === other.name)?.revoked_at).toBeNull();
+    expect(await env.DB.prepare(
+      "SELECT account FROM channel_account_bans WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, account).first()).toEqual({ account });
+    expect((await api(`/api/channels/${slug}/messages`, global.token)).status).toBe(403);
+    expect((await api(`/api/channels/${slug}/messages`, scoped.token)).status).toBe(401);
+
+    await env.DB.prepare("UPDATE channels SET visibility = 'public' WHERE slug = ?").bind(slug).run();
+    expect((await api(`/api/channels/${slug}/messages`, global.token)).status).toBe(403);
+
+    expect((await api(`/api/channels/${slug}/members/${encodeURIComponent(account)}`, owner.token, { method: "PUT" })).status).toBe(200);
+    expect(await env.DB.prepare(
+      "SELECT account FROM channel_account_bans WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, account).first()).toBeNull();
+    expect((await api(`/api/channels/${slug}/messages`, global.token)).status).toBe(200);
   });
 
   it("reuses an open_id profile during a union_id invite and migrates it to the stable id", async () => {

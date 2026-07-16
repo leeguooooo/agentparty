@@ -52,6 +52,7 @@ export interface LarkDirectoryUser {
   name: string;
   avatar_url: string | null;
   already_member: boolean;
+  notification_status?: "sent" | "failed" | "skipped_already_member";
 }
 
 export interface LarkDirectoryPage {
@@ -70,6 +71,7 @@ export interface LarkOrganizationPage {
   users: LarkDirectoryUser[];
   next_department_cursor: string | null;
   next_user_cursor: string | null;
+  department_names_available?: boolean;
 }
 
 export async function searchLarkDirectory(
@@ -97,12 +99,14 @@ export async function browseLarkOrganization(
   userCursor: string | null = null,
   includeDepartments = true,
   includeUsers = true,
+  flat = false,
 ): Promise<LarkOrganizationPage> {
-  const params = new URLSearchParams({ department_id: departmentId, limit: String(limit) });
+  const params = new URLSearchParams({ department_id: flat ? "0" : departmentId, limit: String(limit) });
   if (departmentCursor !== null) params.set("department_cursor", departmentCursor);
   if (userCursor !== null) params.set("user_cursor", userCursor);
-  if (!includeDepartments) params.set("departments", "0");
+  if (flat || !includeDepartments) params.set("departments", "0");
   if (!includeUsers) params.set("users", "0");
+  if (flat) params.set("flat", "1");
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/lark-organization?${params.toString()}`, {
     headers: { authorization: `Bearer ${token}` },
   });
@@ -122,6 +126,19 @@ export async function inviteLarkMember(
   });
   if (!res.ok) throw await larkDirectoryError(res);
   return (await res.json()) as LarkDirectoryUser;
+}
+
+export async function removeLarkMember(token: string, slug: string, userId: string): Promise<void> {
+  const res = await fetchApi(
+    `/api/channels/${encodeURIComponent(slug)}/lark-members/${encodeURIComponent(userId)}`,
+    {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    },
+  );
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("only a Lark channel moderator can remove members");
+  if (!res.ok) throw await larkDirectoryError(res);
 }
 
 export function urlToken(): string | null {

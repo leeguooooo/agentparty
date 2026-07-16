@@ -1,7 +1,7 @@
 // @ts-expect-error Bun executes this test, while the web tsconfig intentionally loads only Vite globals.
 import { afterEach, describe, expect, test } from "bun:test";
 // Run before component suites because Bun's process-global module mocks replace lib/api later.
-import { browseLarkOrganization, inviteLarkMember, searchLarkDirectory } from "./lib/api";
+import { browseLarkOrganization, inviteLarkMember, removeLarkMember, searchLarkDirectory } from "./lib/api";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -39,6 +39,19 @@ describe("Lark directory API", () => {
     expect(rawBody).not.toMatch(/access.?token|tenant/i);
   });
 
+  test("removes only the selected provider user id", async () => {
+    let request: Request | null = null;
+    globalThis.fetch = (async (input, init) => {
+      request = new Request(new URL(String(input), "https://web.test"), init);
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await removeLarkMember("session-token", "private room", "on_alice");
+    expect(request!.method).toBe("DELETE");
+    expect(request!.url).toContain("/api/channels/private%20room/lark-members/on_alice");
+    expect(request!.headers.get("authorization")).toBe("Bearer session-token");
+  });
+
   test("encodes organization browsing and independent pagination", async () => {
     let request: Request | null = null;
     globalThis.fetch = (async (input, init) => {
@@ -57,5 +70,24 @@ describe("Lark directory API", () => {
     expect(request!.url).toContain("user_cursor=users%2Fnext");
     expect(request!.url).toContain("departments=0");
     expect(request!.headers.get("authorization")).toBe("Bearer session-token");
+  });
+
+  test("marks follow-up organization requests as flat-directory pagination", async () => {
+    let request: Request | null = null;
+    globalThis.fetch = (async (input, init) => {
+      request = new Request(new URL(String(input), "https://web.test"), init);
+      return new Response(JSON.stringify({
+        departments: [],
+        users: [],
+        next_department_cursor: null,
+        next_user_cursor: null,
+        department_names_available: false,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await browseLarkOrganization("session-token", "private room", "od_ignored", 50, null, "flat/cursor", true, true, true);
+    expect(request!.url).toContain("department_id=0");
+    expect(request!.url).toContain("departments=0");
+    expect(request!.url).toContain("flat=1");
   });
 });

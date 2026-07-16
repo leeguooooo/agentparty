@@ -145,6 +145,11 @@
 .lark-invite-empty { color: var(--t-muted); }
 .lark-invite-more { justify-self: start; }
 
+.lark-invite .lark-remove {
+  border-color: color-mix(in srgb, var(--d-red) 55%, var(--t-faint));
+  color: var(--d-red);
+}
+
 @media (max-width: 420px) {
   .lark-invite-search { grid-template-columns: 1fr; }
 }
