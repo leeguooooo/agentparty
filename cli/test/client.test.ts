@@ -443,13 +443,16 @@ describe("ws client", () => {
   test("inbound watchdog retires a half-open socket and reconnects even without a close event", async () => {
     jest.useFakeTimers();
     useProbeWebSocket();
-    const statuses: string[] = [];
+    const statuses: Array<{ status: string; error?: string }> = [];
     conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
       backoffBaseMs: 5,
       backoffMaxMs: 5,
       pingIntervalMs: 10,
       inboundIdleTimeoutMs: 30,
-      onStatus: (status) => statuses.push(status),
+      onStatus: (status, detail) => statuses.push({
+        status,
+        ...(detail?.error === undefined ? {} : { error: detail.error }),
+      }),
     });
     const first = ProbeWebSocket.instances[0]!;
     first.open();
@@ -458,14 +461,17 @@ describe("ws client", () => {
 
     expect(first.readyState).toBe(ProbeWebSocket.CLOSED);
     expect(first.closeCalls).toContainEqual({ code: 1011, reason: "inbound idle timeout" });
-    expect(statuses).toEqual(["open", "reconnecting"]);
+    expect(statuses).toEqual([
+      { status: "open" },
+      { status: "reconnecting", error: "inbound idle timeout" },
+    ]);
     expect(ProbeWebSocket.instances).toHaveLength(1);
 
     jest.advanceTimersByTime(5);
     expect(ProbeWebSocket.instances).toHaveLength(2);
   });
 
-  test("any inbound frame resets the idle watchdog", async () => {
+  test("a parseable inbound frame resets the idle watchdog", async () => {
     jest.useFakeTimers();
     useProbeWebSocket();
     conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
@@ -485,6 +491,29 @@ describe("ws client", () => {
     expect(first.readyState).toBe(ProbeWebSocket.OPEN);
 
     jest.advanceTimersByTime(40);
+    expect(first.readyState).toBe(ProbeWebSocket.CLOSED);
+  });
+
+  test("malformed or shape-invalid inbound data cannot keep a half-broken connection alive", async () => {
+    jest.useFakeTimers();
+    useProbeWebSocket();
+    conn = connect("https://party.invalid", "ap_tok", "dev", 0, {
+      backoffBaseMs: 5,
+      pingIntervalMs: 10,
+      inboundIdleTimeoutMs: 60,
+    });
+    const first = ProbeWebSocket.instances[0]!;
+    first.open();
+
+    jest.advanceTimersByTime(20);
+    first.deliver("{not-json");
+    jest.advanceTimersByTime(20);
+    first.deliver("null");
+    jest.advanceTimersByTime(10);
+    first.deliver("{}");
+    jest.advanceTimersByTime(10);
+
+    expect(first.closeCalls).toContainEqual({ code: 1011, reason: "inbound idle timeout" });
     expect(first.readyState).toBe(ProbeWebSocket.CLOSED);
   });
 

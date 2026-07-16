@@ -85,6 +85,82 @@ describe("serve writes local WS health (#254)", () => {
     expect(seen[0]?.reconnect_count).toBeGreaterThanOrEqual(1);
   });
 
+  test("an inbound watchdog reconnect records its exact reason in health", async () => {
+    server = startMockServer((frame, sock, connIndex) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+      if (connIndex > 0) {
+        setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 5);
+      }
+    });
+    const running = runServe(opts({
+      server: server.url,
+      runCommand: async () => {},
+      inboundIdleTimeoutMs: 30,
+    }));
+
+    let reconnecting = readHealthCache();
+    const deadline = Date.now() + 500;
+    while (reconnecting?.reconnecting !== true && Date.now() < deadline) {
+      await Bun.sleep(5);
+      reconnecting = readHealthCache();
+    }
+    expect(reconnecting).toMatchObject({
+      ws_connected: false,
+      reconnecting: true,
+      reconnect_count: 1,
+      last_error: "inbound idle timeout",
+    });
+
+    expect(await running).toBe(EXIT_ARCHIVED);
+  });
+
+  test("a replacement socket stays unhealthy until its first valid server frame", async () => {
+    server = startMockServer((frame, sock, connIndex) => {
+      if (frame.type !== "hello") return;
+      if (connIndex === 0) {
+        sock.send(welcomeFrame(0, "me"));
+        return;
+      }
+      // The replacement accepts a WS handshake but withholds application frames long enough for
+      // the test to observe health. A delayed welcome then proves the same socket becomes healthy.
+      setTimeout(() => sock.send(welcomeFrame(0, "me")), 80);
+      setTimeout(() => sock.send({ type: "error", code: "archived", message: "done" }), 130);
+    });
+    const running = runServe(opts({
+      server: server.url,
+      runCommand: async () => {},
+      inboundIdleTimeoutMs: 200,
+    }));
+
+    let replacement = readHealthCache();
+    const openDeadline = Date.now() + 2_000;
+    while (
+      !(replacement?.reconnect_count === 1 && replacement.ws_connected && replacement.last_frame_at === null)
+      && Date.now() < openDeadline
+    ) {
+      await Bun.sleep(5);
+      replacement = readHealthCache();
+    }
+    expect(replacement).toMatchObject({
+      ws_connected: true,
+      reconnecting: false,
+      reconnect_count: 1,
+      last_frame_at: null,
+      last_error: "inbound idle timeout",
+    });
+
+    let recovered = readHealthCache();
+    const frameDeadline = Date.now() + 500;
+    while (recovered?.last_frame_at === null && Date.now() < frameDeadline) {
+      await Bun.sleep(5);
+      recovered = readHealthCache();
+    }
+    expect(recovered?.last_frame_at).not.toBeNull();
+    expect(recovered?.last_error).toBeNull();
+    expect(await running).toBe(EXIT_ARCHIVED);
+  });
+
   test("EXIT_ALREADY_SERVING does not clobber the winning server's health record", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") sock.send(welcomeFrame(0, "me"));

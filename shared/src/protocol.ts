@@ -205,7 +205,7 @@ export type DecisionKind = "approval" | "choice";
 // pending：等人类；resolved：人类已选；auto_resolved：无人值守模式自动放行。
 export type DecisionState = "pending" | "resolved" | "auto_resolved";
 export type DirectedDeliveryState = "queued" | "claimed" | "running" | "waiting_owner" | "replied" | "failed";
-export type DirectedDeliveryCause = "mention" | "reply" | "owner_answer" | "retry";
+export type DirectedDeliveryCause = "mention" | "mention_edit" | "reply" | "owner_answer" | "retry";
 // decision_request 上限（#284）：与 completion review 同量级，防把 prompt/选项当附加 payload 滥用。
 export const DECISION_PROMPT_LIMIT = 4_000;
 export const DECISION_OPTIONS_MAX = 10;

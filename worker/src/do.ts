@@ -181,6 +181,8 @@ type DeliveryTerminalReason =
   | "unknown_outcome"
   | "owner_answer_failed"
   | "source_retracted"
+  | "source_retention_expired"
+  | "delivery_expired"
   | "orphaned_waiting_owner";
 
 const REVIVABLE_DELIVERY_FAILURES = new Set<DeliveryTerminalReason>(["unknown_outcome"]);
@@ -208,6 +210,13 @@ interface ResolvedMentionFrame {
   frame: SendFrame;
   /** Canonical agent identities proven by the same directory read that validated the mentions. */
   agentTargets: string[];
+}
+
+interface RoutedMentionFrame {
+  frame: SendFrame;
+  /** Canonical, creation-time-bound agent targets that must receive durable work. */
+  deliveryTargets: string[];
+  deliveryTargetOwners: Record<string, string>;
 }
 
 interface ExpectedDecisionLineage {
@@ -280,6 +289,12 @@ const REVIEW_REASON_LIMIT = 4000;
 // （长度 ≤8 的循环里，重访的 tuple 仍在窗口内 → 被判非进展 → 计数累加直到 trip）；又足够小，
 // 让真正线性推进的工作流（每帧都是新 step）永远命中「窗口内没见过」→ 判进展 → 永不误伤。
 const WORKFLOW_GUARD_WINDOW = 8;
+// Durable work cannot outlive its operator indefinitely. Even when message history retention is
+// explicitly off, active delivery capability/lineage expires after 30 days and its terminal audit
+// row is retained for another 7 days. This is far above the hours-long offline replay contract while
+// keeping permanently offline agents and abandoned owner questions bounded.
+const DIRECTED_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const DIRECTED_DELIVERY_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).byteLength;
@@ -323,6 +338,26 @@ function withExpandedMentions(frame: SendFrame, mentions: string[]): SendFrame {
   return frame.kind === "message"
     ? { ...frame, mentions }
     : { ...frame, mentions };
+}
+
+function parseStoredTargetNames(input: unknown): string[] {
+  if (typeof input !== "string") return [];
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    const targets: string[] = [];
+    for (const value of parsed) {
+      if (typeof value !== "string" || !MENTION_NAME_RE.test(value)) continue;
+      const key = mentionMatchKey(value);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push(value);
+    }
+    return targets;
+  } catch {
+    return [];
+  }
 }
 
 function parseStatusScope(input: unknown): string[] | undefined | null {
@@ -1317,6 +1352,7 @@ export class ChannelDO extends Server<Env> {
       kind TEXT NOT NULL,
       body TEXT NOT NULL,
       mentions_json TEXT NOT NULL DEFAULT '[]',
+      delivery_targets_json TEXT NOT NULL DEFAULT '[]',
       reply_to INTEGER,
       state TEXT,
       note TEXT,
@@ -1392,6 +1428,9 @@ export class ChannelDO extends Server<Env> {
       "ALTER TABLE messages ADD COLUMN retracted_by TEXT",
       "ALTER TABLE messages ADD COLUMN supersedes INTEGER",
       "ALTER TABLE messages ADD COLUMN superseded_by INTEGER",
+      // Compact exactly-once tombstone. Delivery rows may be pruned after their bounded audit
+      // window, but editing the retained source must never recreate work for an old target.
+      "ALTER TABLE messages ADD COLUMN delivery_targets_json TEXT NOT NULL DEFAULT '[]'",
       // 修订序号（issue #33）：每次编辑/撤回/超越递增，hello.since_rev 据此限定补拉重放范围
       "ALTER TABLE messages ADD COLUMN rev_seq INTEGER",
       // 迁移回填：历史修订行按 seq 赋 rev_seq（幂等，只补 NULL），让升级后的客户端能收到一次再推进游标
@@ -1651,6 +1690,25 @@ export class ChannelDO extends Server<Env> {
     sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_lease ON directed_deliveries(state, lease_until)",
     );
+    sql.exec(
+      `UPDATE messages
+          SET delivery_targets_json = COALESCE((
+            SELECT json_group_array(target_name)
+              FROM directed_deliveries delivery
+             WHERE delivery.message_seq = messages.seq
+          ), '[]')
+        WHERE CASE
+          WHEN json_valid(delivery_targets_json)
+            THEN json_array_length(delivery_targets_json) = 0
+          ELSE 1
+        END
+          AND messages.retracted_at IS NULL
+          AND messages.body != '[erased]'
+          AND EXISTS (
+            SELECT 1 FROM directed_deliveries delivery
+             WHERE delivery.message_seq = messages.seq
+          )`,
+    );
     sql.exec(`CREATE TABLE IF NOT EXISTS message_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       target_seq INTEGER NOT NULL,
@@ -1684,7 +1742,7 @@ export class ChannelDO extends Server<Env> {
         );
         sql.exec(
           `UPDATE messages
-              SET body = '[retracted]', mentions_json = '[]', original_body = NULL,
+              SET body = '[retracted]', mentions_json = '[]', delivery_targets_json = '[]', original_body = NULL,
                   state = NULL, note = NULL, status_scope_json = NULL, status_blocked_reason = NULL,
                   status_context_json = NULL, status_decision_json = NULL, status_workflow_json = NULL,
                   message_workflow_json = NULL, completion_artifact_json = NULL,
@@ -1928,6 +1986,10 @@ export class ChannelDO extends Server<Env> {
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'),
     );
+    // A permanent, otherwise idle channel may have no presence/webhook/temp/retention alarm at all.
+    // Re-arm upgraded active and terminal delivery deadlines on hydration so bounded retention is a
+    // real clock guarantee rather than something that only runs if unrelated traffic wakes the DO.
+    this.scheduleDirectedDeliveryRetentionAlarm();
   }
 
   private hasCompositeSessionPrimaryKey(table: "presence" | "read_cursor"): boolean {
@@ -2445,6 +2507,7 @@ export class ChannelDO extends Server<Env> {
   // 全走已在 DO 单线程内的 sql.exec，热路径零成本；每张表各按「消费者仍需的窗口」定界，见各方法注释。
   private async pruneStorage(now: number) {
     await this.pruneRetainedContent(now);
+    this.pruneDirectedDeliveryRetention(now);
     this.pruneWakeLedger(now);
     this.pruneMessageAudit();
     this.pruneReadCursors(now);
@@ -2464,15 +2527,30 @@ export class ChannelDO extends Server<Env> {
     const attachmentKeys = new Set<string>();
     if (messageRetention !== null) {
       const cutoff = now - messageRetention;
+      const activeRoots = this.ctx.storage.sql
+        .exec(
+          `SELECT d.* FROM directed_deliveries d
+            JOIN messages m ON m.seq = d.message_seq
+           WHERE m.ts <= ?
+             AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
+           ORDER BY d.created_at, d.id`,
+          cutoff,
+        )
+        .toArray();
+      if (activeRoots.length > 0) {
+        let invalidatedDecisionSeqs: number[] = [];
+        const effects = this.captureAtomicDeliveryEffects(() => {
+          invalidatedDecisionSeqs = this.failDeliveryTree(activeRoots, now, {
+            error: "source expired by channel message retention policy",
+            terminalReason: "source_retention_expired",
+          });
+        });
+        this.flushAtomicDeliveryEffects(effects);
+        this.broadcastInvalidatedDecisions(invalidatedDecisionSeqs, now);
+      }
       const expired = this.ctx.storage.sql
         .exec(
-          `SELECT m.seq, m.attachments_json FROM messages m
-            WHERE m.ts <= ?
-              AND NOT EXISTS (
-                SELECT 1 FROM directed_deliveries d
-                 WHERE d.message_seq = m.seq
-                   AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-              )`,
+          `SELECT m.seq, m.attachments_json FROM messages m WHERE m.ts <= ?`,
           cutoff,
         )
         .toArray();
@@ -2493,55 +2571,29 @@ export class ChannelDO extends Server<Env> {
             `DELETE FROM webhook_queue
               WHERE json_valid(payload)
                 AND CAST(json_extract(payload, '$.seq') AS INTEGER) IN
-                    (SELECT m.seq FROM messages m WHERE m.ts <= ?
-                       AND NOT EXISTS (
-                         SELECT 1 FROM directed_deliveries d
-                          WHERE d.message_seq = m.seq
-                            AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-                       ))`,
+                    (SELECT m.seq FROM messages m WHERE m.ts <= ?)`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
             `DELETE FROM webhook_dead_letters
               WHERE mention_seq IN (
-                SELECT m.seq FROM messages m WHERE m.ts <= ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM directed_deliveries d
-                     WHERE d.message_seq = m.seq
-                       AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-                  ))`,
+                SELECT m.seq FROM messages m WHERE m.ts <= ?)`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
             `DELETE FROM wake_delivery_ledger
               WHERE mention_seq IN (
-                SELECT m.seq FROM messages m WHERE m.ts <= ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM directed_deliveries d
-                     WHERE d.message_seq = m.seq
-                       AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-                  ))`,
+                SELECT m.seq FROM messages m WHERE m.ts <= ?)`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
             `DELETE FROM directed_deliveries
               WHERE message_seq IN (
-                SELECT m.seq FROM messages m WHERE m.ts <= ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM directed_deliveries active
-                     WHERE active.message_seq = m.seq
-                       AND active.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-                  ))`,
+                SELECT m.seq FROM messages m WHERE m.ts <= ?)`,
             cutoff,
           );
           this.ctx.storage.sql.exec(
-            `DELETE FROM messages AS m
-              WHERE m.ts <= ?
-                AND NOT EXISTS (
-                  SELECT 1 FROM directed_deliveries d
-                   WHERE d.message_seq = m.seq
-                     AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
-                )`,
+            `DELETE FROM messages AS m WHERE m.ts <= ?`,
             cutoff,
           );
         });
@@ -2550,6 +2602,62 @@ export class ChannelDO extends Server<Env> {
     if (auditRetention !== null) {
       this.ctx.storage.sql.exec("DELETE FROM message_audit WHERE created_at <= ?", now - auditRetention);
     }
+  }
+
+  private broadcastInvalidatedDecisions(seqs: number[], now: number) {
+    if (seqs.length === 0) return;
+    const actor: Identity = { name: "system", kind: "agent", role: "agent", tokenHash: "" };
+    for (const seq of new Set(seqs)) {
+      const row = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).toArray()[0];
+      if (row !== undefined) {
+        this.broadcastFrame(this.messageUpdate("decision", actor, this.rowToFrame(row), now));
+      }
+    }
+  }
+
+  private pruneDirectedDeliveryRetention(now: number) {
+    const activeCutoff = now - DIRECTED_DELIVERY_MAX_AGE_MS;
+    const activeRoots = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE state IN ('queued', 'claimed', 'running', 'waiting_owner')
+            AND created_at <= ?
+          ORDER BY created_at, id`,
+        activeCutoff,
+      )
+      .toArray();
+    if (activeRoots.length > 0) {
+      let invalidatedDecisionSeqs: number[] = [];
+      const effects = this.captureAtomicDeliveryEffects(() => {
+        invalidatedDecisionSeqs = this.failDeliveryTree(activeRoots, now, {
+          error: "durable delivery expired after 30 days without completion",
+          terminalReason: "delivery_expired",
+        });
+      });
+      this.flushAtomicDeliveryEffects(effects);
+      this.broadcastInvalidatedDecisions(invalidatedDecisionSeqs, now);
+    }
+
+    // Delete only terminal leaves. Parent lineage remains until every descendant is terminal and
+    // pruned; the next alarm removes the now-leaf parent. Pending questions are an additional guard
+    // against deleting a source that has not been invalidated correctly.
+    this.ctx.storage.sql.exec(
+      `DELETE FROM directed_deliveries AS delivery
+        WHERE delivery.state IN ('replied', 'failed')
+          AND delivery.updated_at <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM directed_deliveries child
+             WHERE child.parent_delivery_id = delivery.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM messages question
+             WHERE question.decision_state = 'pending'
+               AND question.decision_request_json IS NOT NULL
+               AND json_valid(question.decision_request_json)
+               AND json_extract(question.decision_request_json, '$.delivery_id') = delivery.id
+          )`,
+      now - DIRECTED_DELIVERY_TERMINAL_RETENTION_MS,
+    );
   }
 
   // wake_delivery_ledger：按时间窗裁。保留窗口 WAKE_LEDGER_RETENTION_MS 严格大于预算窗口上限
@@ -3082,6 +3190,32 @@ export class ChannelDO extends Server<Env> {
       .exec("SELECT MIN(lease_until) AS t FROM directed_deliveries WHERE state IN ('claimed', 'running') AND lease_until IS NOT NULL")
       .one();
     if (nextDeliveryLease.t !== null) candidates.push(Number(nextDeliveryLease.t));
+    const oldestActiveDelivery = this.ctx.storage.sql
+      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state IN ('queued', 'claimed', 'running', 'waiting_owner')")
+      .one();
+    if (oldestActiveDelivery.t !== null) {
+      candidates.push(Number(oldestActiveDelivery.t) + DIRECTED_DELIVERY_MAX_AGE_MS);
+    }
+    const oldestTerminalLeaf = this.ctx.storage.sql
+      .exec(
+        `SELECT MIN(delivery.updated_at) AS t FROM directed_deliveries delivery
+          WHERE delivery.state IN ('replied', 'failed')
+            AND NOT EXISTS (
+              SELECT 1 FROM directed_deliveries child
+               WHERE child.parent_delivery_id = delivery.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM messages question
+               WHERE question.decision_state = 'pending'
+                 AND question.decision_request_json IS NOT NULL
+                 AND json_valid(question.decision_request_json)
+                 AND json_extract(question.decision_request_json, '$.delivery_id') = delivery.id
+            )`,
+      )
+      .one();
+    if (oldestTerminalLeaf.t !== null) {
+      candidates.push(Number(oldestTerminalLeaf.t) + DIRECTED_DELIVERY_TERMINAL_RETENTION_MS);
+    }
     // 暂停接待的定时恢复（issue #180）：取最近的一个未来恢复时刻作为候选，前移 alarm 到点自动恢复。
     const nextResume = this.ctx.storage.sql
       .exec("SELECT MIN(paused_resume_at) AS t FROM presence WHERE paused_resume_at IS NOT NULL")
@@ -4307,8 +4441,16 @@ export class ChannelDO extends Server<Env> {
     return source;
   }
 
-  /** Fail the retracted source plus every still-active owner-answer continuation below it. */
-  private failRetractedDeliveryTree(initial: Record<string, unknown>[], now: number): number[] {
+  /**
+   * Fail a source plus every still-active owner-answer continuation below it, invalidate parked
+   * questions, and scrub reusable capability lineage. Retraction and retention share this exact
+   * closure so neither path can leave a descendant able to resume deleted/expired work.
+   */
+  private failDeliveryTree(
+    initial: Record<string, unknown>[],
+    now: number,
+    failure: { error: string; terminalReason: DeliveryTerminalReason },
+  ): number[] {
     const pending = initial.map((row) => String(row.id));
     const visited = new Set<string>();
     const invalidatedDecisionSeqs = new Set<number>();
@@ -4360,18 +4502,20 @@ export class ChannelDO extends Server<Env> {
       const state = String(row.state);
       if (["queued", "claimed", "running", "waiting_owner"].includes(state)) {
         this.transitionDirectedDeliveryTerminal(id, "failed", now, {
-          error: "source retracted, no retry",
-          terminalReason: "source_retracted",
+          error: failure.error,
+          terminalReason: failure.terminalReason,
           expectedStates: [state],
         });
       } else if (state === "failed") {
-        // Failed rows can still be revivable (typed unknown_outcome or legacy NULL). Retraction is
-        // stronger than that recovery policy, so reclassify every failed descendant authoritatively.
+        // Failed rows can still be revivable (typed unknown_outcome or legacy NULL). Source
+        // invalidation is stronger than that recovery policy, so reclassify every descendant.
         this.ctx.storage.sql.exec(
           `UPDATE directed_deliveries
-              SET last_error = 'source retracted, no retry', terminal_reason = 'source_retracted',
+              SET last_error = ?, terminal_reason = ?,
                   updated_at = ?
             WHERE id = ? AND state = 'failed'`,
+          failure.error,
+          failure.terminalReason,
           now,
           id,
         );
@@ -4390,6 +4534,14 @@ export class ChannelDO extends Server<Env> {
       );
     }
     return [...invalidatedDecisionSeqs];
+  }
+
+  /** Fail the retracted source plus every still-active owner-answer continuation below it. */
+  private failRetractedDeliveryTree(initial: Record<string, unknown>[], now: number): number[] {
+    return this.failDeliveryTree(initial, now, {
+      error: "source retracted, no retry",
+      terminalReason: "source_retracted",
+    });
   }
 
   private isFailedDeliveryRevivable(row: Record<string, unknown>): boolean {
@@ -4428,6 +4580,35 @@ export class ChannelDO extends Server<Env> {
   private async ensureAlarmAt(ts: number) {
     const current = await this.ctx.storage.getAlarm();
     if (current === null || current > ts) await this.ctx.storage.setAlarm(ts);
+  }
+
+  private scheduleDirectedDeliveryRetentionAlarm() {
+    const candidates: number[] = [];
+    const active = this.ctx.storage.sql
+      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state IN ('queued', 'claimed', 'running', 'waiting_owner')")
+      .one().t;
+    if (active !== null) candidates.push(Number(active) + DIRECTED_DELIVERY_MAX_AGE_MS);
+    const terminal = this.ctx.storage.sql
+      .exec(
+        `SELECT MIN(delivery.updated_at) AS t FROM directed_deliveries delivery
+          WHERE delivery.state IN ('replied', 'failed')
+            AND NOT EXISTS (
+              SELECT 1 FROM directed_deliveries child
+               WHERE child.parent_delivery_id = delivery.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM messages question
+               WHERE question.decision_state = 'pending'
+                 AND question.decision_request_json IS NOT NULL
+                 AND json_valid(question.decision_request_json)
+                 AND json_extract(question.decision_request_json, '$.delivery_id') = delivery.id
+            )`,
+      )
+      .one().t;
+    if (terminal !== null) candidates.push(Number(terminal) + DIRECTED_DELIVERY_TERMINAL_RETENTION_MS);
+    if (candidates.length > 0) {
+      this.ctx.waitUntil(this.ensureAlarmAt(Math.max(Math.min(...candidates), Date.now() + 1000)));
+    }
   }
 
   private async scheduleAuditRetention(createdAt: number) {
@@ -4688,7 +4869,14 @@ export class ChannelDO extends Server<Env> {
       if (row.retracted_at !== null && row.retracted_at !== undefined) {
         return Response.json({ error: { code: "bad_request", message: "message is already retracted" } }, { status: 400 });
       }
+      // `[erased]` is the authoritative GDPR tombstone, not an editable sender message. Allowing a
+      // moderator to revise/supersede it would recreate content and durable work under an identity
+      // whose owner/profile data was deliberately removed.
+      if (String(row.body) === "[erased]") {
+        return Response.json({ error: { code: "bad_request", message: "message was erased and cannot be revised" } }, { status: 400 });
+      }
       let body: { body?: unknown; mentions?: unknown } | null = null;
+      let editRouting: RoutedMentionFrame | undefined;
       if (action !== "retract") {
         body = (await request.json().catch(() => null)) as { body?: unknown; mentions?: unknown } | null;
         if (body === null || typeof body.body !== "string" || body.body.trim() === "") {
@@ -4697,34 +4885,166 @@ export class ChannelDO extends Server<Env> {
         if (byteLength(body.body) > BODY_LIMIT) {
           return Response.json({ error: { code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` } }, { status: 413 });
         }
+        if (action === "edit") {
+          const explicitMentions = parseMentions(body.mentions);
+          if (explicitMentions === null) {
+            return Response.json(
+              { error: { code: "bad_request", message: "mentions are invalid or exceed limits" } },
+              { status: 400 },
+            );
+          }
+          const mentions = mergeBodyMentions(explicitMentions, body.body);
+          if (mentions === null) {
+            return Response.json(
+              { error: { code: "too_large", message: "body contains too many mention targets" } },
+              { status: 413 },
+            );
+          }
+          const routed = await this.routeMentionsForDelivery(
+            {
+              type: "send",
+              kind: "message",
+              body: body.body,
+              mentions,
+              reply_to: row.reply_to === null || row.reply_to === undefined ? null : Number(row.reply_to),
+            },
+            identity.name,
+          );
+          if ("ok" in routed) {
+            return Response.json(
+              { error: { code: routed.code, message: routed.message } },
+              { status: ERROR_STATUS[routed.code] },
+            );
+          }
+          editRouting = routed;
+        }
       }
       const now = Date.now();
       const originalBody = row.original_body === null || row.original_body === undefined ? String(row.body) : String(row.original_body);
       if (action === "edit") {
-        this.ctx.storage.sql.exec(
-          `INSERT INTO message_audit (target_seq, action, actor_name, actor_kind, old_body, new_body, created_at)
-           VALUES (?, 'edit', ?, ?, ?, ?, ?)`,
-          seq,
-          identity.name,
-          identity.kind,
-          String(row.body),
-          body!.body,
-          now,
-        );
-        this.ctx.storage.sql.exec(
-          `UPDATE messages
-              SET body = ?, original_body = COALESCE(original_body, ?), edited_at = ?, edited_by = ?, rev_seq = ?
-            WHERE seq = ?`,
-          body!.body,
-          originalBody,
-          now,
-          identity.name,
-          this.nextRevSeq(),
-          seq,
-        );
-        const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
-        const frame = this.rowToFrame(updated);
+        if (editRouting === undefined || editRouting.frame.kind !== "message") {
+          throw new Error("message edit produced no mention routing");
+        }
+        const editState: {
+          failure?: SendErrorOutcome;
+          frame?: MsgFrame;
+        } = {};
+        const effects = this.captureAtomicDeliveryEffects(() => {
+          const current = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
+          if (
+            !current
+            || current.retracted_at !== null && current.retracted_at !== undefined
+            || String(current.body) === "[erased]"
+          ) {
+            editState.failure = { ok: false, code: "bad_request", message: "message is no longer editable" };
+            return;
+          }
+          const currentFrame = this.rowToFrame(current);
+          const oldMentionKeys = new Set(currentFrame.mentions.map(mentionMatchKey));
+          const desiredTargetKeys = new Set(editRouting!.deliveryTargets.map(mentionMatchKey));
+          const existingDeliveries = this.ctx.storage.sql
+            .exec("SELECT target_name FROM directed_deliveries WHERE message_seq = ?", seq)
+            .toArray();
+          const historicalTargets: string[] = [];
+          const historicalTargetKeys = new Set<string>();
+          for (const targetName of [
+            ...parseStoredTargetNames(current.delivery_targets_json),
+            ...existingDeliveries.map((delivery) => String(delivery.target_name)),
+          ]) {
+            const key = mentionMatchKey(targetName);
+            if (historicalTargetKeys.has(key)) continue;
+            historicalTargetKeys.add(key);
+            historicalTargets.push(targetName);
+          }
+
+          // A routed target is an immutable work/audit identity. The compact message tombstone
+          // outlives bounded delivery rows, so pruning a terminal row cannot make a later edit
+          // recreate the same (message_seq,target_name) work. Use supersede/retract to change it.
+          for (const targetName of historicalTargets) {
+            const key = mentionMatchKey(targetName);
+            if (oldMentionKeys.has(key) && !desiredTargetKeys.has(key)) {
+              editState.failure = {
+                ok: false,
+                code: "bad_request",
+                message: `cannot remove routed target @${targetName}; retract or supersede the message instead`,
+              };
+              return;
+            }
+            if (!oldMentionKeys.has(key) && desiredTargetKeys.has(key)) {
+              editState.failure = {
+                ok: false,
+                code: "bad_request",
+                message: `cannot re-add routed target @${targetName} on the same message; send a new message instead`,
+              };
+              return;
+            }
+          }
+          // Before durable deliveries existed, a retained message could already contain @agent but
+          // have neither a delivery row nor a compact tombstone. Preserving that old mention while
+          // merely editing wording is not new work. Tombstone it now, while still routing targets
+          // that are genuinely added by this edit.
+          const preservedLegacyTargets = editRouting!.deliveryTargets.filter((targetName) => {
+            const key = mentionMatchKey(targetName);
+            return oldMentionKeys.has(key) && !historicalTargetKeys.has(key);
+          });
+          const newDeliveryTargets = editRouting!.deliveryTargets.filter((targetName) => {
+            const key = mentionMatchKey(targetName);
+            return !oldMentionKeys.has(key) && !historicalTargetKeys.has(key);
+          });
+          const nextHistoricalTargets = [
+            ...historicalTargets,
+            ...preservedLegacyTargets,
+            ...newDeliveryTargets,
+          ];
+
+          const currentOriginalBody =
+            current.original_body === null || current.original_body === undefined
+              ? String(current.body)
+              : String(current.original_body);
+          this.ctx.storage.sql.exec(
+            `INSERT INTO message_audit (target_seq, action, actor_name, actor_kind, old_body, new_body, created_at)
+             VALUES (?, 'edit', ?, ?, ?, ?, ?)`,
+            seq,
+            identity.name,
+            identity.kind,
+            String(current.body),
+            body!.body,
+            now,
+          );
+          this.ctx.storage.sql.exec(
+            `UPDATE messages
+                SET body = ?, mentions_json = ?, delivery_targets_json = ?,
+                    original_body = COALESCE(original_body, ?),
+                    edited_at = ?, edited_by = ?, rev_seq = ?
+              WHERE seq = ?`,
+            body!.body,
+            JSON.stringify(editRouting!.frame.mentions),
+            JSON.stringify(nextHistoricalTargets),
+            currentOriginalBody,
+            now,
+            identity.name,
+            this.nextRevSeq(),
+            seq,
+          );
+          const updated = this.ctx.storage.sql.exec("SELECT * FROM messages WHERE seq = ?", seq).one();
+          editState.frame = this.rowToFrame(updated);
+          this.ensureDirectedDeliveries(
+            editState.frame,
+            newDeliveryTargets,
+            editRouting!.deliveryTargetOwners,
+            "mention_edit",
+          );
+        });
+        if (editState.failure !== undefined) {
+          return Response.json(
+            { error: { code: editState.failure.code, message: editState.failure.message } },
+            { status: ERROR_STATUS[editState.failure.code] },
+          );
+        }
+        const frame = editState.frame;
+        if (frame === undefined) throw new Error("atomic message edit produced no frame");
         this.broadcastFrame(this.messageUpdate("edit", identity, frame, now));
+        this.flushAtomicDeliveryEffects(effects);
         await this.scheduleAuditRetention(now);
         return Response.json({ message: publicMsgFrame(frame) });
       }
@@ -4751,7 +5071,7 @@ export class ChannelDO extends Server<Env> {
           );
           this.ctx.storage.sql.exec(
             `UPDATE messages
-                SET body = '[retracted]', mentions_json = '[]', original_body = NULL,
+                SET body = '[retracted]', mentions_json = '[]', delivery_targets_json = '[]', original_body = NULL,
                     state = NULL, note = NULL, status_scope_json = NULL, status_blocked_reason = NULL,
                     status_context_json = NULL, status_decision_json = NULL, status_workflow_json = NULL,
                     message_workflow_json = NULL, completion_artifact_json = NULL,
@@ -5962,6 +6282,71 @@ export class ChannelDO extends Server<Env> {
     return withExpandedMentions(frame, [...mentions, target]);
   }
 
+  /**
+   * Resolve/canonicalize every mention and bind agent targets to their creation-time principal.
+   * Message creation and message edits must share this exact path: storing text that visibly says
+   * `@agent` without creating the matching durable delivery is worse than rejecting the write.
+   */
+  private async routeMentionsForDelivery(
+    frame: SendFrame,
+    senderName: string,
+  ): Promise<RoutedMentionFrame | SendErrorOutcome> {
+    const mentionResolution = await this.resolveMentions(frame);
+    if ("ok" in mentionResolution) return mentionResolution;
+    const beforeReplyKeys = new Set((mentionResolution.frame.mentions ?? []).map(mentionMatchKey));
+    frame = this.expandAgentReplyMention(mentionResolution.frame, senderName);
+    const autoReplyTargets = (frame.mentions ?? []).filter(
+      (target) => !beforeReplyKeys.has(mentionMatchKey(target)),
+    );
+    const squadExpansion = await this.expandSquadMentions(frame);
+    if ("ok" in squadExpansion) return squadExpansion;
+    frame = squadExpansion.frame;
+    const requiredDeliveryTargets = [...new Set([
+      ...mentionResolution.agentTargets,
+      ...squadExpansion.agentTargets,
+    ])];
+    const candidateDeliveryTargets = [...new Set([...requiredDeliveryTargets, ...autoReplyTargets])];
+    const ownerLookup = await this.agentOwnersForTargets(candidateDeliveryTargets);
+    if (ownerLookup === null) {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: "agent ownership directory is temporarily unavailable; message was not stored",
+      };
+    }
+    const unboundDeliveryTargets = requiredDeliveryTargets.filter(
+      (target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target),
+    );
+    if (unboundDeliveryTargets.length > 0) {
+      return {
+        ok: false,
+        code: "unavailable",
+        message: `cannot bind delivery identity for @${unboundDeliveryTargets[0]}; retry shortly`,
+      };
+    }
+    // A reply to a historical/revoked agent must remain a valid channel reply, but it must not
+    // create a name-only wake that a future owner could capture. Drop only the server-added mention
+    // when no current creation-time principal exists; explicit mentions keep their own validation.
+    const unboundAutoKeys = new Set(
+      autoReplyTargets
+        .filter((target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target))
+        .map(mentionMatchKey),
+    );
+    if (unboundAutoKeys.size > 0) {
+      frame = withExpandedMentions(
+        frame,
+        (frame.mentions ?? []).filter((target) => !unboundAutoKeys.has(mentionMatchKey(target))),
+      );
+    }
+    return {
+      frame,
+      deliveryTargets: candidateDeliveryTargets.filter((target) =>
+        Object.prototype.hasOwnProperty.call(ownerLookup, target)
+      ),
+      deliveryTargetOwners: ownerLookup,
+    };
+  }
+
   // 校验 → 分配 seq → 落库 → 修剪/presence，返回待广播帧
   private async handleSend(
     identity: Identity,
@@ -6012,57 +6397,10 @@ export class ChannelDO extends Server<Env> {
     if (byteLength(payload) > BODY_LIMIT) {
       return { ok: false, code: "too_large", message: `body exceeds ${BODY_LIMIT} bytes` };
     }
-    const mentionResolution = await this.resolveMentions(frame);
-    if ("ok" in mentionResolution) return mentionResolution;
-    const beforeReplyKeys = new Set((mentionResolution.frame.mentions ?? []).map(mentionMatchKey));
-    frame = this.expandAgentReplyMention(mentionResolution.frame, identity.name);
-    const autoReplyTargets = (frame.mentions ?? []).filter(
-      (target) => !beforeReplyKeys.has(mentionMatchKey(target)),
-    );
-    const squadExpansion = await this.expandSquadMentions(frame);
-    if ("ok" in squadExpansion) return squadExpansion;
-    frame = squadExpansion.frame;
-    const requiredDeliveryTargets = [...new Set([
-      ...mentionResolution.agentTargets,
-      ...squadExpansion.agentTargets,
-    ])];
-    const candidateDeliveryTargets = [...new Set([...requiredDeliveryTargets, ...autoReplyTargets])];
-    const ownerLookup = await this.agentOwnersForTargets(candidateDeliveryTargets);
-    if (ownerLookup === null) {
-      return {
-        ok: false,
-        code: "unavailable",
-        message: "agent ownership directory is temporarily unavailable; message was not stored",
-      };
-    }
-    const unboundDeliveryTargets = requiredDeliveryTargets.filter(
-      (target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target),
-    );
-    if (unboundDeliveryTargets.length > 0) {
-      return {
-        ok: false,
-        code: "unavailable",
-        message: `cannot bind delivery identity for @${unboundDeliveryTargets[0]}; retry shortly`,
-      };
-    }
-    // A reply to a historical/revoked agent must remain a valid channel reply, but it must not
-    // create a name-only wake that a future owner could capture. Drop only the server-added mention
-    // when no current creation-time principal exists; explicit mentions keep their own validation.
-    const unboundAutoKeys = new Set(
-      autoReplyTargets
-        .filter((target) => !Object.prototype.hasOwnProperty.call(ownerLookup, target))
-        .map(mentionMatchKey),
-    );
-    if (unboundAutoKeys.size > 0) {
-      frame = withExpandedMentions(
-        frame,
-        (frame.mentions ?? []).filter((target) => !unboundAutoKeys.has(mentionMatchKey(target))),
-      );
-    }
-    const deliveryTargets = candidateDeliveryTargets.filter((target) =>
-      Object.prototype.hasOwnProperty.call(ownerLookup, target)
-    );
-    const deliveryTargetOwners = ownerLookup;
+    const mentionRouting = await this.routeMentionsForDelivery(frame, identity.name);
+    if ("ok" in mentionRouting) return mentionRouting;
+    frame = mentionRouting.frame;
+    const { deliveryTargets, deliveryTargetOwners } = mentionRouting;
     const workflowGuard = this.workflowGuardDecision(identity, frame);
     if (workflowGuard !== null) {
       const row = this.workflowGuardRow(workflowGuard.workflow.workflow_id);
@@ -6284,14 +6622,14 @@ export class ChannelDO extends Server<Env> {
     sql.exec(
       `INSERT INTO messages (
          seq, sender_name, sender_kind, sender_owner, sender_handle, sender_display_name, sender_avatar_url, sender_avatar_thumb,
-         sender_lineage_json, kind, body, mentions_json, reply_to,
+         sender_lineage_json, kind, body, mentions_json, delivery_targets_json, reply_to,
          state, note, status_scope_json, status_summary_seq, status_blocked_reason, status_context_json,
          status_decision_json, status_workflow_json, message_workflow_json,
          sender_role, sender_role_source, completion_artifact_json, completion_review_state, completion_review_policy,
          completion_review_replaces_seq, decision_request_json, decision_state, decision_resolution_json,
          idempotency_key, attachments_json, sender_client_version, ts
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       seq,
       identity.name,
       identity.kind,
@@ -6304,6 +6642,7 @@ export class ChannelDO extends Server<Env> {
       msg.kind,
       msg.body,
       JSON.stringify(msg.mentions),
+      JSON.stringify(deliveryTargets),
       msg.reply_to,
       msg.state,
       msg.note,
@@ -6399,9 +6738,13 @@ export class ChannelDO extends Server<Env> {
       }
     }
     if (seq % 100 === 0) {
+      // 按数量裁剪也必须尊重终态保留窗口：只删已过 DIRECTED_DELIVERY_TERMINAL_RETENTION_MS
+      // 的非活跃 delivery，否则刚终止的审计行会在下一个第 100 条消息时被立即抹掉，绕过
+      // pruneDirectedDeliveryRetention 的 7 天窗口。
       sql.exec(
         `DELETE FROM directed_deliveries
-          WHERE message_seq IN (
+          WHERE updated_at <= ?
+            AND message_seq IN (
             SELECT m.seq FROM messages m
              WHERE m.seq <= ?
                AND (m.completion_review_state IS NULL OR m.completion_review_state != 'pending_review')
@@ -6412,8 +6755,12 @@ export class ChannelDO extends Server<Env> {
                     AND active.state IN ('queued', 'claimed', 'running', 'waiting_owner')
                )
           )`,
+        now - DIRECTED_DELIVERY_TERMINAL_RETENTION_MS,
         seq - RETAIN_N,
       );
+      // 消息删除也要等 delivery 审计行清空后再动，否则保留期内的终态 delivery 会指向已删消息。
+      // 上面的 delivery 裁剪先跑，剩下的 directed_deliveries 只会是活跃行或仍在保留期的终态行；
+      // 任一残留都保住消息，等下一轮 delivery 过期后再一并回收。
       sql.exec(
         `DELETE FROM messages AS m
           WHERE m.seq <= ?
@@ -6422,7 +6769,6 @@ export class ChannelDO extends Server<Env> {
             AND NOT EXISTS (
               SELECT 1 FROM directed_deliveries d
                WHERE d.message_seq = m.seq
-                 AND d.state IN ('queued', 'claimed', 'running', 'waiting_owner')
             )`,
         seq - RETAIN_N,
       );
@@ -7228,7 +7574,7 @@ export class ChannelDO extends Server<Env> {
         const revSeq = this.nextRevSeq();
         sql.exec(
         `UPDATE messages
-            SET body = '[erased]', mentions_json = '[]', original_body = NULL,
+            SET body = '[erased]', mentions_json = '[]', delivery_targets_json = '[]', original_body = NULL,
                 state = NULL, note = NULL,
                 status_scope_json = NULL, status_blocked_reason = NULL, status_context_json = NULL,
                 status_decision_json = NULL, status_workflow_json = NULL, message_workflow_json = NULL,
@@ -7763,6 +8109,7 @@ export class ChannelDO extends Server<Env> {
     msg: MsgFrame,
     classifiedTargets: string[],
     targetOwners: Record<string, string> = {},
+    causeOverride?: DirectedDeliveryCause,
   ) {
     // Status/presence frames are coordination metadata, not agent work. Self-mentions likewise must
     // never claim a queue slot the CLI intentionally refuses to run, or one poison row blocks every
@@ -7793,7 +8140,7 @@ export class ChannelDO extends Server<Env> {
         msg.seq,
         targetName,
         targetOwners[targetName] ?? null,
-        this.directedDeliveryCause(msg, targetName),
+        causeOverride ?? this.directedDeliveryCause(msg, targetName),
         workId,
         continuationRef,
         msg.decision_response?.delivery_id ?? null,
@@ -7801,7 +8148,10 @@ export class ChannelDO extends Server<Env> {
         now,
       );
       const inserted = this.directedDeliveryRow(id);
-      if (inserted !== undefined) this.broadcastDirectedDelivery(inserted);
+      if (inserted !== undefined) {
+        this.broadcastDirectedDelivery(inserted);
+        this.ctx.waitUntil(this.ensureAlarmAt(now + DIRECTED_DELIVERY_MAX_AGE_MS));
+      }
     }
     for (const targetName of targets) this.dispatchNextDirectedDelivery(targetName);
   }
@@ -7867,7 +8217,10 @@ export class ChannelDO extends Server<Env> {
         const st = candidate.state;
         return st != null && this.identityDeliveryPrincipal(st) === principal;
       });
-      const matchingLegacy = samePrincipalLegacy.filter((candidate) => {
+      // An edit-created delivery has no new raw `msg` broadcast for legacy consumers to execute.
+      // Never hand it to a v0 adapter and then call the work running; keep it queued until a v1
+      // serve/watch or a bound agent webhook can consume the explicit durable delivery frame.
+      const matchingLegacy = String(queued.cause) === "mention_edit" ? [] : samePrincipalLegacy.filter((candidate) => {
         const st = candidate.state;
         return st != null &&
           typeof st.helloSince === "number" &&
@@ -8188,11 +8541,25 @@ export class ChannelDO extends Server<Env> {
       oldState !== "running" &&
       !(oldState === "failed" && update.state === "replied")
     ) return false;
+    if (update.state === "replied" && update.reply_seq === undefined) {
+      if (oldState !== "claimed" && oldState !== "running") return false;
+      const failed = this.transitionDirectedDeliveryTerminal(update.delivery_id, "failed", now, {
+        error: "runner reported success without a linked channel reply",
+        expectedStates: [oldState],
+        expectedLeaseConnectionId: connectionId,
+      });
+      return failed !== undefined && String(failed.state) === "failed";
+    }
     if (update.reply_seq !== undefined) {
       const reply = this.ctx.storage.sql
-        .exec("SELECT sender_name FROM messages WHERE seq = ?", update.reply_seq)
+        .exec("SELECT sender_name, reply_to, status_summary_seq FROM messages WHERE seq = ?", update.reply_seq)
         .toArray()[0];
       if (reply === undefined || String(reply.sender_name) !== identity.name) return false;
+      if (
+        update.state === "replied" &&
+        Number(reply.reply_to ?? -1) !== Number(row.message_seq) &&
+        Number(reply.status_summary_seq ?? -1) !== Number(row.message_seq)
+      ) return false;
     }
 
     if (update.state === "running") {
@@ -8313,6 +8680,7 @@ export class ChannelDO extends Server<Env> {
     const terminal = this.directedDeliveryRow(deliveryId);
     if (terminal === undefined || String(terminal.state) !== terminalState) return undefined;
     this.broadcastDirectedDelivery(terminal);
+    this.ctx.waitUntil(this.ensureAlarmAt(now + DIRECTED_DELIVERY_TERMINAL_RETENTION_MS));
     if (String(terminal.cause) === "owner_answer") {
       this.settleWaitingOwnerAncestors(terminal, terminalState, replySeq, error, now);
     }

@@ -220,3 +220,36 @@ export function blockRunnerContinuation(path: string, reason: string, now = Date
     return true;
   });
 }
+
+export interface RunnerContinuationIdentity {
+  harness: RunnerContinuationHarness;
+  work_id: string;
+  continuation_ref: string;
+}
+
+export type DeleteRunnerContinuationResult = "deleted" | "missing" | "mismatch";
+
+/**
+ * Remove one terminal work mapping under the same cross-process lock used by decision parking.
+ * Identity is checked inside that lock: a bad/reused continuation_ref must never let work B delete
+ * work A's still-actionable owner continuation merely because they hash to the same path.
+ *
+ * The shared SQLite mutex remains as one bounded directory-level coordination file; only the
+ * matching per-work JSON is deleted, so completed deliveries cannot grow runner state forever.
+ */
+export function deleteRunnerContinuation(
+  path: string,
+  expected: RunnerContinuationIdentity,
+): DeleteRunnerContinuationResult {
+  return withRunnerContinuationLock(path, () => {
+    const current = readRunnerContinuation(path);
+    if (current === null) return existsSync(path) ? "mismatch" : "missing";
+    if (
+      current.harness !== expected.harness ||
+      current.work_id !== expected.work_id ||
+      current.continuation_ref !== expected.continuation_ref
+    ) return "mismatch";
+    rmSync(path, { force: true });
+    return "deleted";
+  });
+}

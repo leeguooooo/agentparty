@@ -108,6 +108,136 @@ function isRetryableNetworkError(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSender(value: unknown): boolean {
+  return isRecord(value) && typeof value.name === "string" && (value.kind === "agent" || value.kind === "human");
+}
+
+function isStringOrNull(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
+function isFiniteNumberOrNull(value: unknown): boolean {
+  return value === null || Number.isFinite(value);
+}
+
+function isRecordOrNull(value: unknown): boolean {
+  return value === null || isRecord(value);
+}
+
+// MsgFrame (shared/src/protocol.ts): only `type/seq/sender/kind/body/mentions/reply_to/
+// state/note/status/ts` are required. `state`/`note` are `string | null`, `status` is
+// `StatusEvent | null` (an object — status-type frames carry a StatusEvent). Everything
+// else on MsgFrame is optional (`?`) and is intentionally NOT required here.
+function isMessageFrame(value: unknown): boolean {
+  return isRecord(value) &&
+    (value.type === "msg" || value.type === "status") &&
+    Number.isSafeInteger(value.seq) &&
+    isSender(value.sender) &&
+    typeof value.kind === "string" &&
+    typeof value.body === "string" &&
+    Array.isArray(value.mentions) &&
+    value.mentions.every((m) => typeof m === "string") &&
+    isFiniteNumberOrNull(value.reply_to) &&
+    isStringOrNull(value.state) &&
+    isStringOrNull(value.note) &&
+    isRecordOrNull(value.status) &&
+    Number.isFinite(value.ts);
+}
+
+// Full DirectedDelivery, carried only by holder-only `delivery` frames. Nullable fields
+// (lease_until/work_id/continuation_ref/reply_seq/last_error) are validated only for type,
+// allowing null.
+function isDirectedDelivery(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    Number.isSafeInteger(value.message_seq) &&
+    typeof value.target_name === "string" &&
+    typeof value.cause === "string" &&
+    typeof value.state === "string" &&
+    Number.isSafeInteger(value.attempt) &&
+    isFiniteNumberOrNull(value.lease_until) &&
+    isStringOrNull(value.work_id) &&
+    isStringOrNull(value.continuation_ref) &&
+    isFiniteNumberOrNull(value.reply_seq) &&
+    isStringOrNull(value.last_error) &&
+    Number.isFinite(value.created_at) &&
+    Number.isFinite(value.updated_at);
+}
+
+// PublicDirectedDelivery projection, carried by `delivery_state` frames. It intentionally
+// omits cause/attempt/lease_until/work_id/continuation_ref/last_error — those NEVER appear
+// on a state frame, so requiring them (as the old shared isDelivery did) wrongly rejected
+// every valid delivery_state frame.
+function isPublicDelivery(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    Number.isSafeInteger(value.message_seq) &&
+    typeof value.target_name === "string" &&
+    typeof value.state === "string" &&
+    isFiniteNumberOrNull(value.reply_seq) &&
+    Number.isFinite(value.created_at) &&
+    Number.isFinite(value.updated_at);
+}
+
+/** JSON syntax alone is not a protocol heartbeat: validate the discriminant and required shape. */
+function parseServerFrame(value: unknown): ServerFrame | null {
+  if (!isRecord(value) || typeof value.type !== "string") return null;
+  switch (value.type) {
+    case "welcome":
+      return typeof value.channel === "string" && typeof value.self === "string" &&
+        Number.isSafeInteger(value.last_seq) &&
+        (value.participants === undefined || Array.isArray(value.participants)) &&
+        (value.presence === undefined || Array.isArray(value.presence))
+        ? value as unknown as ServerFrame
+        : null;
+    case "participants":
+      return Array.isArray(value.participants) && value.participants.every(isSender)
+        ? value as unknown as ServerFrame
+        : null;
+    case "msg":
+    case "status":
+      return isMessageFrame(value) ? value as unknown as ServerFrame : null;
+    case "message_update":
+      return Number.isSafeInteger(value.target_seq) && isMessageFrame(value.message)
+        ? value as unknown as ServerFrame
+        : null;
+    case "sent":
+      return Number.isSafeInteger(value.seq) ? value as unknown as ServerFrame : null;
+    case "presence":
+      return typeof value.name === "string" && typeof value.state === "string" && Number.isFinite(value.ts)
+        ? value as unknown as ServerFrame
+        : null;
+    case "read_cursor":
+      return typeof value.name === "string" && Number.isSafeInteger(value.last_seen_seq) && Number.isFinite(value.updated_at)
+        ? value as unknown as ServerFrame
+        : null;
+    case "error":
+      return typeof value.code === "string" && typeof value.message === "string"
+        ? value as unknown as ServerFrame
+        : null;
+    case "pong":
+      return value as unknown as ServerFrame;
+    case "serve_lease":
+      return typeof value.name === "string" && typeof value.held === "boolean"
+        ? value as unknown as ServerFrame
+        : null;
+    case "delivery_adapter":
+      return value.adapter === "watch" && value.registered === true ? value as unknown as ServerFrame : null;
+    case "delivery":
+      return isDirectedDelivery(value.delivery) && isMessageFrame(value.message)
+        ? value as unknown as ServerFrame
+        : null;
+    case "delivery_state":
+      return isPublicDelivery(value.delivery) ? value as unknown as ServerFrame : null;
+    default:
+      return null;
+  }
+}
+
 export interface ConnectOptions {
   onCursor?: (cursor: number) => void;
   /** Declare that this connection consumes durable directed-delivery v1 frames. */
@@ -119,7 +249,7 @@ export interface ConnectOptions {
   backoffMaxMs?: number;
   pingIntervalMs?: number;
   /**
-   * WebSocket 已 open、但连续多久没有收到任何入站 frame 后主动重连。
+   * WebSocket 已 open、但连续多久没有收到可解析的服务端 frame 后主动重连。
    * 默认 3 个 ping 周期；主要暴露给测试注入较短阈值。
    */
   inboundIdleTimeoutMs?: number;
@@ -300,11 +430,11 @@ export function connect(
     }
   };
 
-  const scheduleReconnect = () => {
+  const scheduleReconnect = (error?: string) => {
     if (closed || reconnectTimer) return;
     const delay = Math.min(base * 2 ** attempt, max);
     attempt++;
-    opts.onStatus?.("reconnecting");
+    opts.onStatus?.("reconnecting", error === undefined ? undefined : { error });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (!closed) open();
@@ -334,7 +464,7 @@ export function connect(
         } catch {
           // The socket is already retired; reconnect scheduling below remains authoritative.
         }
-        scheduleReconnect();
+        scheduleReconnect("inbound idle timeout");
       }, inboundIdleTimeoutMs);
     };
     sock.onopen = () => {
@@ -365,16 +495,19 @@ export function connect(
     };
     sock.onmessage = (ev) => {
       if (closed || ws !== sock) return;
-      // 活性定义是收到任意 WebSocket 入站 frame；即使内容随后无法解析，也说明链路仍可达。
-      armInboundWatchdog();
       for (const line of String(ev.data).split("\n")) {
         if (!line.trim()) continue;
-        let frame: ServerFrame;
+        let parsed: unknown;
         try {
-          frame = JSON.parse(line) as ServerFrame;
+          parsed = JSON.parse(line) as unknown;
         } catch {
           continue;
         }
+        const frame = parseServerFrame(parsed);
+        if (frame === null) continue;
+        // 只有可解析的服务端 frame 才证明应用层仍可用。畸形字节不能无限续命一个
+        // 半坏连接，否则健康探针会持续显示在线而业务帧永远到不了。
+        armInboundWatchdog();
         // #373：只有握手/业务帧能证明这次连接恢复了应用层服务。pong 只证明传输层仍有
         // 回包；过载或半坏实例若只回 pong 后断开，不能借此把指数退避反复清零。
         if (frame.type !== "pong") attempt = 0;

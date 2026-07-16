@@ -9,9 +9,10 @@ describe("channel retention policy (#421)", () => {
     const account = `${uniq("retention")}@example.com`;
     const owner = await seedToken("agent", uniq("owner"), { owner: account });
     const slug = await createChannel(owner.token);
-    const oldResponse = await postMessage(slug, owner.token, "expired secret");
+    const target = await seedToken("agent", uniq("target"), { owner: account, channelScope: slug });
+    const oldResponse = await postMessage(slug, owner.token, `@${target.name} expired secret`);
     const oldSeq = ((await oldResponse.json()) as { seq: number }).seq;
-    const freshResponse = await postMessage(slug, owner.token, "fresh body");
+    const freshResponse = await postMessage(slug, target.token, "fresh pending question");
     const freshSeq = ((await freshResponse.json()) as { seq: number }).seq;
 
     const update = await api(`/api/channels/${slug}/retention`, owner.token, {
@@ -33,6 +34,34 @@ describe("channel retention policy (#421)", () => {
         oldSeq,
       );
       state.storage.sql.exec("UPDATE messages SET ts = ? WHERE seq = ?", now, freshSeq);
+      const source = state.storage.sql
+        .exec("SELECT id, work_id, continuation_ref FROM directed_deliveries WHERE message_seq = ?", oldSeq)
+        .one();
+      state.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'waiting_owner', lease_connection_id = NULL, lease_adapter = NULL,
+                lease_until = NULL, updated_at = ?
+          WHERE id = ?`,
+        now - 61_000,
+        source.id,
+      );
+      state.storage.sql.exec(
+        `UPDATE messages
+            SET reply_to = ?, decision_state = 'pending', decision_request_json = ?
+          WHERE seq = ?`,
+        oldSeq,
+        JSON.stringify({
+          kind: "approval",
+          prompt: "retain this question?",
+          options: ["approve", "reject"],
+          delivery_id: source.id,
+          origin_seq: oldSeq,
+          origin_channel: slug,
+          work_id: source.work_id,
+          continuation_ref: source.continuation_ref,
+        }),
+        freshSeq,
+      );
       state.storage.sql.exec(
         `INSERT INTO message_audit (target_seq, action, actor_name, actor_kind, old_body, new_body, created_at)
          VALUES (?, 'edit', ?, 'agent', 'expired audit', 'expired audit 2', ?),
@@ -57,6 +86,9 @@ describe("channel retention policy (#421)", () => {
       expect(state.storage.sql.exec("SELECT target_seq FROM message_audit ORDER BY target_seq").toArray().map((r) => Number(r.target_seq)))
         .toEqual([freshSeq]);
       expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM webhook_queue").one().n)).toBe(0);
+      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM directed_deliveries").one().n)).toBe(0);
+      expect(state.storage.sql.exec("SELECT decision_state, decision_request_json FROM messages WHERE seq = ?", freshSeq).one())
+        .toMatchObject({ decision_state: null, decision_request_json: null });
       expect(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'message_retention_ms'").one().value).toBe("60000");
       expect(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'audit_retention_ms'").one().value).toBe("120000");
     });
@@ -102,5 +134,101 @@ describe("channel retention policy (#421)", () => {
       expect(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'audit_retention_ms'").one().value).toBe("off");
     });
     expect(((await (await api(`/api/channels/${slug}/reconcile`, owner.token)).json()) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("bounds abandoned durable work even when message history retention is off", async () => {
+    const account = `${uniq("delivery-retention")}@example.com`;
+    const owner = await seedToken("agent", uniq("owner"), { owner: account });
+    const slug = await createChannel(owner.token);
+    const target = await seedToken("agent", uniq("target"), { owner: account, channelScope: slug });
+    const sent = await postMessage(slug, owner.token, `@${target.name} keep the history, expire the work`);
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      const now = Date.now();
+      const createdAt = Number(state.storage.sql.exec(
+        "SELECT created_at FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one().created_at);
+      // Simulate an upgraded DO whose historical queued row predates deadline scheduling.
+      await state.storage.deleteAlarm();
+      instance.onStart();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const initialAlarm = await state.storage.getAlarm();
+      expect(initialAlarm).not.toBeNull();
+      expect(Math.abs(initialAlarm! - (createdAt + 30 * 24 * 60 * 60 * 1000))).toBeLessThan(1_000);
+      state.storage.sql.exec(
+        "UPDATE directed_deliveries SET created_at = ?, updated_at = ? WHERE message_seq = ?",
+        now - 31 * 24 * 60 * 60 * 1000,
+        now - 31 * 24 * 60 * 60 * 1000,
+        seq,
+      );
+      await instance.onAlarm();
+      expect(state.storage.sql.exec(
+        "SELECT state, terminal_reason, work_id, continuation_ref FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one()).toMatchObject({
+        state: "failed",
+        terminal_reason: "delivery_expired",
+        work_id: null,
+        continuation_ref: null,
+      });
+      // History retention is explicitly off, so the source body remains while only the capability
+      // and work ledger are bounded.
+      expect(state.storage.sql.exec("SELECT body FROM messages WHERE seq = ?", seq).one().body)
+        .toContain("keep the history");
+      const terminalAlarm = await state.storage.getAlarm();
+      expect(terminalAlarm).not.toBeNull();
+      expect(terminalAlarm!).toBeGreaterThanOrEqual(now + 7 * 24 * 60 * 60 * 1000 - 1_000);
+      expect(terminalAlarm!).toBeLessThanOrEqual(now + 7 * 24 * 60 * 60 * 1000 + 1_000);
+
+      state.storage.sql.exec(
+        "UPDATE directed_deliveries SET updated_at = ? WHERE message_seq = ?",
+        now - 8 * 24 * 60 * 60 * 1000,
+        seq,
+      );
+      await instance.onAlarm();
+      expect(Number(state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one().n)).toBe(0);
+      expect(Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM messages WHERE seq = ?", seq).one().n)).toBe(1);
+    });
+  });
+
+  it("advances a queued delivery's 30-day alarm to terminal retention when dispatch fails immediately", async () => {
+    const owner = await seedToken("agent", uniq("terminal-alarm-owner"));
+    const slug = await createChannel(owner.token);
+    const target = await seedToken("agent", uniq("terminal-alarm-target"), { channelScope: slug });
+    const sent = await postMessage(slug, owner.token, `@${target.name} unsafe legacy principal`);
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      const runtime = instance as unknown as { dispatchNextDirectedDelivery(name: string): void };
+      const row = state.storage.sql.exec(
+        "SELECT id, created_at FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one();
+      await state.storage.setAlarm(Number(row.created_at) + 30 * 24 * 60 * 60 * 1000);
+      state.storage.sql.exec("UPDATE directed_deliveries SET target_owner = NULL WHERE id = ?", row.id);
+      const failedAt = Date.now();
+      runtime.dispatchNextDirectedDelivery(target.name);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(state.storage.sql.exec(
+        "SELECT state, terminal_reason, last_error FROM directed_deliveries WHERE id = ?",
+        row.id,
+      ).one()).toMatchObject({
+        state: "failed",
+        terminal_reason: "delivery_failed",
+        last_error: expect.stringContaining("no creation-time target principal"),
+      });
+      const terminalAlarm = await state.storage.getAlarm();
+      expect(terminalAlarm).not.toBeNull();
+      expect(terminalAlarm!).toBeGreaterThanOrEqual(failedAt + 7 * 24 * 60 * 60 * 1000 - 1_000);
+      expect(terminalAlarm!).toBeLessThanOrEqual(failedAt + 7 * 24 * 60 * 60 * 1000 + 1_000);
+    });
   });
 });

@@ -40,6 +40,7 @@ import { buildContext } from "./status";
 import {
   blockRunnerContinuation,
   continuationPath,
+  deleteRunnerContinuation,
   mergeRunnerContinuation,
   readRunnerContinuation,
   type RunnerContinuationState,
@@ -350,6 +351,8 @@ interface SdkWakeSessionState extends RunnerContinuationState {
 interface ContinuationScope {
   ref: string | null;
   workId: string | null;
+  deliveryId: string | null;
+  deliveryAttempt: number | null;
   path: string;
   ownerAnswer: boolean;
   directed: boolean;
@@ -684,6 +687,8 @@ export interface ServeRunnerContext {
 export type ServeRunner = ((frame: MsgFrame, ctx: ServeRunnerContext) => Promise<void>) & {
   /** Everything that can fail before the model starts. Called before durable `running`. */
   prepare?: (frame: MsgFrame, ctx: ServeRunnerContext) => Promise<void>;
+  /** Release per-work model state only after the Worker confirms a terminal delivery. */
+  onDeliveryTerminal?: (delivery: DirectedDelivery, state: "replied" | "failed") => void | Promise<void>;
 };
 
 export interface ServeOptions {
@@ -745,6 +750,8 @@ export interface ServeOptions {
   now?: () => number;
   /** 单次 runner 的硬超时；默认 30 分钟。到点后恢复监听，不再让 task heartbeat 无限伪装健康。 */
   runnerTimeoutMs?: number;
+  /** WS 入站 watchdog 阈值；仅供诊断/测试注入，默认沿用 client 的 3 个 ping 周期。 */
+  inboundIdleTimeoutMs?: number;
   /** 外层 profile/supervisor 持有的生命周期；存在时 runServe 不再注册进程级 signal listener。 */
   signal?: AbortSignal;
 }
@@ -1068,6 +1075,8 @@ function continuationScope(workdir: string, delivery: DirectedDelivery | null | 
     return {
       ref: null,
       workId: null,
+      deliveryId: null,
+      deliveryAttempt: null,
       path: join(workdir, RUNNER_SESSION_FILE),
       ownerAnswer: false,
       directed: false,
@@ -1084,6 +1093,8 @@ function continuationScope(workdir: string, delivery: DirectedDelivery | null | 
   return {
     ref,
     workId,
+    deliveryId: delivery.id,
+    deliveryAttempt: delivery.attempt,
     // continuation_ref is server data, not a path segment. The shared helper hashes the full opaque
     // value, so both the runner and `party decision ask` commit to exactly the same collision-safe path.
     path: continuationPath(workdir, ref),
@@ -1433,12 +1444,20 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     thread: ThreadLike | null;
     session: SdkWakeSessionState | null;
     activeThreadFromPersistedSession: boolean;
+    activeRunKey: string | null;
   }
-  // CodexClientOptions.env is fixed when the SDK client is created. Keep one client per continuation
-  // slot so shell tools spawned by work A can never inherit work B's decision/continuation identity.
-  const codexPromises = new Map<string, Promise<CodexLike>>();
+  // CodexClientOptions.env is fixed when the SDK client is created. A continuation may receive more
+  // than one delivery (initial mention, then one or more owner answers), so a client/thread created
+  // for the first delivery must not be reused with its stale AP_DELIVERY_ID. The durable thread id is
+  // resumed through a fresh client for each delivery attempt; that keeps nested `party decision ask`
+  // bound to the exact delivery currently running while preserving the model conversation.
   const slots = new Map<string, SdkSlot>();
   let queue = Promise.resolve();
+  const runKey = (scope: ContinuationScope): string => JSON.stringify([
+    scope.path,
+    scope.deliveryId,
+    scope.deliveryAttempt,
+  ]);
   const clientOptions = (scope: ContinuationScope, sessionId: string | null): CodexClientOptions => ({
     env: definedEnv({
       ...process.env,
@@ -1449,8 +1468,10 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
       ...(sessionId === null ? {} : { AP_RUNNER_SESSION_ID: sessionId }),
       ...(scope.directed
         ? {
+            AP_DELIVERY_ID: scope.deliveryId!,
             AP_WORK_ID: scope.workId!,
             AP_CONTINUATION_REF: scope.ref!,
+            AP_DELIVERY_ATTEMPT: String(scope.deliveryAttempt!),
           }
         : {}),
     }),
@@ -1462,18 +1483,15 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
   };
 
   const codex = (scope: ContinuationScope, sessionId: string | null): Promise<CodexLike> => {
-    let client = codexPromises.get(scope.path);
-    if (client === undefined) {
-      client = Promise.resolve((opts.codexFactory ?? defaultCodexFactory)(clientOptions(scope, sessionId)));
-      codexPromises.set(scope.path, client);
-    }
-    return client;
+    // Do not cache a rejected factory promise: pre-model failures are explicitly retriable and need
+    // a fresh SDK client. Successful clients live only for the delivery attempt whose env they carry.
+    return Promise.resolve((opts.codexFactory ?? defaultCodexFactory)(clientOptions(scope, sessionId)));
   };
 
   const slotFor = (scope: ContinuationScope): SdkSlot => {
     let slot = slots.get(scope.path);
     if (slot === undefined) {
-      slot = { thread: null, session: null, activeThreadFromPersistedSession: false };
+      slot = { thread: null, session: null, activeThreadFromPersistedSession: false, activeRunKey: null };
       slots.set(scope.path, slot);
     }
     return slot;
@@ -1483,6 +1501,7 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     slot.thread = null;
     slot.session = null;
     slot.activeThreadFromPersistedSession = false;
+    slot.activeRunKey = null;
   };
 
   const ensureThread = async (
@@ -1490,6 +1509,13 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     scope: ContinuationScope,
     slot: SdkSlot,
   ): Promise<{ thread: ThreadLike; session: SdkWakeSessionState | null }> => {
+    const currentRunKey = runKey(scope);
+    if (slot.activeRunKey !== currentRunKey) {
+      // Keep the durable session mapping, but replace the SDK client/thread so tool subprocesses get
+      // this delivery's AP_DELIVERY_ID instead of the previous turn's lineage.
+      slot.thread = null;
+      slot.activeThreadFromPersistedSession = false;
+    }
     // owner_answer is allowed to resume only a durable, exact mapping. Even a resident in-memory
     // thread is rejected if its file disappeared or was replaced: silently cold-starting here would
     // detach the answer from the work that asked the question.
@@ -1525,6 +1551,7 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
         slot.thread = await client.resumeThread(prior.thread_id, threadOptions);
         slot.session = prior;
         slot.activeThreadFromPersistedSession = true;
+        slot.activeRunKey = currentRunKey;
         return { thread: slot.thread, session: slot.session };
       } catch (error) {
         if (!isInvalidPersistedSessionError(error)) {
@@ -1550,6 +1577,7 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     }
     slot.thread = await beforeModel(() => client.startThread(threadOptions));
     slot.activeThreadFromPersistedSession = false;
+    slot.activeRunKey = currentRunKey;
     const threadId = sdkThreadId(slot.thread);
     // thread id 懒初始化：拿不到就先不落 session 文件，等首个 run() 之后补写
     slot.session = threadId
@@ -1772,6 +1800,27 @@ export function createSdkRunner(opts: SdkRunnerOptions): NonNullable<ServeOption
     return next;
   };
   runner.prepare = prepare;
+  runner.onDeliveryTerminal = (delivery) => {
+    if (delivery.work_id === null || delivery.continuation_ref === null) return;
+    const path = continuationPath(opts.workdir, delivery.continuation_ref);
+    const slot = slots.get(path);
+    const cleanup = deleteRunnerContinuation(path, {
+      harness: "codex-sdk",
+      work_id: delivery.work_id,
+      continuation_ref: delivery.continuation_ref,
+    });
+    const slotMatches = slot !== undefined && (
+      slot.session === null ||
+      slot.session.work_id === delivery.work_id &&
+      slot.session.continuation_ref === delivery.continuation_ref
+    );
+    // A disk mismatch belongs to another still-actionable work. Preserve an in-memory slot with
+    // that same identity too; a null session is only the failed delivery's empty preflight slot.
+    if (slotMatches && cleanup !== "mismatch") {
+      resetSlot(slot!);
+      slots.delete(path);
+    }
+  };
   return runner;
 }
 
@@ -1970,6 +2019,14 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
     );
   };
   runner.prepare = prepare;
+  runner.onDeliveryTerminal = (delivery) => {
+    if (delivery.work_id === null || delivery.continuation_ref === null) return;
+    deleteRunnerContinuation(continuationPath(opts.workdir, delivery.continuation_ref), {
+      harness: opts.harness,
+      work_id: delivery.work_id,
+      continuation_ref: delivery.continuation_ref,
+    });
+  };
   return runner;
 }
 
@@ -2532,6 +2589,7 @@ export async function confirmDeliveryUpdate(
   update: DeliveryUpdateFrame,
   timeoutMs = DELIVERY_UPDATE_ACK_TIMEOUT_MS,
   signal?: AbortSignal,
+  acceptedAuthoritativeStates: readonly PublicDirectedDelivery["state"][] = [],
 ): Promise<PublicDirectedDelivery> {
   const requestId = randomUUID();
   const existingErrors = new Set(conn.pendingFrames().filter((frame) => frame.type === "error"));
@@ -2553,6 +2611,11 @@ export async function confirmDeliveryUpdate(
       // The late generic `replied` receipt is intentionally a no-op; the authoritative suspended
       // state is still a successful durable acknowledgement of this turn.
       if (update.state === "replied" && ack.delivery.state === "waiting_owner") return ack.delivery;
+      // Some transitions are probes rather than commands. In particular, a bare `replied` probe
+      // asks the Worker whether a linked REST reply actually committed. The caller may explicitly
+      // accept the authoritative `failed` answer and handle it as a visible silent-runner failure;
+      // keep the default strict for every ordinary state transition.
+      if (acceptedAuthoritativeStates.includes(ack.delivery.state)) return ack.delivery;
       if (ack.delivery.state === "waiting_owner" || ack.delivery.state === "replied" || ack.delivery.state === "failed") {
         throw new Error(`delivery state is ${ack.delivery.state}, expected ${update.state}`);
       }
@@ -2658,10 +2721,29 @@ export async function runServe(o: ServeOptions): Promise<number> {
   };
   const onWsStatus = (status: "open" | "reconnecting" | "closed", detail?: { error?: string }) => {
     if (status === "open") {
-      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: true, reconnecting: false, connected_since: Date.now(), last_error: null }));
+      // A successful TCP/WS handshake is not proof that the application path is alive. Clear the
+      // previous frame timestamp on every replacement socket and keep the reconnect reason until
+      // the frame loop receives a valid server frame; otherwise a half-broken endpoint that only
+      // accepts WebSockets briefly inherits the old socket's fresh timestamp and looks healthy.
+      bestEffortLocalState(() => writeHealthCache({
+        channel: o.channel,
+        ws_connected: true,
+        reconnecting: false,
+        connected_since: Date.now(),
+        last_frame_at: null,
+      }));
     } else if (status === "reconnecting") {
       reconnectCount += 1;
-      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: true, reconnect_count: reconnectCount, connected_since: null }));
+      bestEffortLocalState(() => writeHealthCache({
+        channel: o.channel,
+        ws_connected: false,
+        reconnecting: true,
+        reconnect_count: reconnectCount,
+        connected_since: null,
+        // 无新错误详情时保留上一条重连原因，避免 inbound timeout 后的替换连接在收到
+        // 有效帧前再次断开时把 last_error 覆盖成 null（丢失原因）。
+        ...(detail?.error === undefined ? {} : { last_error: detail.error }),
+      }));
     } else {
       bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, connected_since: null, last_error: detail?.error ?? null }));
     }
@@ -2688,6 +2770,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
       sinceRev: o.sinceRev,
       onRevCursor: o.onRevCursor,
       onStatus: onWsStatus,
+      inboundIdleTimeoutMs: o.inboundIdleTimeoutMs,
     });
   } catch (error) {
     lock?.release?.();
@@ -2750,6 +2833,15 @@ export async function runServe(o: ServeOptions): Promise<number> {
           },
         })
       : defaultRun);
+  const settleRunnerDelivery = async (delivery: DirectedDelivery, state: "replied" | "failed") => {
+    try {
+      await run.onDeliveryTerminal?.(delivery, state);
+    } catch (error) {
+      // The channel reply/failure is already authoritative. Local cleanup must be visible but can
+      // never roll the durable delivery back or make the runner execute the work again.
+      out(`  delivery ${delivery.id} 本地 continuation 清理失败: ${errText(error)}`);
+    }
+  };
   // 挂载之初就落一份 health 基线：即便还没收到第一帧，watchdog 也能看到「这个 pid 认领了这个频道」，
   // 而不是文件缺失时无法区分「serve 没起来」和「serve 起来了但还没写过健康数据」。
   bestEffortLocalState(() => writeHealthCache({ channel: o.channel, ws_connected: false, reconnecting: false, reconnect_count: 0, last_frame_at: null, last_error: null, connected_since: null }));
@@ -2834,7 +2926,11 @@ export async function runServe(o: ServeOptions): Promise<number> {
       const frame = incoming.type === "delivery" ? incoming.message : incoming;
       // 每收到一帧（含 ping 的 pong 回执）就刷新 last_frame_at——空闲频道也靠 ping 心跳（~25s）
       // 保持新鲜，watchdog 才能把"频道安静"和"连接僵死"分开（issue #254 证据边界）。
-      bestEffortLocalState(() => writeHealthCache({ channel: o.channel, last_frame_at: Date.now() }));
+      bestEffortLocalState(() => writeHealthCache({
+        channel: o.channel,
+        last_frame_at: Date.now(),
+        last_error: null,
+      }));
       if (frame.type === "welcome") {
         self = frame.self;
         if (!welcomeReported) {
@@ -3009,6 +3105,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
         // lastError 必须从盘上接手，否则最终通告里的错误原因是空字符串（门禁 P2）。
         let lastError = (stuck?.seq === frame.seq ? stuck.last_error : "") ?? "";
         let delivered = false;
+        let deliveryCleanupDone = false;
+        const settleCurrentDelivery = async (state: "replied" | "failed") => {
+          if (directedDelivery === null || deliveryCleanupDone) return;
+          await settleRunnerDelivery(directedDelivery, state);
+          deliveryCleanupDone = true;
+        };
         // A crash can happen after a non-retriable model failure was persisted but before the final
         // blocked announcement. Preserve that safety bit across supervisor restarts; old state files
         // omit it and retain the historical retryable behavior for compatibility.
@@ -3119,6 +3221,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 state: "failed",
                 error: sanitizeBlockedError(lastError),
               }, undefined, lifecycleController.signal);
+              await settleCurrentDelivery("failed");
             } catch (error) {
               out(`  delivery ${directedDelivery.id} 预处理失败回执发送失败: ${errText(error)}`);
               code = EXIT_STREAM_ENDED;
@@ -3255,6 +3358,44 @@ export async function runServe(o: ServeOptions): Promise<number> {
           await delay(0);
         }
         if (shutdownError !== null) break frameLoop;
+        let deliveryConfirmed = directedDelivery === null;
+        if (delivered && directedDelivery !== null) {
+          try {
+            const completion = await confirmDeliveryUpdate(conn, {
+              type: "delivery_update",
+              delivery_id: directedDelivery.id,
+              state: "replied",
+            }, undefined, lifecycleController.signal, ["failed"]);
+            if (completion.state === "failed") {
+              // Worker is the race-free authority: if a linked REST reply committed, the row was
+              // already replied before that HTTP request returned. A still-active row receiving a
+              // bare success receipt is atomically failed as a silent runner, never guessed from
+              // whether the asynchronous delivery_state broadcast reached this process yet.
+              delivered = false;
+              retriable = false;
+              deliveryConfirmed = true;
+              lastError = "runner exited successfully without a linked channel reply";
+              attemptsUsed = Math.max(attemptsUsed, attemptFloor + 1);
+              out(`  ${lastError}: seq=${frame.seq}`);
+              // The first completion probe already made `failed` authoritative in the Worker.
+              // Clean exact local continuation state now; a disconnect before the redundant
+              // blocked-state receipt below must not leave a terminal work capability on disk.
+              await settleCurrentDelivery("failed");
+            } else {
+              deliveryConfirmed = true;
+              if (completion.state === "replied") {
+                await settleCurrentDelivery("replied");
+              }
+            }
+          } catch (error) {
+            const message = errText(error);
+            // 不伪称已确认：退出本轮。服务端仍保留 claimed/running，随后按明确的
+            // unknown-outcome 规则收口；绝不在本地把 fire-and-forget 当 durable ack。
+            out(`  delivery ${directedDelivery.id} 完成回执发送失败，重连核对: ${message}`);
+            code = EXIT_STREAM_ENDED;
+            stopAfterFrame = true;
+          }
+        }
         if (delivered) {
           // 一条真正送达的 wake 证明 runner 恢复了；此前连续失败不再代表当前健康状态。
           consecutiveWakeAbandons = 0;
@@ -3268,23 +3409,6 @@ export async function runServe(o: ServeOptions): Promise<number> {
           // 这里的 seq 校验在当前 blockedByDebt 守卫之下**不可达**（变异掉它零条测试变红）。
           // 它是第二道闸：一旦有人放宽 blockedByDebt，这行会挡住「A 的成功清掉 B 的欠账」。
           // 不删，理由写在这里。
-          let deliveryConfirmed = directedDelivery === null;
-          if (directedDelivery !== null) {
-            try {
-              await confirmDeliveryUpdate(conn, {
-                type: "delivery_update",
-                delivery_id: directedDelivery.id,
-                state: "replied",
-              }, undefined, lifecycleController.signal);
-              deliveryConfirmed = true;
-            } catch (error) {
-              // 不伪称已确认：退出本轮。服务端仍保留 claimed/running，随后按明确的
-              // unknown-outcome 规则收口；绝不在本地把 fire-and-forget 当 durable ack。
-              out(`  delivery ${directedDelivery.id} 完成回执发送失败，重连核对: ${errText(error)}`);
-              code = EXIT_STREAM_ENDED;
-              stopAfterFrame = true;
-            }
-          }
           if (deliveryConfirmed && stuck !== null && stuck.seq === frame.seq) setStuck(null);
           // busy 清除（#103）：这条 wake 处理完了。若身后已无待处理 wake（队列排空），补一条「空闲」把
           // 之前 working 帧上的 busy 清回 false——否则任务结束后 presence 会永远卡在「忙」（假忙）。
@@ -3338,8 +3462,11 @@ export async function runServe(o: ServeOptions): Promise<number> {
             code = EXIT_WAKE_UNANNOUNCED;
             break;
           }
-          let failureConfirmed = directedDelivery === null;
-          if (directedDelivery !== null) {
+          // A silent-success completion probe may already have atomically returned the Worker's
+          // terminal `failed` state. Do not require a second, redundant ACK after that authority;
+          // a network drop between the two must not turn a known terminal result into "unknown".
+          let failureConfirmed = deliveryConfirmed || directedDelivery === null;
+          if (directedDelivery !== null && !failureConfirmed) {
             try {
               await confirmDeliveryUpdate(conn, {
                 type: "delivery_update",
@@ -3348,6 +3475,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
                 error: sanitizeBlockedError(lastError),
               }, undefined, lifecycleController.signal);
               failureConfirmed = true;
+              await settleCurrentDelivery("failed");
             } catch (error) {
               out(`  delivery ${directedDelivery.id} 失败回执发送失败，重连重试: ${errText(error)}`);
               code = EXIT_STREAM_ENDED;

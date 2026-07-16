@@ -79,6 +79,83 @@ async function expectUpgradeRequiredWithoutRaw(ws: WsClient, forbiddenSeq?: numb
 }
 
 describe("持久定向投递（issue #551）", () => {
+  it("pause keeps the original delivery queued and resume dispatches that exact work once", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+
+    const paused = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/pause`, sender.token, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(paused.status).toBe(200);
+    const posted = await sendMention(slug, sender.token, target.name, "queued while paused");
+    await expect(holder.nextOfType("delivery", 100)).rejects.toThrow("timeout waiting for frame");
+    const queued = (await deliveryRows(slug))[0]!;
+    expect(queued).toMatchObject({
+      message_seq: posted.seq,
+      target_name: target.name,
+      state: "queued",
+      attempt: 0,
+      lease_connection_id: null,
+    });
+
+    const resumed = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/resume`, sender.token, {
+      method: "POST",
+    });
+    expect(resumed.status).toBe(200);
+    const work = (await holder.nextOfType("delivery")) as DirectedDeliveryFrame;
+    expect(work.delivery).toMatchObject({ id: queued.id, message_seq: posted.seq, state: "claimed", attempt: 1 });
+    holder.send({
+      type: "delivery_update",
+      delivery_id: work.delivery.id,
+      state: "running",
+      work_id: work.delivery.work_id!,
+      continuation_ref: work.delivery.continuation_ref!,
+    });
+    await nextDeliveryState(holder, work.delivery.id, "running");
+
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "resumed once", mentions: [], reply_to: posted.seq }),
+    });
+    expect(reply.status).toBe(200);
+    const replySeq = ((await reply.json()) as { seq: number }).seq;
+    await nextDeliveryState(holder, work.delivery.id, "replied");
+
+    // The runner's inevitable terminal receipt is idempotent after the linked REST reply already
+    // settled the row; it must not manufacture another delivery or another channel reply.
+    holder.send({
+      type: "delivery_update",
+      delivery_id: work.delivery.id,
+      request_id: "pause-resume-terminal",
+      state: "replied",
+      reply_seq: replySeq,
+    });
+    await nextDeliveryState(holder, work.delivery.id, "replied", "pause-resume-terminal");
+    const settledSource = (await deliveryRows(slug)).filter(
+      (delivery) => delivery.message_seq === posted.seq && delivery.target_name === target.name,
+    );
+    expect(settledSource).toMatchObject([{
+      id: queued.id,
+      state: "replied",
+      attempt: 1,
+      reply_seq: replySeq,
+    }]);
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      expect(Number(state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM messages WHERE sender_name = ? AND reply_to = ? AND body = 'resumed once'",
+        target.name,
+        posted.seq,
+      ).one().n)).toBe(1);
+    });
+    holder.close();
+  });
+
   it("legacy serve 已持租时保持 holder，后来的 v1 为 standby 且不重复领取", async () => {
     const sender = await seedToken("agent", uniq("sender"));
     const target = await seedToken("agent", uniq("target"));
@@ -180,7 +257,7 @@ describe("持久定向投递（issue #551）", () => {
     legacy.raw('{"type":"ping"}');
     await legacy.nextOfType("pong");
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
-    await runInDurableObject(stub, async (instance: ChannelDO) => {
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
       for (const connection of instance.getConnections<Record<string, unknown>>()) {
         const state = connection.state;
         if (state?.name !== target.name || state.clientVersion !== "0.2.117") continue;
@@ -310,7 +387,7 @@ describe("持久定向投递（issue #551）", () => {
       await pending.nextOfType("pong");
     }
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
-    await runInDurableObject(stub, async (instance: ChannelDO) => {
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
       for (const connection of instance.getConnections<Record<string, unknown>>()) {
         const state = connection.state;
         if (state?.name === target.name && state.helloPending === true) {
@@ -531,7 +608,7 @@ describe("持久定向投递（issue #551）", () => {
     const work = (await holder.nextOfType("delivery")) as DirectedDeliveryFrame;
 
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
-    await runInDurableObject(stub, async (instance: ChannelDO) => {
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
       const runtime = instance as unknown as {
         isTokenActive(tokenHash: string): Promise<boolean>;
         onMessage(connection: unknown, message: string): Promise<void>;
@@ -542,6 +619,18 @@ describe("持久定向投递（issue #551）", () => {
           candidate.state?.name === target.name && candidate.state?.serveLeaseHeld === true
         );
       expect(connection).toBeDefined();
+      const replySeq = Number(state.storage.sql.exec("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM messages").one().seq);
+      // Model a reply that was already persisted by another request but whose linkWakeResume side
+      // effect has not yet run. The terminal receipt may finish this exact linked reply; a bare
+      // zero-exit receipt is covered separately and must fail.
+      state.storage.sql.exec(
+        `INSERT INTO messages (seq, sender_name, sender_kind, kind, body, mentions_json, reply_to, ts)
+         VALUES (?, ?, 'agent', 'message', 'linked reply', '[]', ?, ?)`,
+        replySeq,
+        target.name,
+        work.message.seq,
+        Date.now(),
+      );
 
       const realIsTokenActive = runtime.isTokenActive.bind(instance);
       let release!: () => void;
@@ -559,6 +648,7 @@ describe("持久定向投递（issue #551）", () => {
           delivery_id: work.delivery.id,
           request_id: "reply-before-close",
           state: "replied",
+          reply_seq: replySeq,
           work_id: work.delivery.work_id,
           continuation_ref: work.delivery.continuation_ref,
         }));
@@ -578,6 +668,41 @@ describe("持久定向投递（issue #551）", () => {
       attempt: 1,
       lease_connection_id: null,
       lease_adapter: null,
+    });
+    holder.close();
+  });
+
+  it("fails a bare success receipt that has no linked channel reply", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+    await sendMention(slug, sender.token, target.name, "silent command");
+    const work = (await holder.nextOfType("delivery")) as DirectedDeliveryFrame;
+
+    holder.send({
+      type: "delivery_update",
+      delivery_id: work.delivery.id,
+      state: "running",
+      ...(work.delivery.work_id === null ? {} : { work_id: work.delivery.work_id }),
+      ...(work.delivery.continuation_ref === null ? {} : { continuation_ref: work.delivery.continuation_ref }),
+    });
+    await nextDeliveryState(holder, work.delivery.id, "running");
+    holder.send({
+      type: "delivery_update",
+      delivery_id: work.delivery.id,
+      request_id: "silent-success",
+      state: "replied",
+    });
+    expect(await nextDeliveryState(holder, work.delivery.id, "failed", "silent-success")).toMatchObject({
+      delivery: { id: work.delivery.id, state: "failed", reply_seq: null },
+    });
+    expect((await deliveryRows(slug))[0]).toMatchObject({
+      state: "failed",
+      reply_seq: null,
+      last_error: "runner reported success without a linked channel reply",
     });
     holder.close();
   });

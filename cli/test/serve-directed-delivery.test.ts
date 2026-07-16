@@ -90,6 +90,73 @@ describe("serve durable directed delivery (#551)", () => {
     expect(exactAckSent).toBe(true);
   });
 
+  test("a completion probe can explicitly accept the Worker's authoritative failed state", async () => {
+    const work = delivery(2);
+    const failed = {
+      id: work.id,
+      message_seq: work.message_seq,
+      target_name: work.target_name,
+      state: "failed" as const,
+      reply_seq: null,
+      created_at: work.created_at,
+      updated_at: Date.now(),
+    };
+    const frames: ServerFrame[] = [];
+    const conn = {
+      send(frame: ClientFrame) {
+        if (frame.type !== "delivery_update") return false;
+        frames.push({ type: "delivery_state", request_id: frame.request_id, delivery: failed });
+        return true;
+      },
+      pendingFrames: () => frames,
+    };
+
+    await expect(confirmDeliveryUpdate(conn, {
+      type: "delivery_update",
+      delivery_id: work.id,
+      state: "replied",
+    }, 200)).rejects.toThrow("delivery state is failed, expected replied");
+    expect(await confirmDeliveryUpdate(conn, {
+      type: "delivery_update",
+      delivery_id: work.id,
+      state: "replied",
+    }, 200, undefined, ["failed"])).toMatchObject({ id: work.id, state: "failed" });
+  });
+
+  test("waiting_owner is parked work and never triggers terminal continuation cleanup", async () => {
+    const message = msgFrame(3, "ask owner", { mentions: ["me"] }) as unknown as MsgFrame;
+    const work = delivery(3);
+    const terminals: Array<{ id: string; state: "replied" | "failed" }> = [];
+    const runner: ServeRunner = async () => {};
+    runner.onDeliveryTerminal = (terminal, state) => {
+      terminals.push({ id: terminal.id, state });
+    };
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+      } else if (frame.type === "serve_lease") {
+        sock.send({ type: "serve_lease", name: "me", held: true });
+        sock.send({ type: "delivery", delivery: work, message });
+      } else if (frame.type === "delivery_update" && frame.state === "running") {
+        sock.send({
+          type: "delivery_state",
+          request_id: frame.request_id,
+          delivery: { ...work, state: "running", updated_at: Date.now() },
+        });
+      } else if (frame.type === "delivery_update" && frame.state === "replied") {
+        sock.send({
+          type: "delivery_state",
+          request_id: frame.request_id,
+          delivery: { ...work, state: "waiting_owner", updated_at: Date.now() },
+        });
+        sock.send({ type: "error", code: "archived", message: "parked" });
+      }
+    });
+
+    expect(await runServe(opts({ server: server.url, runCommand: runner }))).toBe(EXIT_ARCHIVED);
+    expect(terminals).toEqual([]);
+  });
+
   test("custom decision resumes as a fresh process on the served channel with exact lineage context", async () => {
     const home = mkdtempSync(join(tmpdir(), "ap-custom-continuation-"));
     const evidencePath = join(home, "owner-answer.json");
@@ -121,8 +188,23 @@ describe("serve durable directed delivery (#551)", () => {
       work_id: source.work_id,
       continuation_ref: source.continuation_ref,
     });
+    let channelSocket: { send(frame: ServerFrame): void } | undefined;
     const rest = startRestMock((request) => {
       if (request.method !== "POST" || request.path !== "/api/channels/serve-b/messages") return undefined;
+      const requestBody = request.body as { decision_request?: unknown; reply_to?: unknown } | null;
+      if (requestBody?.decision_request === undefined) {
+        if (requestBody?.reply_to === ownerMessage.seq) {
+          channelSocket?.send({
+            type: "delivery_state",
+            delivery: { ...owner, state: "replied", reply_seq: 71, updated_at: Date.now() },
+          });
+        }
+        return Response.json({ seq: 71 });
+      }
+      channelSocket?.send({
+        type: "delivery_state",
+        delivery: { ...source, state: "waiting_owner", updated_at: Date.now() },
+      });
       return Response.json({
         seq: 70,
         decision_request: {
@@ -156,6 +238,17 @@ describe("serve durable directed delivery (#551)", () => {
               continuationRef: process.env.AP_CONTINUATION_REF,
             },
           }));
+          const child = Bun.spawn([
+            process.execPath,
+            ${JSON.stringify(indexPath)},
+            "send",
+            "owner continuation complete",
+            "--channel",
+            process.env.AGENTPARTY_CHANNEL,
+            "--reply-to",
+            String(context.reply_to),
+          ], { env: process.env, stdin: "ignore", stdout: "inherit", stderr: "inherit" });
+          process.exit(await child.exited);
         } else {
           const child = Bun.spawn([
             process.execPath,
@@ -171,6 +264,7 @@ describe("serve durable directed delivery (#551)", () => {
       const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(customScriptPath)}`;
       server = startMockServer((frame, sock) => {
         if (frame.type === "hello") {
+          channelSocket = sock;
           sock.send({ ...welcomeFrame(0, "me"), channel: "serve-b", directed_delivery: "v1" });
           return;
         }
@@ -329,6 +423,7 @@ describe("serve durable directed delivery (#551)", () => {
     const updates: Array<Record<string, unknown>> = [];
     const cursors: number[] = [];
     const seen: number[] = [];
+    const terminals: Array<{ id: string; state: "replied" | "failed" }> = [];
     let receivedContext: DirectedDelivery | null | undefined;
     server = startMockServer((frame, sock) => {
       if (frame.type === "hello") {
@@ -352,19 +447,24 @@ describe("serve durable directed delivery (#551)", () => {
       }
     });
 
+    const runner: ServeRunner = async (frame, context) => {
+      seen.push(frame.seq);
+      receivedContext = context.delivery;
+      expect(context.recent.map((item) => item.seq)).not.toContain(frame.seq);
+    };
+    runner.onDeliveryTerminal = (terminal, state) => {
+      terminals.push({ id: terminal.id, state });
+    };
     const code = await runServe(opts({
       server: server.url,
       onCursor: (cursor) => cursors.push(cursor),
-      runCommand: async (frame, context) => {
-        seen.push(frame.seq);
-        receivedContext = context.delivery;
-        expect(context.recent.map((item) => item.seq)).not.toContain(frame.seq);
-      },
+      runCommand: runner,
     }));
 
     expect(code).toBe(EXIT_ARCHIVED);
     expect(seen).toEqual([1]);
     expect(cursors).toEqual([1]);
+    expect(terminals).toEqual([{ id: work.id, state: "replied" }]);
     expect(receivedContext).toMatchObject({ id: work.id, work_id: "work-1", continuation_ref: "codex:thread-1" });
     expect(updates).toEqual([
       expect.objectContaining({
@@ -486,12 +586,127 @@ describe("serve durable directed delivery (#551)", () => {
     expect(String(updates[1]?.error)).toContain("runner exploded");
   });
 
+  test("a zero-exit custom command with no linked reply is blocked instead of reported as delivered", async () => {
+    const message = msgFrame(8, "silent success", { mentions: ["me"] }) as unknown as MsgFrame;
+    const work = delivery(8);
+    const updates: Array<Record<string, unknown>> = [];
+    const posts: Array<{ kind: string; state?: string; note?: string }> = [];
+    const lines: string[] = [];
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+        return;
+      }
+      if (frame.type === "serve_lease") {
+        sock.send({ type: "serve_lease", name: "me", held: true });
+        sock.send({ type: "delivery", delivery: work, message });
+        return;
+      }
+      if (frame.type !== "delivery_update") return;
+      updates.push(frame as unknown as Record<string, unknown>);
+      const state = frame.state === "replied" ? "failed" : frame.state;
+      sock.send({
+        type: "delivery_state",
+        request_id: frame.request_id,
+        delivery: {
+          ...work,
+          state,
+          last_error: state === "failed" ? "runner reported success without a linked channel reply" : null,
+          updated_at: Date.now(),
+        },
+      });
+      if (frame.state === "replied") {
+        sock.send({ type: "error", code: "archived", message: "done" });
+      }
+    });
+
+    const code = await runServe(opts({
+      server: server.url,
+      cmd: "true",
+      out: (line) => lines.push(line),
+      post: async (_server, _token, _channel, body) => {
+        posts.push(body as { kind: string; state?: string; note?: string });
+        return { seq: 100 + posts.length };
+      },
+    }));
+
+    expect(code).toBe(EXIT_ARCHIVED);
+    expect(updates.map((update) => update.state)).toEqual(["running", "replied"]);
+    expect(posts).toContainEqual(expect.objectContaining({
+      kind: "status",
+      state: "blocked",
+      note: expect.stringContaining("runner exited successfully without a linked channel reply"),
+    }));
+    expect(lines.some((line) => line.includes("runner exited successfully without a linked channel reply"))).toBe(true);
+  });
+
+  test("authoritative silent-success failure cleans continuation before a later ACK disconnect", async () => {
+    const message = msgFrame(81, "silent success cleanup", { mentions: ["me"] }) as unknown as MsgFrame;
+    const work = delivery(81);
+    const updates: string[] = [];
+    const terminals: Array<{ id: string; state: "replied" | "failed" }> = [];
+    server = startMockServer((frame, sock, connectionIndex) => {
+      if (frame.type === "hello") {
+        if (connectionIndex > 0) {
+          sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+          sock.send({ type: "error", code: "archived", message: "done" });
+          return;
+        }
+        sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+        return;
+      }
+      if (frame.type === "serve_lease") {
+        sock.send({ type: "serve_lease", name: "me", held: true });
+        sock.send({ type: "delivery", delivery: work, message });
+        return;
+      }
+      if (frame.type !== "delivery_update") return;
+      updates.push(frame.state);
+      if (frame.state === "running") {
+        sock.send({
+          type: "delivery_state",
+          request_id: frame.request_id,
+          delivery: { ...work, state: "running", updated_at: Date.now() },
+        });
+        return;
+      }
+      if (frame.state === "replied") {
+        sock.send({
+          type: "delivery_state",
+          request_id: frame.request_id,
+          delivery: {
+            ...work,
+            state: "failed",
+            last_error: "runner reported success without a linked channel reply",
+            updated_at: Date.now(),
+          },
+        });
+        setTimeout(() => sock.close(), 0);
+      }
+    });
+    const runner: ServeRunner = async () => {};
+    runner.onDeliveryTerminal = (terminal, state) => {
+      terminals.push({ id: terminal.id, state });
+    };
+
+    const code = await runServe(opts({
+      server: server.url,
+      runCommand: runner,
+      post: async () => ({ seq: 181 }),
+    }));
+
+    expect(code).toBe(EXIT_ARCHIVED);
+    expect(updates).toEqual(["running", "replied"]);
+    expect(terminals).toEqual([{ id: work.id, state: "failed" }]);
+  });
+
   test("a disconnect that loses the terminal update exits unknown-outcome and never runs a redelivery", async () => {
     const message = msgFrame(9, "do not duplicate", { mentions: ["me"] }) as unknown as MsgFrame;
     const work = delivery(9);
     const lines: string[] = [];
     let runnerCalls = 0;
     let updateCalls = 0;
+    const terminals: Array<{ id: string; state: "replied" | "failed" }> = [];
     server = startMockServer((frame, sock, connectionIndex) => {
       if (frame.type === "hello") {
         sock.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
@@ -523,15 +738,20 @@ describe("serve durable directed delivery (#551)", () => {
       }
     });
 
+    const runner: ServeRunner = async () => { runnerCalls += 1; };
+    runner.onDeliveryTerminal = (terminal, state) => {
+      terminals.push({ id: terminal.id, state });
+    };
     const code = await runServe(opts({
       server: server.url,
       out: (line) => lines.push(line),
-      runCommand: async () => { runnerCalls += 1; },
+      runCommand: runner,
     }));
 
     expect(code).toBe(EXIT_STREAM_ENDED);
     expect(runnerCalls).toBe(1);
     expect(updateCalls).toBe(2);
+    expect(terminals).toEqual([]);
     expect(lines.some((line) => line.includes("完成回执发送失败"))).toBe(true);
   });
 

@@ -19,6 +19,7 @@ import { prepareDecisionContinuation } from "../src/commands/decision";
 import {
   blockRunnerContinuation,
   continuationPath,
+  deleteRunnerContinuation,
   mergeRunnerContinuation,
   readRunnerContinuation,
   withRunnerContinuationLock,
@@ -403,6 +404,75 @@ describe("codex-sdk per-work continuations (#548)", () => {
     expect(existsSync(join(workdir, "wake-session.json"))).toBe(false);
   });
 
+  test("refreshes the exact delivery lineage inherited by nested decision asks on owner answers", async () => {
+    const workdir = tempDir();
+    const workId = "work-sdk-decision";
+    const ref = "sdk-decision-ref";
+    const source = delivery(35, workId, ref);
+    const answer = delivery(36, workId, ref, "owner_answer");
+    answer.attempt = 2;
+    const clientEnvs: Record<string, string>[] = [];
+    const starts: string[] = [];
+    const resumes: string[] = [];
+
+    const makeThread = (id: string, env: Record<string, string>): ThreadLike => ({
+      id,
+      run: async () => {
+        const parked = prepareDecisionContinuation({ ...env, CODEX_THREAD_ID: id } as NodeJS.ProcessEnv);
+        expect(parked).toMatchObject({
+          deliveryId: env.AP_DELIVERY_ID,
+          workId,
+          continuationRef: ref,
+          sessionId: id,
+        });
+        return { final_response: `handled ${env.AP_DELIVERY_ID}` };
+      },
+    });
+    const exactRun = createSdkRunner({
+      server: "http://agentparty.test",
+      token: "ap_test",
+      channel: "dev",
+      workdir,
+      codexFactory: (options) => {
+        const env = options?.env ?? {};
+        clientEnvs.push(env);
+        return {
+          startThread: () => {
+            starts.push(env.AP_DELIVERY_ID ?? "missing");
+            return makeThread("thread-sdk-decision", env);
+          },
+          resumeThread: (id) => {
+            resumes.push(env.AP_DELIVERY_ID ?? "missing");
+            return makeThread(id, env);
+          },
+        };
+      },
+      post,
+    });
+
+    await exactRun(message(35), context(source));
+    await exactRun(message(36, {
+      decision_response: { request_seq: 35, chosen_index: 1, chosen_option: "B" },
+    }), context(answer));
+
+    expect(clientEnvs).toHaveLength(2);
+    expect(clientEnvs[0]).toMatchObject({
+      AP_DELIVERY_ID: source.id,
+      AP_WORK_ID: workId,
+      AP_CONTINUATION_REF: ref,
+      AP_DELIVERY_ATTEMPT: "1",
+    });
+    expect(clientEnvs[1]).toMatchObject({
+      AP_DELIVERY_ID: answer.id,
+      AP_WORK_ID: workId,
+      AP_CONTINUATION_REF: ref,
+      AP_DELIVERY_ATTEMPT: "2",
+      AP_RUNNER_SESSION_ID: "thread-sdk-decision",
+    });
+    expect(starts).toEqual([source.id]);
+    expect(resumes).toEqual([answer.id]);
+  });
+
   test("pins child identity and channel worktree into the SDK client and resumed thread", async () => {
     const workdir = tempDir();
     const cwd = tempDir("ap-profile-channel-");
@@ -486,6 +556,78 @@ describe("codex-sdk per-work continuations (#548)", () => {
     expect((mismatch as WakeBlockedError).retriable).toBe(false);
     expect(String((mismatch as Error).message)).toContain("mismatch");
     expect(starts).toBe(1);
+  });
+
+  test("runServe failing mismatched work B never cleans same-ref work A", async () => {
+    const workdir = tempDir();
+    const ref = "sdk-runserve-shared-ref";
+    const path = continuationPath(workdir, ref);
+    writeRunnerContinuation(path, {
+      harness: "codex-sdk",
+      thread_id: "thread-work-a",
+      created_at: 1,
+      last_wake_ts: 2,
+      wakes: 1,
+      work_id: "work-a",
+      continuation_ref: ref,
+    });
+    let starts = 0;
+    let resumes = 0;
+    const runner = sdk(workdir, () => ({
+      startThread: () => {
+        starts += 1;
+        return { id: "wrong-new-thread", run: async () => ({ final_response: "wrong" }) };
+      },
+      resumeThread: (id) => {
+        resumes += 1;
+        return { id, run: async () => ({ final_response: "wrong" }) };
+      },
+    }));
+    const answer = delivery(45, "work-b", ref, "owner_answer");
+    const answerMessage = message(45, {
+      decision_response: { request_seq: 44, chosen_index: 0, chosen_option: "approve" },
+    });
+    const updates: string[] = [];
+    const server = startMockServer((frame, socket) => {
+      if (frame.type === "hello") {
+        socket.send({ ...welcomeFrame(0, "me"), directed_delivery: "v1" });
+      } else if (frame.type === "serve_lease") {
+        socket.send({ type: "serve_lease", name: "me", held: true });
+        socket.send({ type: "delivery", delivery: answer, message: answerMessage });
+      } else if (frame.type === "delivery_update") {
+        updates.push(frame.state);
+        socket.send({
+          type: "delivery_state",
+          request_id: frame.request_id,
+          delivery: { ...answer, state: frame.state, last_error: frame.error ?? null, updated_at: Date.now() },
+        });
+        if (frame.state === "failed") socket.send({ type: "error", code: "archived", message: "done" });
+      }
+    });
+    servers.push(server);
+
+    expect(await runServe({
+      server: server.url,
+      token: "ap_test",
+      channel: "dev",
+      since: 0,
+      cmd: "",
+      mentionsOnly: true,
+      allowMultiple: true,
+      advertise: async () => {},
+      post,
+      runCommand: runner,
+    })).toBe(EXIT_ARCHIVED);
+
+    expect(updates).toEqual(["failed"]);
+    expect(starts).toBe(0);
+    expect(resumes).toBe(0);
+    expect(readRunnerContinuation(path)).toMatchObject({
+      harness: "codex-sdk",
+      thread_id: "thread-work-a",
+      work_id: "work-a",
+      continuation_ref: ref,
+    });
   });
 
   test("SDK timeout preserves and blocks the scoped handle so owner_answer fails without cold-starting", async () => {
@@ -634,6 +776,111 @@ describe("continuation transaction lock", () => {
     withRunnerContinuationLock(path, () => {});
     expect(statSync(join(workdir, "continuations")).mode & 0o777).toBe(0o700);
     expect(statSync(join(workdir, "continuations", ".continuation-lock.sqlite")).mode & 0o777).toBe(0o600);
+  });
+
+  test("deletes terminal per-work mappings under the shared lock and remains idempotent", () => {
+    const workdir = tempDir();
+    const path = continuationPath(workdir, "terminal-work");
+    const identity = {
+      harness: "codex",
+      work_id: "terminal-work-id",
+      continuation_ref: "terminal-work",
+    } as const;
+    writeRunnerContinuation(path, {
+      ...identity,
+      session_id: "terminal-session",
+      created_at: 1,
+      last_wake_ts: 2,
+      wakes: 1,
+    });
+
+    expect(deleteRunnerContinuation(path, identity)).toBe("deleted");
+    expect(existsSync(path)).toBe(false);
+    expect(readRunnerContinuation(path)).toBeNull();
+    expect(deleteRunnerContinuation(path, identity)).toBe("missing");
+    expect(existsSync(join(workdir, "continuations", ".continuation-lock.sqlite"))).toBe(true);
+  });
+
+  test("terminal cleanup preserves a same-ref mapping owned by another work", () => {
+    const workdir = tempDir();
+    const path = continuationPath(workdir, "shared-ref");
+    writeRunnerContinuation(path, {
+      harness: "codex",
+      session_id: "work-a-session",
+      created_at: 1,
+      last_wake_ts: 2,
+      wakes: 1,
+      work_id: "work-a",
+      continuation_ref: "shared-ref",
+    });
+
+    expect(deleteRunnerContinuation(path, {
+      harness: "codex",
+      work_id: "work-b",
+      continuation_ref: "shared-ref",
+    })).toBe("mismatch");
+    expect(readRunnerContinuation(path)).toMatchObject({
+      session_id: "work-a-session",
+      work_id: "work-a",
+      continuation_ref: "shared-ref",
+    });
+  });
+
+  test("builtin and SDK terminal hooks release their exact continuation files", async () => {
+    const cases = [
+      {
+        harness: "codex" as const,
+        runner: (workdir: string) => createBuiltinRunner({
+          server: "https://party.test",
+          token: "ap_test",
+          channel: "dev",
+          harness: "codex",
+          workdir,
+        }),
+        state: (ref: string) => ({
+          harness: "codex" as const,
+          session_id: "builtin-session",
+          created_at: 1,
+          last_wake_ts: 2,
+          wakes: 1,
+          work_id: "terminal-work-id",
+          continuation_ref: ref,
+        }),
+      },
+      {
+        harness: "codex-sdk" as const,
+        runner: (workdir: string) => createSdkRunner({
+          server: "https://party.test",
+          token: "ap_test",
+          channel: "dev",
+          workdir,
+        }),
+        state: (ref: string) => ({
+          harness: "codex-sdk" as const,
+          thread_id: "sdk-thread",
+          created_at: 1,
+          last_wake_ts: 2,
+          wakes: 1,
+          work_id: "terminal-work-id",
+          continuation_ref: ref,
+        }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const workdir = tempDir(`ap-${testCase.harness}-terminal-`);
+      const ref = `${testCase.harness}-terminal-ref`;
+      const path = continuationPath(workdir, ref);
+      writeRunnerContinuation(path, testCase.state(ref));
+      const runner = testCase.runner(workdir);
+      await runner.onDeliveryTerminal?.(delivery(89, "different-work", ref), "failed");
+      expect(readRunnerContinuation(path)).toMatchObject({
+        work_id: "terminal-work-id",
+        continuation_ref: ref,
+      });
+      await runner.onDeliveryTerminal?.(delivery(90, "terminal-work-id", ref), "replied");
+      expect(existsSync(path)).toBe(false);
+    }
   });
 
   test("block-before-merge and merge-before-block both preserve the monotonic block", () => {

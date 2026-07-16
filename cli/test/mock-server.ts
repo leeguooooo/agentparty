@@ -82,6 +82,7 @@ export function msgFrame(seq: number, body: string, over: Record<string, unknown
     reply_to: null,
     state: null,
     note: null,
+    status: null,
     ts: Date.now(),
     ...over,
   };

@@ -219,6 +219,39 @@ describe("gdpr identity erasure + export (#421)", () => {
     expect(after.read_cursor).toBeNull();
     expect(after.presence.length).toBe(0);
 
+    const deliveriesBeforeRevise = await runInDurableObject(stub, async (_instance: ChannelDO, state) =>
+      state.storage.sql.exec(
+        "SELECT id, message_seq, target_name, state FROM directed_deliveries ORDER BY id",
+      ).toArray().map((row) => ({
+        id: String(row.id),
+        message_seq: Number(row.message_seq),
+        target_name: String(row.target_name),
+        state: String(row.state),
+      })),
+    );
+
+    for (const [action, init] of [
+      ["edit", { method: "POST", body: JSON.stringify({ body: `@${other.name} forged after erase` }) }],
+      ["supersede", { method: "POST", body: JSON.stringify({ body: `@${other.name} forged replacement` }) }],
+      ["retract", { method: "POST" }],
+    ] as const) {
+      const revise = await api(`/api/channels/${slug}/messages/${firstSeq}/${action}`, owner.token, init);
+      expect(revise.status).toBe(400);
+      expect(await revise.json()).toMatchObject({
+        error: { code: "bad_request", message: "message was erased and cannot be revised" },
+      });
+    }
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      expect(state.storage.sql.exec(
+        "SELECT id, message_seq, target_name, state FROM directed_deliveries ORDER BY id",
+      ).toArray().map((row) => ({
+        id: String(row.id),
+        message_seq: Number(row.message_seq),
+        target_name: String(row.target_name),
+        state: String(row.state),
+      }))).toEqual(deliveriesBeforeRevise);
+    });
+
     const otherAfter = (await (
       await api(`/api/channels/${slug}/identity/${encodeURIComponent(other.name)}/data`, owner.token)
     ).json()) as ExportShape;

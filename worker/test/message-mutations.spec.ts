@@ -6,6 +6,7 @@ import { WsClient, api, createChannel, postMessage, seedToken, uniq } from "./he
 interface MsgLike {
   seq: number;
   body: string;
+  mentions?: string[];
   note?: string | null;
   edited?: true;
   retracted?: true;
@@ -30,7 +31,7 @@ async function scopedFixture() {
   const slug = await createChannel(owner.token);
   const writer = await seedToken("agent", uniq("writer"), { owner: acct, channelScope: slug });
   const other = await seedToken("agent", uniq("other"), { owner: acct, channelScope: slug });
-  return { slug, owner, writer, other };
+  return { acct, slug, owner, writer, other };
 }
 
 describe("message edit/retract/supersede", () => {
@@ -66,6 +67,226 @@ describe("message edit/retract/supersede", () => {
     expect(audit.status).toBe(200);
     expect((await audit.json()) as { audit: unknown[] }).toMatchObject({
       audit: [{ target_seq: seq, action: "edit", old_body: "wrong body", new_body: "correct body" }],
+    });
+  });
+
+  it("routes body-derived agent mentions added by an edit into durable work", async () => {
+    const { slug, writer, other } = await scopedFixture();
+    const sent = await postMessage(slug, writer.token, "plain draft");
+    const seq = ((await sent.json()) as { seq: number }).seq;
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: `请@${other.name}处理这个问题` }),
+    });
+    expect(edited.status).toBe(200);
+    expect(((await edited.json()) as { message: MsgLike }).message).toMatchObject({
+      seq,
+      body: `请@${other.name}处理这个问题`,
+      mentions: [other.name],
+      edited: true,
+    });
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      const deliveries = state.storage.sql
+        .exec(
+          `SELECT message_seq, target_name, cause, state, target_owner
+             FROM directed_deliveries WHERE message_seq = ?`,
+          seq,
+        )
+        .toArray();
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]).toMatchObject({
+        message_seq: seq,
+        target_name: other.name,
+        cause: "mention_edit",
+        state: "queued",
+        target_owner: expect.any(String),
+      });
+    });
+  });
+
+  it("does not redeliver a preserved pre-v1 mention while routing a genuinely added target", async () => {
+    const { acct, slug, writer, other } = await scopedFixture();
+    const added = await seedToken("agent", uniq("added"), { owner: acct, channelScope: slug });
+    const sent = await postMessage(slug, writer.token, `@${other.name} legacy wording`);
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      // Model a message created before durable delivery rows and compact target tombstones existed.
+      state.storage.sql.exec("DELETE FROM directed_deliveries WHERE message_seq = ?", seq);
+      state.storage.sql.exec("UPDATE messages SET delivery_targets_json = '[]' WHERE seq = ?", seq);
+    });
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: `@${other.name} wording changed; @${added.name} newly assigned` }),
+    });
+    expect(edited.status).toBe(200);
+
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      const deliveries = state.storage.sql
+        .exec(
+          `SELECT target_name, cause
+             FROM directed_deliveries WHERE message_seq = ?
+             ORDER BY target_name`,
+          seq,
+        )
+        .toArray();
+      expect(deliveries).toEqual([{ target_name: added.name, cause: "mention_edit" }]);
+      const tombstone = JSON.parse(String(state.storage.sql.exec(
+        "SELECT delivery_targets_json FROM messages WHERE seq = ?",
+        seq,
+      ).one().delivery_targets_json)) as string[];
+      expect(tombstone.sort()).toEqual([added.name, other.name].sort());
+    });
+  });
+
+  it("rejects unknown edited mentions without changing the message or audit", async () => {
+    const { slug, writer } = await scopedFixture();
+    const sent = await postMessage(slug, writer.token, "keep this body");
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const missing = uniq("missing-agent");
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: `请@${missing}处理` }),
+    });
+    expect(edited.status).toBe(400);
+    expect(await edited.json()).toMatchObject({ error: { code: "mention_not_found" } });
+
+    const history = await api(`/api/channels/${slug}/messages?since=0`, writer.token);
+    const messages = ((await history.json()) as { messages: MsgLike[] }).messages;
+    expect(messages.find((message) => message.seq === seq)).toMatchObject({
+      body: "keep this body",
+      mentions: [],
+    });
+    const audit = await api(`/api/channels/${slug}/messages/${seq}/audit`, writer.token);
+    expect((await audit.json()) as { audit: unknown[] }).toEqual({ audit: [] });
+  });
+
+  it("rejects removing an already-routed target instead of silently detaching its work", async () => {
+    const { slug, writer, other } = await scopedFixture();
+    const sent = await postMessage(slug, writer.token, `@${other.name} original work`);
+    const seq = ((await sent.json()) as { seq: number }).seq;
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: "remove the routed target" }),
+    });
+    expect(edited.status).toBe(400);
+    expect(await edited.json()).toMatchObject({
+      error: { code: "bad_request", message: expect.stringContaining("retract or supersede") },
+    });
+
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      const message = state.storage.sql.exec("SELECT body, mentions_json FROM messages WHERE seq = ?", seq).one();
+      expect(message).toMatchObject({ body: `@${other.name} original work` });
+      expect(JSON.parse(String(message.mentions_json))).toEqual([other.name]);
+      const delivery = state.storage.sql
+        .exec("SELECT target_name, state FROM directed_deliveries WHERE message_seq = ?", seq)
+        .one();
+      expect(delivery).toMatchObject({ target_name: other.name, state: "queued" });
+    });
+  });
+
+  it("keeps an exactly-once target tombstone after terminal delivery retention prunes the row", async () => {
+    const { slug, writer, other } = await scopedFixture();
+    const sent = await postMessage(slug, writer.token, `@${other.name} original retained work`);
+    const seq = ((await sent.json()) as { seq: number }).seq;
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'replied', lease_connection_id = NULL, lease_adapter = NULL,
+                lease_until = NULL, updated_at = ?
+          WHERE message_seq = ?`,
+        Date.now() - 8 * 24 * 60 * 60 * 1000,
+        seq,
+      );
+      await instance.onAlarm();
+      expect(Number(state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one().n)).toBe(0);
+      expect(JSON.parse(String(state.storage.sql.exec(
+        "SELECT delivery_targets_json FROM messages WHERE seq = ?",
+        seq,
+      ).one().delivery_targets_json))).toEqual([other.name]);
+    });
+
+    const edited = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: `@${other.name} wording changed, work identity unchanged` }),
+    });
+    expect(edited.status).toBe(200);
+
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      expect(Number(state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM directed_deliveries WHERE message_seq = ?",
+        seq,
+      ).one().n)).toBe(0);
+    });
+
+    const removal = await api(`/api/channels/${slug}/messages/${seq}/edit`, writer.token, {
+      method: "POST",
+      body: JSON.stringify({ body: "do not recreate or silently detach retained work" }),
+    });
+    expect(removal.status).toBe(400);
+    expect(await removal.json()).toMatchObject({
+      error: { code: "bad_request", message: expect.stringContaining("retract or supersede") },
+    });
+  });
+
+  it("repairs malformed legacy tombstones without re-identifying retracted or erased messages", async () => {
+    const { slug, writer, other } = await scopedFixture();
+    const normal = await postMessage(slug, writer.token, `@${other.name} legacy normal`);
+    const normalSeq = ((await normal.json()) as { seq: number }).seq;
+    const retracted = await postMessage(slug, writer.token, `@${other.name} legacy retracted`);
+    const retractedSeq = ((await retracted.json()) as { seq: number }).seq;
+    const erased = await postMessage(slug, writer.token, `@${other.name} legacy erased`);
+    const erasedSeq = ((await erased.json()) as { seq: number }).seq;
+
+    expect((await api(`/api/channels/${slug}/messages/${retractedSeq}/retract`, writer.token, {
+      method: "POST",
+    })).status).toBe(200);
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      // Model the upgrade state: one legacy row has a malformed compact tombstone, while
+      // retraction/GDPR scrubbing is authoritative and must remain empty on restart.
+      state.storage.sql.exec(
+        "UPDATE messages SET delivery_targets_json = '[]' WHERE seq IN (?, ?)",
+        retractedSeq,
+        erasedSeq,
+      );
+      state.storage.sql.exec(
+        "UPDATE messages SET delivery_targets_json = '{broken' WHERE seq = ?",
+        normalSeq,
+      );
+      state.storage.sql.exec(
+        "UPDATE messages SET body = '[erased]', mentions_json = '[]' WHERE seq = ?",
+        erasedSeq,
+      );
+      instance.onStart();
+
+      const rows = state.storage.sql.exec(
+        "SELECT seq, delivery_targets_json FROM messages WHERE seq IN (?, ?, ?) ORDER BY seq",
+        normalSeq,
+        retractedSeq,
+        erasedSeq,
+      ).toArray();
+      expect(rows.map((row) => ({
+        seq: Number(row.seq),
+        targets: JSON.parse(String(row.delivery_targets_json)),
+      }))).toEqual([
+        { seq: normalSeq, targets: [other.name] },
+        { seq: retractedSeq, targets: [] },
+        { seq: erasedSeq, targets: [] },
+      ]);
     });
   });
 
