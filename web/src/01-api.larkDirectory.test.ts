@@ -57,7 +57,14 @@ describe("Lark directory API", () => {
     expect(request!.method).toBe("DELETE");
     expect(request!.url).toContain("/api/channels/private%20room/lark-members/on_alice");
     expect(request!.headers.get("authorization")).toBe("Bearer session-token");
-    expect(result).toMatchObject({ memberRemoved: true, revokedAgents: 2, notification_status: "sent" });
+    expect(result).toEqual({
+      ok: true,
+      user_id: "on_alice",
+      memberRemoved: true,
+      revokedAgents: 2,
+      revokedProjectAgentInvites: 1,
+      notification_status: "sent",
+    });
   });
 
   test("encodes organization browsing and independent pagination", async () => {

@@ -635,7 +635,11 @@ export function inferReceiveIdType(providerUserId: string, email: string | null 
   return "union_id";
 }
 
-export async function getTenantAccessToken(env: EnvLike, provider: LarkProviderConfig): Promise<string> {
+export async function getTenantAccessToken(
+  env: EnvLike,
+  provider: LarkProviderConfig,
+  signal?: AbortSignal,
+): Promise<string> {
   const secret = providerSecret(env, provider);
   const cacheKey = `${provider.id}:${provider.kind}:${provider.clientId}:${secret}`;
   const cached = tokenCache.get(cacheKey);
@@ -645,6 +649,7 @@ export async function getTenantAccessToken(env: EnvLike, provider: LarkProviderC
     method: "POST",
     headers: { "content-type": "application/json; charset=utf-8" },
     body: JSON.stringify({ app_id: provider.clientId, app_secret: secret }),
+    signal,
   });
   const data = (await res.json().catch(() => null)) as unknown;
   if (!res.ok || !isRecord(data)) throw new Error(`tenant_access_token failed (${res.status})`);
@@ -665,8 +670,9 @@ export async function sendLarkCard(
   receiveId: string,
   idType: LarkReceiveIdType,
   card: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<void> {
-  const token = await getTenantAccessToken(env, provider);
+  const token = await getTenantAccessToken(env, provider, signal);
   const res = await fetch(`${larkApiBase(provider.kind)}/open-apis/im/v1/messages?receive_id_type=${idType}`, {
     method: "POST",
     headers: {
@@ -678,6 +684,7 @@ export async function sendLarkCard(
       msg_type: "interactive",
       content: JSON.stringify(card),
     }),
+    signal,
   });
   const data = (await res.json().catch(() => null)) as unknown;
   if (!res.ok || !isRecord(data) || (data.code !== undefined && Number(data.code) !== 0)) {

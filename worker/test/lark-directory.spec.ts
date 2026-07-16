@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { clearLarkTokenCache } from "../src/integrations/lark";
+import { clearLarkTokenCache, getTenantAccessToken, resolveLarkProvider } from "../src/integrations/lark";
 import { api, createChannel, seedToken, uniq } from "./helpers";
 import { fetchMock } from "./fetch-mock";
 
@@ -690,17 +690,59 @@ describe("Lark organization member invitations (#358)", () => {
       .intercept({ path: "/open-apis/im/v1/messages?receive_id_type=union_id", method: "POST" })
       .reply(200, { code: 999, msg: "permission denied" });
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const response = await api(`/api/channels/${slug}/lark-members/on_remove_notify_fail`, owner.token, { method: "DELETE" });
 
-    const response = await api(`/api/channels/${slug}/lark-members/on_remove_notify_fail`, owner.token, { method: "DELETE" });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ memberRemoved: true, revokedAgents: 1, notification_status: "failed" });
+      expect(await env.DB.prepare(
+        "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
+      ).bind(slug, account).first()).toBeNull();
+      expect(await env.DB.prepare("SELECT revoked_at FROM tokens WHERE name = ?").bind(scoped.name).first<{ revoked_at: number | null }>())
+        .toMatchObject({ revoked_at: expect.any(Number) });
+      expect(warning).toHaveBeenCalledOnce();
+    } finally {
+      warning.mockRestore();
+    }
+  });
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ memberRemoved: true, revokedAgents: 1, notification_status: "failed" });
-    expect(await env.DB.prepare(
-      "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
-    ).bind(slug, account).first()).toBeNull();
-    expect(await env.DB.prepare("SELECT revoked_at FROM tokens WHERE name = ?").bind(scoped.name).first<{ revoked_at: number | null }>())
-      .toMatchObject({ revoked_at: expect.any(Number) });
-    expect(warning).toHaveBeenCalledOnce();
+  it("bounds a stuck Lark removal notification and still returns the removal result", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let timeout: ReturnType<typeof vi.spyOn> | null = null;
+    try {
+      const owner = await larkHuman();
+      const slug = await createChannel(owner.token);
+      const account = "lark-main:on_remove_timeout";
+      const now = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO account_profiles (
+           account, handle, display_name, provider, provider_user_id, tenant_key, created_at, updated_at
+         ) VALUES (?, ?, 'Remove Timeout', 'lark-main', 'on_remove_timeout', 'tenant-test', ?, ?)`,
+      ).bind(account, uniq("remove_timeout"), now, now).run();
+      await env.DB.prepare(
+        "INSERT INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, ?, ?)",
+      ).bind(slug, account, owner.account, now).run();
+      mockTenantToken();
+      const larkEnv = env as unknown as Parameters<typeof resolveLarkProvider>[0];
+      const provider = resolveLarkProvider(larkEnv, "lark-main");
+      expect(provider).not.toBeNull();
+      await getTenantAccessToken(larkEnv, provider!);
+      timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(
+        AbortSignal.abort(new DOMException("The operation timed out", "TimeoutError")),
+      );
+      const response = await api(`/api/channels/${slug}/lark-members/on_remove_timeout`, owner.token, { method: "DELETE" });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ memberRemoved: true, notification_status: "failed" });
+      expect(await env.DB.prepare(
+        "SELECT account FROM channel_members WHERE channel_slug = ? AND account = ?",
+      ).bind(slug, account).first()).toBeNull();
+      expect(timeout).toHaveBeenCalledWith(5_000);
+      expect(warning).toHaveBeenCalledOnce();
+    } finally {
+      warning.mockRestore();
+      timeout?.mockRestore();
+    }
   });
 
   it("reuses an open_id profile during a union_id invite and migrates it to the stable id", async () => {

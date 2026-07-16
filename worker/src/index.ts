@@ -104,6 +104,7 @@ import { openapiDocument } from "./openapi";
 
 declare const __AGENTPARTY_BUILD_VERSION__: string | undefined;
 declare const __AGENTPARTY_BUILD_COMMIT__: string | undefined;
+const LARK_NOTIFICATION_TIMEOUT_MS = 5_000;
 declare const __AGENTPARTY_DEPLOYED_AT__: string | undefined;
 
 export { ChannelDO };
@@ -4010,6 +4011,7 @@ app.delete("/api/channels/:slug/lark-members/:userId", async (c) => {
         userId,
         inferReceiveIdType(userId),
         buildChannelRemovalCard(slug),
+        AbortSignal.timeout(LARK_NOTIFICATION_TIMEOUT_MS),
       );
       notificationStatus = "sent";
     } catch (notificationError) {
