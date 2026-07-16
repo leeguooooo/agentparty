@@ -911,6 +911,20 @@ function parseStoredLineage(input: unknown): AgentLineage | undefined {
   }
 }
 
+// mentions_json 是唯一没兜底的读路径 JSON 解析（其余都 try/catch 或走 parseStored* 守卫）。
+// 一旦某行存进空串或坏 JSON（NOT NULL DEFAULT '[]' 挡得住漏写，挡不住显式写入 ''），
+// 裸 JSON.parse('') 会抛未捕获异常，整条频道的 messages/hello 回填全 500。按其余存储解析同样
+// 的模式兜底：空/坏值当作无 mentions，绝不因一行坏数据拖垮整个频道读路径。
+function parseStoredMentions(input: unknown): string[] {
+  if (typeof input !== "string" || input === "") return [];
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((name): name is string => typeof name === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function parseLineage(input: unknown): AgentLineage | null {
   if (typeof input !== "object" || input === null) return null;
   const raw = input as Record<string, unknown>;
@@ -9277,7 +9291,7 @@ export class ChannelDO extends Server<Env> {
       },
       kind,
       body: retracted ? "[retracted]" : String(r.body),
-      mentions: JSON.parse(String(r.mentions_json ?? "[]")) as string[],
+      mentions: parseStoredMentions(r.mentions_json),
       reply_to: r.reply_to === null ? null : Number(r.reply_to),
       state,
       note,
