@@ -101,10 +101,10 @@ export async function browseLarkOrganization(
   includeUsers = true,
   flat = false,
 ): Promise<LarkOrganizationPage> {
-  const params = new URLSearchParams({ department_id: departmentId, limit: String(limit) });
+  const params = new URLSearchParams({ department_id: flat ? "0" : departmentId, limit: String(limit) });
   if (departmentCursor !== null) params.set("department_cursor", departmentCursor);
   if (userCursor !== null) params.set("user_cursor", userCursor);
-  if (!includeDepartments) params.set("departments", "0");
+  if (flat || !includeDepartments) params.set("departments", "0");
   if (!includeUsers) params.set("users", "0");
   if (flat) params.set("flat", "1");
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/lark-organization?${params.toString()}`, {

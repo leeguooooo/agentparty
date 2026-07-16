@@ -193,6 +193,71 @@ describe("Lark organization member invitations (#358)", () => {
     });
   });
 
+  it("rejects flat organization pagination when users are disabled", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+
+    const response = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=50&departments=0&users=0&flat=1`,
+      owner.token,
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "bad_request" } });
+  });
+
+  it("preserves department users across flat pages after direct users consume part of a page", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/scopes?user_id_type=union_id&department_id_type=open_department_id&page_size=100",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, department_ids: ["od_app"], user_ids: ["on_direct"] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/contact/v3/users/on_direct?user_id_type=union_id", method: "GET" })
+      .reply(200, { code: 0, data: { user: { union_id: "on_direct", name: "Direct User" } } });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od_app&page_size=1",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: true, page_token: "department-next", items: [{ union_id: "on_first", name: "First" }] },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=od_app&page_size=2&page_token=department-next",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ union_id: "on_second", name: "Second" }] },
+      });
+
+    const first = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=2&departments=0&flat=1`,
+      owner.token,
+    );
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as { users: Array<{ id: string }>; next_user_cursor: string };
+    expect(firstBody.users.map((user) => user.id)).toEqual(["on_direct", "on_first"]);
+    expect(firstBody.next_user_cursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+
+    const second = await api(
+      `/api/channels/${slug}/lark-organization?department_id=0&limit=2&departments=0&flat=1&user_cursor=${encodeURIComponent(firstBody.next_user_cursor)}`,
+      owner.token,
+    );
+    expect(second.status).toBe(200);
+    expect(((await second.json()) as { users: Array<{ id: string }> }).users.map((user) => user.id)).toEqual(["on_second"]);
+  });
+
   it("matches English names and email aliases without returning them", async () => {
     const owner = await larkHuman();
     const slug = await createChannel(owner.token);

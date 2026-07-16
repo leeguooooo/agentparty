@@ -72,7 +72,8 @@ describe("Lark directory API", () => {
       }), { status: 200, headers: { "content-type": "application/json" } });
     }) as typeof fetch;
 
-    await browseLarkOrganization("session-token", "private room", "0", 50, null, "flat/cursor", false, true, true);
+    await browseLarkOrganization("session-token", "private room", "od_ignored", 50, null, "flat/cursor", true, true, true);
+    expect(request!.url).toContain("department_id=0");
     expect(request!.url).toContain("departments=0");
     expect(request!.url).toContain("flat=1");
   });

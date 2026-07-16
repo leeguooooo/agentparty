@@ -3678,7 +3678,7 @@ app.get("/api/channels/:slug/lark-organization", async (c) => {
   const flat = url.searchParams.get("flat") === "1";
   if (
     !LARK_DEPARTMENT_ID_RE.test(departmentId) || !Number.isInteger(limit) || limit < 1 || limit > LARK_DIRECTORY_MAX_LIMIT ||
-    (flat && (departmentId !== "0" || includeDepartments)) ||
+    (flat && (departmentId !== "0" || includeDepartments || !includeUsers)) ||
     (departmentCursor !== null && (departmentCursor.length === 0 || departmentCursor.length > 512)) ||
     (userCursor !== null && (userCursor.length === 0 || userCursor.length > (flat ? 1024 : 512)))
   ) {

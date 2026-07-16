@@ -495,7 +495,7 @@ async function scopedLarkDirectorySearch(
       continue;
     }
     if (state.d !== "0") {
-      const page = await directDepartmentUsersPage(env, provider, state.d, pageSize, state.u);
+      const page = await directDepartmentUsersPage(env, provider, state.d, pageSize - users.length, state.u);
       state.u = page.nextPageToken;
       if (state.u === null) state.d = state.a.shift() ?? "0";
       for (const user of page.users) {
