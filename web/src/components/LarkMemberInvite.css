@@ -16,6 +16,72 @@
   gap: 8px;
 }
 
+.lark-org-toggle { justify-self: start; }
+
+.lark-invite-or {
+  margin: 0;
+  color: var(--t-muted);
+  font-size: 12px;
+}
+
+.lark-org-browser {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--t-faint);
+  background: var(--t-panel);
+}
+
+.lark-org-breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.lark-org-breadcrumbs button,
+.lark-org-departments button {
+  border: 0;
+  background: transparent;
+  color: var(--t-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.lark-org-breadcrumbs button {
+  padding: 2px 4px;
+  color: var(--d-blue, var(--t-text));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.lark-org-breadcrumbs button + button::before {
+  margin-right: 6px;
+  color: var(--t-muted);
+  content: "/";
+  text-decoration: none;
+}
+
+.lark-org-departments {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lark-org-departments button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 6px;
+  text-align: left;
+}
+
+.lark-org-departments button:hover { background: var(--t-faint); }
+.lark-org-users { margin-top: 2px; }
+
 .lark-invite-search input {
   min-width: 0;
   height: 34px;

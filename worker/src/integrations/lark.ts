@@ -16,11 +16,18 @@ export interface LarkDirectoryUser {
   identifiers: string[];
   name: string;
   avatarUrl: string | null;
+  searchTerms: string[];
+}
+
+export interface LarkDirectoryDepartment {
+  id: string;
+  name: string;
+  parentId: string;
 }
 
 export class LarkDirectoryError extends Error {
   constructor(
-    readonly kind: "permission" | "invalid_cursor" | "not_found" | "rate_limited" | "upstream",
+    readonly kind: "permission" | "department_permission" | "invalid_cursor" | "not_found" | "rate_limited" | "upstream",
     message: string,
   ) {
     super(message);
@@ -251,9 +258,84 @@ function directoryUsers(data: Record<string, unknown>): LarkDirectoryUser[] {
       : typeof value.avatar_url === "string"
         ? value.avatar_url
         : null;
-    users.push({ id, identifiers, name, avatarUrl });
+    const searchTerms = [value.name, value.en_name, value.nickname, value.email, value.enterprise_email]
+      .filter((term): term is string => typeof term === "string" && term.trim().length > 0)
+      .map((term) => term.trim().toLocaleLowerCase())
+      .filter((term, index, all) => all.indexOf(term) === index);
+    users.push({ id, identifiers, name, avatarUrl, searchTerms });
   }
   return users;
+}
+
+function directoryDepartments(data: Record<string, unknown>): LarkDirectoryDepartment[] {
+  const payload = isRecord(data.data) ? data.data : {};
+  const rows = Array.isArray(payload.items) ? payload.items : [];
+  const departments: LarkDirectoryDepartment[] = [];
+  for (const value of rows) {
+    if (!isRecord(value)) continue;
+    const id = typeof value.open_department_id === "string" ? value.open_department_id.trim() : "";
+    const parentId = typeof value.parent_department_id === "string" ? value.parent_department_id.trim() : "0";
+    const name = typeof value.name === "string" ? value.name.trim() : "";
+    if (DEPARTMENT_ID_RE.test(id) && !name) {
+      throw new LarkDirectoryError("department_permission", "Lark department names are not visible to this app");
+    }
+    if (!DEPARTMENT_ID_RE.test(id) || !DEPARTMENT_ID_RE.test(parentId) || !name) continue;
+    departments.push({ id, parentId, name });
+  }
+  return departments;
+}
+
+export async function browseLarkOrganization(
+  env: EnvLike,
+  provider: LarkProviderConfig,
+  departmentId: string,
+  pageSize: number,
+  departmentPageToken: string | null,
+  userPageToken: string | null,
+  includeDepartments = true,
+  includeUsers = true,
+): Promise<{
+  departments: LarkDirectoryDepartment[];
+  users: LarkDirectoryUser[];
+  nextDepartmentCursor: string | null;
+  nextUserCursor: string | null;
+}> {
+  const departmentParams = new URLSearchParams({
+    department_id_type: "open_department_id",
+    fetch_child: "false",
+    page_size: String(pageSize),
+  });
+  if (departmentPageToken !== null) departmentParams.set("page_token", departmentPageToken);
+  // Both calls share the tenant-token cache. Keep them sequential so a cold cache
+  // cannot race two token exchanges for the same provider.
+  const departmentData = includeDepartments
+    ? await larkDirectoryRequest(
+        env,
+        provider,
+        `/open-apis/contact/v3/departments/${encodeURIComponent(departmentId)}/children?${departmentParams.toString()}`,
+      )
+    : { data: { items: [], has_more: false } };
+  const departments = directoryDepartments(departmentData);
+  const userPage = includeUsers
+    ? await directDepartmentUsersPage(env, provider, departmentId, pageSize, userPageToken)
+    : { users: [], nextPageToken: null };
+  const payload = isRecord(departmentData.data) ? departmentData.data : {};
+  const nextDepartmentCursor = payload.has_more === true && typeof payload.page_token === "string" && payload.page_token
+    ? payload.page_token
+    : null;
+  if (payload.has_more === true && nextDepartmentCursor === null) {
+    throw new LarkDirectoryError("upstream", "Lark omitted the next department cursor");
+  }
+  return {
+    departments,
+    users: userPage.users,
+    nextDepartmentCursor,
+    nextUserCursor: userPage.nextPageToken,
+  };
+}
+
+function matchesDirectoryQuery(user: LarkDirectoryUser, normalizedQuery: string): boolean {
+  return user.searchTerms.some((term) => term.includes(normalizedQuery));
 }
 
 async function nextLarkDepartments(
@@ -407,7 +489,7 @@ async function scopedLarkDirectorySearch(
         scanned += 1;
         if (seen.has(user.id)) continue;
         seen.add(user.id);
-        if (user.name.toLocaleLowerCase().includes(normalizedQuery)) users.push(user);
+        if (matchesDirectoryQuery(user, normalizedQuery)) users.push(user);
       }
       state.i = directUserIds;
       continue;
@@ -420,7 +502,7 @@ async function scopedLarkDirectorySearch(
         scanned += 1;
         if (seen.has(user.id)) continue;
         seen.add(user.id);
-        if (user.name.toLocaleLowerCase().includes(normalizedQuery)) users.push(user);
+        if (matchesDirectoryQuery(user, normalizedQuery)) users.push(user);
         if (users.length >= pageSize || scanned >= DIRECTORY_SCOPE_SCAN_LIMIT) break;
       }
       continue;
@@ -483,7 +565,7 @@ export async function searchLarkDirectory(
       }
       throw error;
     }
-    const users = directoryUsers(data).filter((user) => user.name.toLocaleLowerCase().includes(normalizedQuery));
+    const users = directoryUsers(data).filter((user) => matchesDirectoryQuery(user, normalizedQuery));
     const payload = isRecord(data.data) ? data.data : {};
     const hasMore = payload.has_more === true;
     const pageToken = typeof payload.page_token === "string" && payload.page_token ? payload.page_token : null;

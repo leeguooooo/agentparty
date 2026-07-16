@@ -59,6 +59,19 @@ export interface LarkDirectoryPage {
   next_cursor: string | null;
 }
 
+export interface LarkDepartment {
+  id: string;
+  name: string;
+  parent_id: string;
+}
+
+export interface LarkOrganizationPage {
+  departments: LarkDepartment[];
+  users: LarkDirectoryUser[];
+  next_department_cursor: string | null;
+  next_user_cursor: string | null;
+}
+
 export async function searchLarkDirectory(
   token: string,
   slug: string,
@@ -73,6 +86,28 @@ export async function searchLarkDirectory(
   });
   if (!res.ok) throw await larkDirectoryError(res);
   return (await res.json()) as LarkDirectoryPage;
+}
+
+export async function browseLarkOrganization(
+  token: string,
+  slug: string,
+  departmentId = "0",
+  limit = 50,
+  departmentCursor: string | null = null,
+  userCursor: string | null = null,
+  includeDepartments = true,
+  includeUsers = true,
+): Promise<LarkOrganizationPage> {
+  const params = new URLSearchParams({ department_id: departmentId, limit: String(limit) });
+  if (departmentCursor !== null) params.set("department_cursor", departmentCursor);
+  if (userCursor !== null) params.set("user_cursor", userCursor);
+  if (!includeDepartments) params.set("departments", "0");
+  if (!includeUsers) params.set("users", "0");
+  const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/lark-organization?${params.toString()}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw await larkDirectoryError(res);
+  return (await res.json()) as LarkOrganizationPage;
 }
 
 export async function inviteLarkMember(

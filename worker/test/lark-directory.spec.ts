@@ -76,11 +76,103 @@ describe("Lark organization member invitations (#358)", () => {
     expect(response.status).toBe(200);
     const document = (await response.json()) as { paths: Record<string, unknown> };
     expect(document.paths["/api/channels/{slug}/lark-directory"]).toBeDefined();
+    expect(document.paths["/api/channels/{slug}/lark-organization"]).toBeDefined();
     expect(document.paths["/api/channels/{slug}/lark-members"]).toBeDefined();
     expect(JSON.stringify({
       search: document.paths["/api/channels/{slug}/lark-directory"],
+      organization: document.paths["/api/channels/{slug}/lark-organization"],
       invite: document.paths["/api/channels/{slug}/lark-members"],
     })).not.toMatch(/access.?token/i);
+  });
+
+  it("lets a moderator browse child departments and direct members", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=false&page_size=50",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: {
+          has_more: false,
+          items: [{ open_department_id: "od_app", parent_department_id: "0", name: "APP-Dev" }],
+        },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=50",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ union_id: "on_evan", name: "陈文捷" }] },
+      });
+
+    const response = await api(`/api/channels/${slug}/lark-organization?department_id=0&limit=50`, owner.token);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      departments: [{ id: "od_app", name: "APP-Dev", parent_id: "0" }],
+      users: [{ id: "on_evan", name: "陈文捷", avatar_url: null, already_member: false }],
+      next_department_cursor: null,
+      next_user_cursor: null,
+    });
+  });
+
+  it("reports missing department-name field permission without pretending the organization is empty", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=false&page_size=50",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: { has_more: false, items: [{ open_department_id: "od_app" }] },
+      });
+
+    const response = await api(`/api/channels/${slug}/lark-organization?department_id=0&limit=50&users=0`, owner.token);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: { code: "lark_department_permission_required" },
+    });
+  });
+
+  it("matches English names and email aliases without returning them", async () => {
+    const owner = await larkHuman();
+    const slug = await createChannel(owner.token);
+    mockTenantToken();
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/users/find_by_department?user_id_type=union_id&department_id_type=open_department_id&department_id=0&page_size=20",
+        method: "GET",
+      })
+      .reply(200, {
+        code: 0,
+        data: {
+          has_more: false,
+          items: [{ union_id: "on_evan", name: "陈文捷", en_name: "Evan", email: "evan@example.com" }],
+        },
+      });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({
+        path: "/open-apis/contact/v3/departments/0/children?department_id_type=open_department_id&fetch_child=true&page_size=4",
+        method: "GET",
+      })
+      .reply(200, { code: 0, data: { has_more: false, items: [] } });
+
+    const response = await api(`/api/channels/${slug}/lark-directory?q=evan&limit=20`, owner.token);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      users: [{ id: "on_evan", name: "陈文捷", avatar_url: null, already_member: false }],
+      next_cursor: null,
+    });
+    expect(JSON.stringify(body)).not.toContain("evan@example.com");
   });
 
   it("lets a Lark human moderator search a same-tenant directory page without leaking tokens or sensitive fields", async () => {

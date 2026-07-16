@@ -47,6 +47,66 @@ test("searches and directly invites a Lark organization user", async () => {
   expect(JSON.stringify(renderer!.toJSON())).toContain("Added");
 });
 
+test("browses departments and directly invites a selected organization user", async () => {
+  const browsed: string[] = [];
+  const invited: string[] = [];
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          browse={async (_token, _slug, departmentId) => {
+            const selectedDepartment = departmentId ?? "0";
+            browsed.push(selectedDepartment);
+            return selectedDepartment === "0"
+              ? {
+                  departments: [{ id: "od_app", name: "APP-Dev", parent_id: "0" }],
+                  users: [],
+                  next_department_cursor: null,
+                  next_user_cursor: null,
+                }
+              : {
+                  departments: [],
+                  users: [{ id: "on_evan", name: "陈文捷", avatar_url: null, already_member: false }],
+                  next_department_cursor: null,
+                  next_user_cursor: null,
+                };
+          }}
+          invite={async (_token, _slug, id) => {
+            invited.push(id);
+            return { id, name: "陈文捷", avatar_url: null, already_member: false };
+          }}
+        />
+      </LocaleProvider>,
+    );
+  });
+  await act(async () => renderer!.root.findByProps({ className: "d-btn lark-org-toggle" }).props.onClick());
+  await act(async () => renderer!.root.findByProps({ "data-lark-department-id": "od_app" }).props.onClick());
+  await act(async () => renderer!.root.findByProps({ "data-lark-user-id": "on_evan" }).props.onClick());
+  expect(browsed).toEqual(["0", "od_app"]);
+  expect(invited).toEqual(["on_evan"]);
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Added");
+});
+
+test("keeps name search available when department-name permission is missing", async () => {
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <LarkMemberInvite
+          slug="room"
+          token="token"
+          browse={async () => { throw new LarkDirectoryApiError("missing field", 503, "lark_department_permission_required", null); }}
+        />
+      </LocaleProvider>,
+    );
+  });
+  await act(async () => renderer!.root.findByProps({ className: "d-btn lark-org-toggle" }).props.onClick());
+  expect(renderer!.root.findAllByType("form")).toHaveLength(1);
+  expect(renderer!.root.findByProps({ role: "status" }).children.join("")).toContain("Department names are not enabled");
+  expect(renderer!.root.findByProps({ className: "d-btn lark-org-toggle" }).props.disabled).toBe(true);
+});
+
 test("renders Chinese labels and a contact-permission error", async () => {
   localStorage.setItem("ap_locale", "zh");
   act(() => {

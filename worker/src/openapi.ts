@@ -360,6 +360,30 @@ export const openapiDocument = {
         },
       },
     },
+    "/api/channels/{slug}/lark-organization": {
+      get: {
+        summary: "browse same-tenant Lark departments and direct members",
+        security: [{ bearer: [] }],
+        description: "Returns the direct child departments and direct users of one department so the channel moderator can navigate the organization tree and select a person without knowing their searchable name.",
+        parameters: [
+          { name: "slug", in: "path", required: true, schema: { type: "string" } },
+          { name: "department_id", in: "query", schema: { type: "string", default: "0", maxLength: 64 } },
+          { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 50, default: 50 } },
+          { name: "department_cursor", in: "query", schema: { type: "string", maxLength: 512 } },
+          { name: "user_cursor", in: "query", schema: { type: "string", maxLength: 512 } },
+          { name: "departments", in: "query", description: "set to 0 when paginating only users", schema: { type: "string", enum: ["0"] } },
+          { name: "users", in: "query", description: "set to 0 when paginating only departments", schema: { type: "string", enum: ["0"] } },
+        ],
+        responses: {
+          "200": { description: "{departments:[{id,name,parent_id}],users:[{id,name,avatar_url,already_member}],next_department_cursor,next_user_cursor}" },
+          "400": { description: "invalid department id, limit, or cursor" },
+          "403": { description: "not a same-tenant Lark human moderator" },
+          "404": { description: "channel not found" },
+          "429": { description: "per-account directory request limit reached; Retry-After included" },
+          "503": { description: "directory unavailable: lark_contact_permission_required when contact access is missing, or lark_department_permission_required when department name fields are missing" },
+        },
+      },
+    },
     "/api/channels/{slug}/lark-members": {
       post: {
         summary: "directly invite a same-tenant Lark user as a channel member",

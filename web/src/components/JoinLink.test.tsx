@@ -36,6 +36,12 @@ mock.module("../lib/api", () => ({
     return { id, state: body.action === "approve" ? "approved" : "rejected" };
   },
   searchLarkDirectory: async () => ({ users: [], next_cursor: null }),
+  browseLarkOrganization: async () => ({
+    departments: [],
+    users: [],
+    next_department_cursor: null,
+    next_user_cursor: null,
+  }),
   inviteLarkMember: async () => ({ id: "", name: "", avatar_url: null, already_member: true }),
   revokeJoinLink: async () => {},
   revokeShareLink: async () => {},

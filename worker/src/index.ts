@@ -84,6 +84,7 @@ import {
   parseManagementAuditPagination,
 } from "./management-audit";
 import {
+  browseLarkOrganization,
   buildMentionCard,
   getLarkDirectoryUser,
   inferReceiveIdType,
@@ -352,6 +353,7 @@ const JOIN_REQUEST_REASON_MAX = 2000;
 const LARK_DIRECTORY_QUERY_MAX = 64;
 const LARK_DIRECTORY_MAX_LIMIT = 50;
 const LARK_DIRECTORY_SEARCHES_PER_MINUTE = 10;
+const LARK_DEPARTMENT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_\-@.]{0,63}$/;
 const PROJECT_AGENT_RUNNERS = ["codex", "claude", "codex-sdk", "shell"] as const;
 const PROJECT_AGENT_WORKTREE = ["branch", "shared", "none"] as const;
 const PROJECT_AGENT_INVITABLE = ["owner", "org", "anyone"] as const;
@@ -3612,6 +3614,92 @@ app.get("/api/channels/:slug/lark-directory", async (c) => {
     if (error instanceof LarkDirectoryError) {
       if (error.kind === "permission") return c.json(errorBody("lark_contact_permission_required", "Lark contact permission is not enabled"), 503);
       if (error.kind === "invalid_cursor") return c.json(errorBody("bad_request", "Lark directory cursor is invalid"), 400);
+      if (error.kind === "rate_limited") return c.json(errorBody("unavailable", "Lark directory is rate limited"), 503);
+    }
+    return c.json(errorBody("unavailable", "Lark directory is unavailable"), 503);
+  }
+});
+
+app.get("/api/channels/:slug/lark-organization", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (identity.kind !== "human" || identity.account == null || !isChannelModerator(identity, channel)) {
+    return c.json(errorBody("forbidden", "only a Lark human moderator can browse the organization directory"), 403);
+  }
+  const profile = await c.env.DB.prepare(
+    "SELECT provider, tenant_key FROM account_profiles WHERE account = ?",
+  ).bind(identity.account).first<{ provider: string | null; tenant_key: string | null }>();
+  const provider = profile?.provider == null
+    ? undefined
+    : parseAuthProviders(c.env).find((candidate) => candidate.id === profile.provider);
+  if (
+    provider === undefined || (provider.kind !== "lark" && provider.kind !== "feishu") ||
+    profile?.tenant_key == null || provider.tenantKey == null || profile.tenant_key !== provider.tenantKey
+  ) {
+    return c.json(errorBody("forbidden", "Lark tenant does not match the configured organization"), 403);
+  }
+  const url = new URL(c.req.url);
+  const departmentId = (url.searchParams.get("department_id") ?? "0").trim();
+  const limitRaw = url.searchParams.get("limit");
+  const limit = limitRaw === null ? 50 : Number(limitRaw);
+  const departmentCursor = url.searchParams.get("department_cursor");
+  const userCursor = url.searchParams.get("user_cursor");
+  const includeDepartments = url.searchParams.get("departments") !== "0";
+  const includeUsers = url.searchParams.get("users") !== "0";
+  if (
+    !LARK_DEPARTMENT_ID_RE.test(departmentId) || !Number.isInteger(limit) || limit < 1 || limit > LARK_DIRECTORY_MAX_LIMIT ||
+    (departmentCursor !== null && (departmentCursor.length === 0 || departmentCursor.length > 512)) ||
+    (userCursor !== null && (userCursor.length === 0 || userCursor.length > 512))
+  ) {
+    return c.json(errorBody("bad_request", "department_id, limit, or cursor is invalid"), 400);
+  }
+  const retryAfter = await consumeLarkDirectorySearchLimit(c.env.DB, identity.account);
+  if (retryAfter > 0) {
+    return c.json(errorBody("rate_limited", "too many Lark directory requests"), 429, { "retry-after": String(retryAfter) });
+  }
+  try {
+    const page = await browseLarkOrganization(
+      c.env,
+      provider,
+      departmentId,
+      limit,
+      departmentCursor,
+      userCursor,
+      includeDepartments,
+      includeUsers,
+    );
+    const profiles = await c.env.DB.prepare(
+      "SELECT account, provider_user_id FROM account_profiles WHERE provider = ? AND tenant_key = ?",
+    ).bind(provider.id, profile.tenant_key).all<{ account: string; provider_user_id: string | null }>();
+    const knownAccounts = new Map(
+      profiles.results.filter((row) => row.provider_user_id !== null).map((row) => [row.provider_user_id!, row.account]),
+    );
+    const members = new Set((await c.env.DB.prepare(
+      "SELECT account FROM channel_members WHERE channel_slug = ?",
+    ).bind(slug).all<{ account: string }>()).results.map((row) => row.account));
+    return c.json({
+      departments: page.departments.map((department) => ({
+        id: department.id,
+        name: department.name,
+        parent_id: department.parentId,
+      })),
+      users: page.users.map((user) => {
+        const account = user.identifiers.map((identifier) => knownAccounts.get(identifier)).find((known) => known !== undefined)
+          ?? directoryAccount(provider.id, user.id);
+        return { id: user.id, name: user.name, avatar_url: user.avatarUrl, already_member: account !== null && members.has(account) };
+      }),
+      next_department_cursor: page.nextDepartmentCursor,
+      next_user_cursor: page.nextUserCursor,
+    });
+  } catch (error) {
+    if (error instanceof LarkDirectoryError) {
+      if (error.kind === "department_permission") {
+        return c.json({ error: { code: "lark_department_permission_required", message: "Lark department basic information permission is not enabled" } }, 503);
+      }
+      if (error.kind === "permission") return c.json(errorBody("lark_contact_permission_required", "Lark contact permission is not enabled"), 503);
+      if (error.kind === "invalid_cursor") return c.json(errorBody("bad_request", "Lark organization cursor is invalid"), 400);
       if (error.kind === "rate_limited") return c.json(errorBody("unavailable", "Lark directory is rate limited"), 503);
     }
     return c.json(errorBody("unavailable", "Lark directory is unavailable"), 503);

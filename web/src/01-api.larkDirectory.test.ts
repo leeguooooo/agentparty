@@ -1,7 +1,7 @@
 // @ts-expect-error Bun executes this test, while the web tsconfig intentionally loads only Vite globals.
 import { afterEach, describe, expect, test } from "bun:test";
 // Run before component suites because Bun's process-global module mocks replace lib/api later.
-import { inviteLarkMember, searchLarkDirectory } from "./lib/api";
+import { browseLarkOrganization, inviteLarkMember, searchLarkDirectory } from "./lib/api";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -37,5 +37,25 @@ describe("Lark directory API", () => {
     const rawBody = await request!.clone().text();
     expect(await request!.json()).toEqual({ user_id: "on_alice" });
     expect(rawBody).not.toMatch(/access.?token|tenant/i);
+  });
+
+  test("encodes organization browsing and independent pagination", async () => {
+    let request: Request | null = null;
+    globalThis.fetch = (async (input, init) => {
+      request = new Request(new URL(String(input), "https://web.test"), init);
+      return new Response(JSON.stringify({
+        departments: [{ id: "od_app", name: "APP-Dev", parent_id: "0" }],
+        users: [],
+        next_department_cursor: null,
+        next_user_cursor: null,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    await browseLarkOrganization("session-token", "private room", "od_app", 50, null, "users/next", false, true);
+    expect(request!.url).toContain("/api/channels/private%20room/lark-organization?");
+    expect(request!.url).toContain("department_id=od_app");
+    expect(request!.url).toContain("user_cursor=users%2Fnext");
+    expect(request!.url).toContain("departments=0");
+    expect(request!.headers.get("authorization")).toBe("Bearer session-token");
   });
 });
