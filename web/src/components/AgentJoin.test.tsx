@@ -16,6 +16,8 @@ mock.module("../lib/api", () => ({
 
 mock.module("../lib/agentTokenVault", () => ({
   copyText: async () => true,
+  MIN_CLI: "0.2.124",
+  VERSION_GE_SNIPPET: "version_ge(){ :; }",
   mcpServerName: (agentName: string) => `party-${agentName.replace(/[^a-zA-Z0-9_-]/g, "-")}`,
   saveAgentToken: (record: { name: string; token: string; command: string }) => savedAgents.push(record),
 }));

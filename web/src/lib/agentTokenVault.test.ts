@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildMinimalAgentCommand, mcpServerName } from "./agentTokenVault";
+import { buildMinimalAgentCommand, mcpServerName, MIN_CLI } from "./agentTokenVault";
 
 describe("buildMinimalAgentCommand", () => {
   test("stores the agent config in a persistent per-agent directory", () => {
@@ -59,9 +59,28 @@ describe("buildMinimalAgentCommand", () => {
     expect(command).toContain("Non-MCP harnesses: keep using the party CLI with the AGENTPARTY_CONFIG prefix");
   });
 
-  test("mcpServerName：名字里 NAME_RE 允许的 `.` 要消毒成 `-`（Codex TOML 键等处不安全）", () => {
+  test("mcpServerName：`.` 消毒成 `-`，且消毒必须单射——a.b 与 a-b 不得同名（否则同目录注册互相覆盖=串号）", () => {
     expect(mcpServerName("desktop-worker")).toBe("party-desktop-worker");
-    expect(mcpServerName("leo.g_2")).toBe("party-leo-g_2");
+    // 有损清洗追加原名短哈希；无损名字保持干净、稳定。
+    expect(mcpServerName("leo.g_2")).toMatch(/^party-leo-g_2-[0-9a-z]+$/);
+    expect(mcpServerName("a.b")).not.toBe(mcpServerName("a-b"));
+    expect(mcpServerName("a-b")).toBe("party-a-b");
+    expect(mcpServerName("a.b")).toBe(mcpServerName("a.b"));
+  });
+
+  test("桌面最小接入包带 MIN_CLI 版本闸：只查 command -v 会放过装着旧版、缺 MCP 工具的机器", () => {
+    const command = buildMinimalAgentCommand({
+      server: "https://agentparty.example.com",
+      slug: "release-room",
+      name: "desktop-worker",
+      token: "ap_fixture",
+      inviterName: "leo",
+      checkinMessage: "checking in",
+    });
+    expect(command).toContain("version_ge(){ awk");
+    expect(command).toContain(`need=${MIN_CLI}; have=`);
+    expect(command).toContain('version_ge "$have" "$need" || curl -fsSL');
+    expect(command).not.toContain("command -v party >/dev/null || curl");
   });
 
   test("#530 桌面接入包：把传入的真实后端 server 原样写进 party init --server", () => {

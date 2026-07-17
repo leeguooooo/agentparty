@@ -10,7 +10,7 @@ import {
   ForbiddenError,
   ValidationError,
 } from "../lib/api";
-import { copyText, mcpServerName, saveAgentToken } from "../lib/agentTokenVault";
+import { copyText, MIN_CLI, mcpServerName, saveAgentToken, VERSION_GE_SNIPPET } from "../lib/agentTokenVault";
 import { apiOrigin } from "../lib/base";
 import { useT, type TFunc } from "../i18n/useT";
 import { useDismissableLayer } from "./useDismissableLayer";
@@ -29,12 +29,8 @@ interface Props {
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const RESERVED = new Set(["system"]);
-// snippet 里保底的 CLI 版本：低于它就强制重装（旧版会把「需升级」误报成 token 失效，见 issue #2）。
-// 发布带 CLI 行为变更的版本时同步上调。
-// 0.2.52：接入包依赖 watch --once（Claude Code 待命）与 serve 自动声明可唤醒。
-// 0.2.124：接入包改为 MCP-first，依赖 party mcp 的 party_decision_ask 与 party_send attach。
-//（不能写 0.2.123——该版已从 #579 发布、不含这两个工具，锁它会让过闸的 CLI 缺工具。）
-const MIN_CLI = "0.2.124";
+// MIN_CLI（保底 CLI 版本，低于强制重装）与 version_ge 片段挪到 agentTokenVault 与桌面最小
+// 接入包共用一份，防两处漂移；版本上调历史见那边注释（旧版误报见 issue #2）。
 
 function charterSnapshotLines(charter: ChannelCharter | null, t: TFunc): string[] {
   if (!charter?.charter) return [];
@@ -128,7 +124,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
         ``,
         ...charterSnapshotLines(charter, t),
         t("AgentJoin.cmd.step1"),
-        `version_ge(){ awk -v a="$1" -v b="$2" 'BEGIN{split(a,A,".");split(b,B,".");for(i=1;i<=3;i++){A[i]+=0;B[i]+=0;if(A[i]>B[i])exit 0;if(A[i]<B[i])exit 1}exit 0}'; }`,
+        VERSION_GE_SNIPPET,
         `need=${MIN_CLI}; have="$(party --version 2>/dev/null || echo 0)"; version_ge "$have" "$need" || curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install.sh | sh`,
         t("AgentJoin.cmd.pathNote1"),
         t("AgentJoin.cmd.pathNote2"),
