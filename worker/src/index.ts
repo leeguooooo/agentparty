@@ -3261,12 +3261,16 @@ async function ensureLarkNotifySubscription(
   );
   if (!doRes.ok) return "skipped";
   const now = Date.now();
-  await env.DB.prepare(
+  // 原子化（#604 评审）：入口的 optout 检查和这次写入之间，用户可能显式退订——把 NOT EXISTS
+  // 放进同一条 INSERT，D1 单语句原子，晚到的自动入册绝不压过刚落的退订；被跳过时回收 DO webhook。
+  const inserted = await env.DB.prepare(
     `INSERT INTO lark_notify_subscriptions (
        channel_slug, account, target_name, provider_id, provider_kind,
        receive_id, receive_id_type, secret, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(channel_slug, account) DO NOTHING`,
+     )
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (SELECT 1 FROM lark_notify_optouts WHERE channel_slug = ? AND account = ?)
+        AND NOT EXISTS (SELECT 1 FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?)`,
   )
     .bind(
       slug,
@@ -3279,8 +3283,23 @@ async function ensureLarkNotifySubscription(
       secret,
       now,
       now,
+      slug,
+      account,
+      slug,
+      account,
     )
     .run();
+  if (inserted.meta.changes === 0) {
+    await fetchChannelDO(
+      env,
+      slug,
+      new Request(`https://do/internal/webhooks?name=${encodeURIComponent(profile.handle)}`, {
+        method: "DELETE",
+        headers: { "x-partykit-room": slug },
+      }),
+    ).catch(() => null);
+    return "skipped";
+  }
   return "created";
 }
 

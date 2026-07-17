@@ -126,6 +126,16 @@ describe("lark notification integration", () => {
     expect(await webhookRows(slug)).toEqual([]);
   });
 
+  async function waitFor<T>(probe: () => Promise<T | null>, timeoutMs = 2000): Promise<T | null> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const value = await probe();
+      if (value !== null) return value;
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
   it("#595: adding a lark member auto-enrolls the mention subscription (idempotent, optout respected)", async () => {
     const ownerAccount = `lark-email:${uniq("owner")}@example.com`;
     await seedLarkProfile(ownerAccount, "larkowner");
@@ -137,10 +147,10 @@ describe("lark notification integration", () => {
     // 被拉进频道 → waitUntil 自动入册。
     const add = await api(`/api/channels/${slug}/members/${encodeURIComponent(memberAccount)}`, owner.token, { method: "PUT" });
     expect(add.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const sub = await env.DB.prepare(
+    // waitUntil 的落库时机不保证：条件轮询而非固定 sleep（评审意见）。
+    const sub = await waitFor(() => env.DB.prepare(
       "SELECT target_name FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?",
-    ).bind(slug, memberAccount).first<{ target_name: string }>();
+    ).bind(slug, memberAccount).first<{ target_name: string }>());
     expect(sub?.target_name).toBe(memberProfile.handle);
     expect((await webhookRows(slug)).some((row) => row.name === memberProfile.handle)).toBe(true);
 
@@ -148,11 +158,11 @@ describe("lark notification integration", () => {
     const member = await seedToken("human", uniq("member"), { owner: memberAccount });
     expect((await api(`/api/channels/${slug}/lark-notify`, member.token, { method: "DELETE" })).status).toBe(200);
     expect((await api(`/api/channels/${slug}/members/${encodeURIComponent(memberAccount)}`, owner.token, { method: "PUT" })).status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const after = await env.DB.prepare(
+    // 负向断言没有「落库事件」可等：等一个足以让 waitUntil 完成的窗口（轮询确认始终为空）。
+    const reappeared = await waitFor(() => env.DB.prepare(
       "SELECT 1 FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?",
-    ).bind(slug, memberAccount).first();
-    expect(after).toBeNull();
+    ).bind(slug, memberAccount).first(), 300);
+    expect(reappeared).toBeNull();
 
     // 手动重新开启 → optout 撤销。
     expect((await api(`/api/channels/${slug}/lark-notify`, member.token, { method: "POST" })).status).toBe(201);

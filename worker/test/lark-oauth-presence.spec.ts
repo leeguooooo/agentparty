@@ -14,6 +14,44 @@ afterEach(() => fetchMock.assertNoPendingInterceptors());
 afterAll(() => fetchMock.deactivate());
 
 describe("Lark OAuth human presence (#527)", () => {
+  it("#595: OAuth 登录自动把成员频道的 @ 通知入册（waitUntil 落库）", async () => {
+    const openId = uniq("on_enroll");
+    // 账号形状 = directoryAccount(providerId, openId) = "<providerId>:<openId>"。
+    const account = `lark-main:${openId}`;
+    // 预置成员关系与 handle（模拟老成员回来登录）；登录回调应触发 autoEnrollLarkNotify。
+    const owner = await seedToken("human", uniq("human"), { owner: `lark-email:${uniq("o")}@example.com` });
+    const slug = await createChannel(owner.token);
+    await env.DB.prepare(
+      "INSERT INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, 'test', ?)",
+    ).bind(slug, account, Date.now()).run();
+
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/authen/v2/oauth/token", method: "POST" })
+      .reply(200, { code: 0, access_token: "oauth-user-token", expires_in: 3600 });
+    fetchMock.get(LARK_ORIGIN)
+      .intercept({ path: "/open-apis/authen/v1/user_info", method: "GET" })
+      .reply(200, {
+        code: 0,
+        data: { open_id: openId, name: "Enroll User", tenant_key: "tenant-test" },
+      });
+    const callback = await SELF.fetch("http://ap.test/api/auth/lark-main/callback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "oauth-code", redirect_uri: "https://app.example/callback" }),
+    });
+    expect(callback.status).toBe(200);
+
+    const deadline = Date.now() + 2000;
+    let sub: { target_name: string } | null = null;
+    while (sub === null && Date.now() < deadline) {
+      sub = await env.DB.prepare(
+        "SELECT target_name FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?",
+      ).bind(slug, account).first<{ target_name: string }>();
+      if (sub === null) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(sub).not.toBeNull();
+  });
+
   it("keeps a no-email Lark profile across first join, reconnect, messages, and a new channel", async () => {
     const openId = uniq("on_profile");
     const displayName = "Lark Profile User";
