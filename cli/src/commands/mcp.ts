@@ -8,6 +8,7 @@ import { stripTerminalControls } from "../format";
 import pkg from "../../package.json" with { type: "json" };
 import {
   advanceCursorPastOwnMessage,
+  clearStuck,
   loadCursor,
   loadRevCursor,
   loadStuck,
@@ -40,7 +41,7 @@ import { isName, isSlug } from "../validation";
 import { askDecision } from "./decision";
 import { uploadAttachmentPaths } from "./send";
 import { buildContext } from "./status";
-import { runWatch } from "./watch";
+import { EXIT_ALREADY_WATCHING, runWatch } from "./watch";
 
 const HELP = `usage: party mcp
 
@@ -78,6 +79,7 @@ Tools:
   task_block
   party_spawn_worker
   party_watch_once
+  party_ack         (clear a watch wake that needs no reply, #594)
   party_wake_test
 
 Resources:
@@ -1050,7 +1052,24 @@ export function createMcpServer(defaultChannel?: string): McpServer {
           onRevCursor: (r) => saveRevCursor(resolved, r),
           out: (line) => lines.push(line),
         });
-        const frames = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+        const frames = lines.map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            // json 模式下仍可能混入人类可读提示（如单实例冲突）；保留为文本帧，别让整个结果炸掉。
+            return { type: "text", text: line };
+          }
+        });
+        // #596：单 watcher 冲突对 MCP 调用方是可编程状态，不是不可解析的散文。
+        if (code === EXIT_ALREADY_WATCHING) {
+          return {
+            ...fail(
+              `another watcher already holds #${resolved} (likely a CLI \`party watch\` in a terminal). ` +
+                "Wait for it to exit or kill it; a second concurrent watcher would double-fire every @.",
+            ),
+            structuredContent: { type: "watch_once", channel: resolved, exit_code: code, reason: "watcher_conflict", frames },
+          };
+        }
         // 同 replay 路径：唤醒返回帧带缓存化的升级提示（probe:false，零额外网络）。
         const liveUpgrade = await mcpUpgradeNotice(cfg.server, {}, { probe: false });
         const data = {
@@ -1061,6 +1080,39 @@ export function createMcpServer(defaultChannel?: string): McpServer {
           ...(liveUpgrade !== null ? { cli_upgrade: liveUpgrade } : {}),
         };
         return code === 0 ? ok(data) : { ...fail(lines.join("\n") || `watch_once failed with exit ${code}`), structuredContent: data };
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "party_ack",
+    {
+      title: "Acknowledge a watch wake that needs no reply",
+      description:
+        "Clear the pending watch wake debt without posting a message (#594). Use after party_watch_once delivered a frame that warrants no reply — replying with empty acks burns the loop guard; leaving the debt makes every later watch replay the same frame. Serve-owned debt is never touched.",
+      inputSchema: {
+        channel: z.string().optional().describe("Channel slug. Defaults to the workspace-bound channel."),
+        seq: z.number().int().positive().optional().describe("Only ack if the pending debt is exactly this seq."),
+      },
+    },
+    async ({ channel, seq }) => {
+      try {
+        const resolved = normalizeChannel(channel, defaultChannel);
+        const stuck = loadStuck(resolved);
+        if (stuck === null) return ok({ type: "ack", channel: resolved, acked: false, note: "no pending wake debt" });
+        if (stuck.source !== "watch") {
+          return fail(
+            `refusing to ack: pending debt at seq=${stuck.seq} is owned by party serve (source=${stuck.source}); ` +
+              "serve replays it durably — clearing it by hand would silently drop that @",
+          );
+        }
+        if (seq !== undefined && stuck.seq !== seq) {
+          return fail(`refusing to ack: pending watch debt is seq=${stuck.seq}, not seq=${seq}`);
+        }
+        clearStuck(resolved);
+        return ok({ type: "ack", channel: resolved, acked: true, seq: stuck.seq });
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       }
@@ -1150,6 +1202,9 @@ export async function run(argv: string[]): Promise<number> {
     console.error("usage: party mcp [--channel C]");
     return 1;
   }
+  // #596：stdio 模式下 stdout 是 JSON-RPC 信道。任何库/命令路径的 console.log（如 watch 的
+  // 单实例冲突提示）落到 stdout 都会把客户端的解析打碎成 "JSON Parse error"。统一改道 stderr。
+  console.log = (...args: unknown[]) => console.error(...args);
   const server = createMcpServer(defaultChannel);
   await server.connect(new StdioServerTransport());
   return new Promise<number>((resolve) => {

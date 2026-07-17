@@ -278,9 +278,12 @@ export async function runWatch(o: WatchOptions): Promise<number> {
   // Only the single-shot watcher whose caller can persist and acknowledge directed debt is an
   // actionable v1 adapter. Declare this in the first hello so the Worker never has to guess in the
   // welcome -> register window; observers deliberately omit the capability.
+  // #598：mentionsOnly 不是必要条件——非 mentions-only 的 --once watcher 同样接了完整的
+  // debt 回调（directed 帧本就是 @self 的 mention，两种过滤都匹配）；把它留在条件里会让
+  // `party watch <slug> --once` 在存在 pending durable delivery 时被服务端 upgrade_required
+  // 硬闭，而 latest CLI 明明有能力处理。
   const acceptsDirectedDelivery =
     o.once === true &&
-    o.mentionsOnly &&
     o.onStuck !== undefined &&
     o.onDirectedAccepted !== undefined;
   // 先抢锁，再连服务端：第二个 watcher 连 WS 都不该建，否则它已经开始消费 @ 了（#195）
@@ -537,6 +540,14 @@ export async function runWatch(o: WatchOptions): Promise<number> {
           out(JSON.stringify(jsonFrame({ ...frame, retryable: false, ts: nowTs() })));
         }
         else console.error(terminalOutput(`error: ${frame.code} ${frame.message}`));
+        if (frame.message.startsWith("upgrade_required: durable")) {
+          // #598：别让 upgrade_required 指向死路——说明哪种姿势能接住 durable delivery。
+          console.error(terminalOutput(
+            "hint: durable directed delivery needs an actionable adapter — run `party watch <channel> --once`" +
+              " (CLI >= 0.2.127), or `party serve`; --follow observers cannot attach while a directed delivery" +
+              " is pending for this identity.",
+          ));
+        }
         if (frame.code === "unauthorized") code = EXIT_AUTH;
         else if (frame.code === "loop_guard") code = EXIT_LOOP_GUARD;
         else if (frame.code === "archived") code = EXIT_ARCHIVED;
@@ -806,7 +817,7 @@ export async function run(argv: string[]): Promise<number> {
                 : "") +
               `channel_last_seq=${channelLastSeq} lag=${lag} ` +
               `skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}; ` +
-              `send a reply/status after handling it to clear this debt.` +
+              `send a reply/status after handling it to clear this debt (or \`party ack\` if it needs no response).` +
               (lag > 0 ? ` 补上下文：party history ${channel} --since ${stuck.seq}` : ""),
           ));
           console.log(formatMsg(pending));

@@ -26,6 +26,7 @@ commands:
   retract   <seq> [--channel C] [--json]
   supersede <seq> <text|-> [--channel C] [--json]
   watch     [channel|--channel C] [--timeout N] [--mentions-only] [--follow] [--json]
+  ack       [--channel C] [--seq N]                acknowledge a watch wake that needs no reply (#594)
   serve     [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude|codex-sdk) [--all] | --profile owner/handle
   mcp                                                structured control plane (not an idle wake provider)
   lark      notify on|off|status [--channel C]       send channel @mentions to your Lark/Feishu account
@@ -99,6 +100,8 @@ export async function main(argv: string[]): Promise<number> {
       return (await import("./commands/revise")).run(cmd, rest);
     case "watch":
       return (await import("./commands/watch")).run(rest);
+    case "ack":
+      return (await import("./commands/ack")).run(rest);
     case "serve":
       return (await import("./commands/serve")).run(rest);
     case "mcp":
