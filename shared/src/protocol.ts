@@ -553,8 +553,10 @@ export function parseAgentActivity(input: unknown): AgentActivity | undefined {
   const value = input as Record<string, unknown>;
   if (!AGENT_ACTIVITY_PHASES.includes(value.phase as AgentActivityPhase)) return undefined;
   if (typeof value.ts !== "number" || !Number.isSafeInteger(value.ts) || value.ts < 0) return undefined;
+  // tool 只在 tool / waiting_permission 阶段有意义（见 AgentActivity 注释）；其余阶段丢字段留活动，兼容旧客户端。
+  const allowsTool = value.phase === "tool" || value.phase === "waiting_permission";
   const tool =
-    typeof value.tool === "string" && value.tool.length > 0
+    allowsTool && typeof value.tool === "string" && value.tool.length > 0
       ? // eslint-disable-next-line no-control-regex
         value.tool.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, 64)
       : undefined;

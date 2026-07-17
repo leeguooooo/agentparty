@@ -190,3 +190,17 @@ describe("claudeHookSettingsJson", () => {
     expect(settings.hooks.Stop[0]!.hooks[0]!.command).toBe("party hook report");
   });
 });
+
+// tool 字段只在 tool / waiting_permission 阶段有意义（协议约定）：其余阶段丢字段保留活动。
+import { parseAgentActivity } from "@agentparty/shared";
+describe("parseAgentActivity phase-gated tool", () => {
+  test("drops tool on phases that do not allow it, keeps the activity", () => {
+    expect(parseAgentActivity({ phase: "idle", tool: "Bash", ts: 1 })).toEqual({ phase: "idle", ts: 1 });
+    expect(parseAgentActivity({ phase: "tool", tool: "Bash", ts: 1 })).toEqual({ phase: "tool", tool: "Bash", ts: 1 });
+    expect(parseAgentActivity({ phase: "waiting_permission", tool: "Bash", ts: 1 })).toEqual({
+      phase: "waiting_permission",
+      tool: "Bash",
+      ts: 1,
+    });
+  });
+});
