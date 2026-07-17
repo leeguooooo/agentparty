@@ -4668,7 +4668,10 @@ export class ChannelDO extends Server<Env> {
     try {
       return await this.onRequestImpl(request);
     } catch (err) {
-      logDoException("onRequest", this.name, err, `${request.method} ${new URL(request.url).pathname}`);
+      // 只记路由族（第一段静态前缀，如 api/internal）+ method，不落完整 pathname——动态段可能含
+      // agent 名等标识（/internal/identity/{name}/…），即便编码也可还原。真正定位靠 stack。
+      const family = new URL(request.url).pathname.split("/").filter(Boolean)[0] ?? "";
+      logDoException("onRequest", this.name, err, `${request.method} /${family}/…`);
       throw err;
     }
   }
