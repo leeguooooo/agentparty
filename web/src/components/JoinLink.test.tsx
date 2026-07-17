@@ -7,6 +7,9 @@ import { LocaleProvider } from "../i18n/locale";
 //   participate → createJoinLink，watch → createShareLink。整体桩掉 ../lib/api，不打网络。
 const joinCalls: Array<{ slug: string }> = [];
 const shareCalls: Array<{ slug: string }> = [];
+const externalCalls: Array<{ slug: string; handle: string }> = [];
+const externalRevokeCalls: Array<{ code: string }> = [];
+let externalInvitesList: Array<Record<string, unknown>> = [];
 const reviewCalls: Array<{ id: string | number; body: { action: "approve" } | { action: "reject"; reason: string } }> = [];
 let pendingRequests: Array<{ id: string | number; state: string; requester_name: string; requester_handle?: string; note: string | null }> = [];
 let pendingError: Error | null = null;
@@ -47,6 +50,25 @@ mock.module("../lib/api", () => ({
   removeLarkMember: async () => {},
   revokeJoinLink: async () => {},
   revokeShareLink: async () => {},
+  createExternalInvite: mock(async (_token: string, slug: string, opts: { handle: string }) => {
+    externalCalls.push({ slug, handle: opts.handle });
+    return {
+      code: "ext123",
+      url: "https://x/invite/ext123",
+      channel_slug: slug,
+      preset_handle: opts.handle,
+      created_by: "o",
+      created_at: 0,
+      expires_at: null,
+      redeemed_by: null,
+      redeemed_at: null,
+      revoked_at: null,
+    };
+  }),
+  listExternalInvites: async () => externalInvitesList,
+  revokeExternalInvite: async (_token: string, _slug: string, code: string) => {
+    externalRevokeCalls.push({ code });
+  },
 }));
 
 const { JoinLink } = await import("./JoinLink");
@@ -82,6 +104,9 @@ class TestEventTarget {
 beforeEach(() => {
   joinCalls.length = 0;
   shareCalls.length = 0;
+  externalCalls.length = 0;
+  externalRevokeCalls.length = 0;
+  externalInvitesList = [];
   reviewCalls.length = 0;
   pendingRequests = [
     { id: "jr_1", state: "pending", requester_name: "Alice", requester_handle: "alice", note: "I can help" },
@@ -175,6 +200,85 @@ describe("JoinLink invite mode selector", () => {
     await act(async () => {});
     expect(shareCalls).toEqual([{ slug: "devchan" }]);
     expect(joinCalls).toEqual([]);
+  });
+
+  // #593 外部协作者：昵称必填且合法才可生成；生成走 createExternalInvite 而非另两条通道
+  test("external mode requires a valid nickname, then wires generate into createExternalInvite", async () => {
+    const r = render();
+    const externalRadio = r.root.findAll((n) => n.type === "input" && n.props.value === "external")[0]!;
+    await act(async () => {
+      (externalRadio.props.onChange as () => void)();
+    });
+    const primary = () =>
+      r.root.findAll((n) => n.type === "button" && String(n.props.className ?? "").includes("d-btn--primary"))[0]!;
+    // 昵称为空 → 生成按钮禁用
+    expect(primary().props.disabled).toBe(true);
+
+    const nicknameInput = r.root.findAll(
+      (n) => n.type === "input" && String(n.props.className ?? "").includes("joinlink-nickname-input"),
+    )[0]!;
+    await act(async () => {
+      (nicknameInput.props.onChange as (e: unknown) => void)({ target: { value: "中文" } });
+    });
+    expect(primary().props.disabled).toBe(true); // 非 ASCII handle 不放行
+
+    await act(async () => {
+      (nicknameInput.props.onChange as (e: unknown) => void)({ target: { value: "alice" } });
+    });
+    expect(primary().props.disabled).toBe(false);
+    clickPrimary(r);
+    await act(async () => {});
+    expect(externalCalls).toEqual([{ slug: "devchan", handle: "alice" }]);
+    expect(joinCalls).toEqual([]);
+    expect(shareCalls).toEqual([]);
+  });
+
+  // #593：pending 邀请可复制/撤销；已兑换的只留档（不可复制、不可撤销）
+  test("external list shows pending invites with revoke, redeemed ones as archive", async () => {
+    externalInvitesList = [
+      {
+        code: "pend01",
+        url: "https://x/invite/pend01",
+        channel_slug: "devchan",
+        preset_handle: "alice",
+        created_by: "o",
+        created_at: 0,
+        expires_at: null,
+        redeemed_by: null,
+        redeemed_at: null,
+        revoked_at: null,
+      },
+      {
+        code: "used01",
+        url: "https://x/invite/used01",
+        channel_slug: "devchan",
+        preset_handle: "bob",
+        created_by: "o",
+        created_at: 0,
+        expires_at: null,
+        redeemed_by: "ext-bob@example.com",
+        redeemed_at: 1,
+        revoked_at: null,
+      },
+    ];
+    const r = render();
+    const externalRadio = r.root.findAll((n) => n.type === "input" && n.props.value === "external")[0]!;
+    await act(async () => {
+      (externalRadio.props.onChange as () => void)();
+    });
+    await act(async () => {});
+    const urls = r.root.findAllByProps({ className: "joinlink-url t-mono" }).map((node) => node.children.join(""));
+    expect(urls).toContain("https://x/invite/pend01");
+    expect(urls).toContain("@bob"); // 已兑换：不再展示链接，只留昵称档
+
+    const revokeButtons = r.root.findAll(
+      (n) => n.type === "button" && String(n.props.className ?? "").includes("joinlink-revoke"),
+    );
+    expect(revokeButtons).toHaveLength(1); // 只有 pending 那条可撤销
+    await act(async () => {
+      (revokeButtons[0]!.props.onClick as () => void)();
+    });
+    expect(externalRevokeCalls).toEqual([{ code: "pend01" }]);
   });
 });
 

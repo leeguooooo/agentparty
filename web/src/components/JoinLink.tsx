@@ -477,7 +477,8 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, la
               {activeExternalInvites.length > 0 && (
                 <ul className="joinlink-list">
                   {activeExternalInvites.map((invite) => {
-                    const url = invite.url ?? `${location.origin}/invite/${invite.code}`;
+                    // 桌面版 location.origin 是 agentparty-ui://localhost，兜底必须拼真实后端 origin
+                    const url = invite.url ?? `${apiOrigin()}/invite/${invite.code}`;
                     const redeemed = invite.redeemed_by !== null;
                     return (
                       <li key={invite.code} className="joinlink-item">
