@@ -115,6 +115,8 @@ describe("presence per-task heartbeat (issue #228)", () => {
     await ws.nextOfType("welcome");
     ws.send({ type: "hello", since: 0 });
     await seedPresence(ws);
+    // 排掉 seedPresence 自己触发的 presence 广播，后续每个 nextOfType("presence") 都对齐一拍心跳
+    await ws.nextOfType("presence");
 
     ws.send({
       type: "heartbeat",
@@ -143,6 +145,7 @@ describe("presence per-task heartbeat (issue #228)", () => {
     await ws.nextOfType("welcome");
     ws.send({ type: "hello", since: 0 });
     await seedPresence(ws);
+    await ws.nextOfType("presence");
 
     ws.send({
       type: "heartbeat",
@@ -152,7 +155,14 @@ describe("presence per-task heartbeat (issue #228)", () => {
       activity: { phase: "waiting_permission", tool: "Bash", ts: 1000 },
     });
     await ws.nextOfType("presence");
-    ws.send({ type: "heartbeat", current_task: null, task_started_at: null, heartbeat_at: null });
+    // 清除帧即便捎带 activity 也一并清：没有任务就没有活动可言
+    ws.send({
+      type: "heartbeat",
+      current_task: null,
+      task_started_at: null,
+      heartbeat_at: null,
+      activity: { phase: "idle", ts: 2000 },
+    });
     await ws.nextOfType("presence");
 
     const entry = (await fetchPresence(slug, agent.token)).find((e) => e.name === agent.name);
@@ -169,6 +179,7 @@ describe("presence per-task heartbeat (issue #228)", () => {
     await ws.nextOfType("welcome");
     ws.send({ type: "hello", since: 0 });
     await seedPresence(ws);
+    await ws.nextOfType("presence");
 
     // 未知 phase → 整帧丢弃；随后的干净帧照常生效（不炸连接）
     ws.send({
@@ -185,7 +196,9 @@ describe("presence per-task heartbeat (issue #228)", () => {
       heartbeat_at: 1000,
       activity: { phase: "working", ts: 1000 },
     });
-    await ws.nextOfType("presence");
+    // 排掉 seed 后第一条到达的 presence 就是干净帧的广播——脏帧被丢弃、从未广播
+    const frame = await ws.nextOfType("presence");
+    expect(frame).toMatchObject({ name: agent.name, current_task: 6, activity: { phase: "working", ts: 1000 } });
 
     const entry = (await fetchPresence(slug, agent.token)).find((e) => e.name === agent.name);
     expect(entry).toMatchObject({ current_task: 6, activity: { phase: "working", ts: 1000 } });

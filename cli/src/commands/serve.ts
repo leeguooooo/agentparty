@@ -1761,8 +1761,10 @@ interface HarnessRun {
 // party）；dev（bun run）下 execPath 是 bun，回退裸 `party`。timeout 收紧到 10s：hook 挂死不许拖模型。
 export function claudeHookSettingsJson(execPath: string = process.execPath): string {
   const partyBin = isPartyBinaryPath(execPath) ? execPath : "party";
-  // 路径含空白时用 JSON.stringify 包双引号并转义——hook command 是交给 shell 的一整串。
-  const command = `${/\s/.test(partyBin) ? JSON.stringify(partyBin) : partyBin} hook report`;
+  // hook command 是交给 shell 的一整串：绝对路径一律 JSON.stringify 包双引号并转义（空白、引号、
+  // 反斜杠都盖住；双引号在 POSIX sh 与 cmd 下都成立——单引号会破 Windows）。裸 `party` 不引，
+  // 保持 PATH 查找语义。路径里的 `$` 反引号属 POSIX 双引号残余风险，party 安装路径不含此类字符。
+  const command = `${partyBin === "party" ? partyBin : JSON.stringify(partyBin)} hook report`;
   const hook = [{ hooks: [{ type: "command", command, timeout: 10 }] }];
   return JSON.stringify({
     hooks: {

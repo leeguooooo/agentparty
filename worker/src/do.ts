@@ -3441,6 +3441,7 @@ export class ChannelDO extends Server<Env> {
     if (!exists) return;
     this.ctx.storage.sql.exec(
       // activity（#602）不走 COALESCE：新鲜度与心跳同生共死，本拍没带就清空，绝不留僵值。
+      // 清除帧（current_task=null）即便捎带了 activity 也一并清——没有任务就没有活动可言。
       `UPDATE presence SET current_task = ?, task_started_at = ?, heartbeat_at = ?,
          activity_json = ?,
          agent_session_json = COALESCE(?, agent_session_json)
@@ -3448,7 +3449,7 @@ export class ChannelDO extends Server<Env> {
       hb.current_task,
       hb.task_started_at,
       hb.heartbeat_at,
-      hb.activity === undefined ? null : JSON.stringify(hb.activity),
+      hb.current_task === null || hb.activity === undefined ? null : JSON.stringify(hb.activity),
       hb.agent_session === undefined ? null : JSON.stringify(hb.agent_session),
       name,
       sessionId,

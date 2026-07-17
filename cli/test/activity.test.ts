@@ -80,6 +80,21 @@ describe("activity file contract", () => {
     expect(readActivityFile(file, NOW + ACTIVITY_TTL_MS + 1)).toBeNull();
   });
 
+  test("a future timestamp is rejected (it would defeat the TTL forever)", () => {
+    const file = runnerActivityFile(tempDir());
+    writeActivityFile(file, { phase: "tool", tool: "Bash", ts: NOW + 10 * 60_000 });
+    expect(readActivityFile(file, NOW)).toBeNull();
+    // 1 分钟内的正常时钟抖动仍容忍
+    writeActivityFile(file, { phase: "tool", tool: "Bash", ts: NOW + 30_000 });
+    expect(readActivityFile(file, NOW)).not.toBeNull();
+  });
+
+  test("control characters in a stored tool name are stripped on read (terminal-injection hygiene)", () => {
+    const file = runnerActivityFile(tempDir());
+    writeFileSync(file, JSON.stringify({ phase: "tool", tool: "Bash\u001b[31mevil\u0007", ts: NOW }));
+    expect(readActivityFile(file, NOW)?.tool).toBe("Bash[31mevil");
+  });
+
   test("missing file / garbage content read as null, clear is idempotent", () => {
     const dir = tempDir();
     const file = runnerActivityFile(dir);
@@ -155,7 +170,8 @@ describe("claudeHookSettingsJson", () => {
     for (const event of ["PreToolUse", "PostToolUse", "Notification", "Stop", "SessionStart", "SessionEnd", "PreCompact", "UserPromptSubmit"]) {
       const entry = settings.hooks[event]?.[0]?.hooks[0];
       expect(entry?.type).toBe("command");
-      expect(entry?.command).toBe("/usr/local/bin/party hook report");
+      // 绝对路径一律加引号转义（不只空白路径）——引号在 POSIX sh 与 cmd 下都成立
+      expect(entry?.command).toBe('"/usr/local/bin/party" hook report');
       expect(entry?.timeout).toBe(10);
     }
   });

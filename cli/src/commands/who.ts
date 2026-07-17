@@ -215,11 +215,13 @@ export function activityNote(r: Row, now: number): string {
   const activity = r.activity;
   if (activity === undefined) return "";
   const age = humanAge(Math.max(0, now - activity.ts));
+  // tool 名来自远端 presence（REST 路径不过帧校验），渲染前统一归一化控制字符，防终端转义注入。
+  const tool = activity.tool === undefined ? undefined : terminalIdentityText(activity.tool) || undefined;
   switch (activity.phase) {
     case "tool":
-      return ` · ⚙ ${activity.tool ?? "tool"} (${age})`;
+      return ` · ⚙ ${tool ?? "tool"} (${age})`;
     case "waiting_permission":
-      return ` · ⏸ awaiting permission${activity.tool !== undefined ? `: ${activity.tool}` : ""} (${age})`;
+      return ` · ⏸ awaiting permission${tool !== undefined ? `: ${tool}` : ""} (${age})`;
     case "waiting_input":
       return ` · ⏸ awaiting input (${age})`;
     case "compacting":

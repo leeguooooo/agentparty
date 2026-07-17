@@ -546,17 +546,21 @@ export interface AgentActivity {
 }
 
 // activity 校验的统一口径：CLI 读 hook 落盘文件、DO 收 heartbeat 帧共用。
-// 脏值返回 undefined（调用方各自决定丢字段还是丢整帧）。tool 名截断到 64 字符——只是展示用途。
+// 脏值返回 undefined（调用方各自决定丢字段还是丢整帧）。tool 名截断到 64 字符——只是展示用途；
+// 剥掉 ESC/C0/C1 控制字符（tool 名来自远端，会被直接渲染进终端，不给转义序列注入留门）。
 export function parseAgentActivity(input: unknown): AgentActivity | undefined {
   if (typeof input !== "object" || input === null) return undefined;
   const value = input as Record<string, unknown>;
   if (!AGENT_ACTIVITY_PHASES.includes(value.phase as AgentActivityPhase)) return undefined;
   if (typeof value.ts !== "number" || !Number.isSafeInteger(value.ts) || value.ts < 0) return undefined;
   const tool =
-    typeof value.tool === "string" && value.tool.length > 0 ? value.tool.slice(0, 64) : undefined;
+    typeof value.tool === "string" && value.tool.length > 0
+      ? // eslint-disable-next-line no-control-regex
+        value.tool.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, 64)
+      : undefined;
   return {
     phase: value.phase as AgentActivityPhase,
-    ...(tool === undefined ? {} : { tool }),
+    ...(tool === undefined || tool === "" ? {} : { tool }),
     ts: value.ts,
   };
 }

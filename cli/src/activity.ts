@@ -58,11 +58,13 @@ export function writeActivityFile(path: string, activity: AgentActivity): void {
   atomicWriteJson(path, activity);
 }
 
-/** serve 心跳侧读取：文件缺失/脏值/超 TTL 都返回 null（本拍不带 activity）。 */
+/** serve 心跳侧读取：文件缺失/脏值/超 TTL/未来时间戳都返回 null（本拍不带 activity）。 */
 export function readActivityFile(path: string, now: number, ttlMs: number = ACTIVITY_TTL_MS): AgentActivity | null {
   try {
     const parsed = parseAgentActivity(JSON.parse(readFileSync(path, "utf8")) as unknown);
     if (parsed === undefined) return null;
+    // 未来时间戳（写坏/时钟跳变）会让 TTL 永不过期，按脏值丢弃；容忍 1 分钟正常时钟抖动。
+    if (parsed.ts - now > 60_000) return null;
     return now - parsed.ts <= ttlMs ? parsed : null;
   } catch {
     return null;
