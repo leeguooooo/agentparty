@@ -36,6 +36,11 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.logs.label": "Local agent logs",
     "DesktopSettings.agent.logs.loading": "Loading logs",
     "DesktopSettings.agent.logs.empty": "No logs yet.",
+    "DesktopSettings.agent.workdir": "Working directory (optional)",
+    "DesktopSettings.agent.repo": "Repo URL (optional)",
+    "DesktopSettings.agent.instances": "Duty instances",
+    "DesktopSettings.agent.instanceStop": "Stop",
+    "DesktopSettings.agent.instanceLogs": "Logs",
   },
   zh: {
     "DesktopSettings.control.label": "应用设置",
@@ -72,6 +77,11 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.logs.label": "本机 agent 日志",
     "DesktopSettings.agent.logs.loading": "正在加载日志",
     "DesktopSettings.agent.logs.empty": "暂无日志。",
+    "DesktopSettings.agent.workdir": "工作目录（可选）",
+    "DesktopSettings.agent.repo": "仓库地址（可选）",
+    "DesktopSettings.agent.instances": "值守实例",
+    "DesktopSettings.agent.instanceStop": "停止",
+    "DesktopSettings.agent.instanceLogs": "日志",
   },
 };
 

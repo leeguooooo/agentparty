@@ -44,32 +44,63 @@ function canRequestStop(status: DesktopAgentStatus | null): boolean {
   return status?.state === "starting" || status?.state === "running";
 }
 
+// #616 多实例：statusAll 可用（新 shell）时用实例列表；旧 shell 抛错则回退单实例视图。
+function derivePrimary(instances: DesktopAgentStatus[]): DesktopAgentStatus | null {
+  return (
+    instances.find((item) => isActive(item)) ??
+    instances.find((item) => item.state === "failed") ??
+    instances[0] ??
+    null
+  );
+}
+
 export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler = defaultScheduler }: Props) {
   const [configs, setConfigs] = useState<DesktopAgentConfig[] | null>(null);
   const [status, setStatus] = useState<DesktopAgentStatus | null>(null);
+  const [instances, setInstances] = useState<DesktopAgentStatus[] | null>(null);
   const [configId, setConfigId] = useState("");
   const [channel, setChannel] = useState("");
   const [runner, setRunner] = useState<DesktopAgentRunner>("codex");
+  const [workdir, setWorkdir] = useState("");
+  const [repo, setRepo] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logsOpen, setLogsOpen] = useState(false);
+  const [logsFor, setLogsFor] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const aliveRef = useRef(true);
   const operationRef = useRef(false);
+  // null=未探测，true/false=statusAll 是否可用（探测一次，之后不再打旧 shell 的未知命令）。
+  const multiRef = useRef<boolean | null>(null);
+
+  const fetchStatus = async (): Promise<DesktopAgentStatus | null> => {
+    if (multiRef.current !== false) {
+      try {
+        const all = await adapter.statusAll();
+        multiRef.current = true;
+        if (aliveRef.current) setInstances(all);
+        return derivePrimary(all);
+      } catch {
+        if (multiRef.current === true) throw new Error("desktop agent status is unavailable");
+        multiRef.current = false;
+      }
+    }
+    return await adapter.status();
+  };
 
   useEffect(() => {
     aliveRef.current = true;
     let active = true;
-    void Promise.all([adapter.listConfigs(), adapter.status()]).then(([nextConfigs, nextStatus]) => {
+    void Promise.all([adapter.listConfigs(), fetchStatus()]).then(([nextConfigs, nextStatus]) => {
       if (!active) return;
       setConfigs(nextConfigs);
       setStatus(nextStatus);
-      const selected = nextConfigs.find((item) => item.configId === nextStatus.configId) ?? nextConfigs[0];
+      const selected = nextConfigs.find((item) => item.configId === nextStatus?.configId) ?? nextConfigs[0];
       setConfigId(selected?.configId ?? "");
-      setChannel(nextStatus.channel ?? selected?.channel ?? "");
-      if (RUNNERS.includes(nextStatus.runner as DesktopAgentRunner)) {
-        setRunner(nextStatus.runner as DesktopAgentRunner);
+      setChannel(nextStatus?.channel ?? selected?.channel ?? "");
+      if (RUNNERS.includes(nextStatus?.runner as DesktopAgentRunner)) {
+        setRunner(nextStatus?.runner as DesktopAgentRunner);
       }
     }).catch((cause) => {
       if (!active) return;
@@ -79,20 +110,28 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
       active = false;
       aliveRef.current = false;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adapter, loadAttempt]);
 
+  const anyActive = isActive(status) || (instances ?? []).some((item) => isActive(item));
+
+  const fetchLogs = async (): Promise<string[]> => {
+    if (logsFor !== null && multiRef.current === true) return await adapter.logsInstance(logsFor);
+    return await adapter.logs();
+  };
+
   useEffect(() => {
-    if (!isActive(status)) return;
+    if (!anyActive) return;
     let active = true;
     const cancel = scheduler.every(() => {
       if (!active) return;
-      void adapter.status().then((next) => {
+      void fetchStatus().then((next) => {
         if (active) setStatus(next);
       }).catch((cause) => {
         if (active) setError(safeError(cause));
       });
       if (logsOpen) {
-        void adapter.logs().then((next) => {
+        void fetchLogs().then((next) => {
           if (active) setLogs(next.map(safeError));
         }).catch((cause) => {
           if (active) setError(safeError(cause));
@@ -103,7 +142,8 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
       active = false;
       cancel();
     };
-  }, [adapter, logsOpen, scheduler, status?.state]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adapter, anyActive, logsFor, logsOpen, scheduler, status?.state]);
 
   const runOperation = async (operation: () => Promise<DesktopAgentStatus>) => {
     if (operationRef.current) return;
@@ -115,9 +155,21 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
       const next = await operation();
       if (aliveRef.current) {
         setStatus(next);
+        // 多实例：任何操作后刷新整表，别让列表与单实例回执漂移。
+        if (multiRef.current === true) {
+          try {
+            const all = await adapter.statusAll();
+            if (aliveRef.current) {
+              setInstances(all);
+              setStatus(derivePrimary(all));
+            }
+          } catch {
+            // 刷新失败不吞操作结果；下一轮轮询会补上。
+          }
+        }
         if (logsOpen) {
           try {
-            const nextLogs = (await adapter.logs()).map(safeError);
+            const nextLogs = (await fetchLogs()).map(safeError);
             if (aliveRef.current) setLogs(nextLogs);
           } catch (cause) {
             if (aliveRef.current) setError(safeError(cause));
@@ -143,7 +195,19 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
     setLogsOpen(nextOpen);
     if (!nextOpen || logs !== null) return;
     try {
-      const nextLogs = (await adapter.logs()).map(safeError);
+      const nextLogs = (await fetchLogs()).map(safeError);
+      if (aliveRef.current) setLogs(nextLogs);
+    } catch (cause) {
+      if (aliveRef.current) setError(safeError(cause));
+    }
+  };
+
+  const openInstanceLogs = async (instanceId: string) => {
+    setLogsFor(instanceId);
+    setLogsOpen(true);
+    setLogs(null);
+    try {
+      const nextLogs = (await adapter.logsInstance(instanceId)).map(safeError);
       if (aliveRef.current) setLogs(nextLogs);
     } catch (cause) {
       if (aliveRef.current) setError(safeError(cause));
@@ -154,8 +218,15 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
     ? t("DesktopSettings.agent.state.loading")
     : t(`DesktopSettings.agent.state.${status.state}`);
   const noConfig = configs !== null && configs.length === 0;
-  const canStart = !busy && !noConfig && configId !== "" && channel.trim() !== "" && !isActive(status);
-  const canStop = !busy && canRequestStop(status);
+  const targetKey = `${configId}:${channel.trim()}`;
+  const targetActive = instances === null
+    ? isActive(status)
+    : instances.some((item) => item.instanceId === targetKey && isActive(item));
+  const activeCount = (instances ?? []).filter((item) => isActive(item)).length;
+  const canStart =
+    !busy && !noConfig && configId !== "" && channel.trim() !== "" && !targetActive &&
+    (instances === null || activeCount < 8);
+  const canStop = !busy && (instances === null ? canRequestStop(status) : activeCount > 0);
   const channels = [...new Set((configs ?? []).map((item) => item.channel).filter((value): value is string => Boolean(value)))];
 
   return (
@@ -175,7 +246,7 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
             <span>{t("DesktopSettings.agent.identity")}</span>
             <select
               value={configId}
-              disabled={busy || configs === null || isActive(status)}
+              disabled={busy || configs === null || (instances === null && isActive(status))}
               onChange={(event) => changeConfig(event.target.value)}
             >
               {(configs ?? []).map((item) => (
@@ -190,7 +261,7 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
               name="desktop-agent-channel"
               value={channel}
               list="desktop-agent-channels"
-              disabled={busy || configs === null || isActive(status)}
+              disabled={busy || configs === null || (instances === null && isActive(status))}
               onChange={(event) => setChannel(event.target.value)}
               autoComplete="off"
             />
@@ -202,16 +273,83 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
             <span>{t("DesktopSettings.agent.runner")}</span>
             <select
               value={runner}
-              disabled={busy || configs === null || isActive(status)}
+              disabled={busy || configs === null || (instances === null && isActive(status))}
               onChange={(event) => setRunner(event.target.value as DesktopAgentRunner)}
             >
               {RUNNERS.map((value) => <option key={value} value={value}>{value}</option>)}
             </select>
           </label>
+          <label>
+            <span>{t("DesktopSettings.agent.workdir")}</span>
+            <input
+              className="t-mono"
+              name="desktop-agent-workdir"
+              value={workdir}
+              placeholder="/absolute/path"
+              disabled={busy || configs === null}
+              onChange={(event) => setWorkdir(event.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            <span>{t("DesktopSettings.agent.repo")}</span>
+            <input
+              className="t-mono"
+              name="desktop-agent-repo"
+              value={repo}
+              placeholder="https://github.com/org/repo.git"
+              disabled={busy || configs === null}
+              onChange={(event) => setRepo(event.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
         </div>
       )}
 
-      {status !== null && status.state !== "stopped" && (
+      {instances !== null && instances.length > 0 && (
+        <ul className="desktop-agent-instances" aria-label={t("DesktopSettings.agent.instances")}>
+          {instances.map((item) => (
+            <li key={item.instanceId ?? `${item.configId}:${item.channel}`} className="desktop-agent-instance">
+              <span className={`desktop-agent-state desktop-agent-state--${item.state}`}>
+                {t(`DesktopSettings.agent.state.${item.state}`)}
+              </span>
+              <span className="t-mono desktop-agent-instance-name">
+                {[item.name, item.channel ? `#${item.channel}` : null, item.runner].filter(Boolean).join(" · ")}
+              </span>
+              {item.workdir !== null && (
+                <span className="t-mono desktop-agent-instance-dir" title={item.workdir}>{item.workdir}</span>
+              )}
+              {item.instanceId !== null && (
+                <>
+                  <button
+                    type="button"
+                    className="d-btn"
+                    aria-label={`${t("DesktopSettings.agent.instanceLogs")} ${item.instanceId}`}
+                    onClick={() => void openInstanceLogs(item.instanceId!)}
+                  >
+                    {t("DesktopSettings.agent.instanceLogs")}
+                  </button>
+                  {isActive(item) && (
+                    <button
+                      type="button"
+                      className="d-btn"
+                      aria-label={`${t("DesktopSettings.agent.instanceStop")} ${item.instanceId}`}
+                      disabled={busy || item.state === "stopping"}
+                      onClick={() => runOperation(() => adapter.stopInstance(item.instanceId!))}
+                    >
+                      {t("DesktopSettings.agent.instanceStop")}
+                    </button>
+                  )}
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {instances === null && status !== null && status.state !== "stopped" && (
         <p className="desktop-agent-detail">
           {[status.name, status.channel ? `#${status.channel}` : null, status.runner].filter(Boolean).join(" · ")}
         </p>
@@ -238,7 +376,17 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
           className="d-btn"
           aria-label={t("DesktopSettings.agent.start")}
           disabled={!canStart}
-          onClick={() => runOperation(() => adapter.start({ configId, channel: channel.trim(), runner }))}
+          onClick={() =>
+            runOperation(() =>
+              adapter.start({
+                configId,
+                channel: channel.trim(),
+                runner,
+                workdir: workdir.trim() === "" ? undefined : workdir.trim(),
+                repo: repo.trim() === "" ? undefined : repo.trim(),
+              }),
+            )
+          }
         >
           {t("DesktopSettings.agent.start")}
         </button>

@@ -30,15 +30,24 @@ const stopped: DesktopAgentStatus = {
   startedAt: null,
   exitCode: null,
   lastError: null,
+  instanceId: null,
+  workdir: null,
+  repo: null,
 };
 
 function adapter(overrides: Partial<DesktopAgentAdapter> = {}): DesktopAgentAdapter {
   return {
     listConfigs: async () => [config],
     status: async () => stopped,
+    // 默认模拟旧 shell：statusAll 不存在 → 面板走单实例回退路径（存量用例语义不变）。
+    statusAll: async () => {
+      throw new Error("desktop_agent_status_all is not available");
+    },
     start: async () => ({ ...stopped, state: "running", pid: 42 }),
     stop: async () => stopped,
+    stopInstance: async () => stopped,
     logs: async () => [],
+    logsInstance: async () => [],
     ...overrides,
   };
 }
@@ -72,6 +81,97 @@ beforeEach(() => {
 afterEach(async () => {
   if (renderer !== null) await act(async () => renderer?.unmount());
   renderer = null;
+});
+
+// #616：statusAll 可用（新 shell）时的多实例路径
+describe("DesktopAgentPanel 多实例 (#616)", () => {
+  const running: DesktopAgentStatus = {
+    ...stopped,
+    state: "running",
+    pid: 41,
+    configId: "local-main",
+    name: "Leo Codex",
+    channel: "agentparty",
+    runner: "codex",
+    startedAt: 100,
+    instanceId: "local-main:agentparty",
+    workdir: "/srv/duty",
+  };
+  const failed: DesktopAgentStatus = {
+    ...stopped,
+    state: "failed",
+    configId: "local-main",
+    name: "Leo Codex",
+    channel: "ops",
+    runner: "claude",
+    startedAt: 90,
+    instanceId: "local-main:ops",
+    lastError: "party sidecar exited with code 1",
+  };
+
+  test("渲染实例列表：每行状态/身份/workdir，活跃行有停止按钮并调 stopInstance", async () => {
+    const stops: string[] = [];
+    const root = await render(adapter({
+      statusAll: async () => [running, failed],
+      stopInstance: async (instanceId: string) => {
+        stops.push(instanceId);
+        return { ...running, state: "stopped", pid: null };
+      },
+    }));
+
+    const list = root.find((node) => node.props["aria-label"] === "Duty instances");
+    expect(list.findAllByType("li")).toHaveLength(2);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("/srv/duty");
+
+    const stopButton = button("Stop local-main:agentparty");
+    expect(root.findAll((node) => node.type === "button" && node.props["aria-label"] === "Stop local-main:ops")).toHaveLength(0);
+    await act(async () => {
+      await stopButton.props.onClick();
+    });
+    expect(stops).toEqual(["local-main:agentparty"]);
+  });
+
+  test("start 透传 workdir/repo；同键实例活跃时禁用启动", async () => {
+    const starts: DesktopAgentStartInput[] = [];
+    const root = await render(adapter({
+      statusAll: async () => [failed],
+      start: async (input: DesktopAgentStartInput) => {
+        starts.push(input);
+        return running;
+      },
+    }));
+
+    const workdirInput = root.find((node) => node.props.name === "desktop-agent-workdir");
+    const repoInput = root.find((node) => node.props.name === "desktop-agent-repo");
+    await act(async () => {
+      workdirInput.props.onChange({ target: { value: "/srv/duty" } });
+      repoInput.props.onChange({ target: { value: "https://github.com/org/repo.git" } });
+    });
+    await act(async () => {
+      await button("Start local agent").props.onClick();
+    });
+    // 初始选中值来自 primary（failed 行：#ops / claude）——断言透传的正是表单当前值。
+    expect(starts).toEqual([
+      {
+        configId: "local-main",
+        channel: "ops",
+        runner: "claude",
+        workdir: "/srv/duty",
+        repo: "https://github.com/org/repo.git",
+      },
+    ]);
+  });
+
+  test("同键实例活跃时启动按钮禁用，但可以为其它频道再起实例", async () => {
+    const root = await render(adapter({ statusAll: async () => [running] }));
+    // 预填频道 = running 实例的 agentparty → 目标键已活跃 → 禁用
+    expect(button("Start local agent").props.disabled).toBe(true);
+    const channelInput = root.find((node) => node.props.name === "desktop-agent-channel");
+    await act(async () => {
+      channelInput.props.onChange({ target: { value: "ops" } });
+    });
+    expect(button("Start local agent").props.disabled).toBe(false);
+  });
 });
 
 describe("DesktopAgentPanel", () => {

@@ -17,7 +17,16 @@ describe("desktop agent native adapter", () => {
           role: "worker",
         }];
       }
-      if (command === "desktop_agent_logs") return ["ready", "watching #agentparty"];
+      if (command === "desktop_agent_logs" || command === "desktop_agent_logs_instance") {
+        return ["ready", "watching #agentparty"];
+      }
+      if (command === "desktop_agent_status_all") {
+        return [{
+          state: "stopped", pid: null, configId: null, name: null, channel: null, runner: null,
+          startedAt: null, exitCode: null, lastError: null,
+          instanceId: "local-main:agentparty", workdir: "/tmp/duty", repo: null,
+        }];
+      }
       return {
         state: command === "desktop_agent_start" ? "running" : "stopped",
         pid: command === "desktop_agent_start" ? 42 : null,
@@ -37,10 +46,18 @@ describe("desktop agent native adapter", () => {
     expect((await adapter.start({ configId: "local-main", channel: "agentparty", runner: "codex" })).pid).toBe(42);
     expect((await adapter.stop()).state).toBe("stopped");
     expect(await adapter.logs()).toEqual(["ready", "watching #agentparty"]);
-    expect(calls).toEqual([
+    expect((await adapter.statusAll())[0]!.state).toBe("stopped");
+    expect((await adapter.stopInstance("local-main:agentparty")).state).toBe("stopped");
+    expect(await adapter.logsInstance("local-main:agentparty")).toEqual(["ready", "watching #agentparty"]);
+    expect(calls.slice(-3)).toEqual([
+      { command: "desktop_agent_status_all", args: undefined },
+      { command: "desktop_agent_stop_instance", args: { instanceId: "local-main:agentparty" } },
+      { command: "desktop_agent_logs_instance", args: { instanceId: "local-main:agentparty" } },
+    ]);
+    expect(calls.slice(0, 5)).toEqual([
       { command: "desktop_agent_list_configs", args: undefined },
       { command: "desktop_agent_status", args: undefined },
-      { command: "desktop_agent_start", args: { configId: "local-main", channel: "agentparty", runner: "codex" } },
+      { command: "desktop_agent_start", args: { configId: "local-main", channel: "agentparty", runner: "codex", workdir: null, repo: null } },
       { command: "desktop_agent_stop", args: undefined },
       { command: "desktop_agent_logs", args: undefined },
     ]);

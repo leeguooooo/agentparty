@@ -1176,9 +1176,12 @@ pub fn run() {
             desktop_ui_storage_snapshot,
             agent::desktop_agent_list_configs,
             agent::desktop_agent_status,
+            agent::desktop_agent_status_all,
             agent::desktop_agent_start,
             agent::desktop_agent_stop,
-            agent::desktop_agent_logs
+            agent::desktop_agent_stop_instance,
+            agent::desktop_agent_logs,
+            agent::desktop_agent_logs_instance
         ]);
 
     #[cfg(mobile)]

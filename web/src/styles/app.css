@@ -298,6 +298,39 @@
 .desktop-agent-fields select:focus-visible,
 .desktop-agent-fields input:focus-visible { border-color: var(--t-accent); outline: 1px solid var(--t-accent); }
 .desktop-agent-empty,
+/* #616 多实例值守列表 */
+.desktop-agent-instances {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.desktop-agent-instance {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.desktop-agent-instance-name {
+  font-size: 12px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desktop-agent-instance-dir {
+  font-size: 11px;
+  color: var(--t-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
 .desktop-agent-detail,
 .desktop-agent-error { margin: 7px 0 0; overflow-wrap: anywhere; font-size: 10px; line-height: 1.4; }
 .desktop-agent-empty,

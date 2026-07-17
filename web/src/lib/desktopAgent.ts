@@ -20,20 +20,30 @@ export interface DesktopAgentStatus {
   startedAt: number | null;
   exitCode: number | null;
   lastError: string | null;
+  // #616 多实例字段；旧 shell 不下发时为 null（parse 兜底），面板据此回退单实例视图。
+  instanceId: string | null;
+  workdir: string | null;
+  repo: string | null;
 }
 
 export interface DesktopAgentStartInput {
   configId: string;
   channel: string;
   runner: DesktopAgentRunner;
+  workdir?: string;
+  repo?: string;
 }
 
 export interface DesktopAgentAdapter {
   listConfigs(): Promise<DesktopAgentConfig[]>;
   status(): Promise<DesktopAgentStatus>;
+  /** #616：全部实例（含终止态）。旧 shell 无此命令时 reject——调用方回退 status()。 */
+  statusAll(): Promise<DesktopAgentStatus[]>;
   start(input: DesktopAgentStartInput): Promise<DesktopAgentStatus>;
   stop(): Promise<DesktopAgentStatus>;
+  stopInstance(instanceId: string): Promise<DesktopAgentStatus>;
   logs(): Promise<string[]>;
+  logsInstance(instanceId: string): Promise<string[]>;
 }
 
 export type DesktopAgentInvoker = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -91,6 +101,8 @@ function parseStatus(value: unknown): DesktopAgentStatus {
     !isNullableNumber(value.exitCode) ||
     !isNullableString(value.lastError)
   ) throw new Error("invalid desktop agent status");
+  // #616 的三个新字段对旧 shell 是 undefined——按 null 归一，不因缺字段拒帧。
+  const optional = (field: unknown): string | null => (typeof field === "string" ? field : null);
   return {
     state,
     pid: value.pid,
@@ -101,6 +113,9 @@ function parseStatus(value: unknown): DesktopAgentStatus {
     startedAt: value.startedAt,
     exitCode: value.exitCode,
     lastError: value.lastError,
+    instanceId: optional(value.instanceId),
+    workdir: optional(value.workdir),
+    repo: optional(value.repo),
   };
 }
 
@@ -119,18 +134,31 @@ export function createDesktopAgentAdapter(invoke: DesktopAgentInvoker): DesktopA
     async status() {
       return parseStatus(await invoke<unknown>("desktop_agent_status"));
     },
+    async statusAll() {
+      const value = await invoke<unknown>("desktop_agent_status_all");
+      if (!Array.isArray(value)) throw new Error("invalid desktop agent status list");
+      return value.map(parseStatus);
+    },
     async start(input) {
       return parseStatus(await invoke<unknown>("desktop_agent_start", {
         configId: input.configId,
         channel: input.channel,
         runner: input.runner,
+        workdir: input.workdir ?? null,
+        repo: input.repo ?? null,
       }));
     },
     async stop() {
       return parseStatus(await invoke<unknown>("desktop_agent_stop"));
     },
+    async stopInstance(instanceId) {
+      return parseStatus(await invoke<unknown>("desktop_agent_stop_instance", { instanceId }));
+    },
     async logs() {
       return parseLogs(await invoke<unknown>("desktop_agent_logs"));
+    },
+    async logsInstance(instanceId) {
+      return parseLogs(await invoke<unknown>("desktop_agent_logs_instance", { instanceId }));
     },
   };
 }

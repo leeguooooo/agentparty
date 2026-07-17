@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -71,10 +71,24 @@ pub(crate) struct AgentRuntime {
     pub(crate) started_at: Option<u64>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) last_error: Option<String>,
+    // #616 多实例：instance_id = config_id:channel；旧 UI（单实例面板）忽略未知字段，不破坏兼容。
+    pub(crate) instance_id: Option<String>,
+    pub(crate) workdir: Option<String>,
+    pub(crate) repo: Option<String>,
 }
 
 impl AgentRuntime {
-    fn begin_start(&mut self, config_id: &str, name: &str, channel: &str, runner: &str) {
+    #[allow(clippy::too_many_arguments)]
+    fn begin_start(
+        &mut self,
+        instance_id: &str,
+        config_id: &str,
+        name: &str,
+        channel: &str,
+        runner: &str,
+        workdir: Option<&str>,
+        repo: Option<&str>,
+    ) {
         self.phase = AgentPhase::Starting;
         self.pid = None;
         self.config_id = Some(config_id.to_string());
@@ -84,6 +98,9 @@ impl AgentRuntime {
         self.started_at = Some(now_millis());
         self.exit_code = None;
         self.last_error = None;
+        self.instance_id = Some(instance_id.to_string());
+        self.workdir = workdir.map(str::to_string);
+        self.repo = repo.map(str::to_string);
     }
 
     fn mark_running(&mut self, pid: u32) {
@@ -110,7 +127,11 @@ impl AgentRuntime {
     }
 
     fn mark_stopped(&mut self) {
-        *self = Self::default();
+        // 保留身份字段（instance_id/config/频道/目录）供停止后的列表展示；只清运行态。
+        self.phase = AgentPhase::Stopped;
+        self.pid = None;
+        self.exit_code = None;
+        self.last_error = None;
     }
 }
 
@@ -124,9 +145,45 @@ struct ManagedAgent {
     stop_requested: bool,
 }
 
+/// #616 多实例：以 instance_id（config_id:channel）为键，一台机器可同时值守多个频道/身份。
+/// 终止态（stopped/failed）的实例保留在表里供 UI 展示与重启；活跃实例数量另有上限。
 #[cfg(desktop)]
 #[derive(Clone, Default)]
-pub(crate) struct AgentManager(Arc<Mutex<ManagedAgent>>);
+pub(crate) struct AgentManager(Arc<Mutex<HashMap<String, ManagedAgent>>>);
+
+/// 活跃（starting/running/stopping）实例上限：桌面机资源兜底，不是产品限制。
+const MAX_ACTIVE_INSTANCES: usize = 8;
+
+/// 终止态（stopped/failed）实例的保留上限：超出按 started_at 淘汰最旧——历史与日志
+/// 不能随「用过的频道数」无限长（CodeRabbit #618 finding）。
+const MAX_TERMINAL_INSTANCES: usize = 16;
+
+/// 淘汰多余的终止态实例。只动非活跃项；活跃实例永不淘汰。
+fn evict_terminal_overflow(instances: &mut HashMap<String, ManagedAgent>) {
+    let mut terminal: Vec<(String, Option<u64>)> = instances
+        .iter()
+        .filter(|(_, agent)| !is_active_phase(agent.runtime.phase))
+        .map(|(key, agent)| (key.clone(), agent.runtime.started_at))
+        .collect();
+    if terminal.len() <= MAX_TERMINAL_INSTANCES {
+        return;
+    }
+    terminal.sort_by_key(|(_, started_at)| *started_at);
+    for (key, _) in terminal.iter().take(terminal.len() - MAX_TERMINAL_INSTANCES) {
+        instances.remove(key);
+    }
+}
+
+fn instance_key(config_id: &str, channel: &str) -> String {
+    format!("{config_id}:{channel}")
+}
+
+fn is_active_phase(phase: AgentPhase) -> bool {
+    matches!(
+        phase,
+        AgentPhase::Starting | AgentPhase::Running | AgentPhase::Stopping
+    )
+}
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -378,7 +435,7 @@ fn push_bounded_log(logs: &mut VecDeque<String>, line: String) {
 
 #[cfg(desktop)]
 impl AgentManager {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ManagedAgent>, String> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, ManagedAgent>>, String> {
         self.0
             .lock()
             .map_err(|_| "desktop agent state is unavailable".to_string())
@@ -388,9 +445,29 @@ impl AgentManager {
         push_bounded_log(&mut agent.logs, line);
     }
 
-    async fn stop(&self) -> Result<AgentRuntime, String> {
+    /// 旧单实例 UI 的状态口径：优先第一个活跃实例，其次最近失败的，最后默认 stopped。
+    fn primary_runtime(instances: &HashMap<String, ManagedAgent>) -> AgentRuntime {
+        let mut sorted: Vec<&ManagedAgent> = instances.values().collect();
+        sorted.sort_by_key(|agent| std::cmp::Reverse(agent.runtime.started_at));
+        sorted
+            .iter()
+            .find(|agent| is_active_phase(agent.runtime.phase))
+            .or_else(|| {
+                sorted
+                    .iter()
+                    .find(|agent| agent.runtime.phase == AgentPhase::Failed)
+            })
+            .map(|agent| agent.runtime.clone())
+            .unwrap_or_default()
+    }
+
+    /// 停一个实例：kill child → 等事件泵把 phase 收敛出 Stopping → 超时兜底标记失败。
+    async fn stop_instance_key(&self, key: &str) -> Result<AgentRuntime, String> {
         let child = {
-            let mut agent = self.lock()?;
+            let mut instances = self.lock()?;
+            let Some(agent) = instances.get_mut(key) else {
+                return Err("unknown desktop agent instance".to_string());
+            };
             let child = agent.child.take();
             if child.is_none() {
                 agent.runtime.mark_stopped();
@@ -403,25 +480,33 @@ impl AgentManager {
 
         let kill_error = child.and_then(|child| child.kill().err());
         if let Some(error) = kill_error {
-            let mut agent = self.lock()?;
+            let mut instances = self.lock()?;
+            let Some(agent) = instances.get_mut(key) else {
+                return Err("unknown desktop agent instance".to_string());
+            };
             agent.stop_requested = false;
             if agent.runtime.phase == AgentPhase::Stopping {
                 let message = redact_line(&format!("failed to stop party sidecar: {error}"));
                 agent.runtime.mark_exited(None, Some(&message));
-                Self::push_log(&mut agent, message);
+                Self::push_log(agent, message);
             }
             return Ok(agent.runtime.clone());
         }
 
         for _ in 0..80 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            let agent = self.lock()?;
-            if agent.runtime.phase != AgentPhase::Stopping {
-                return Ok(agent.runtime.clone());
+            let instances = self.lock()?;
+            match instances.get(key) {
+                Some(agent) if agent.runtime.phase == AgentPhase::Stopping => {}
+                Some(agent) => return Ok(agent.runtime.clone()),
+                None => return Err("unknown desktop agent instance".to_string()),
             }
         }
 
-        let mut agent = self.lock()?;
+        let mut instances = self.lock()?;
+        let Some(agent) = instances.get_mut(key) else {
+            return Err("unknown desktop agent instance".to_string());
+        };
         if agent.runtime.phase == AgentPhase::Stopping {
             agent.stop_requested = false;
             agent.runtime.mark_exited(
@@ -429,21 +514,42 @@ impl AgentManager {
                 Some("party sidecar did not exit within the stop timeout"),
             );
             Self::push_log(
-                &mut agent,
+                agent,
                 "party sidecar did not exit within the stop timeout".to_string(),
             );
         }
-        Ok(agent.runtime.clone())
+        let runtime = agent.runtime.clone();
+        evict_terminal_overflow(&mut instances);
+        Ok(runtime)
+    }
+
+    /// 旧 stop 命令语义：停掉所有活跃实例（旧 UI 只可能起过一个，行为等价）。
+    async fn stop_all(&self) -> Result<AgentRuntime, String> {
+        let keys: Vec<String> = {
+            let instances = self.lock()?;
+            instances
+                .iter()
+                .filter(|(_, agent)| is_active_phase(agent.runtime.phase))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        for key in &keys {
+            let _ = self.stop_instance_key(key).await;
+        }
+        let instances = self.lock()?;
+        Ok(Self::primary_runtime(&instances))
     }
 
     pub(crate) fn kill_on_exit(&self) {
-        if let Ok(mut agent) = self.0.lock() {
-            agent.generation = agent.generation.wrapping_add(1);
-            if let Some(child) = agent.child.take() {
-                let _ = child.kill();
+        if let Ok(mut instances) = self.0.lock() {
+            for agent in instances.values_mut() {
+                agent.generation = agent.generation.wrapping_add(1);
+                if let Some(child) = agent.child.take() {
+                    let _ = child.kill();
+                }
+                agent.runtime.mark_stopped();
+                agent.stop_requested = false;
             }
-            agent.runtime.mark_stopped();
-            agent.stop_requested = false;
         }
     }
 }
@@ -460,13 +566,65 @@ pub(crate) fn desktop_agent_list_configs() -> Result<Vec<AgentConfigSummary>, St
 #[cfg(desktop)]
 #[tauri::command]
 pub(crate) fn desktop_agent_status(state: State<'_, AgentManager>) -> Result<AgentRuntime, String> {
-    Ok(state.lock()?.runtime.clone())
+    let instances = state.lock()?;
+    Ok(AgentManager::primary_runtime(&instances))
+}
+
+/// #616：全部实例状态（含终止态，供列表展示与重启）。按 started_at 倒序稳定输出。
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) fn desktop_agent_status_all(
+    state: State<'_, AgentManager>,
+) -> Result<Vec<AgentRuntime>, String> {
+    let instances = state.lock()?;
+    let mut runtimes: Vec<AgentRuntime> =
+        instances.values().map(|agent| agent.runtime.clone()).collect();
+    runtimes.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| left.instance_id.cmp(&right.instance_id))
+    });
+    Ok(runtimes)
 }
 
 #[cfg(desktop)]
 #[tauri::command]
 pub(crate) fn desktop_agent_logs(state: State<'_, AgentManager>) -> Result<Vec<String>, String> {
-    Ok(state.lock()?.logs.iter().cloned().collect())
+    // 旧命令的多实例口径：单实例时原样；多实例时带 [name#channel] 前缀合并，旧 UI 仍可读。
+    let instances = state.lock()?;
+    if instances.len() <= 1 {
+        return Ok(instances
+            .values()
+            .next()
+            .map(|agent| agent.logs.iter().cloned().collect())
+            .unwrap_or_default());
+    }
+    let mut lines = Vec::new();
+    let mut sorted: Vec<&ManagedAgent> = instances.values().collect();
+    sorted.sort_by(|left, right| left.runtime.instance_id.cmp(&right.runtime.instance_id));
+    for agent in sorted {
+        let label = format!(
+            "[{}#{}]",
+            agent.runtime.name.as_deref().unwrap_or("agent"),
+            agent.runtime.channel.as_deref().unwrap_or("-"),
+        );
+        lines.extend(agent.logs.iter().map(|line| format!("{label} {line}")));
+    }
+    Ok(lines)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) fn desktop_agent_logs_instance(
+    state: State<'_, AgentManager>,
+    instance_id: String,
+) -> Result<Vec<String>, String> {
+    let instances = state.lock()?;
+    instances
+        .get(&instance_id)
+        .map(|agent| agent.logs.iter().cloned().collect())
+        .ok_or_else(|| "unknown desktop agent instance".to_string())
 }
 
 #[cfg(desktop)]
@@ -474,7 +632,43 @@ pub(crate) fn desktop_agent_logs(state: State<'_, AgentManager>) -> Result<Vec<S
 pub(crate) async fn desktop_agent_stop(
     state: State<'_, AgentManager>,
 ) -> Result<AgentRuntime, String> {
-    state.stop().await
+    state.stop_all().await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) async fn desktop_agent_stop_instance(
+    state: State<'_, AgentManager>,
+    instance_id: String,
+) -> Result<AgentRuntime, String> {
+    state.stop_instance_key(&instance_id).await
+}
+
+/// workdir 必须是已存在的绝对路径目录——错误路径宁可拒绝，不能让 serve 静默落到默认目录。
+fn validate_workdir(workdir: &str) -> Result<&str, String> {
+    let path = Path::new(workdir);
+    if !path.is_absolute() {
+        return Err("workdir must be an absolute path".to_string());
+    }
+    if !path.is_dir() {
+        return Err("workdir does not exist or is not a directory".to_string());
+    }
+    Ok(workdir)
+}
+
+/// repo 只透传给 `party serve --repo`（serve 内部 git clone/pull）；这里挡明显的坏值与注入面。
+fn validate_repo(repo: &str) -> Result<&str, String> {
+    let valid_scheme = repo.starts_with("https://")
+        || repo.starts_with("http://")
+        || repo.starts_with("ssh://")
+        || repo.starts_with("git@");
+    if repo.len() > 512
+        || repo.chars().any(|value| value.is_whitespace() || value.is_control())
+        || !valid_scheme
+    {
+        return Err("repo must be an http(s)/ssh/git@ URL".to_string());
+    }
+    Ok(repo)
 }
 
 #[cfg(desktop)]
@@ -485,34 +679,72 @@ pub(crate) fn desktop_agent_start(
     config_id: String,
     channel: String,
     runner: String,
+    workdir: Option<String>,
+    repo: Option<String>,
 ) -> Result<AgentRuntime, String> {
     validate_channel(&channel)?;
     validate_runner(&runner)?;
+    if let Some(dir) = workdir.as_deref() {
+        validate_workdir(dir)?;
+    }
+    if let Some(url) = repo.as_deref() {
+        validate_repo(url)?;
+    }
     let (config_path, summary) = resolve_config(&config_id)?;
     let secrets = config_secrets(&config_path);
+    let key = instance_key(&config_id, &channel);
 
     let generation = {
-        let mut agent = state.lock()?;
-        if matches!(
-            agent.runtime.phase,
-            AgentPhase::Starting | AgentPhase::Running
-        ) {
-            return Err("a desktop agent is already running".to_string());
+        let mut instances = state.lock()?;
+        let active = instances
+            .values()
+            .filter(|agent| is_active_phase(agent.runtime.phase))
+            .count();
+        // 上限校验先于插入：拒绝路径绝不留下字段全空的幽灵记录（CodeRabbit #618 finding）。
+        if instances
+            .get(&key)
+            .is_some_and(|existing| is_active_phase(existing.runtime.phase))
+        {
+            return Err("this desktop agent instance is already running".to_string());
         }
-        agent.generation = agent.generation.wrapping_add(1);
-        agent.logs.clear();
-        agent.stop_requested = false;
-        agent
-            .runtime
-            .begin_start(&config_id, &summary.name, &channel, &runner);
-        agent.generation
+        if active >= MAX_ACTIVE_INSTANCES {
+            return Err(format!(
+                "at most {MAX_ACTIVE_INSTANCES} desktop agent instances can run at once"
+            ));
+        }
+        evict_terminal_overflow(&mut instances);
+        let entry = instances.entry(key.clone()).or_default();
+        entry.generation = entry.generation.wrapping_add(1);
+        entry.logs.clear();
+        entry.stop_requested = false;
+        entry.runtime.begin_start(
+            &key,
+            &config_id,
+            &summary.name,
+            &channel,
+            &runner,
+            workdir.as_deref(),
+            repo.as_deref(),
+        );
+        entry.generation
     };
 
     let spawn_result = app.shell().sidecar("party").and_then(|command| {
-        command
-            .args(["serve", channel.as_str(), "--runner", runner.as_str()])
-            .env("AGENTPARTY_CONFIG", &config_path)
-            .spawn()
+        let mut args = vec![
+            "serve".to_string(),
+            channel.clone(),
+            "--runner".to_string(),
+            runner.clone(),
+        ];
+        if let Some(dir) = workdir.as_deref() {
+            args.push("--workdir".to_string());
+            args.push(dir.to_string());
+        }
+        if let Some(url) = repo.as_deref() {
+            args.push("--repo".to_string());
+            args.push(url.to_string());
+        }
+        command.args(args).env("AGENTPARTY_CONFIG", &config_path).spawn()
     });
 
     let (mut events, child) = match spawn_result {
@@ -522,33 +754,46 @@ pub(crate) fn desktop_agent_start(
                 &format!("failed to start party sidecar: {error}"),
                 &secrets,
             );
-            let mut agent = state.lock()?;
+            let mut instances = state.lock()?;
+            let Some(agent) = instances.get_mut(&key) else {
+                return Err(message);
+            };
             if agent.generation == generation {
                 agent.runtime.mark_exited(None, Some(&message));
-                AgentManager::push_log(&mut agent, message);
+                AgentManager::push_log(agent, message);
             }
-            return Ok(agent.runtime.clone());
+            let runtime = agent.runtime.clone();
+            evict_terminal_overflow(&mut instances);
+            return Ok(runtime);
         }
     };
 
     let pid = child.pid();
     {
-        let mut agent = state.lock()?;
+        let mut instances = state.lock()?;
+        let Some(agent) = instances.get_mut(&key) else {
+            let _ = child.kill();
+            return Err("desktop agent start was cancelled".to_string());
+        };
         if agent.generation != generation {
             let _ = child.kill();
             return Err("desktop agent start was cancelled".to_string());
         }
         agent.child = Some(child);
         agent.runtime.mark_running(pid);
-        AgentManager::push_log(&mut agent, format!("party sidecar started (pid {pid})"));
+        AgentManager::push_log(agent, format!("party sidecar started (pid {pid})"));
     }
 
     let manager = state.inner().clone();
+    let pump_key = key.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
-            let mut agent = match manager.lock() {
-                Ok(agent) => agent,
+            let mut instances = match manager.lock() {
+                Ok(instances) => instances,
                 Err(_) => return,
+            };
+            let Some(agent) = instances.get_mut(&pump_key) else {
+                return;
             };
             if agent.generation != generation {
                 return;
@@ -556,16 +801,13 @@ pub(crate) fn desktop_agent_start(
             match event {
                 CommandEvent::Stdout(bytes) | CommandEvent::Stderr(bytes) => {
                     for line in String::from_utf8_lossy(&bytes).lines() {
-                        AgentManager::push_log(
-                            &mut agent,
-                            redact_line_with_secrets(line, &secrets),
-                        );
+                        AgentManager::push_log(agent, redact_line_with_secrets(line, &secrets));
                     }
                 }
                 CommandEvent::Error(error) => {
                     let message = redact_line_with_secrets(&error, &secrets);
                     agent.runtime.last_error = Some(bound_text(&message, ERROR_BYTES));
-                    AgentManager::push_log(&mut agent, message);
+                    AgentManager::push_log(agent, message);
                 }
                 CommandEvent::Terminated(payload) => {
                     agent.child = None;
@@ -584,38 +826,48 @@ pub(crate) fn desktop_agent_start(
                             None => "party sidecar exited".to_string(),
                         }
                     };
-                    AgentManager::push_log(&mut agent, message);
+                    AgentManager::push_log(agent, message);
+                    // 每个转入终止态的路径都立即收敛历史上限，不等下一次 start（CodeRabbit #618）。
+                    evict_terminal_overflow(&mut instances);
                     return;
                 }
                 _ => {}
             }
         }
-        if let Ok(mut agent) = manager.lock() {
-            if agent.generation == generation
-                && matches!(
-                    agent.runtime.phase,
-                    AgentPhase::Running | AgentPhase::Stopping
-                )
-            {
-                agent.child = None;
-                if agent.stop_requested {
-                    agent.stop_requested = false;
-                    agent.runtime.mark_stopped();
-                    AgentManager::push_log(&mut agent, "party sidecar stopped".to_string());
-                } else {
-                    agent
-                        .runtime
-                        .mark_exited(None, Some("party sidecar event stream closed unexpectedly"));
-                    AgentManager::push_log(
-                        &mut agent,
-                        "party sidecar event stream closed unexpectedly".to_string(),
-                    );
+        if let Ok(mut instances) = manager.lock() {
+            if let Some(agent) = instances.get_mut(&pump_key) {
+                if agent.generation == generation
+                    && matches!(
+                        agent.runtime.phase,
+                        AgentPhase::Running | AgentPhase::Stopping
+                    )
+                {
+                    agent.child = None;
+                    if agent.stop_requested {
+                        agent.stop_requested = false;
+                        agent.runtime.mark_stopped();
+                        AgentManager::push_log(agent, "party sidecar stopped".to_string());
+                    } else {
+                        agent.runtime.mark_exited(
+                            None,
+                            Some("party sidecar event stream closed unexpectedly"),
+                        );
+                        AgentManager::push_log(
+                            agent,
+                            "party sidecar event stream closed unexpectedly".to_string(),
+                        );
+                    }
+                    evict_terminal_overflow(&mut instances);
                 }
             }
         }
     });
 
-    Ok(state.lock()?.runtime.clone())
+    let instances = state.lock()?;
+    instances
+        .get(&key)
+        .map(|agent| agent.runtime.clone())
+        .ok_or_else(|| "desktop agent instance vanished during start".to_string())
 }
 
 #[cfg(test)]
@@ -826,12 +1078,69 @@ mod tests {
     }
 
     #[test]
+    fn workdir_must_be_an_existing_absolute_directory() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_string_lossy().into_owned();
+        assert!(super::validate_workdir(&dir).is_ok());
+        assert!(super::validate_workdir("relative/path").is_err());
+        assert!(super::validate_workdir(&format!("{dir}/missing")).is_err());
+        let file = temp.path().join("plain.txt");
+        fs::write(&file, "x").unwrap();
+        assert!(super::validate_workdir(&file.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn repo_rejects_injection_shaped_values() {
+        assert!(super::validate_repo("https://github.com/leeguooooo/agentparty.git").is_ok());
+        assert!(super::validate_repo("git@github.com:leeguooooo/agentparty.git").is_ok());
+        assert!(super::validate_repo("ssh://git@host/repo.git").is_ok());
+        assert!(super::validate_repo("--upload-pack=touch /tmp/pwn").is_err());
+        assert!(super::validate_repo("https://x.com/a b").is_err());
+        assert!(super::validate_repo("file:///etc").is_err());
+        assert!(super::validate_repo(&format!("https://x.com/{}", "a".repeat(600))).is_err());
+    }
+
+    #[test]
+    fn terminal_history_is_capped_and_never_evicts_active() {
+        use std::collections::HashMap;
+        let mut instances: HashMap<String, super::ManagedAgent> = HashMap::new();
+        for index in 0..30u64 {
+            let mut agent = super::ManagedAgent::default();
+            agent.runtime.started_at = Some(index);
+            agent.runtime.phase = if index == 0 { AgentPhase::Running } else { AgentPhase::Stopped };
+            instances.insert(format!("cfg:{index}"), agent);
+        }
+        super::evict_terminal_overflow(&mut instances);
+        // 活跃实例（index 0）永不淘汰；终止态收敛到上限，且留下的是最新的。
+        assert!(instances.contains_key("cfg:0"));
+        assert_eq!(instances.len(), 1 + 16);
+        assert!(instances.contains_key("cfg:29"));
+        assert!(!instances.contains_key("cfg:1"));
+    }
+
+    #[test]
+    fn instance_key_is_config_and_channel_scoped() {
+        assert_eq!(super::instance_key("abc", "dev"), "abc:dev");
+        assert_ne!(super::instance_key("abc", "dev"), super::instance_key("abc", "ops"));
+    }
+
+    #[test]
     fn runtime_transitions_start_run_fail_and_stop() {
         let mut runtime = AgentRuntime::default();
         assert_eq!(runtime.phase, AgentPhase::Stopped);
 
-        runtime.begin_start("config-id", "worker", "native-r4", "codex");
+        runtime.begin_start(
+            "config-id:native-r4",
+            "config-id",
+            "worker",
+            "native-r4",
+            "codex",
+            Some("/tmp/duty"),
+            None,
+        );
         assert_eq!(runtime.phase, AgentPhase::Starting);
+        assert_eq!(runtime.instance_id.as_deref(), Some("config-id:native-r4"));
+        assert_eq!(runtime.workdir.as_deref(), Some("/tmp/duty"));
         let serialized = serde_json::to_value(&runtime).unwrap();
         assert_eq!(serialized["state"], "starting");
         assert!(serialized.get("status").is_none());
