@@ -81,7 +81,7 @@ export function buildFullJoinPack(input: FullJoinPackInput): string {
     ``,
     t("AgentJoin.cmd.step3"),
     `party init --server ${server} --token ${agentToken} --channel ${slug}`,
-    inviterName === null ? t("AgentJoin.cmd.step3noteNoMention") : t("AgentJoin.cmd.step3note"),
+    inviterName === null ? t("AgentJoin.cmd.step3noteNoMention", { slug }) : t("AgentJoin.cmd.step3note"),
     inviterName === null
       ? `party send "${t("AgentJoin.cmd.checkinMessage", { agentName })}" --channel ${slug}`
       : `party send "${t("AgentJoin.cmd.checkinMessage", { agentName })}" --channel ${slug} --mention ${inviterName}`,
