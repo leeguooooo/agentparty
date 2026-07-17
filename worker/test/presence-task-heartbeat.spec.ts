@@ -214,6 +214,8 @@ describe("presence per-task heartbeat (issue #228)", () => {
     await ws.nextOfType("welcome");
     ws.send({ type: "hello", since: 0 });
     await seedPresence(ws);
+    // 排掉 seedPresence 的 presence 广播，后续 nextOfType("presence") 对齐一拍心跳（防竞态）
+    await ws.nextOfType("presence");
 
     // 任务放弃后的清除帧：task 字段全 null，但 runner_health 留在 presence 上（空闲期可见）
     ws.send({
@@ -245,6 +247,7 @@ describe("presence per-task heartbeat (issue #228)", () => {
     await ws.nextOfType("welcome");
     ws.send({ type: "hello", since: 0 });
     await seedPresence(ws);
+    await ws.nextOfType("presence");
 
     ws.send({
       type: "heartbeat",
