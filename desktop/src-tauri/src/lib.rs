@@ -1185,6 +1185,7 @@ pub fn run() {
             agent::desktop_agent_logs_instance,
             duty::desktop_duty_list,
             duty::desktop_duty_persist,
+            duty::desktop_duty_adopt,
             duty::desktop_duty_unpersist
         ]);
 

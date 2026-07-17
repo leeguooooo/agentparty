@@ -275,56 +275,168 @@ pub(crate) async fn desktop_duty_persist(
         if let Some(url) = repo.as_deref() {
             crate::agent::validate_repo(url)?;
         }
-        let (config_path, _summary) = crate::agent::resolve_config(&config_id)?;
+        duty_persist_inner(
+            &app,
+            &agent_state,
+            &config_id,
+            &channel,
+            &runner,
+            workdir.as_deref(),
+            repo.as_deref(),
+        )
+        .await
+    }
+}
+
+/// persist 的共同内核：desktop_duty_persist（面板路径）与 desktop_duty_adopt（web 一键接管）
+/// 共用——校验已由调用方完成。
+#[cfg(all(desktop, target_os = "macos"))]
+async fn duty_persist_inner(
+    app: &AppHandle,
+    agent_state: &State<'_, crate::agent::AgentManager>,
+    config_id: &str,
+    channel: &str,
+    runner: &str,
+    workdir: Option<&str>,
+    repo: Option<&str>,
+) -> Result<DutyEntry, String> {
+    let (config_path, _summary) = crate::agent::resolve_config(config_id)?;
+    let home = home_dir()?;
+    let instance_id = format!("{config_id}:{channel}");
+    let label = duty_label(&instance_id);
+
+    // 同一实例不允许 app 内 child 与 launchd 常驻双跑（同身份两个 serve 会互抢租约）：
+    // 先停掉 app 内的同键实例。
+    let _ = agent_state.stop_instance_for_duty(&instance_id).await;
+
+    let party_bin = ensure_duty_binary(app, &home)?;
+    let log_path = duty_log_path(&home, &label);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("cannot create duty log dir: {error}"))?;
+    }
+    let plist = duty_plist_content(&DutyPlistSpec {
+        label: &label,
+        party_bin: &party_bin.to_string_lossy(),
+        config_path: &config_path.to_string_lossy(),
+        channel,
+        runner,
+        workdir,
+        repo,
+        log_path: &log_path.to_string_lossy(),
+    });
+    let plist_path = duty_plist_path(&home, &label);
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("cannot create LaunchAgents dir: {error}"))?;
+    }
+    let tmp = plist_path.with_extension("plist.tmp");
+    fs::write(&tmp, plist).map_err(|error| format!("cannot write duty plist: {error}"))?;
+    fs::rename(&tmp, &plist_path).map_err(|error| format!("cannot install duty plist: {error}"))?;
+
+    // 已加载的旧实例先卸再装（幂等重装）；bootout 对未加载的 label 报错，忽略。
+    let domain = gui_domain();
+    let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
+    let boot = launchctl(&["bootstrap", &domain, &plist_path.to_string_lossy()])?;
+    if !boot.status.success() {
+        let detail = String::from_utf8_lossy(&boot.stderr);
+        return Err(format!(
+            "launchctl bootstrap failed: {}",
+            detail.trim().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(DutyEntry {
+        label: label.clone(),
+        instance_id,
+        plist_path: plist_path.to_string_lossy().into_owned(),
+        log_path: log_path.to_string_lossy().into_owned(),
+        loaded: duty_loaded(&label),
+    })
+}
+
+/// #616 第 4 块：web「无人值守」流程在桌面 webview 内一键接管。
+/// token 经 tauri IPC 本机直达（绝不进 URL / 剪贴板 / 终端），写成与 party init 同构的
+/// 配置文件后走 persist 同一条链路。name 校验对齐 CLI 的 agent 名正则。
+#[cfg(desktop)]
+fn validate_adopt_inputs(server: &str, token: &str, name: &str) -> Result<(), String> {
+    if !token.starts_with("ap_")
+        || token.len() <= 3
+        || token.len() > 256
+        || token.chars().any(|value| value.is_whitespace() || value.is_control())
+    {
+        return Err("token must be a valid agent token".to_string());
+    }
+    let name_ok = name.len() <= 64
+        && name.chars().next().is_some_and(|value| value.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-'));
+    if !name_ok {
+        return Err("name must match the agent name grammar".to_string());
+    }
+    if server.len() > 512 || server.chars().any(|value| value.is_whitespace() || value.is_control()) {
+        return Err("server origin is invalid".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) async fn desktop_duty_adopt(
+    app: AppHandle,
+    agent_state: State<'_, crate::agent::AgentManager>,
+    server: String,
+    token: String,
+    name: String,
+    channel: String,
+    runner: String,
+) -> Result<DutyEntry, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, agent_state, server, token, name, channel, runner);
+        return Err("system-level duty is currently macOS-only (launchd)".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        validate_channel(&channel)?;
+        validate_runner(&runner)?;
+        validate_adopt_inputs(&server, &token, &name)?;
         let home = home_dir()?;
-        let instance_id = format!("{config_id}:{channel}");
-        let label = duty_label(&instance_id);
-
-        // 同一实例不允许 app 内 child 与 launchd 常驻双跑（同身份两个 serve 会互抢租约）：
-        // 先停掉 app 内的同键实例。
-        let _ = agent_state.stop_instance_for_duty(&instance_id).await;
-
-        let party_bin = ensure_duty_binary(&app, &home)?;
-        let log_path = duty_log_path(&home, &label);
-        if let Some(parent) = log_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("cannot create duty log dir: {error}"))?;
-        }
-        let plist = duty_plist_content(&DutyPlistSpec {
-            label: &label,
-            party_bin: &party_bin.to_string_lossy(),
-            config_path: &config_path.to_string_lossy(),
-            channel: &channel,
-            runner: &runner,
-            workdir: workdir.as_deref(),
-            repo: repo.as_deref(),
-            log_path: &log_path.to_string_lossy(),
+        // 与 join pack 的 AGENTPARTY_CONFIG 约定同路径：CLI 与桌面端看见的是同一个身份文件。
+        let config_dir = home.join(".agentparty/agents");
+        fs::create_dir_all(&config_dir).map_err(|error| format!("cannot create agents dir: {error}"))?;
+        let config_path = config_dir.join(format!("agentparty-{name}-{channel}.json"));
+        let config = serde_json::json!({
+            "server": server,
+            "token": token,
+            "identity": {
+                "name": name,
+                "email": null,
+                "kind": "agent",
+                "role": "agent",
+                "owner": null,
+                "channel_scope": channel,
+                "verified_at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_millis() as u64)
+                    .unwrap_or(0),
+            },
         });
-        let plist_path = duty_plist_path(&home, &label);
-        if let Some(parent) = plist_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("cannot create LaunchAgents dir: {error}"))?;
+        // 0600 + tmp/rename：token 文件既不给同机他人可读，也不落半截。
+        let tmp = config_path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("cannot write agent config: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
         }
-        let tmp = plist_path.with_extension("plist.tmp");
-        fs::write(&tmp, plist).map_err(|error| format!("cannot write duty plist: {error}"))?;
-        fs::rename(&tmp, &plist_path).map_err(|error| format!("cannot install duty plist: {error}"))?;
-
-        // 已加载的旧实例先卸再装（幂等重装）；bootout 对未加载的 label 报错，忽略。
-        let domain = gui_domain();
-        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
-        let boot = launchctl(&["bootstrap", &domain, &plist_path.to_string_lossy()])?;
-        if !boot.status.success() {
-            let detail = String::from_utf8_lossy(&boot.stderr);
-            return Err(format!(
-                "launchctl bootstrap failed: {}",
-                detail.trim().chars().take(200).collect::<String>()
-            ));
+        fs::rename(&tmp, &config_path).map_err(|error| format!("cannot install agent config: {error}"))?;
+        // 写完立刻用现有解析器回验（server 白名单、identity 完整性都在里面）；不合格就删掉退出。
+        if let Err(error) = crate::agent::parse_config_summary(&config_path) {
+            let _ = fs::remove_file(&config_path);
+            return Err(format!("adopted config failed validation: {error}"));
         }
-        Ok(DutyEntry {
-            label: label.clone(),
-            instance_id,
-            plist_path: plist_path.to_string_lossy().into_owned(),
-            log_path: log_path.to_string_lossy().into_owned(),
-            loaded: duty_loaded(&label),
-        })
+        let config_id = crate::agent::config_id(&config_path)?;
+        duty_persist_inner(&app, &agent_state, &config_id, &channel, &runner, None, None).await
     }
 }
 

@@ -57,6 +57,8 @@ export interface DesktopAgentAdapter {
   dutyList(): Promise<DesktopDutyEntry[]>;
   dutyPersist(input: DesktopAgentStartInput): Promise<DesktopDutyEntry>;
   dutyUnpersist(instanceId: string): Promise<void>;
+  /** #616 phase 4：web 无人值守流程一键接管——token 经本机 IPC 直达，绝不进 URL/剪贴板。 */
+  dutyAdopt(input: { server: string; token: string; name: string; channel: string; runner: DesktopAgentRunner }): Promise<DesktopDutyEntry>;
 }
 
 export type DesktopAgentInvoker = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -207,6 +209,15 @@ export function createDesktopAgentAdapter(invoke: DesktopAgentInvoker): DesktopA
     },
     async dutyUnpersist(instanceId) {
       await invoke<unknown>("desktop_duty_unpersist", { instanceId });
+    },
+    async dutyAdopt(input) {
+      return parseDutyEntry(await invoke<unknown>("desktop_duty_adopt", {
+        server: input.server,
+        token: input.token,
+        name: input.name,
+        channel: input.channel,
+        runner: input.runner,
+      }));
     },
   };
 }

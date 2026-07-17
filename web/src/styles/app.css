@@ -298,6 +298,15 @@
 .desktop-agent-fields select:focus-visible,
 .desktop-agent-fields input:focus-visible { border-color: var(--t-accent); outline: 1px solid var(--t-accent); }
 .desktop-agent-empty,
+/* #616 phase 4：接入包一键接管 */
+.agent-join-adopt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+
 /* #616 phase 3：常驻值守 */
 .desktop-agent-persist {
   flex-direction: row !important;

@@ -86,6 +86,7 @@ afterEach(() => {
 function render(
   onActiveChange?: (open: boolean) => void,
   charter: React.ComponentProps<typeof AgentJoin>["charter"] = null,
+  extra: Partial<React.ComponentProps<typeof AgentJoin>> = {},
 ): ReactTestRenderer {
   act(() => {
     renderer = create(
@@ -98,6 +99,7 @@ function render(
           charter={charter}
           accountKey="acct-1"
           onActiveChange={onActiveChange}
+          {...extra}
         />
       </LocaleProvider>,
     );
@@ -253,6 +255,73 @@ describe("AgentJoin 无人值守值守预设 (#612)", () => {
     expect(saved.mode).toBe("interactive");
     expect(saved.command).toContain("claude mcp add");
     expect(saved.command).not.toContain("--runner claude");
+  });
+});
+
+describe("AgentJoin 桌面一键接管 (#616 phase 4)", () => {
+  function pickUnattended(r: ReactTestRenderer) {
+    act(() =>
+      r.root
+        .find((node) => node.props.name === "agent-join-mode" && node.props.value === "unattended")
+        .props.onChange(),
+    );
+  }
+  async function generate(r: ReactTestRenderer) {
+    await act(async () => {
+      await r.root.find((node) => node.props.className === "d-btn d-btn--primary" && node.props.onClick).props.onClick();
+    });
+  }
+
+  test("桌面环境 + 无人值守：一键接管调 dutyAdopt，token 走 IPC 而非 URL", async () => {
+    localStorage.setItem("ap_locale", "en");
+    setApiBase("https://agentparty.leeguoo.com");
+    const adopts: unknown[] = [];
+    const r = render(undefined, null, {
+      desktopDetect: () => true,
+      dutyAdapter: {
+        dutyAdopt: async (input: unknown) => {
+          adopts.push(input);
+          return {
+            label: "com.agentparty.duty.x.demo",
+            instanceId: "x:demo",
+            plistPath: "/p",
+            logPath: "/l",
+            loaded: true,
+          };
+        },
+      },
+    });
+    open(r);
+    pickUnattended(r);
+    await generate(r);
+
+    const adoptBtn = r.root.find(
+      (node) => node.type === "button" && String(node.children[0] ?? "").includes("Keep resident on this Mac"),
+    );
+    await act(async () => {
+      await adoptBtn.props.onClick();
+    });
+    expect(adopts).toEqual([
+      {
+        server: "https://agentparty.leeguoo.com",
+        token: "ap_created",
+        name: "leo-demo",
+        channel: "demo",
+        runner: "claude",
+      },
+    ]);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("resident ✓");
+  });
+
+  test("非桌面环境或交互模式：不渲染接管按钮", async () => {
+    localStorage.setItem("ap_locale", "en");
+    const r = render(undefined, null, { desktopDetect: () => false });
+    open(r);
+    pickUnattended(r);
+    await generate(r);
+    expect(
+      r.root.findAll((node) => node.type === "button" && String(node.children[0] ?? "").includes("Keep resident")),
+    ).toHaveLength(0);
   });
 });
 

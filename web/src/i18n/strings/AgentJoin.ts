@@ -95,6 +95,11 @@ export const AgentJoinStrings: LocaleDict = {
     "AgentJoin.ua.note2": "#   · project code: add --repo <git url> to auto git pull before each wake, or --workdir DIR to pin the working directory",
     "AgentJoin.ua.note3": "#   · the channel page shows duty health live: runner failing / not listening / awaiting permission all get red-amber badges",
     "AgentJoin.ua.note4": "#   · unattended claude -p needs its permissions pre-approved in Claude Code settings, or wakes will stall on \"awaiting permission\"",
+    "AgentJoin.adoptButton": "⚡ Keep resident on this Mac (launchd)",
+    "AgentJoin.adoptBusy": "setting up…",
+    "AgentJoin.adoptDone": "resident ✓",
+    "AgentJoin.adoptHint": "one click: writes the identity locally and installs a launchd duty — the token never leaves this machine. The script below stays for servers.",
+    "AgentJoin.adoptDoneHint": "duty installed — survives quitting the app and reboots. Manage it in desktop settings.",
   },
   zh: {
     "AgentJoin.minting": "铸 token…",
@@ -188,6 +193,11 @@ export const AgentJoinStrings: LocaleDict = {
     "AgentJoin.ua.note2": "#   · 项目代码：加 --repo <git url> 每次唤醒前自动 git pull，或 --workdir DIR 固定工作目录",
     "AgentJoin.ua.note3": "#   · 频道页 presence 实时可见值守健康：runner 连败 / 没在听 / 等权限确认 都有红黄警示",
     "AgentJoin.ua.note4": "#   · 无人值守跑 claude -p 需预先在 Claude Code 设置里放行所需权限，否则唤醒会卡在「等权限确认」",
+    "AgentJoin.adoptButton": "⚡ 在本机常驻值守（launchd）",
+    "AgentJoin.adoptBusy": "配置中…",
+    "AgentJoin.adoptDone": "已常驻 ✓",
+    "AgentJoin.adoptHint": "一键完成：身份写入本机 + 装 launchd 常驻，token 全程不出本机。下方脚本保留给服务器场景。",
+    "AgentJoin.adoptDoneHint": "常驻已装好——退出 App、重启机器都不断线。可在桌面设置里管理。",
   },
 };
 
