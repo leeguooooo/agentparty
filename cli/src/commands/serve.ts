@@ -4309,6 +4309,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
         const nowFn = o.now ?? (() => Date.now());
         const taskStartedAt = nowFn();
         const heartbeatIntervalMs = o.heartbeatIntervalMs ?? DEFAULT_TASK_HEARTBEAT_MS;
+        // runner 健康（#603）：finally 里的结账以「当时的 delivered」为准；随后的 completion probe
+        // 可能把 delivered 翻成 false（silent runner）。记住任务前的连败基数，供 probe 纠账。
+        const runnerFailuresBeforeTask = runnerHealth.consecutive_failures;
         // 活动上报（#602）：builtin claude runner 的 hooks 会把「正在干什么」落到约定文件；
         // 每拍读一次捎带进心跳帧。其它 runner（codex/sdk/custom）没有 hook 落盘，恒不带。
         const activityFile = o.builtinRunner?.harness === "claude" ? runnerActivityFile(o.builtinRunner.workdir) : null;
@@ -4448,6 +4451,12 @@ export async function runServe(o: ServeOptions): Promise<number> {
               deliveryConfirmed = true;
               lastError = "runner exited successfully without a linked channel reply";
               attemptsUsed = Math.max(attemptsUsed, attemptFloor + 1);
+              // runner 健康纠账（#603）：finally 已按「当时 delivered=true」清零；silent runner 是
+              // 真失败，按任务前基数 +1 恢复连败计数（下一拍心跳把纠正带给频道）。
+              runnerHealth = {
+                consecutive_failures: runnerFailuresBeforeTask + 1,
+                last_error: sanitizeBlockedError(lastError).slice(0, 160),
+              };
               out(`  ${lastError}: seq=${frame.seq}`);
               // The first completion probe already made `failed` authoritative in the Worker.
               // Clean exact local continuation state now; a disconnect before the redundant

@@ -576,10 +576,13 @@ export function parseRunnerHealth(input: unknown): RunnerHealth | undefined {
     value.consecutive_failures < 0 ||
     value.consecutive_failures > 1_000_000
   ) return undefined;
-  const lastError =
-    typeof value.last_error === "string" && value.last_error.length > 0
-      ? value.last_error.slice(0, 160)
-      : undefined;
+  // last_error 会被 who/wake 直接拼进终端输出：与 activity.tool 同口径剥 ESC/C0/C1，防转义序列注入。
+  const cleanedError =
+    typeof value.last_error === "string"
+      ? // eslint-disable-next-line no-control-regex
+        value.last_error.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").slice(0, 160)
+      : "";
+  const lastError = cleanedError.length > 0 ? cleanedError : undefined;
   return {
     ok: value.ok,
     consecutive_failures: value.consecutive_failures,
