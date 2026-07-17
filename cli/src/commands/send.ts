@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { extractMentionTokens, MAX_MENTIONS, mentionMatchKey, type Attachment } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError, type Parsed } from "../args";
 import { advanceCursorPastOwnMessage, resolveChannel, type Config } from "../config";
+import { stripTerminalControls } from "../format";
 import { formatAuthDebugLine, resolveAuthDetailed } from "../oidc-cli";
 import { fetchMe, fetchPresence, handleRestError, postMessage, RestError, uploadAttachment } from "../rest";
 import { formatReachLine, reachOf } from "../reach";
@@ -256,7 +257,8 @@ export async function doSend(cfg: Config, input: SendInput): Promise<number | { 
         return 1;
       }
       if (e instanceof RestError) return handleRestError(e);
-      console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+      // 校验错误里带调用方给的路径（MCP 侧也可能传入），照 decision.ts 的 terminalText 惯例剥控制字符。
+      console.error(`error: ${stripTerminalControls(e instanceof Error ? e.message : String(e))}`);
       return 1;
     }
     for (const ref of attachments) console.error(`uploaded ${ref.filename} (${formatSize(ref.size)})`);
