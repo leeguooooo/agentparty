@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 mod agent;
+mod duty;
 #[cfg(desktop)]
 mod ui_download;
 #[cfg(desktop)]
@@ -1181,7 +1182,10 @@ pub fn run() {
             agent::desktop_agent_stop,
             agent::desktop_agent_stop_instance,
             agent::desktop_agent_logs,
-            agent::desktop_agent_logs_instance
+            agent::desktop_agent_logs_instance,
+            duty::desktop_duty_list,
+            duty::desktop_duty_persist,
+            duty::desktop_duty_unpersist
         ]);
 
     #[cfg(mobile)]

@@ -298,6 +298,15 @@
 .desktop-agent-fields select:focus-visible,
 .desktop-agent-fields input:focus-visible { border-color: var(--t-accent); outline: 1px solid var(--t-accent); }
 .desktop-agent-empty,
+/* #616 phase 3：常驻值守 */
+.desktop-agent-persist {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+}
+.desktop-agent-duties { margin-top: 12px; }
+.desktop-agent-duties-title { font-size: 12px; color: var(--t-dim); }
+
 /* #616 多实例值守列表 */
 .desktop-agent-instances {
   list-style: none;

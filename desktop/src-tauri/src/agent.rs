@@ -331,7 +331,7 @@ pub(crate) fn parse_config_summary(path: &Path) -> Result<AgentConfigSummary, St
     })
 }
 
-fn resolve_config(config_id: &str) -> Result<(PathBuf, AgentConfigSummary), String> {
+pub(crate) fn resolve_config(config_id: &str) -> Result<(PathBuf, AgentConfigSummary), String> {
     trusted_configs(&agentparty_home()?)?
         .into_iter()
         .find(|(_, summary)| summary.config_id == config_id)
@@ -540,6 +540,16 @@ impl AgentManager {
         Ok(Self::primary_runtime(&instances))
     }
 
+    /// #616 phase 3：转系统常驻前停掉 app 内同键实例（同身份双 serve 会互抢租约）。
+    /// 实例不存在不是错——常驻可以直接从表单发起。
+    pub(crate) async fn stop_instance_for_duty(&self, instance_id: &str) -> Result<(), String> {
+        match self.stop_instance_key(instance_id).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.contains("unknown desktop agent instance") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn kill_on_exit(&self) {
         if let Ok(mut instances) = self.0.lock() {
             for agent in instances.values_mut() {
@@ -645,7 +655,7 @@ pub(crate) async fn desktop_agent_stop_instance(
 }
 
 /// workdir 必须是已存在的绝对路径目录——错误路径宁可拒绝，不能让 serve 静默落到默认目录。
-fn validate_workdir(workdir: &str) -> Result<&str, String> {
+pub(crate) fn validate_workdir(workdir: &str) -> Result<&str, String> {
     let path = Path::new(workdir);
     if !path.is_absolute() {
         return Err("workdir must be an absolute path".to_string());
@@ -657,7 +667,7 @@ fn validate_workdir(workdir: &str) -> Result<&str, String> {
 }
 
 /// repo 只透传给 `party serve --repo`（serve 内部 git clone/pull）；这里挡明显的坏值与注入面。
-fn validate_repo(repo: &str) -> Result<&str, String> {
+pub(crate) fn validate_repo(repo: &str) -> Result<&str, String> {
     let valid_scheme = repo.starts_with("https://")
         || repo.starts_with("http://")
         || repo.starts_with("ssh://")

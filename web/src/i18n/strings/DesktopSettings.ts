@@ -41,6 +41,11 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.instances": "Duty instances",
     "DesktopSettings.agent.instanceStop": "Stop",
     "DesktopSettings.agent.instanceLogs": "Logs",
+    "DesktopSettings.agent.persistMode": "Start at login (launchd resident — survives quitting the app)",
+    "DesktopSettings.agent.dutyTitle": "System resident duty",
+    "DesktopSettings.agent.dutyLoaded": "resident",
+    "DesktopSettings.agent.dutyNotLoaded": "not loaded",
+    "DesktopSettings.agent.dutyUnload": "Remove",
   },
   zh: {
     "DesktopSettings.control.label": "应用设置",
@@ -82,6 +87,11 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.instances": "值守实例",
     "DesktopSettings.agent.instanceStop": "停止",
     "DesktopSettings.agent.instanceLogs": "日志",
+    "DesktopSettings.agent.persistMode": "随系统启动（launchd 常驻，退出 App 不断线）",
+    "DesktopSettings.agent.dutyTitle": "系统常驻值守",
+    "DesktopSettings.agent.dutyLoaded": "常驻中",
+    "DesktopSettings.agent.dutyNotLoaded": "未加载",
+    "DesktopSettings.agent.dutyUnload": "卸载",
   },
 };
 

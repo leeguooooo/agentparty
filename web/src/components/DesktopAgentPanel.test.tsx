@@ -48,6 +48,11 @@ function adapter(overrides: Partial<DesktopAgentAdapter> = {}): DesktopAgentAdap
     stopInstance: async () => stopped,
     logs: async () => [],
     logsInstance: async () => [],
+    dutyList: async () => [],
+    dutyPersist: async () => {
+      throw new Error("duty persist unavailable");
+    },
+    dutyUnpersist: async () => {},
     ...overrides,
   };
 }
@@ -170,6 +175,65 @@ describe("DesktopAgentPanel 多实例 (#616)", () => {
     await act(async () => {
       channelInput.props.onChange({ target: { value: "ops" } });
     });
+    expect(button("Start local agent").props.disabled).toBe(false);
+  });
+});
+
+// #616 phase 3：launchd 常驻
+describe("DesktopAgentPanel 系统常驻 (#616 phase 3)", () => {
+  const duty = {
+    label: "com.agentparty.duty.local-main.agentparty",
+    instanceId: "local-main:agentparty",
+    plistPath: "/Users/x/Library/LaunchAgents/com.agentparty.duty.local-main.agentparty.plist",
+    logPath: "/Users/x/.agentparty/desktop/logs/duty.log",
+    loaded: true,
+  };
+
+  test("勾选常驻后启动走 dutyPersist；常驻列表渲染并可卸载", async () => {
+    const persisted: unknown[] = [];
+    const removed: string[] = [];
+    let entries = [duty];
+    const root = await render(adapter({
+      dutyList: async () => entries,
+      dutyPersist: async (input: unknown) => {
+        persisted.push(input);
+        return duty;
+      },
+      dutyUnpersist: async (instanceId: string) => {
+        removed.push(instanceId);
+        entries = [];
+      },
+    }));
+
+    const section = root.find((node) => node.props["aria-label"] === "System resident duty");
+    expect(section.findAllByType("li")).toHaveLength(1);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("resident");
+
+    const persistBox = root.find((node) => node.props.name === "desktop-agent-persist");
+    await act(async () => {
+      persistBox.props.onChange({ target: { checked: true } });
+    });
+    await act(async () => {
+      await button("Start local agent").props.onClick();
+    });
+    expect(persisted).toHaveLength(1);
+    expect((persisted[0] as { channel: string }).channel).toBe("agentparty");
+
+    await act(async () => {
+      await button("Remove local-main:agentparty").props.onClick();
+    });
+    expect(removed).toEqual(["local-main:agentparty"]);
+    expect(root.findAll((node) => node.props["aria-label"] === "System resident duty")).toHaveLength(0);
+  });
+
+  test("dutyList 不可用（非 macOS/旧 shell）：常驻区块与勾选框整体隐藏/禁用，面板其余功能不受影响", async () => {
+    const root = await render(adapter({
+      dutyList: async () => {
+        throw new Error("unsupported");
+      },
+    }));
+    expect(root.findAll((node) => node.props["aria-label"] === "System resident duty")).toHaveLength(0);
+    expect(root.find((node) => node.props.name === "desktop-agent-persist").props.disabled).toBe(true);
     expect(button("Start local agent").props.disabled).toBe(false);
   });
 });

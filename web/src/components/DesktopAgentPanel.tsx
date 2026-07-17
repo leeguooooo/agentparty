@@ -6,6 +6,7 @@ import {
   type DesktopAgentConfig,
   type DesktopAgentRunner,
   type DesktopAgentStatus,
+  type DesktopDutyEntry,
 } from "../lib/desktopAgent";
 
 const RUNNERS: readonly DesktopAgentRunner[] = ["codex", "claude", "codex-sdk"];
@@ -63,6 +64,9 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
   const [runner, setRunner] = useState<DesktopAgentRunner>("codex");
   const [workdir, setWorkdir] = useState("");
   const [repo, setRepo] = useState("");
+  // #616 phase 3：launchd 常驻。duties=null 表示不可用（非 macOS / 旧 shell），整个区块隐藏。
+  const [persistMode, setPersistMode] = useState(false);
+  const [duties, setDuties] = useState<DesktopDutyEntry[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logsOpen, setLogsOpen] = useState(false);
@@ -92,6 +96,11 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
   useEffect(() => {
     aliveRef.current = true;
     let active = true;
+    void adapter.dutyList().then((entries) => {
+      if (active) setDuties(entries);
+    }).catch(() => {
+      // 非 macOS / 旧 shell：常驻不可用，静默隐藏
+    });
     void Promise.all([adapter.listConfigs(), fetchStatus()]).then(([nextConfigs, nextStatus]) => {
       if (!active) return;
       setConfigs(nextConfigs);
@@ -202,6 +211,58 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
     }
   };
 
+  const persistDuty = async () => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      await adapter.dutyPersist({
+        configId,
+        channel: channel.trim(),
+        runner,
+        workdir: workdir.trim() === "" ? undefined : workdir.trim(),
+        repo: repo.trim() === "" ? undefined : repo.trim(),
+      });
+      const entries = await adapter.dutyList();
+      if (aliveRef.current) setDuties(entries);
+      // 转常驻会顺带停掉 app 内同键实例——刷新实例表别让两处状态漂移
+      if (multiRef.current === true) {
+        try {
+          const all = await adapter.statusAll();
+          if (aliveRef.current) {
+            setInstances(all);
+            setStatus(derivePrimary(all));
+          }
+        } catch {
+          // 下一轮轮询补上
+        }
+      }
+    } catch (cause) {
+      if (aliveRef.current) setError(safeError(cause));
+    } finally {
+      operationRef.current = false;
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+
+  const unpersistDuty = async (instanceId: string) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      await adapter.dutyUnpersist(instanceId);
+      const entries = await adapter.dutyList();
+      if (aliveRef.current) setDuties(entries);
+    } catch (cause) {
+      if (aliveRef.current) setError(safeError(cause));
+    } finally {
+      operationRef.current = false;
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+
   const openInstanceLogs = async (instanceId: string) => {
     setLogsFor(instanceId);
     setLogsOpen(true);
@@ -292,6 +353,16 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
               spellCheck={false}
             />
           </label>
+          <label className="desktop-agent-persist">
+            <input
+              type="checkbox"
+              name="desktop-agent-persist"
+              checked={persistMode}
+              disabled={busy || duties === null}
+              onChange={(event) => setPersistMode(event.target.checked)}
+            />
+            <span>{t("DesktopSettings.agent.persistMode")}</span>
+          </label>
           <label>
             <span>{t("DesktopSettings.agent.repo")}</span>
             <input
@@ -306,6 +377,32 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
             />
           </label>
         </div>
+      )}
+
+      {duties !== null && duties.length > 0 && (
+        <section aria-label={t("DesktopSettings.agent.dutyTitle")} className="desktop-agent-duties">
+          <strong className="desktop-agent-duties-title">{t("DesktopSettings.agent.dutyTitle")}</strong>
+          <ul className="desktop-agent-instances">
+            {duties.map((entry) => (
+              <li key={entry.label} className="desktop-agent-instance">
+                <span className={`desktop-agent-state desktop-agent-state--${entry.loaded ? "running" : "stopped"}`}>
+                  {t(entry.loaded ? "DesktopSettings.agent.dutyLoaded" : "DesktopSettings.agent.dutyNotLoaded")}
+                </span>
+                <span className="t-mono desktop-agent-instance-name">{entry.instanceId}</span>
+                <span className="t-mono desktop-agent-instance-dir" title={entry.logPath}>{entry.logPath}</span>
+                <button
+                  type="button"
+                  className="d-btn"
+                  aria-label={`${t("DesktopSettings.agent.dutyUnload")} ${entry.instanceId}`}
+                  disabled={busy}
+                  onClick={() => void unpersistDuty(entry.instanceId)}
+                >
+                  {t("DesktopSettings.agent.dutyUnload")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {instances !== null && instances.length > 0 && (
@@ -376,8 +473,12 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
           className="d-btn"
           aria-label={t("DesktopSettings.agent.start")}
           disabled={!canStart}
-          onClick={() =>
-            runOperation(() =>
+          onClick={() => {
+            if (persistMode && duties !== null) {
+              void persistDuty();
+              return;
+            }
+            void runOperation(() =>
               adapter.start({
                 configId,
                 channel: channel.trim(),
@@ -385,8 +486,8 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
                 workdir: workdir.trim() === "" ? undefined : workdir.trim(),
                 repo: repo.trim() === "" ? undefined : repo.trim(),
               }),
-            )
-          }
+            );
+          }}
         >
           {t("DesktopSettings.agent.start")}
         </button>

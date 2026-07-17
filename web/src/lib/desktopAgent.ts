@@ -34,6 +34,15 @@ export interface DesktopAgentStartInput {
   repo?: string;
 }
 
+// #616 phase 3：launchd 系统级常驻值守条目。
+export interface DesktopDutyEntry {
+  label: string;
+  instanceId: string;
+  plistPath: string;
+  logPath: string;
+  loaded: boolean;
+}
+
 export interface DesktopAgentAdapter {
   listConfigs(): Promise<DesktopAgentConfig[]>;
   status(): Promise<DesktopAgentStatus>;
@@ -44,6 +53,10 @@ export interface DesktopAgentAdapter {
   stopInstance(instanceId: string): Promise<DesktopAgentStatus>;
   logs(): Promise<string[]>;
   logsInstance(instanceId: string): Promise<string[]>;
+  /** #616 phase 3：系统级常驻（launchd）。非 macOS / 旧 shell 会 reject，调用方按不可用处理。 */
+  dutyList(): Promise<DesktopDutyEntry[]>;
+  dutyPersist(input: DesktopAgentStartInput): Promise<DesktopDutyEntry>;
+  dutyUnpersist(instanceId: string): Promise<void>;
 }
 
 export type DesktopAgentInvoker = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -119,6 +132,24 @@ function parseStatus(value: unknown): DesktopAgentStatus {
   };
 }
 
+function parseDutyEntry(value: unknown): DesktopDutyEntry {
+  if (!isRecord(value)) throw new Error("invalid desktop duty entry");
+  if (
+    typeof value.label !== "string" ||
+    typeof value.instanceId !== "string" ||
+    typeof value.plistPath !== "string" ||
+    typeof value.logPath !== "string" ||
+    typeof value.loaded !== "boolean"
+  ) throw new Error("invalid desktop duty entry");
+  return {
+    label: value.label,
+    instanceId: value.instanceId,
+    plistPath: value.plistPath,
+    logPath: value.logPath,
+    loaded: value.loaded,
+  };
+}
+
 function parseLogs(value: unknown): string[] {
   if (!Array.isArray(value) || !value.every((line) => typeof line === "string")) {
     throw new Error("invalid desktop agent logs");
@@ -159,6 +190,23 @@ export function createDesktopAgentAdapter(invoke: DesktopAgentInvoker): DesktopA
     },
     async logsInstance(instanceId) {
       return parseLogs(await invoke<unknown>("desktop_agent_logs_instance", { instanceId }));
+    },
+    async dutyList() {
+      const value = await invoke<unknown>("desktop_duty_list");
+      if (!Array.isArray(value)) throw new Error("invalid desktop duty list");
+      return value.map(parseDutyEntry);
+    },
+    async dutyPersist(input) {
+      return parseDutyEntry(await invoke<unknown>("desktop_duty_persist", {
+        configId: input.configId,
+        channel: input.channel,
+        runner: input.runner,
+        workdir: input.workdir ?? null,
+        repo: input.repo ?? null,
+      }));
+    },
+    async dutyUnpersist(instanceId) {
+      await invoke<unknown>("desktop_duty_unpersist", { instanceId });
     },
   };
 }
