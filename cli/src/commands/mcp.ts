@@ -26,6 +26,7 @@ import {
   fetchMessages,
   fetchPresence,
   fetchRecentMessages,
+  fetchServerVersion,
   handleRestError,
   listChannels,
   listTasks,
@@ -34,6 +35,7 @@ import {
   updateTask,
   type Identity,
 } from "../rest";
+import { serverVersionUpgradeNotice, upgradeNotice, type UpgradeDeps } from "../upgrade";
 import { isName, isSlug } from "../validation";
 import { askDecision } from "./decision";
 import { uploadAttachmentPaths } from "./send";
@@ -214,6 +216,93 @@ function charterReminder(boundChannel: string | undefined): string {
   return `read the channel charter first (${where}) — it defines this channel's scope and etiquette before you act.`;
 }
 
+// MCP server 是长驻进程，#485 给 serve 做的升级闭环没有覆盖这里（#588）：磁盘 party 升级后
+// 本进程仍是旧二进制，新注册的 party_* 工具不会出现；服务端发新版时旧进程同样不自知。
+// 两层检测，提示挂在 whoami / watch_once 两个「重锚点」的结构化结果上：
+//   a) 磁盘二进制 > 运行版（upgradeNotice）——命中即短路，零网络。MCP 语境下无需重装、
+//      无需重新注册（注册命令按 PATH 解析 party），重启 harness 会话即可加载新版。
+//      不做 serve 式 auto re-exec：stdio server 自杀会掐断 MCP 连接、丢掉在途工具调用。
+//   b) 服务端 /api/version > 运行版（serverVersionUpgradeNotice）——10 分钟节流缓存；
+//      探测失败（老 worker 无该端点、网络错）静默跳过，绝不为提示挡住或拖慢工具调用。
+const SERVER_VERSION_PROBE_TTL_MS = 10 * 60_000;
+let serverVersionProbe: { at: number; version: string | null } = { at: 0, version: null };
+
+/** 测试缝隙：注入 UpgradeDeps 走磁盘路径、重置节流缓存。 */
+export function resetServerVersionProbeForTest(): void {
+  serverVersionProbe = { at: 0, version: null };
+}
+
+// MCP 语境的升级提示用自己的形状，不复用 CliUpgradeNotice 的 message/command——那套话术是
+// serve 专属（「重启 serve」「auto re-exec」「重装命令」），在 MCP 场景是矛盾指令（磁盘已新
+// 无需重装；重启对象是 harness 会话不是 serve）。保留 action_required=ask_user 让 runner
+// 复用同一条询问用户的处理流；command 只在真有命令要跑时才给（server 路径的升级命令）。
+export interface McpUpgradeNotice {
+  running_version: string;
+  available_version: string;
+  /** 磁盘路径才有：已安装、等待会话重启加载的版本。 */
+  installed_version?: string;
+  source: "disk" | "server";
+  action_required: "ask_user";
+  message: string;
+  /** 需要用户真的跑命令时才给（server 路径的安装/升级命令）；磁盘路径无命令可跑。 */
+  command?: string;
+}
+
+// 服务端探测是可选增益：3 秒等不到就放弃本轮（缓存留空、下轮再试），
+// 绝不让 whoami 被 rest 默认 30s 超时拖住。
+const SERVER_VERSION_PROBE_TIMEOUT_MS = 3_000;
+
+export async function mcpUpgradeNotice(
+  server: string,
+  deps: UpgradeDeps = {},
+  options: { probe?: boolean } = {},
+): Promise<McpUpgradeNotice | null> {
+  const disk = upgradeNotice(false, deps);
+  if (disk !== null) {
+    return {
+      running_version: disk.running_version,
+      available_version: disk.available_version,
+      ...(disk.installed_version !== undefined ? { installed_version: disk.installed_version } : {}),
+      source: "disk",
+      action_required: "ask_user",
+      message:
+        `party CLI on disk is already v${disk.available_version} while this MCP server still runs v${disk.running_version}. ` +
+        "No reinstall and no re-registration needed (the MCP registration resolves `party` from PATH) — " +
+        "ask the user to restart this harness session so the server respawns on the new binary.",
+    };
+  }
+  // probe=false（watch_once 唤醒路径）只读缓存：唤醒 replay 是延迟敏感的极简路径（#551 的
+  // 测试固定了它的请求数），版本探测只允许发生在 whoami 这类非关键调用里。
+  const now = Date.now();
+  if (options.probe !== false && now - serverVersionProbe.at > SERVER_VERSION_PROBE_TTL_MS) {
+    serverVersionProbe = { at: now, version: null };
+    try {
+      serverVersionProbe.version = await Promise.race([
+        fetchServerVersion(server).then((v) => v.version),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("probe timeout")), SERVER_VERSION_PROBE_TIMEOUT_MS),
+        ),
+      ]);
+    } catch {
+      // 静默：升级提示是增益信号，不是墙。
+    }
+  }
+  if (serverVersionProbe.version === null) return null;
+  const notice = serverVersionUpgradeNotice(serverVersionProbe.version, deps);
+  if (notice === null) return null;
+  return {
+    running_version: notice.running_version,
+    available_version: notice.available_version,
+    source: "server",
+    action_required: "ask_user",
+    message:
+      `AgentParty server has published party CLI v${notice.available_version}; this MCP server still runs v${notice.running_version}. ` +
+      "Ask the user to upgrade with the command below, then restart this harness session so the server respawns on the new binary — " +
+      "do NOT re-register (the MCP registration resolves `party` from PATH).",
+    command: notice.command,
+  };
+}
+
 async function charterData(channel: string): Promise<Record<string, unknown>> {
   const cfg = await auth();
   const body = await fetchChannelCharter(cfg.server, cfg.token, channel);
@@ -250,7 +339,15 @@ export function createMcpServer(defaultChannel?: string): McpServer {
       try {
         const cfg = await auth();
         const me = await fetchMe(cfg.server, cfg.token);
-        return ok({ type: "me", server: cfg.server, identity: me, protocol_reminder: reminder });
+        const upgrade = await mcpUpgradeNotice(cfg.server);
+        return ok({
+          type: "me",
+          server: cfg.server,
+          cli_version: pkg.version,
+          identity: me,
+          protocol_reminder: reminder,
+          ...(upgrade !== null ? { cli_upgrade: upgrade } : {}),
+        });
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       }
@@ -915,7 +1012,16 @@ export function createMcpServer(defaultChannel?: string): McpServer {
             lag: Math.max(0, channelLastSeq - pending.seq),
             skipped_mention_seqs: stuck.skipped_mention_seqs ?? [],
           });
-          return ok({ type: "watch_once", channel: resolved, exit_code: 0, frames: [frame] });
+          // 唤醒返回帧＝一轮的起点：旧进程/旧版的升级提示在这里最可能被看见并转达 owner（#588）。
+          // probe:false——唤醒路径零额外网络（磁盘检测 + whoami 已填充的缓存）。
+          const replayUpgrade = await mcpUpgradeNotice(cfg.server, {}, { probe: false });
+          return ok({
+            type: "watch_once",
+            channel: resolved,
+            exit_code: 0,
+            frames: [frame],
+            ...(replayUpgrade !== null ? { cli_upgrade: replayUpgrade } : {}),
+          });
         }
 
         const lines: string[] = [];
@@ -945,7 +1051,15 @@ export function createMcpServer(defaultChannel?: string): McpServer {
           out: (line) => lines.push(line),
         });
         const frames = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-        const data = { type: "watch_once", channel: resolved, exit_code: code, frames };
+        // 同 replay 路径：唤醒返回帧带缓存化的升级提示（probe:false，零额外网络）。
+        const liveUpgrade = await mcpUpgradeNotice(cfg.server, {}, { probe: false });
+        const data = {
+          type: "watch_once",
+          channel: resolved,
+          exit_code: code,
+          frames,
+          ...(liveUpgrade !== null ? { cli_upgrade: liveUpgrade } : {}),
+        };
         return code === 0 ? ok(data) : { ...fail(lines.join("\n") || `watch_once failed with exit ${code}`), structuredContent: data };
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
