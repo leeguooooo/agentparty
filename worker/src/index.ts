@@ -3263,41 +3263,50 @@ async function ensureLarkNotifySubscription(
   const now = Date.now();
   // 原子化（#604 评审）：入口的 optout 检查和这次写入之间，用户可能显式退订——把 NOT EXISTS
   // 放进同一条 INSERT，D1 单语句原子，晚到的自动入册绝不压过刚落的退订；被跳过时回收 DO webhook。
-  const inserted = await env.DB.prepare(
-    `INSERT INTO lark_notify_subscriptions (
-       channel_slug, account, target_name, provider_id, provider_kind,
-       receive_id, receive_id_type, secret, created_at, updated_at
-     )
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-      WHERE NOT EXISTS (SELECT 1 FROM lark_notify_optouts WHERE channel_slug = ? AND account = ?)
-        AND NOT EXISTS (SELECT 1 FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?)`,
-  )
-    .bind(
-      slug,
-      account,
-      profile.handle,
-      provider.id,
-      provider.kind,
-      profile.provider_user_id,
-      inferReceiveIdType(profile.provider_user_id),
-      secret,
-      now,
-      now,
-      slug,
-      account,
-      slug,
-      account,
-    )
-    .run();
-  if (inserted.meta.changes === 0) {
-    await fetchChannelDO(
+  const reclaimWebhook = () =>
+    fetchChannelDO(
       env,
       slug,
-      new Request(`https://do/internal/webhooks?name=${encodeURIComponent(profile.handle)}`, {
+      new Request(`https://do/internal/webhooks?name=${encodeURIComponent(profile.handle!)}`, {
         method: "DELETE",
         headers: { "x-partykit-room": slug },
       }),
     ).catch(() => null);
+  let inserted: D1Result;
+  try {
+    inserted = await env.DB.prepare(
+      `INSERT INTO lark_notify_subscriptions (
+         channel_slug, account, target_name, provider_id, provider_kind,
+         receive_id, receive_id_type, secret, created_at, updated_at
+       )
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM lark_notify_optouts WHERE channel_slug = ? AND account = ?)
+          AND NOT EXISTS (SELECT 1 FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?)`,
+    )
+      .bind(
+        slug,
+        account,
+        profile.handle,
+        provider.id,
+        provider.kind,
+        profile.provider_user_id,
+        inferReceiveIdType(profile.provider_user_id),
+        secret,
+        now,
+        now,
+        slug,
+        account,
+        slug,
+        account,
+      )
+      .run();
+  } catch (error) {
+    // INSERT 抛异常（非零行跳过）同样不能留下无主 DO webhook（CodeRabbit #604 复审）。
+    await reclaimWebhook();
+    throw error;
+  }
+  if (inserted.meta.changes === 0) {
+    await reclaimWebhook();
     return "skipped";
   }
   return "created";
@@ -3309,9 +3318,13 @@ async function autoEnrollLarkNotify(env: AppEnv, requestOrigin: string, account:
     const rows = await env.DB.prepare(
       "SELECT channel_slug FROM channel_members WHERE account = ? LIMIT 50",
     ).bind(account).all<{ channel_slug: string }>();
-    for (const row of rows.results ?? []) {
-      await ensureLarkNotifySubscription(env, requestOrigin, account, row.channel_slug).catch(() => "skipped");
-    }
+    // 并行 ensure（CodeRabbit #604 复审）：50 个频道串行 = 50×(多次 D1 + DO fetch)，可能吃穿
+    // waitUntil 预算；并行后墙钟 = 最慢单频道。每个 promise 各自吞错，互不拖累。
+    await Promise.all(
+      (rows.results ?? []).map((row) =>
+        ensureLarkNotifySubscription(env, requestOrigin, account, row.channel_slug).catch(() => "skipped"),
+      ),
+    );
   } catch {
     // 自动入册是增益：任何失败都不打扰登录主流程。
   }
@@ -3461,6 +3474,13 @@ app.delete("/api/channels/:slug/lark-notify", async (c) => {
   if (!(await canAccessLoadedChannel(c.env.DB, identity, channel))) {
     return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
   }
+  // 显式退订要被记住（#595），且必须【先落 optout 再删订阅】（CodeRabbit #604 复审）：
+  // 反序时删订阅→写 optout 的窗口里，并发自动入册的条件 INSERT 见不到 optout 会重插一行，
+  // 最终落成「已退订但订阅仍在」的矛盾态。optout 先持久化，自动入册即不可能再通过。
+  await c.env.DB.prepare(
+    `INSERT INTO lark_notify_optouts (channel_slug, account, opted_out_at) VALUES (?, ?, ?)
+     ON CONFLICT(channel_slug, account) DO UPDATE SET opted_out_at = excluded.opted_out_at`,
+  ).bind(slug, identity.account, Date.now()).run();
   const sub = await c.env.DB.prepare(
     "SELECT target_name FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?",
   )
@@ -3479,11 +3499,6 @@ app.delete("/api/channels/:slug/lark-notify", async (c) => {
       .bind(slug, identity.account)
       .run();
   }
-  // 显式退订要被记住（#595）：自动入册（登录/入会）见 optout 即跳过，绝不压过用户手选。
-  await c.env.DB.prepare(
-    `INSERT INTO lark_notify_optouts (channel_slug, account, opted_out_at) VALUES (?, ?, ?)
-     ON CONFLICT(channel_slug, account) DO UPDATE SET opted_out_at = excluded.opted_out_at`,
-  ).bind(slug, identity.account, Date.now()).run();
   return c.json({ enabled: false, channel_slug: slug });
 });
 
