@@ -935,6 +935,28 @@ function parseStoredLineage(input: unknown): AgentLineage | undefined {
   }
 }
 
+// DO 未捕获异常的应用级日志：Cloudflare 对 DO 抛出的异常只回不透明的 "internal error; reference"，
+// tail 里 exceptions 也是空的，等于对自己的异常完全失明。在 onRequest/onMessage 边界记一条带频道与
+// 真实堆栈的日志，让下次同类瞬时故障能直接在 wrangler tail 里定位，而不是靠猜。
+function logDoException(entry: string, channel: string, err: unknown, ctx = ""): void {
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  console.error(`ChannelDO ${entry} uncaught channel=${channel}${ctx ? ` ${ctx}` : ""}: ${detail}`);
+}
+
+// mentions_json 是唯一没兜底的读路径 JSON 解析（其余都 try/catch 或走 parseStored* 守卫）。
+// 一旦某行存进空串或坏 JSON（NOT NULL DEFAULT '[]' 挡得住漏写，挡不住显式写入 ''），
+// 裸 JSON.parse('') 会抛未捕获异常，整条频道的 messages/hello 回填全 500。按其余存储解析同样
+// 的模式兜底：空/坏值当作无 mentions，绝不因一行坏数据拖垮整个频道读路径。
+function parseStoredMentions(input: unknown): string[] {
+  if (typeof input !== "string" || input === "") return [];
+  try {
+    const parsed = JSON.parse(input) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((name): name is string => typeof name === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 function parseLineage(input: unknown): AgentLineage | null {
   if (typeof input !== "object" || input === null) return null;
   const raw = input as Record<string, unknown>;
@@ -2198,6 +2220,12 @@ export class ChannelDO extends Server<Env> {
     this.wsMessageTails.set(connection.id, current);
     try {
       await current;
+    } catch (err) {
+      // DO 抛未捕获异常时 Cloudflare 只回不透明的 "internal error; reference"，不留任何应用日志
+      // （kyc/seamail 那次 30 分钟只能靠猜就是因为这里没日志）。落一条带频道/连接的真实堆栈，
+      // 让下次同类故障在 wrangler tail 里直接可诊断；行为不变，照旧向上抛。
+      logDoException("onMessage", this.name, err, `conn=${connection.id}`);
+      throw err;
     } finally {
       if (this.wsMessageTails.get(connection.id) === current) {
         this.wsMessageTails.delete(connection.id);
@@ -4661,6 +4689,19 @@ export class ChannelDO extends Server<Env> {
 
   // worker 转发来的内部 rest
   async onRequest(request: Request): Promise<Response> {
+    // 见 onMessage：未捕获异常否则只剩 Cloudflare 不透明 500。包一层落真实堆栈再原样抛。
+    try {
+      return await this.onRequestImpl(request);
+    } catch (err) {
+      // 只记路由族（第一段静态前缀，如 api/internal）+ method，不落完整 pathname——动态段可能含
+      // agent 名等标识（/internal/identity/{name}/…），即便编码也可还原。真正定位靠 stack。
+      const family = new URL(request.url).pathname.split("/").filter(Boolean)[0] ?? "";
+      logDoException("onRequest", this.name, err, `${request.method} /${family}/…`);
+      throw err;
+    }
+  }
+
+  private async onRequestImpl(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/internal/summary" && request.method === "GET") {
       // 频道列表页聚合用：最近一条消息（正文截断）+ presence 快照（spec §9 第 1 块）
@@ -7042,14 +7083,8 @@ export class ChannelDO extends Server<Env> {
   // 别人的普通回帖不能伪造成「被唤醒」证据（校验必须来自真实的 @→resume 闭环）。
   private messageMentions(seq: number): string[] {
     const rows = this.ctx.storage.sql.exec("SELECT mentions_json FROM messages WHERE seq = ?", seq).toArray();
-    const raw = rows[0]?.mentions_json;
-    if (typeof raw !== "string") return [];
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === "string") : [];
-    } catch {
-      return [];
-    }
+    // 与 rowToFrame 共用同一个存储 mentions 解析器，避免两处对空/坏值的语义漂移。
+    return parseStoredMentions(rows[0]?.mentions_json);
   }
 
   // #191：服务端对某 agent 的 serve/watch wake layer 记下「已验证可唤醒」的时间戳。
@@ -9371,7 +9406,7 @@ export class ChannelDO extends Server<Env> {
       },
       kind,
       body: retracted ? "[retracted]" : String(r.body),
-      mentions: JSON.parse(String(r.mentions_json ?? "[]")) as string[],
+      mentions: parseStoredMentions(r.mentions_json),
       reply_to: r.reply_to === null ? null : Number(r.reply_to),
       state,
       note,
