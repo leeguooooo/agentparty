@@ -1,7 +1,7 @@
 {
   "name": "@agentparty/cli",
   "license": "BUSL-1.1",
-  "version": "0.2.124",
+  "version": "0.2.125",
   "private": true,
   "type": "module",
   "bin": {
