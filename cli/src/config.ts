@@ -649,6 +649,41 @@ export function markWatchDirectedStuckAccepted(channel: string, deliveryId: stri
   return accepted;
 }
 
+/**
+ * 显式 ack（#594/#599 评审）：校验与清除必须在同一个跨进程临界区里完成——
+ * 读后清的窗口里可能落下新的 watch 债（另一个 watcher 正在跑），裸 clear 会误吞它。
+ * 只清 watch 源；serve 债与 seq 不匹配都原样保留并回报原因。
+ */
+export type AckWatchStuckOutcome =
+  | { outcome: "cleared"; seq: number }
+  | { outcome: "none" }
+  | { outcome: "serve_owned"; seq: number; source: string }
+  | { outcome: "seq_mismatch"; seq: number };
+
+export function ackWatchStuck(channel: string, expectedSeq?: number, cwd?: string): AckWatchStuckOutcome {
+  let result: AckWatchStuckOutcome = { outcome: "none" };
+  updateChannelCursor(channel, (cur) => {
+    const stuck = cur.stuck;
+    if (stuck === undefined) {
+      result = { outcome: "none" };
+      return null;
+    }
+    if (stuck.source !== "watch") {
+      // 旧格式债可能缺 source：来源不明按 serve 保守处理，绝不清（误清=静默丢 @）。
+      result = { outcome: "serve_owned", seq: stuck.seq, source: stuck.source ?? "unknown" };
+      return null;
+    }
+    if (expectedSeq !== undefined && stuck.seq !== expectedSeq) {
+      result = { outcome: "seq_mismatch", seq: stuck.seq };
+      return null;
+    }
+    result = { outcome: "cleared", seq: stuck.seq };
+    const { stuck: _dropped, ...rest } = cur;
+    return rest;
+  }, cwd);
+  return result;
+}
+
 /** 了结欠账：送达成功，或有界重试耗尽后显式放弃。 */
 export function clearStuck(channel: string, cwd?: string): void {
   updateChannelCursor(channel, (cur) => {

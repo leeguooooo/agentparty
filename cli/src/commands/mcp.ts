@@ -7,8 +7,8 @@ import { z } from "zod";
 import { stripTerminalControls } from "../format";
 import pkg from "../../package.json" with { type: "json" };
 import {
+  ackWatchStuck,
   advanceCursorPastOwnMessage,
-  clearStuck,
   loadCursor,
   loadRevCursor,
   loadStuck,
@@ -1100,19 +1100,19 @@ export function createMcpServer(defaultChannel?: string): McpServer {
     async ({ channel, seq }) => {
       try {
         const resolved = normalizeChannel(channel, defaultChannel);
-        const stuck = loadStuck(resolved);
-        if (stuck === null) return ok({ type: "ack", channel: resolved, acked: false, note: "no pending wake debt" });
-        if (stuck.source !== "watch") {
+        // 与 CLI party ack 共用原子 compare-and-clear（#599 评审）：读后清会误吞窗口内新债。
+        const acked = ackWatchStuck(resolved, seq);
+        if (acked.outcome === "none") return ok({ type: "ack", channel: resolved, acked: false, note: "no pending wake debt" });
+        if (acked.outcome === "serve_owned") {
           return fail(
-            `refusing to ack: pending debt at seq=${stuck.seq} is owned by party serve (source=${stuck.source}); ` +
+            `refusing to ack: pending debt at seq=${acked.seq} is owned by party serve (source=${acked.source}); ` +
               "serve replays it durably — clearing it by hand would silently drop that @",
           );
         }
-        if (seq !== undefined && stuck.seq !== seq) {
-          return fail(`refusing to ack: pending watch debt is seq=${stuck.seq}, not seq=${seq}`);
+        if (acked.outcome === "seq_mismatch") {
+          return fail(`refusing to ack: pending watch debt is seq=${acked.seq}, not seq=${seq}`);
         }
-        clearStuck(resolved);
-        return ok({ type: "ack", channel: resolved, acked: true, seq: stuck.seq });
+        return ok({ type: "ack", channel: resolved, acked: true, seq: acked.seq });
       } catch (e) {
         return fail(e instanceof Error ? e.message : String(e));
       }

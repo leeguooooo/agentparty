@@ -817,7 +817,7 @@ export async function run(argv: string[]): Promise<number> {
                 : "") +
               `channel_last_seq=${channelLastSeq} lag=${lag} ` +
               `skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}; ` +
-              `send a reply/status after handling it to clear this debt (or \`party ack\` if it needs no response).` +
+              `send a reply/status after handling it to clear this debt (or \`party ack --seq ${stuck.seq}\` if it needs no response).` +
               (lag > 0 ? ` 补上下文：party history ${channel} --since ${stuck.seq}` : ""),
           ));
           console.log(formatMsg(pending));
