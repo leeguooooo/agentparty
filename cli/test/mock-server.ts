@@ -92,6 +92,9 @@ export function welcomeFrame(lastSeq: number, self = "me", readCursors?: Array<{
   return {
     type: "welcome",
     channel: "dev",
+    // Match the production wire frame: the worker sends mode on EVERY welcome (ChannelMode = "normal"
+    // | "party"). Emitting it here keeps the whole suite honest against parseServerFrame's validator.
+    mode: "normal",
     self,
     last_seq: lastSeq,
     participants: [],

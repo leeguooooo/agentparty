@@ -113,10 +113,16 @@ const SENDER_KINDS = new Set(["agent", "human"]);
 const MESSAGE_KINDS = new Set(["message", "status"]);
 const STATUS_STATES = new Set(["working", "waiting", "blocked", "done"]);
 const PRESENCE_STATES = new Set(["online", "offline", "working", "waiting", "blocked", "done"]);
-const CHANNEL_MODES = new Set(["public", "private", "personal", "public_watch"]);
+// welcome.mode carries the wire ChannelMode (shared/src/protocol.ts: "normal" | "party"), NOT the
+// REST channel-visibility vocabulary (public/private/personal/public_watch). The worker sends mode on
+// every welcome, so this MUST stay in lockstep with ChannelMode or parseServerFrame drops every
+// welcome frame (serve never learns `self`, watch never registers its delivery adapter).
+const CHANNEL_MODES = new Set(["normal", "party"]);
 const TOKEN_ROLES = new Set(["agent", "readonly", "owner", "member", "moderator"]);
 const DELIVERY_STATES = new Set(["queued", "claimed", "running", "waiting_owner", "replied", "failed"]);
-const DELIVERY_CAUSES = new Set(["mention", "reply", "owner_answer", "retry"]);
+// Mirror DirectedDeliveryCause in shared/src/protocol.ts exactly — "mention_edit" (a mention added by
+// editing an existing message) is a real cause; omitting it drops those delivery frames.
+const DELIVERY_CAUSES = new Set(["mention", "mention_edit", "reply", "owner_answer", "retry"]);
 const ERROR_CODES = new Set([
   "bad_request",
   "unavailable",

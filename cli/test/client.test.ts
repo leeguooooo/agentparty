@@ -111,6 +111,57 @@ describe("ws client", () => {
     expect(conn.cursor).toBe(1);
   });
 
+  // Regression: the worker sends a wire ChannelMode ("normal" | "party") on EVERY welcome; the CLI
+  // validator once checked it against the REST visibility vocabulary and silently dropped every
+  // welcome frame (serve never learned `self`, watch never registered its delivery adapter).
+  test("accepts a welcome carrying the wire ChannelMode (normal and party), never dropping it", async () => {
+    for (const mode of ["normal", "party"] as const) {
+      server = startMockServer((frame, sock) => {
+        if (frame.type === "hello") {
+          sock.send({ ...welcomeFrame(1), mode });
+          sock.send(msgFrame(1, "a"));
+        }
+      });
+      conn = connect(server.url, "ap_tok", "dev", 0, {});
+      const frames = await collect(conn, 2, 3000, false);
+      expect(frames.map((f) => f.type)).toEqual(["welcome", "msg"]);
+      conn.close();
+      await server.stop();
+    }
+  });
+
+  // Regression: DELIVERY_CAUSES must mirror DirectedDeliveryCause in the protocol; "mention_edit"
+  // (a mention added by editing an existing message) was missing, so those delivery frames were dropped.
+  test("accepts a directed-delivery frame whose cause is mention_edit", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type === "hello") {
+        sock.send(welcomeFrame(1));
+        sock.send({
+          type: "delivery",
+          delivery: {
+            id: "d-1",
+            message_seq: 1,
+            target_name: "me",
+            cause: "mention_edit",
+            state: "queued",
+            attempt: 0,
+            lease_until: null,
+            work_id: null,
+            continuation_ref: null,
+            reply_seq: null,
+            last_error: null,
+            created_at: 1,
+            updated_at: 1,
+          },
+          message: msgFrame(1, "edited @me in"),
+        });
+      }
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0, {});
+    const frames = await collect(conn, 2, 3000, false);
+    expect(frames.map((f) => f.type)).toEqual(["welcome", "delivery"]);
+  });
+
   test("replayUnacked puts consumed standby frames back before newer queued frames", async () => {
     server = startMockServer((frame, sock) => {
       if (frame.type !== "hello") return;
