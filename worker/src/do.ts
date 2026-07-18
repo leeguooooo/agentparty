@@ -5437,6 +5437,16 @@ export class ChannelDO extends Server<Env> {
       }
       const now = Date.now();
       const state: CompletionReviewState = action === "approve" ? "approved" : "rejected";
+      // #627 / CodeRabbit #650：驳回回复要定向投递给完成作者（agent）。必须用落库时快照的
+      // creation-time principal（row.sender_owner），不是当前同名 token 的 owner——原 agent 被撤、
+      // 同名 token 被别的 owner 重建时，按当前 owner 投递会送错人。缺快照则在改动 review 状态**前**
+      // fail closed，绝不静默投给错误 owner 或原地失败。
+      if (action === "reject" && String(row.sender_kind) === "agent" && senderOwner === undefined) {
+        return Response.json(
+          { error: { code: "unavailable", message: "completion is missing its creation-time principal; cannot bind reject reply delivery" } },
+          { status: 503 },
+        );
+      }
       this.ctx.storage.sql.exec(
         `UPDATE messages
             SET completion_review_state = ?,
@@ -5468,13 +5478,12 @@ export class ChannelDO extends Server<Env> {
       const mentions = action === "reject" ? [senderName] : [];
       const reply = this.insertReviewerReply(identity, replyBody, mentions, seq, now);
       this.broadcastFrame(reply);
-      // #627：驳回回复 @ 原作者（agent）必须绑定 creation-time principal，否则 ensureDirectedDeliveries
-      // 存 target_owner=null，dispatchNextDirectedDelivery 的 null-principal 守卫立即把行置 failed
-      // (delivery_failed 不在 REVIVABLE_DELIVERY_FAILURES)→ agent 永远不被唤醒重交。镜像决策回应路径
-      // 的 agentOwnersForTargets 绑定。
+      // #627：驳回回复 @ 原作者（agent）必须绑定 creation-time principal（上面 fail-closed 已保证
+      // agent sender 时 senderOwner 存在），否则 ensureDirectedDeliveries 存 target_owner=null，
+      // dispatchNextDirectedDelivery 的 null-principal 守卫立即把行置 failed（delivery_failed 不在
+      // REVIVABLE_DELIVERY_FAILURES）→ agent 永远不被唤醒重交。
       const rejectTargets = String(row.sender_kind) === "agent" ? [senderName] : [];
-      const rejectTargetOwners =
-        rejectTargets.length > 0 ? ((await this.agentOwnersForTargets([senderName])) ?? {}) : {};
+      const rejectTargetOwners = senderOwner !== undefined ? { [senderName]: senderOwner } : {};
       await this.afterSend(reply, rejectTargets, false, rejectTargetOwners);
       return Response.json({ message: publicMsgFrame(message), reply: publicMsgFrame(reply) });
     }

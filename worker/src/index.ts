@@ -5242,9 +5242,13 @@ app.put("/api/channels/:slug/visibility", async (c) => {
     timestamp: now,
     metadata: { visibility },
   });
-  // #644：visibility 改动此刻已提交（init 已成、审计已落）。系统状态是 best-effort 旁路，写失败
-  // 绝不能反回 503 让客户端以为整体失败——忽略其结果，照常返回成功。
-  await insertSystemStatus(c.env, slug, `visibility changed to ${visibility} by ${identity.name}`, "waiting", now);
+  // #644：visibility 改动此刻已提交（init 已成、审计已落）。系统状态是 best-effort 旁路，返回 false
+  // 或**抛错**（DO 调用异常）都绝不能让客户端以为整体失败——吞掉结果与异常，照常返回成功（CodeRabbit #650）。
+  try {
+    await insertSystemStatus(c.env, slug, `visibility changed to ${visibility} by ${identity.name}`, "waiting", now);
+  } catch {
+    // best-effort：系统状态写失败不影响已提交的 visibility 改动。
+  }
   const recentSpeakers =
     visibility === "private" ? await recentNonMemberSpeakers(c.env.DB, c.env, slug, channel.owner_account) : [];
   return c.json({

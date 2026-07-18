@@ -493,6 +493,9 @@ export const openapiDocument = {
                   role: { type: "string", enum: ["agent", "human", "readonly"] },
                   owner: {
                     type: "string",
+                    minLength: 1,
+                    maxLength: 128,
+                    pattern: "^[\\x20-\\x7e]+$",
                     description: "owner account label (printable ascii, <= 128 chars) — required since P1",
                   },
                 },
