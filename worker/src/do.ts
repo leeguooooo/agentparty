@@ -5427,8 +5427,10 @@ export class ChannelDO extends Server<Env> {
           ? "sender"
           : (String(row.completion_review_policy) as CompletionReviewPolicy);
       const senderName = String(row.sender_name);
+      // #650 CodeRabbit：空串 sender_owner 视同缺失快照——绝不能当成一个合法 principal 绕过 fail-closed
+      // 守卫，也不能在 owner-policy 校验里让两个「空 owner」误相等。
       const senderOwner =
-        row.sender_owner === null || row.sender_owner === undefined ? undefined : String(row.sender_owner);
+        typeof row.sender_owner === "string" && row.sender_owner.length > 0 ? row.sender_owner : undefined;
       if (identity.name === senderName) {
         return Response.json({ error: { code: "forbidden", message: "completion sender cannot review their own completion" } }, { status: 403 });
       }
