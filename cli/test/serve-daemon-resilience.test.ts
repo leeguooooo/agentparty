@@ -301,3 +301,64 @@ describe("profile daemon resilience (#115)", () => {
     expect(front).not.toBe(worker);
   });
 });
+
+describe("profile daemon auto-upgrade re-exec (#630)", () => {
+  const readyNotice = {
+    running_version: "0.1.0",
+    installed_version: "9.9.9",
+    available_version: "9.9.9",
+    auto_upgrade: true,
+    action_required: "auto_reexec" as const,
+    message: "downloaded and verified",
+    command: "party upgrade",
+  };
+
+  test("下载校验新二进制后 supervisor 排空 lane 再协调 re-exec（不在单 lane execv），退出 EXIT_UPGRADED", async () => {
+    const { EXIT_UPGRADED } = await import("@agentparty/shared");
+    const reexec: Array<{ path: string; argv: string[] }> = [];
+    const { served, logs, opts } = baseOpts({
+      once: false,
+      availableUpgrade: readyNotice,
+      upgradeDeps: {
+        runningVersion: "0.2.60",
+        execPath: "/usr/local/bin/party",
+        readInstalledVersion: () => "0.2.61",
+        reexec: (path, argv) => reexec.push({ path, argv }),
+      },
+      listInvites: async () => [invite("alpha")],
+    });
+
+    await withHome(async () => {
+      expect(await runProfileServe(opts)).toBe(EXIT_UPGRADED);
+    });
+
+    // lane 被挂上（排空点确实等到了它们），re-exec 被协调调用恰好一次（而非在每条 lane 各 execv）。
+    expect(served.length).toBeGreaterThanOrEqual(1);
+    expect(reexec).toHaveLength(1);
+    expect(logs.some((l) => l.includes("re-exec"))).toBe(true);
+  });
+
+  test("notice 无 auto_reexec（--auto-upgrade 关或未下载）时不 re-exec", async () => {
+    const reexec: string[] = [];
+    const { opts } = baseOpts({
+      once: false,
+      availableUpgrade: {
+        running_version: "0.1.0",
+        available_version: "9.9.9",
+        auto_upgrade: false,
+        action_required: "ask_user" as const,
+        message: "manual upgrade available",
+        command: "party upgrade",
+      },
+      upgradeDeps: { readInstalledVersion: () => "9.9.9", reexec: (path) => reexec.push(path) },
+      listInvites: async () => {
+        throw new RestError(401, "unauthorized", "stop the loop");
+      },
+    });
+
+    await withHome(async () => {
+      await expect(runProfileServe(opts)).rejects.toThrow("stop the loop");
+    });
+    expect(reexec).toHaveLength(0);
+  });
+});

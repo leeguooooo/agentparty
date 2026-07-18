@@ -2706,6 +2706,8 @@ export interface ProfileServeOptions {
   availableUpgrade?: CliUpgradeNotice | null;
   refreshAvailableUpgrade?: (current: CliUpgradeNotice | null) => Promise<CliUpgradeNotice | null>;
   upgradeProbeIntervalMs?: number;
+  // #630：多 lane profile daemon 协调 re-exec 用（测试注入版本读取/execv；生产走默认 execv）。
+  upgradeDeps?: UpgradeDeps;
   once?: boolean;
   pollIntervalMs?: number;
   runnerTimeoutMs?: number;
@@ -3304,11 +3306,26 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
     ): ServeOptions => {
       // 升级迁移只对 front lane（频道对话的继承者）做一次：迁旧游标/欠账 + 清旧自由文本会话（#7/#10）。
       if (role === "front") migrateLegacyProfileFrontLane(channel, stateKey, prepared.runnerWorkdir);
-      // #581 managed MCP：lane 清单 + child token config 落到 runnerWorkdir/mcp（0600）。
-      // 注意这是 #578「child token 纯内存」边界的有意放宽（issue #581 拍板）：MCP server 进程
-      // 要持有身份就必须能读到它；模型 env 仍是 denied-home，token 不进模型环境。
-      const mcpStateDir = join(prepared.runnerWorkdir, "mcp");
+      // #581 managed MCP：lane 清单 + child token config（0600）。这是 #578「child token 纯内存」
+      // 边界的有意放宽（issue #581 拍板）：MCP server 进程要持有身份就必须能读到它；模型 env 仍是
+      // denied-home，token 不进模型环境。
+      // #647：但它绝不能落在 worker 模型的 workspace-write 沙箱根（channelWorkdir）之内——否则模型能
+      // 读回自己的 token（绕过 denied-home 直接打 REST）并篡改 managed.json（放宽 attachment_root
+      // 越权上传宿主文件）。非 branch 策略下 channelWorkdir === runnerWorkdir，故不能再用 runnerWorkdir/mcp；
+      // 改用 runnerWorkdir 的**同级**目录（.mcp 后缀），在所有策略下都保证落在沙箱之外。MCP server
+      // 子进程（serve 起、非沙箱）照常读得到，被沙箱的只是模型本身。
+      const mcpStateDir = `${prepared.runnerWorkdir}.mcp`;
       if (laneProtocol === "mcp") {
+        // 兜底 fail-closed：万一某种策略下路径推导仍落进沙箱，拒绝启动而不是把 token 暴露给模型。
+        // rel === "" 表示 mcpStateDir 与沙箱根**相等**，同样越界（CodeRabbit #651）；rel 不以 .. 开头
+        // 且非绝对路径表示嵌套在沙箱内。两种都拒。
+        const relToWorkspace = relative(prepared.channelWorkdir, mcpStateDir);
+        if (!relToWorkspace.startsWith("..") && !isAbsolute(relToWorkspace)) {
+          throw new Error(
+            `refusing managed MCP: state dir ${mcpStateDir} is inside the worker sandbox ${prepared.channelWorkdir} ` +
+              "(would leak the child token / manifest to the sandboxed model)",
+          );
+        }
         writeManagedManifest(mcpStateDir, {
           version: 1,
           server: opts.server,
@@ -3554,6 +3571,25 @@ export async function runProfileServe(opts: ProfileServeOptions): Promise<number
       if (opts.once) throw err;
       await abortableSleep(backoff);
       continue;
+    }
+    // #630：--auto-upgrade 已把新二进制下载+校验落盘（notice.action_required === "auto_reexec"，仅
+    // autoDownload 成功才置）。多 lane profile daemon 同进程，绝不能在单个 lane 里 execv——会把另一条
+    // lane 的在飞 runner 连根拔起、留孤儿 + 重启后双 runner 抢跑。改在 supervisor 空档协调：先排空所有
+    // lane，再整进程 re-exec 新版（此刻无在飞 runner，干净）。execv 不可用/测试注入时退出 EXIT_UPGRADED
+    // 让外层 supervisor（launchd KeepAlive / tmux）用新二进制拉起。此前只下载不 re-exec，daemon 永远跑旧版。
+    if (currentAvailableUpgrade?.action_required === "auto_reexec") {
+      out(`serve: 新版 party v${currentAvailableUpgrade.available_version} 已下载校验，排空 lane 后 re-exec`);
+      if (!lifecycleSignal.aborted) lifecycleController.abort(new ServeShutdownError("SIGTERM"));
+      await Promise.allSettled([...attaching.values()]);
+      await Promise.allSettled([...running.values()]);
+      // re-exec 失败（execv 抛错）也必须返回 EXIT_UPGRADED，让外层 supervisor（launchd/tmux）用新
+      // 二进制拉起，而不是把异常抛出 daemon（CodeRabbit #651）。lane 已排空，此刻退出干净。
+      try {
+        maybeReexecUpgrade(true, opts.upgradeDeps);
+      } catch (error) {
+        out(`serve: re-exec 失败，退出让 supervisor 用新版拉起: ${errText(error)}`);
+      }
+      return EXIT_UPGRADED;
     }
     if (opts.once) {
       await Promise.all([...running.values()]);
@@ -4197,6 +4233,14 @@ export async function runServe(o: ServeOptions): Promise<number> {
               }
             }
             cliUpgrade = upgradeNotice(o.autoUpgrade === true, o.upgradeDeps) ?? availableUpgrade;
+            // #646：prepare（git clone/pull、SDK startThread、附件下载）此前只受 shutdown 信号约束，
+            // 停滞远端会无界挂住串行 wake 消费者——正是 runner 硬超时的初衷。给 prepare 也套一个超时预算
+            // （与 runner 同额，并上 shutdown）：超时即中止本轮 prepare，走常规重试/放弃而非永久挂起。
+            const prepareTimeoutMs = o.runnerTimeoutMs ?? DEFAULT_RUNNER_TIMEOUT_MS;
+            const preparationSignal = AbortSignal.any([
+              lifecycleController.signal,
+              AbortSignal.timeout(prepareTimeoutMs),
+            ]);
             const preflightContext: ServeRunnerContext = {
               cmd: o.cmd,
               channel: o.channel,
@@ -4209,11 +4253,11 @@ export async function runServe(o: ServeOptions): Promise<number> {
               attachments: wakeAttachments,
               queueDepth,
               delivery: directedDelivery,
-              signal: lifecycleController.signal,
+              signal: preparationSignal,
             };
             const preparation = run.prepare?.(frame, preflightContext);
             if (preparation !== undefined) {
-              await awaitWithAbort(preparation, lifecycleController.signal);
+              await awaitWithAbort(preparation, preparationSignal);
             }
             if (lifecycleController.signal.aborted) throw lifecycleController.signal.reason;
             break;
@@ -4477,6 +4521,34 @@ export async function runServe(o: ServeOptions): Promise<number> {
             stopAfterFrame = true;
           }
         }
+        // #646：busy 清除（#103）抽成闭包，送达与放弃两条终局都要调用——否则放弃分支永不清 busy，
+        // 任务结束后 presence 永远卡在「忙」（假忙）。只在队列真排空时清：还有 @ 排队就保持 busy=true，
+        // 等下一条 wake 的 working 帧继续覆盖 queue_depth（避免闪烁）。
+        const clearBusyIfDrained = async (idleNote: string) => {
+          if (!busyReported) return;
+          const remaining = pendingWakeDepth(
+            conn.pendingFrames(),
+            self,
+            o.mentionsOnly === true,
+            conn.cursor,
+            directedDeliveryMode,
+          );
+          if (remaining !== 0) return;
+          busyReported = false;
+          try {
+            await (o.post ?? postMessage)(o.server, o.token, o.channel, {
+              kind: "status",
+              state: "waiting",
+              note: idleNote,
+              mentions: [],
+              busy: false,
+              queue_depth: 0,
+            }, lifecycleController.signal);
+          } catch (e) {
+            // 清 busy 只是锦上添花：发不出去就下条 wake 的 working 帧会重置 queue_depth，或下次排空再补。
+            out(`  busy 清除通告发送失败（不影响送达）: ${errText(e)}`);
+          }
+        };
         if (delivered) {
           // 一条真正送达的 wake 证明 runner 恢复了；此前连续失败不再代表当前健康状态。
           consecutiveWakeAbandons = 0;
@@ -4491,35 +4563,7 @@ export async function runServe(o: ServeOptions): Promise<number> {
           // 它是第二道闸：一旦有人放宽 blockedByDebt，这行会挡住「A 的成功清掉 B 的欠账」。
           // 不删，理由写在这里。
           if (deliveryConfirmed && stuck !== null && stuck.seq === frame.seq) setStuck(null);
-          // busy 清除（#103）：这条 wake 处理完了。若身后已无待处理 wake（队列排空），补一条「空闲」把
-          // 之前 working 帧上的 busy 清回 false——否则任务结束后 presence 会永远卡在「忙」（假忙）。
-          // 只在真排空时补：还有 @ 排队就保持 busy=true，等下一条 wake 的 working 帧继续覆盖 queue_depth。
-          if (busyReported) {
-            const remaining = pendingWakeDepth(
-              conn.pendingFrames(),
-              self,
-              o.mentionsOnly === true,
-              conn.cursor,
-              directedDeliveryMode,
-            );
-            if (remaining === 0) {
-              busyReported = false;
-              try {
-                await (o.post ?? postMessage)(o.server, o.token, o.channel, {
-                  kind: "status",
-                  state: "waiting",
-                  note: `idle: ${self} finished wake seq=${frame.seq}, waiting for next @`,
-                  mentions: [],
-                  busy: false,
-                  queue_depth: 0,
-                }, lifecycleController.signal);
-              } catch (e) {
-                // 清 busy 只是锦上添花：发不出去就下条 wake 的 working 帧会重置 queue_depth，
-                // 或下次排空再补。留痕但不影响主流程（wake 已成功送达）。
-                out(`  busy 清除通告发送失败（不影响送达）: ${errText(e)}`);
-              }
-            }
-          }
+          await clearBusyIfDrained(`idle: ${self} finished wake seq=${frame.seq}, waiting for next @`);
         } else {
           // 有界重放到顶：显式放弃，但必须响亮留痕——静默丢弃正是 #118 要修的东西。
           // 没有 CLI flag，所以重试预算与退避必须**在频道里可见**：把常数藏进源码是不诚实的。
@@ -4588,6 +4632,9 @@ export async function runServe(o: ServeOptions): Promise<number> {
             wakeAbandonCircuitTripped = true;
             code = EXIT_WAKE_ABANDON_CIRCUIT;
           }
+          // #646：放弃这条 wake 后若队列已排空，同样把 busy 清回 false（否则假忙永久卡住，
+          // 只有下一次真正送达的 wake 或进程退出才自愈）。已宣告过 blocked，这里只收 busy。
+          await clearBusyIfDrained(`idle: ${self} gave up wake seq=${frame.seq}, waiting for next @`);
         }
       }
       const heldForLease = deferredLeaseSeq !== null && frame.seq >= deferredLeaseSeq;
@@ -4856,12 +4903,18 @@ export async function run(argv: string[]): Promise<number> {
   const cmd = str(flags["on-mention"]);
   const runner = str(flags.runner);
   const runnerTimeoutSecondsRaw = str(flags["runner-timeout-seconds"]);
-  const runnerTimeoutSeconds = runnerTimeoutSecondsRaw === undefined ? DEFAULT_RUNNER_TIMEOUT_MS / 1000 : Number(runnerTimeoutSecondsRaw);
-  if (!Number.isInteger(runnerTimeoutSeconds) || runnerTimeoutSeconds < 1 || runnerTimeoutSeconds > 7 * 24 * 60 * 60) {
+  // #646：flag 未显式提供时保持 undefined，让各 lane 用自己的默认（front 10min / worker+单 runner
+  // 30min，见下游 `?? DEFAULT_FRONT_RUNNER_TIMEOUT_MS` / `?? DEFAULT_RUNNER_TIMEOUT_MS`）。此前这里
+  // 恒填 30min，front 的 DEFAULT_FRONT_RUNNER_TIMEOUT_MS 永不生效（死代码）。显式提供则两 lane 统一用它。
+  const runnerTimeoutSeconds = runnerTimeoutSecondsRaw === undefined ? undefined : Number(runnerTimeoutSecondsRaw);
+  if (
+    runnerTimeoutSeconds !== undefined &&
+    (!Number.isInteger(runnerTimeoutSeconds) || runnerTimeoutSeconds < 1 || runnerTimeoutSeconds > 7 * 24 * 60 * 60)
+  ) {
     console.error("--runner-timeout-seconds must be an integer between 1 and 604800");
     return 1;
   }
-  const runnerTimeoutMs = runnerTimeoutSeconds * 1000;
+  const runnerTimeoutMs = runnerTimeoutSeconds === undefined ? undefined : runnerTimeoutSeconds * 1000;
   const profileRef = parseProfileRef(str(flags.profile));
   if (flags.profile !== undefined && !profileRef) {
     console.error("profile must be <owner>/<handle>");
