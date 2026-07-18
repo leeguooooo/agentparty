@@ -44,6 +44,10 @@ export class ChannelSocket {
   private backoff = BACKOFF_MIN_MS;
   private pingTimer: number | null = null;
   private lastFrameAt = 0; // 最近一次收到任何入站帧（含 pong）的时刻，心跳看门狗判活用（issue #130）
+  // 当前这段「已发 ping 但一帧未回」沉默窗口的起点（epoch ms）；0 = 无在途未答 ping。
+  // 看门狗据 now - lastPingAt 判死，而不是「lastFrameAt 超 2×interval」——后台标签页 timer 被节流到
+  // ~60s/次时，后者会把每个 ping 都即时收到 pong 的健康连接误判掉线、每分钟无谓重连一次（issue #634）。
+  private lastPingAt = 0;
   private reconnectTimer: number | null = null;
   private everConnected = false;
   private handshakeFails = 0; // 连续「从未 open 就被关」的次数
@@ -78,6 +82,7 @@ export class ChannelSocket {
       this.handshakeFails = 0;
       this.backoff = BACKOFF_MIN_MS;
       this.lastFrameAt = Date.now(); // 看门狗基线：刚连上视为"此刻收到过帧"，避免首个周期误判死连接
+      this.lastPingAt = 0; // 新连接尚无在途未答 ping
       this.handlers.onStatus("open");
       // hello 等 welcome 到了再发（见 onmessage）：welcome.last_rev_seq 作 since_rev，
       // 服务端就不会把全部历史修订快照无条件重放进来——IM 窗口模式下，一条被编辑的
@@ -85,22 +90,30 @@ export class ChannelSocket {
       // 字面量须与 do 的 setWebSocketAutoResponse 配对，不唤醒 do
       this.pingTimer = window.setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
         // 静默死连接（TCP 半开）看门狗：健康连接下每个 ping 都会被 do 即时 pong 回来刷新 lastFrameAt。
-        // 若连续 PONG_TIMEOUT_MS 一帧未回（含 pong），说明发出去的 ping 全部石沉大海——链路已死但
-        // readyState 仍是 OPEN、onclose 迟迟不来。此时必须主动 close + 重连，绝不能把"沉默"当成健康
-        // 继续对用户显示 open（issue #130：一个 supervisor 挂着却收不到消息，presence 还显示在线）。
-        if (Date.now() - this.lastFrameAt > PONG_TIMEOUT_MS) {
+        // 判死只认「确实发过 ping，且自那以后一帧未回（含 pong），且真实墙钟已过 PONG_TIMEOUT_MS」——
+        // 用 now - lastPingAt 这个真实时间戳差判活，而不是假设 interval 准点触发。后台标签页 timer 被浏览器
+        // 节流到 ~60s/次时，旧的「lastFrameAt 超 2×interval」会把每个 ping 都即时收到 pong 的健康连接
+        // 误判掉线、每分钟无谓重连（issue #634）；这里只要上一个 ping 收到过回帧，沉默窗口就被 onmessage
+        // 归零，节流拉长的 tick 间隔完全不触发判死。真死连接（ping 发出、pong 石沉大海）照样在窗口越界后
+        // 主动 close + 重连，绝不把"沉默"当成健康继续显示 open（issue #130）。
+        if (this.lastPingAt > 0 && now - this.lastPingAt > PONG_TIMEOUT_MS) {
           this.handleStaleConnection(ws);
           return;
         }
         ws.send('{"type":"ping"}');
+        // 沉默窗口起点只在「上一个 ping 已被回帧确认」（lastPingAt 已被 onmessage 归零）时才前移，
+        // 已有在途未答 ping 则保留旧起点，否则每 tick 重发 ping 会不断刷新窗口、把死连接拖成永不判定。
+        if (this.lastPingAt === 0) this.lastPingAt = now;
       }, PING_INTERVAL_MS);
     };
 
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") return;
-      // 任何入站帧（含 pong）都证明链路还活着 → 刷新看门狗时钟（issue #130）
+      // 任何入站帧（含 pong）都证明链路还活着 → 刷新看门狗时钟、归零在途未答 ping 窗口（issue #130 / #634）
       this.lastFrameAt = Date.now();
+      this.lastPingAt = 0;
       let frame: ServerFrame;
       try {
         frame = JSON.parse(ev.data) as ServerFrame;
@@ -167,7 +180,11 @@ export class ChannelSocket {
   }
 
   private scheduleReconnect() {
-    this.reconnectTimer = window.setTimeout(() => this.connect(), this.backoff);
+    // 退避加 jitter（issue #634）：同频道多客户端常被同一次 DO 驱逐/重启/worker 部署/网络抖动同时断开，
+    // 纯确定性退避会让它们在 1s/2s/4s 精确同拍重连，形成惊群反复打垮刚恢复的 ChannelDO，再把整群
+    // 同步到下一轮。抖到 [0.5, 1)×backoff 把重连摊开到窗口内，天花板仍按 backoff 确定性翻倍。
+    const delay = this.backoff * (0.5 + Math.random() * 0.5);
+    this.reconnectTimer = window.setTimeout(() => this.connect(), delay);
     this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
   }
 

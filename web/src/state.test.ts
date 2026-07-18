@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { DirectedDelivery, MsgFrame, PresenceFrame } from "@agentparty/shared";
+import type { DirectedDelivery, ErrorCode, MsgFrame, PresenceFrame } from "@agentparty/shared";
 import { channelReducer, initialChannelState } from "./state";
 
 const NOW_FOR_RETENTION = 1_725_000_000_000;
@@ -506,5 +506,98 @@ describe("channel state", () => {
       frame: { ...frame, ts: frame.ts + 1, waiting_owner_count: undefined },
     });
     expect(cleared.presence["runner-a"]?.waiting_owner_count).toBeUndefined();
+  });
+
+  test("carries activity / runner_health / listening through incremental presence frames (#608/#632)", () => {
+    // 全量 welcome 之外，activity/探活字段只走 presence delta 下发；漏合并则 #608 徽章只在连接那一瞬
+    // 亮起、第一拍增量就被抹掉——恰是无人值守 agent 卡 waiting_permission / runner 熔断前最该看见的时刻。
+    const frame: PresenceFrame = {
+      type: "presence",
+      name: "runner-a",
+      kind: "agent",
+      state: "working",
+      note: "handling wake",
+      ts: 1_725_000_000_000,
+      live: true,
+      busy: true,
+      current_task: 45,
+      activity: { phase: "waiting_permission", tool: "Bash", ts: 1_725_000_000_500 },
+      runner_health: { ok: false, consecutive_failures: 2, last_error: "spawn failed" },
+      listening: "suspect",
+    };
+    const next = channelReducer(initialChannelState, { type: "frame", frame });
+
+    expect(next.presence["runner-a"]?.activity).toEqual({
+      phase: "waiting_permission",
+      tool: "Bash",
+      ts: 1_725_000_000_500,
+    });
+    expect(next.presence["runner-a"]?.runner_health).toEqual({
+      ok: false,
+      consecutive_failures: 2,
+      last_error: "spawn failed",
+    });
+    expect(next.presence["runner-a"]?.listening).toBe("suspect");
+
+    // 活动/探活与心跳同生共死：下一拍缺省即清，绝不留僵值。
+    const cleared = channelReducer(next, {
+      type: "frame",
+      frame: { ...frame, ts: frame.ts + 1, activity: undefined, runner_health: undefined, listening: undefined },
+    });
+    expect(cleared.presence["runner-a"]?.activity).toBeUndefined();
+    expect(cleared.presence["runner-a"]?.runner_health).toBeUndefined();
+    expect(cleared.presence["runner-a"]?.listening).toBeUndefined();
+  });
+
+  test("send-rejecting error frames bump sendRejectedSeq so the composer queue drops the stale entry (#633)", () => {
+    // sendRejectedSeq 是 composer 侧 pendingSends 摘账用的单调触发器：被拒的 send 永不发 sent、
+    // 不推进 lastSentSeq，只有靠它 +1 才能把错位的待发条目摘掉。
+    expect(initialChannelState.sendRejectedSeq).toBe(0);
+
+    const loopGuard = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "error", code: "loop_guard", message: "loop detected" },
+    });
+    expect(loopGuard.sendRejectedSeq).toBe(1);
+    expect(loopGuard.loopGuard).toBe("loop detected");
+
+    const rateLimited = channelReducer(loopGuard, {
+      type: "frame",
+      frame: { type: "error", code: "rate_limited", message: "slow down" },
+    });
+    expect(rateLimited.sendRejectedSeq).toBe(2);
+    expect(rateLimited.sendError).toBe("slow down");
+
+    const unauthorized = channelReducer(rateLimited, {
+      type: "frame",
+      frame: { type: "error", code: "unauthorized", message: "nope" },
+    });
+    expect(unauthorized.sendRejectedSeq).toBe(3);
+    expect(unauthorized.readonly).toBe(true);
+
+    const archived = channelReducer(unauthorized, {
+      type: "frame",
+      frame: { type: "error", code: "archived", message: "gone" },
+    });
+    expect(archived.sendRejectedSeq).toBe(4);
+    expect(archived.archived).toBe(true);
+  });
+
+  test("a sent ack never bumps sendRejectedSeq; connect-time forbidden never does either (#633)", () => {
+    // sent 走 lastSentSeq 摘账，不该同时被算作一次拒绝。
+    const sent = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "sent", seq: 9 },
+    });
+    expect(sent.sendRejectedSeq).toBe(0);
+    expect(sent.lastSentSeq).toBe(9);
+
+    // forbidden 是连接期 ACL 拒入、不对应任何已入队 send，若也 +1 会误摘一条无辜的待发条目。
+    const forbidden = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "error", code: "forbidden" as ErrorCode, message: "private" },
+    });
+    expect(forbidden.forbidden).toBe(true);
+    expect(forbidden.sendRejectedSeq).toBe(0);
   });
 });

@@ -2718,7 +2718,10 @@ export function ChannelPage({
   }, []);
   const sockRef = useRef<ChannelSocket | null>(null);
   const streamRef = useRef<HTMLDivElement | null>(null);
-  const pendingSendsRef = useRef<Array<{ draft: string; replyTo: number | null }>>([]);
+  // 每条已写出 ws 的待发消息一个条目，按客户端自增 id 标识；服务端每回一个终局帧（sent 或 error）
+  // 就按 id 精确摘掉队头一条。用 id 而非无脑 shift：即便同一次归约被 React 触发两次也幂等（issue #633）。
+  const pendingSendsRef = useRef<Array<{ id: number; draft: string; replyTo: number | null }>>([]);
+  const pendingSendIdRef = useRef(0);
   const stickBottom = useRef(true);
   const authFailedRef = useRef(onAuthFailed);
   authFailedRef.current = onAuthFailed;
@@ -3365,14 +3368,32 @@ export function ChannelPage({
     if (el.scrollTop < TOP_LOAD_PX) loadOlder();
   }, [loadOlder, sendSeen]);
 
+  // 按 id 精确摘掉待发队头一条（已被服务端终结的那次 send），返回被摘条目；队空即 no-op。
+  // 摘队头而非按内容匹配：ws 有序，服务端对每次 send 恰好回一个终局帧（sent 或 error），FIFO 对齐。
+  const reconcilePendingSend = useCallback(() => {
+    const head = pendingSendsRef.current[0];
+    if (head === undefined) return undefined;
+    pendingSendsRef.current = pendingSendsRef.current.filter((p) => p.id !== head.id);
+    return head;
+  }, []);
+
   // 服务端 sent 确认后才清对应草稿；用户已输入的新内容不能被旧 ack 清掉。
   useEffect(() => {
     if (state.lastSentSeq <= 0) return;
-    const submitted = pendingSendsRef.current.shift();
+    const submitted = reconcilePendingSend();
     if (submitted === undefined) return;
     setDraft((current) => (current === submitted.draft ? "" : current));
     setReplyTo((current) => (current === submitted.replyTo ? null : current));
-  }, [state.lastSentSeq]);
+  }, [state.lastSentSeq, reconcilePendingSend]);
+
+  // 服务端 error 帧（loop_guard / rate_limited / too_large / unauthorized / archived）即一次 send 被拒：
+  // 它永不发 sent，若不在此摘掉对应待发条目，FIFO 队列永久错位一位——之后一次成功发送的 sent ack 会去
+  // 清那条陈旧草稿、清不掉真正已发出的 composer，用户误以为没发出去而重复发送（issue #633）。被拒时草稿
+  // 保留供重试，故这里只摘队头、不动 composer。
+  useEffect(() => {
+    if (state.sendRejectedSeq <= 0) return;
+    reconcilePendingSend();
+  }, [state.sendRejectedSeq, reconcilePendingSend]);
 
   const send = useCallback(() => {
     const body = draft.trim();
@@ -3393,7 +3414,7 @@ export function ChannelPage({
       }) ?? false;
     // ⌘⏎ 不受按钮 disabled 门控，断线窗口内发送失败要内联提示（草稿保留）
     if (ok) {
-      pendingSendsRef.current.push({ draft, replyTo });
+      pendingSendsRef.current.push({ id: ++pendingSendIdRef.current, draft, replyTo });
       // 附件已落 R2，ws 已接收帧 → 乐观清空待发引用（失败上传一并丢弃，失败时保留草稿由 ack 逻辑处理）
       setAttachments([]);
       setUploads([]);

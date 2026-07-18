@@ -1689,6 +1689,21 @@ export interface PresenceFrame {
   agent_session?: AgentSessionInfo;
   /** 同一身份当前活跃连接数。 */
   connection_count?: number;
+  /**
+   * 模型 session 内的细粒度活动（issue #602）：跑哪个工具、是否卡权限确认、是否 compact。
+   * 与 current_task 同生共死；presence delta 帧照常捎带，前端据此渲染活动徽章（#608）。旧客户端忽略。
+   */
+  activity?: AgentActivity;
+  /**
+   * runner 健康自报（issue #603）：serve runner 连败中（"在线但干不动"）。仅有连败时下发，
+   * 恢复由后续心跳缺省即清；presence delta 帧照常捎带，前端据此渲染探活徽章（#608）。旧客户端忽略。
+   */
+  runner_health?: RunnerHealth;
+  /**
+   * 服务端派生的监听力判定（issue #603）：suspect / deaf（"在线但没在听"）。仅有负面信号时下发；
+   * presence delta 帧照常捎带，前端据此渲染探活徽章（#608）。旧客户端忽略。
+   */
+  listening?: ListeningVerdict;
 }
 
 export interface ErrorFrame {

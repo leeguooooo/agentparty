@@ -32,6 +32,10 @@ export interface ChannelState {
   loopGuardBaselineSeq: number | null; // welcome/error 时的游标；历史回放中的旧 human 消息不能清黄条
   sendError: string | null; // rate_limited / too_large 红条
   lastSentSeq: number; // sent 确认，composer 据此清空草稿
+  // 服务端拒绝一次 send 的累计次数（loop_guard / rate_limited / too_large / unauthorized / archived）。
+  // 被拒的 send 永不发 sent、不推进 lastSentSeq，composer 侧据此计数从待发队列摘掉对应条目，
+  // 避免 FIFO 永久错位（issue #633）。只增不减，值本身无意义，只作单调触发器用。
+  sendRejectedSeq: number;
 }
 
 export const initialChannelState: ChannelState = {
@@ -51,6 +55,7 @@ export const initialChannelState: ChannelState = {
   loopGuardBaselineSeq: null,
   sendError: null,
   lastSentSeq: 0,
+  sendRejectedSeq: 0,
 };
 
 export type ChannelAction =
@@ -336,26 +341,41 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
             current_task: frame.current_task,
             task_started_at: frame.task_started_at,
             heartbeat_at: frame.heartbeat_at,
+            // #608 的活动与探活徽章靠这三条：presence delta 每拍都下发（活动新鲜度与心跳同生共死），
+            // 漏合并则徽章只在 welcome 快照那一瞬亮起、第一拍增量就被抹掉（issue #632）。
+            activity: frame.activity,
+            runner_health: frame.runner_health,
+            listening: frame.listening,
           },
         },
       };
     case "sent":
       return { ...state, lastSentSeq: frame.seq, sendError: null, loopGuard: null, loopGuardBaselineSeq: null };
-    case "error":
+    case "error": {
       // worker 可能先发 error:forbidden 再 1008 关连（private ACL 拒入，spec §3）。
-      // "forbidden" 尚未进 shared ErrorCode 联合类型，运行时按字符串识别。
+      // "forbidden" 尚未进 shared ErrorCode 联合类型，运行时按字符串识别。它是连接期 ACL 拒入、
+      // 不对应任何已入队的 send，故不计入 sendRejectedSeq（否则会误摘一条无辜的待发条目）。
       if ((frame.code as string) === "forbidden") return { ...state, forbidden: true };
+      // 走到这里的 error 帧都是对一次 send 的拒答（loop_guard/rate_limited/too_large/unauthorized/archived）——
+      // 永不发 sent，故计数 +1 让 composer 侧摘掉对应待发条目，队列不再错位（issue #633）。
+      const sendRejectedSeq = state.sendRejectedSeq + 1;
       switch (frame.code) {
         case "unauthorized":
           // 契约：send 被拒 unauthorized 即视为 readonly token（吊销场景随后会被 1008 踢线接管）
-          return { ...state, readonly: true };
+          return { ...state, readonly: true, sendRejectedSeq };
         case "loop_guard":
-          return { ...state, loopGuard: frame.message, loopGuardBaselineSeq: state.messages.at(-1)?.seq ?? 0 };
+          return {
+            ...state,
+            loopGuard: frame.message,
+            loopGuardBaselineSeq: state.messages.at(-1)?.seq ?? 0,
+            sendRejectedSeq,
+          };
         case "archived":
-          return { ...state, archived: true };
+          return { ...state, archived: true, sendRejectedSeq };
         default:
-          return { ...state, sendError: frame.message };
+          return { ...state, sendError: frame.message, sendRejectedSeq };
       }
+    }
     default:
       return state; // pong 等
   }

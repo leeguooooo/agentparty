@@ -200,6 +200,35 @@ describe("ChannelSocket 心跳 pong 看门狗 (issue #130)", () => {
     sock.dispose();
   });
 
+  test("后台标签页 timer 被节流到 ~60s/次、但每 tick 服务端仍即时回 pong → 绝不误判掉线重连 (issue #634)", () => {
+    const { statuses, handlers } = statusRecorder();
+    const sock = new ChannelSocket("demo", "tok", handlers);
+    sock.connect();
+    const s0 = FakeSocket.instances[0]!;
+    s0.open();
+    s0.deliver(welcome());
+
+    // 节流：tick 间隔被浏览器拉到 60s（> PONG_TIMEOUT_MS=50s）。旧看门狗按「lastFrameAt 超 2×interval」
+    // 会在每个 tick 前就把健康连接误判成死连接、每分钟无谓重连；新看门狗只认「发了 ping 又一帧未回」的
+    // 真实沉默窗口——上一个 ping 每次都被紧随的 pong 归零，节流拉长的 tick 间隔完全不触发判死。
+    const THROTTLED_INTERVAL = 60_000;
+    for (let i = 0; i < 6; i++) {
+      clock += THROTTLED_INTERVAL;
+      fireHeartbeat();
+      s0.deliver({ type: "pong" }); // do 的 auto-response，紧随 ping 立即到达
+    }
+
+    // 过程断言：健康连接从不被 close、从不翻 reconnecting、只有一个 socket（没有惊群重连）
+    expect(s0.closed).toBe(false);
+    expect(FakeSocket.instances.length).toBe(1);
+    expect(statuses).not.toContain("reconnecting");
+    expect(statuses[statuses.length - 1]).toBe("open");
+    // 心跳没被误停：每个 tick 都照常发了 ping
+    expect(s0.pings().length).toBe(6);
+
+    sock.dispose();
+  });
+
   test("连上后迟迟没有 welcome/任何帧：看门狗以 open 时刻为基线，首个周期内不误杀、超阈值后照样判死", () => {
     const { handlers } = statusRecorder();
     const sock = new ChannelSocket("demo", "tok", handlers);
