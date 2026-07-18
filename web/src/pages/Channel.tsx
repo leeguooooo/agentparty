@@ -3370,6 +3370,11 @@ export function ChannelPage({
 
   // 按 id 精确摘掉待发队头一条（已被服务端终结的那次 send），返回被摘条目；队空即 no-op。
   // 摘队头而非按内容匹配：ws 有序，服务端对每次 send 恰好回一个终局帧（sent 或 error），FIFO 对齐。
+  // #633：按 FIFO 摘队头。服务端在同一条 WebSocket 上**串行**处理 send 并**按序**回终局帧——每条 send
+  // 恰好对应一个 sent 或一个 send-拒绝 error（见 state.ts 仅对 send-拒绝码 bump sendRejectedSeq，连接级
+  // 的 forbidden 不算），故终局帧与待发条目严格同序，摘队头即摘其对应条目。head.id 用于幂等（万一某个
+  // reconcile effect 重入也只删这一条、不误删两条）。若未来终局回执会乱序/去重/合并，需服务端在 sent/error
+  // 帧里回带一个 client_id 精确关联——那是跨 worker+shared+web 的协议强化，非本 bug 修复范围。
   const reconcilePendingSend = useCallback(() => {
     const head = pendingSendsRef.current[0];
     if (head === undefined) return undefined;
