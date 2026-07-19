@@ -735,6 +735,65 @@
   padding-top: 8px;
   border-top: 1.4px dashed var(--t-faint);
 }
+
+/* ── Markdown 正文块级排版（消息卡片 + charter 共用 .msg-body）────────────────────
+   之前只有 .msg-body 的容器样式，marked 出的 <table>/<blockquote>/<hr>/标题/列表全无样式，
+   按浏览器默认裸渲染——表格没有边框看着就像挤在一起的纯文本（用户报的「没办法展示表格」）。
+   这里补一套主题感知（明/暗都走 --t-* / --code-* token）的正文排版。代码块沿用 hljs 主题，不动。 */
+.msg-body > :first-child { margin-top: 0; }
+.msg-body > :last-child { margin-bottom: 0; }
+.msg-body p { margin: 6px 0; }
+.msg-body a { color: var(--t-link); text-decoration: underline; text-underline-offset: 2px; }
+.msg-body h1, .msg-body h2, .msg-body h3,
+.msg-body h4, .msg-body h5, .msg-body h6 {
+  margin: 14px 0 6px;
+  line-height: 1.25;
+  font-weight: 700;
+}
+.msg-body h1 { font-size: 1.35em; }
+.msg-body h2 { font-size: 1.2em; }
+.msg-body h3 { font-size: 1.08em; }
+.msg-body h4, .msg-body h5, .msg-body h6 { font-size: 1em; }
+.msg-body ul, .msg-body ol { margin: 6px 0; padding-left: 22px; }
+.msg-body li { margin: 2px 0; }
+.msg-body li > input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: middle; }
+/* GFM 任务列表项：复选框自己当标记，去掉圆点 */
+.msg-body li:has(> input[type="checkbox"]) { list-style: none; }
+.msg-body hr { margin: 12px 0; border: 0; border-top: 1.4px solid var(--t-faint); }
+.msg-body blockquote {
+  margin: 8px 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--t-faint);
+  color: var(--t-muted);
+}
+/* 行内代码（不含代码块里的 code——那由 hljs 负责）*/
+.msg-body :not(pre) > code {
+  font-family: var(--t-mono);
+  font-size: 0.9em;
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 3px;
+  padding: 0.1em 0.35em;
+  overflow-wrap: anywhere;
+}
+/* 表格：GitHub 式带边框；窄屏时表格自身横向滚动，不把整条消息撑宽 */
+.msg-body table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 8px 0;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+.msg-body th, .msg-body td {
+  padding: 5px 10px;
+  border: 1px solid var(--t-border);
+  text-align: left;
+}
+.msg-body th { background: var(--t-panel2); font-weight: 700; }
+.msg-body tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--t-panel2) 55%, transparent); }
+
 .charter-empty {
   margin: 0;
   padding-top: 8px;

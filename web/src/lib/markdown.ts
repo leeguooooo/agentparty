@@ -87,9 +87,14 @@ const ALLOWED_TAGS = [
   "ul", "ol", "li",
   "strong", "em", "del", "blockquote",
   "table", "thead", "tbody", "tr", "th", "td",
+  // input 只为 GFM 任务列表 `- [ ]` 的复选框：marked 的 html renderer 已把消息正文里的裸 HTML
+  // 整体转义（#642），所以能到达 DOMPurify 的 <input> 只可能是 marked 任务列表 token 生成的；
+  // 下面的 hook 再把它强制成 disabled 复选框，杜绝任何交互/表单面。
+  "input",
   "h1", "h2", "h3", "h4", "h5", "h6",
 ];
-const ALLOWED_ATTR = ["href", "title", "class", "start"];
+// align：保留 GFM 表格列对齐（marked 发 <th align="center">）。type/checked/disabled：任务列表复选框。
+const ALLOWED_ATTR = ["href", "title", "class", "start", "align", "type", "checked", "disabled"];
 
 // class 只留 hljs 产物和受控 mention 产物，防止消息正文借用应用自身样式伪装系统 UI。
 const SAFE_CLASS_RE = /^(?:hljs(?:-[\w-]+)?|ap-mention)$/;
@@ -103,6 +108,15 @@ if (typeof DOMPurify.addHook === "function") {
     if (node.tagName === "A" && node.hasAttribute("href")) {
       node.setAttribute("target", "_blank");
       node.setAttribute("rel", "noopener noreferrer");
+    }
+    // 任务列表复选框：强制成不可交互的 disabled 复选框（type 只能是 checkbox），并删掉除
+    // type/checked/disabled 外的一切属性——即便未来有别的路径塞进 <input>，也没有任何表单/交互面。
+    if (node.tagName === "INPUT") {
+      node.setAttribute("type", "checkbox");
+      node.setAttribute("disabled", "");
+      for (const attr of [...node.attributes]) {
+        if (!["type", "checked", "disabled"].includes(attr.name)) node.removeAttribute(attr.name);
+      }
     }
     if (node.hasAttribute("class")) {
       const kept = (node.getAttribute("class") ?? "")
