@@ -140,4 +140,44 @@ describe("MessageCard touch and keyboard details (#357)", () => {
     expect(root.findAllByProps({ className: "msg-status-group-head" }).map((node) => node.children.join("")))
       .toContain("Reliable @ delivery");
   });
+
+  test("queued shows the pending indicator while genuinely pending (#667)", () => {
+    const queued: PublicDirectedDelivery = {
+      id: "delivery-10-queued", message_seq: 10, target_name: "kyc-claude",
+      state: "queued", reply_seq: null, created_at: 1_700_000_000_000, updated_at: 1_700_000_000_000,
+    };
+    const root = renderMessage([queued]);
+    const pill = root.findByProps({ "data-delivery-id": "delivery-10-queued" });
+    expect(pill.props.className).toContain("msg-delivery--queued");
+    expect(pill.props.className).not.toContain("msg-delivery--undelivered");
+    expect(pill.findByProps({ className: "msg-receipt-label" }).children.join("")).toBe("queued");
+    // ⏳ 家族图标：waiting，不是 failed。
+    expect(pill.findByProps({ className: "msg-receipt-icon ap-sprite ap-sprite--waiting" })).toBeDefined();
+  });
+
+  test("a timed-out delivery renders a distinct terminal 'undelivered', never a permanent ⏳ (#667)", () => {
+    const undelivered: PublicDirectedDelivery = {
+      id: "delivery-10-undelivered", message_seq: 10, target_name: "kyc-claude",
+      state: "failed", undelivered: true, reply_seq: null,
+      created_at: 1_700_000_000_000, updated_at: 1_700_000_600_000,
+    };
+    const root = renderMessage([undelivered]);
+    const pill = root.findByProps({ "data-delivery-id": "delivery-10-undelivered" });
+    // 终态与 queued 明确区分：独立类名 + 独立文案。
+    expect(pill.props.className).toContain("msg-delivery--undelivered");
+    expect(pill.props.className).not.toContain("msg-delivery--queued");
+    expect(pill.props.className).not.toContain("msg-delivery--failed");
+    expect(pill.findByProps({ className: "msg-receipt-label" }).children.join("")).toBe("undelivered");
+  });
+
+  test("replied (processed) stays visually distinct from queued (#667/#665)", () => {
+    const replied: PublicDirectedDelivery = {
+      id: "delivery-10-replied", message_seq: 10, target_name: "kyc-claude",
+      state: "replied", reply_seq: 42, created_at: 1_700_000_000_000, updated_at: 1_700_000_600_000,
+    };
+    const root = renderMessage([replied]);
+    const pill = root.findByProps({ "data-delivery-id": "delivery-10-replied" });
+    expect(pill.props.className).toContain("msg-delivery--replied");
+    expect(pill.findByProps({ className: "msg-receipt-label" }).children.join("")).toBe("replied");
+  });
 });

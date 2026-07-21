@@ -191,6 +191,7 @@ type DeliveryTerminalReason =
   | "source_retracted"
   | "source_retention_expired"
   | "delivery_expired"
+  | "undelivered_timeout"
   | "orphaned_waiting_owner";
 
 const REVIVABLE_DELIVERY_FAILURES = new Set<DeliveryTerminalReason>(["unknown_outcome"]);
@@ -317,6 +318,15 @@ const WORKFLOW_GUARD_WINDOW = 8;
 // keeping permanently offline agents and abandoned owner questions bounded.
 const DIRECTED_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const DIRECTED_DELIVERY_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// #667：一条 @ 一旦落 `queued`（无任何 serve/watch/webhook adapter 可领取）就永不收敛——发送方
+// 永远看到 ⏳「已排队」，分不清「还在等」「送到了没醒」还是「永远送不到」。给排队态一个超时闸：
+// 排队超过此阈值、且到期扫描时对端仍无任何唤醒通道（live 连接/注册 webhook 都没有，正是 #665 里
+// watcher 被回收的 host），就把它转终态 `failed`（terminal_reason=undelivered_timeout），发一条
+// delivery_state 让 UI 从 ⏳ 收敛到「未送达」。10 分钟：远大于 60s presence 新鲜度与常见断线重连，
+// 又给发送方及时回执。注意这会把「无 webhook 的离线 host」的离线重放窗口从数小时收窄到此阈值——
+// 这类目标恰是无独立唤醒通道、只能靠自己重连轮询的，对齐 #665 的判定；有 webhook/在线连接的目标
+// 属可达，dispatchNextDirectedDelivery 会领走，永不被本闸命中。
+export const DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS = 10 * 60_000;
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).byteLength;
@@ -2647,6 +2657,7 @@ export class ChannelDO extends Server<Env> {
   async onAlarm() {
     const now = Date.now();
     this.requeueExpiredDirectedDeliveries(now);
+    this.failStaleQueuedDeliveries(now);
     const scan = this.scanPresence(now);
     this.resumeDuePauses(now);
     await this.retryWebhooks(now);
@@ -3366,6 +3377,13 @@ export class ChannelDO extends Server<Env> {
       .one();
     if (oldestActiveDelivery.t !== null) {
       candidates.push(Number(oldestActiveDelivery.t) + DIRECTED_DELIVERY_MAX_AGE_MS);
+    }
+    // #667：排队超时闸。取最老的 queued 行，到点跑 failStaleQueuedDeliveries 收敛未送达的 @。
+    const oldestQueued = this.ctx.storage.sql
+      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state = 'queued'")
+      .one();
+    if (oldestQueued.t !== null) {
+      candidates.push(Number(oldestQueued.t) + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS);
     }
     const oldestTerminalLeaf = this.ctx.storage.sql
       .exec(
@@ -4838,6 +4856,11 @@ export class ChannelDO extends Server<Env> {
       .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state IN ('queued', 'claimed', 'running', 'waiting_owner')")
       .one().t;
     if (active !== null) candidates.push(Number(active) + DIRECTED_DELIVERY_MAX_AGE_MS);
+    // #667：DO 水合后也要重挂排队超时闸，否则驱逐/迁移后陈旧的 queued 行再无扫描把它收敛。
+    const oldestQueued = this.ctx.storage.sql
+      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state = 'queued'")
+      .one().t;
+    if (oldestQueued !== null) candidates.push(Number(oldestQueued) + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS);
     const terminal = this.ctx.storage.sql
       .exec(
         `SELECT MIN(delivery.updated_at) AS t FROM directed_deliveries delivery
@@ -8342,6 +8365,9 @@ export class ChannelDO extends Server<Env> {
       detailedState || delivery.state === "queued" || delivery.state === "replied" || delivery.state === "failed"
         ? delivery.state
         : "running";
+    // #667：把「排队超时/无唤醒通道」这一粗粒度失因下发，让 UI 把它和「跑了但失败」区分成「未送达」。
+    // 只在终态 failed 且 terminal_reason=undelivered_timeout 时置 true，不泄露任何 runner/session 细节。
+    const undelivered = state === "failed" && String(row.terminal_reason ?? "") === "undelivered_timeout";
     return {
       id: delivery.id,
       message_seq: delivery.message_seq,
@@ -8351,6 +8377,7 @@ export class ChannelDO extends Server<Env> {
       created_at: delivery.created_at,
       updated_at: delivery.updated_at,
       preview: preview !== undefined ? preview : this.deliveryMessagePreview(delivery.message_seq),
+      ...(undelivered ? { undelivered: true } : {}),
     };
   }
 
@@ -8654,6 +8681,8 @@ export class ChannelDO extends Server<Env> {
       if (inserted !== undefined) {
         this.broadcastDirectedDelivery(inserted);
         this.ctx.waitUntil(this.ensureAlarmAt(now + DIRECTED_DELIVERY_MAX_AGE_MS));
+        // #667：即使频道随后无连接、alarm 长期不被重排，也保证排队超时闸能到点触发收敛。
+        this.ctx.waitUntil(this.ensureAlarmAt(now + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS));
       }
     }
     for (const targetName of targets) this.dispatchNextDirectedDelivery(targetName);
@@ -8891,6 +8920,64 @@ export class ChannelDO extends Server<Env> {
       if (queued !== undefined && String(queued.state) === "queued") this.broadcastDirectedDelivery(queued);
     }
     return [...targets];
+  }
+
+  // #667：一条 @ 是否还有任何唤醒通道可把它从 queued 领走。镜像 dispatchNextDirectedDelivery 的候选口径：
+  // 持租的 v1 serve、活的 watch、同 principal 的 legacy serve、或注册在册的 agent webhook 任一存在即可达。
+  // 全无 = 对端此刻无法收到这条 @（正是 watcher 被回收、无 webhook 的 host），排队超时后应转终态。
+  private targetHasLiveDeliveryAdapter(targetName: string, principal: string | null): boolean {
+    if (principal === null) return false;
+    const samePrincipal = (state: ConnState | null | undefined): boolean =>
+      state != null && this.identityDeliveryPrincipal(state) === principal;
+    const hasServe = this.serveLeaseCandidates(targetName).some(
+      (candidate) => candidate.state?.serveLeaseHeld === true && samePrincipal(candidate.state),
+    );
+    if (hasServe) return true;
+    const hasWatch = this.watchLeaseCandidates(targetName).some((candidate) => samePrincipal(candidate.state));
+    if (hasWatch) return true;
+    const hasLegacy = this.claimedServeConnections(targetName).some(
+      (candidate) =>
+        candidate.state?.directedDeliveryV1 !== true &&
+        candidate.state?.serveLeaseHeld === true &&
+        samePrincipal(candidate.state),
+    );
+    if (hasLegacy) return true;
+    return this.agentWebhookCandidates(targetName).some((hook) => hook.targetOwner === principal);
+  }
+
+  // #667：把排队超过 DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS、且到期扫描时对端仍无任何唤醒通道的定向 @
+  // 收敛到终态 failed(undelivered_timeout)。gate 在无 adapter 上：有 webhook/在线连接的目标属可达，
+  // dispatchNextDirectedDelivery 会领走，绝不被误伤；只有真无唤醒通道（#665 的死目标）才转终态。
+  private failStaleQueuedDeliveries(now: number) {
+    const cutoff = now - DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS;
+    const stale = this.ctx.storage.sql
+      .exec(
+        `SELECT * FROM directed_deliveries
+          WHERE state = 'queued' AND created_at <= ?
+          ORDER BY created_at, id`,
+        cutoff,
+      )
+      .toArray();
+    if (stale.length === 0) return;
+    const doomed = stale.filter((row) => {
+      const targetName = String(row.target_name);
+      // 暂停接待（#180）是 owner 主动持债、等定时/手动恢复——绝不能被超时闸误判为「未送达」。
+      if (this.isPresencePaused(targetName)) return false;
+      const principal = typeof row.target_owner === "string" && row.target_owner.length > 0
+        ? String(row.target_owner)
+        : null;
+      return !this.targetHasLiveDeliveryAdapter(targetName, principal);
+    });
+    if (doomed.length === 0) return;
+    let invalidatedDecisionSeqs: number[] = [];
+    const effects = this.captureAtomicDeliveryEffects(() => {
+      invalidatedDecisionSeqs = this.failDeliveryTree(doomed, now, {
+        error: "no live wake channel for target after queued timeout; @ undelivered",
+        terminalReason: "undelivered_timeout",
+      });
+    });
+    this.flushAtomicDeliveryEffects(effects);
+    this.broadcastInvalidatedDecisions(invalidatedDecisionSeqs, now);
   }
 
   private requeueExpiredDirectedDeliveries(now: number) {

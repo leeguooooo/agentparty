@@ -1,7 +1,7 @@
 import type { DirectedDelivery, DirectedDeliveryFrame, PublicDirectedDelivery } from "@agentparty/shared";
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { ChannelDO } from "../src/do";
+import { type ChannelDO, DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS } from "../src/do";
 import { WsClient, api, createChannel, seedToken, uniq } from "./helpers";
 
 async function sendMention(slug: string, token: string, target: string, body = `@${target} ping`) {
@@ -1054,5 +1054,103 @@ describe("持久定向投递（issue #551）", () => {
     expect(frame.delivery).toMatchObject({ message_seq: posted.seq, state: "queued" });
     expect(frame.delivery.preview).toBeNull();
     viewer.close();
+  });
+});
+
+describe("排队超时收敛为终态（issue #667）", () => {
+  async function backdateAndSweep(slug: string, deliveryId: string | null) {
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      const backdated = Date.now() - (DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS + 1000);
+      if (deliveryId === null) {
+        state.storage.sql.exec("UPDATE directed_deliveries SET created_at = ?", backdated);
+      } else {
+        state.storage.sql.exec("UPDATE directed_deliveries SET created_at = ? WHERE id = ?", backdated, deliveryId);
+      }
+      await instance.onAlarm();
+    });
+  }
+
+  async function terminalReason(slug: string, deliveryId: string): Promise<string | null> {
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    return runInDurableObject(stub, async (_i: ChannelDO, state) => {
+      const row = state.storage.sql
+        .exec("SELECT terminal_reason AS r FROM directed_deliveries WHERE id = ?", deliveryId)
+        .toArray()[0];
+      return row?.r === null || row?.r === undefined ? null : String(row.r);
+    });
+  }
+
+  it("对无唤醒通道的死目标，排队超时后转 failed(undelivered) 并广播 delivery_state", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("dead-target"));
+    const slug = await createChannel(sender.token);
+    // 目标从不连接、无 webhook —— 正是 watcher 被回收的死目标（#665）。
+    const posted = await sendMention(slug, sender.token, target.name, `@${target.name} please reply`);
+    const queued = (await deliveryRows(slug))[0]!;
+    expect(queued).toMatchObject({ message_seq: posted.seq, target_name: target.name, state: "queued", attempt: 0 });
+
+    // 观察者连接在扫描前就位，收广播；它不是 adapter，不会领走这条投递。
+    const viewer = await WsClient.open(slug, sender.token);
+    await viewer.nextOfType("welcome");
+
+    await backdateAndSweep(slug, queued.id);
+
+    const failedFrame = await nextDeliveryState(viewer, queued.id, "failed");
+    expect(failedFrame.delivery.undelivered).toBe(true);
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: queued.id, state: "failed" });
+    expect(await terminalReason(slug, queued.id)).toBe("undelivered_timeout");
+    viewer.close();
+  });
+
+  it("暂停接待（#180）持债的排队投递不被超时闸误判为未送达", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("paused-target"));
+    const slug = await createChannel(sender.token);
+    const paused = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/pause`, sender.token, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(paused.status).toBe(200);
+    const posted = await sendMention(slug, sender.token, target.name, `@${target.name} held while paused`);
+    const queued = (await deliveryRows(slug))[0]!;
+    expect(queued).toMatchObject({ message_seq: posted.seq, state: "queued" });
+
+    await backdateAndSweep(slug, queued.id);
+
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: queued.id, state: "queued" });
+    expect(await terminalReason(slug, queued.id)).toBeNull();
+  });
+
+  it("已回复的投递不受排队超时扫描影响（无回归）", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("live-target"));
+    const slug = await createChannel(sender.token);
+    const holder = await WsClient.open(slug, target.token);
+    await holder.nextOfType("welcome");
+    expect((await claim(holder)).held).toBe(true);
+    const posted = await sendMention(slug, sender.token, target.name, `@${target.name} please reply`);
+    const work = (await holder.nextOfType("delivery")) as DirectedDeliveryFrame;
+    holder.send({
+      type: "delivery_update",
+      delivery_id: work.delivery.id,
+      state: "running",
+      work_id: work.delivery.work_id!,
+      continuation_ref: work.delivery.continuation_ref!,
+    });
+    await nextDeliveryState(holder, work.delivery.id, "running");
+    const reply = await api(`/api/channels/${slug}/messages`, target.token, {
+      method: "POST",
+      body: JSON.stringify({ kind: "message", body: "done", mentions: [], reply_to: posted.seq }),
+    });
+    expect(reply.status).toBe(200);
+    await nextDeliveryState(holder, work.delivery.id, "replied");
+
+    // 终态 replied 不属 queued，扫描绝不触碰它。
+    await backdateAndSweep(slug, null);
+
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: work.delivery.id, state: "replied" });
+    expect(await terminalReason(slug, work.delivery.id)).toBeNull();
+    holder.close();
   });
 });

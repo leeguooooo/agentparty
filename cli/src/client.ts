@@ -274,7 +274,9 @@ function isPublicDirectedDelivery(value: unknown): boolean {
     DELIVERY_STATES.has(String(value.state)) &&
     (value.reply_seq === null || isPositiveInteger(value.reply_seq)) &&
     isFiniteNumber(value.created_at) &&
-    isFiniteNumber(value.updated_at);
+    isFiniteNumber(value.updated_at) &&
+    // #667: optional coarse "undelivered" flag on a terminal `failed`; older servers omit it.
+    (value.undelivered === undefined || typeof value.undelivered === "boolean");
 }
 
 function asServerFrame(value: Record<string, unknown>): ServerFrame {

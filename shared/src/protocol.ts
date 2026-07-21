@@ -1013,6 +1013,12 @@ export interface PublicDirectedDelivery {
    * 已撤回消息为 null；旧 worker 不下发该字段。
    */
   preview?: string | null;
+  /**
+   * 仅当终态 `failed` 是「排队超时/对端无唤醒通道」导致（issue #667）时下发 true：这条 @ 从未被
+   * 领取执行，是「未送达」而非「跑了但失败」。粒度刻意粗（布尔），不携带任何 runner/session 私有
+   * 细节，可安全跨组织下发。旧客户端不认识该字段会忽略，仍按普通 `failed` 展示——不影响正确性。
+   */
+  undelivered?: boolean;
 }
 
 /** 只发给目标身份当前持有 serve lease 的连接；message 正文仍引用原 messages 行，不复制存储。 */

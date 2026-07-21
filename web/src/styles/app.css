@@ -4950,6 +4950,11 @@
 .msg-delivery--failed .msg-receipt-label {
   color: #b3261e;
 }
+/* #667：未送达（排队超时/对端无唤醒通道）是终态，但与「跑了但失败」的硬红区分——用琥珀色警示。 */
+.msg-delivery--undelivered .msg-receipt-icon,
+.msg-delivery--undelivered .msg-receipt-label {
+  color: #a15c00;
+}
 /* 统一消息状态条（Phase 3）：已读摘要(可点开 Lark 式弹层) + 内联 @ 唤醒回执 */
 .msg-status-bar {
   margin-top: 4px;

@@ -58,8 +58,11 @@ export function MessageStatus({ receipts, readers, unread, display, deliveries =
   };
   const receiptTitle = (r: MentionReceipt): string =>
     t(`WakeReceipt.title.${r.state}`, { name: display(r.name), detail: r.detail ?? "" });
+  // #667：终态 failed 若带 undelivered（排队超时/对端无唤醒通道），用「未送达」独立文案，与「跑了但失败」区分。
+  const deliveryStateKey = (delivery: PublicDirectedDelivery): string =>
+    delivery.state === "failed" && delivery.undelivered === true ? "undelivered" : delivery.state;
   const deliveryText = (delivery: PublicDirectedDelivery): string =>
-    t(`WakeReceipt.delivery.state.${delivery.state}`);
+    t(`WakeReceipt.delivery.state.${deliveryStateKey(delivery)}`);
   const deliveryTitle = (delivery: PublicDirectedDelivery): string =>
     [
       t("WakeReceipt.delivery.title", {
@@ -103,7 +106,7 @@ export function MessageStatus({ receipts, readers, unread, display, deliveries =
         {deliveries.map((delivery) => (
           <span
             key={delivery.id}
-            className={`msg-receipt msg-delivery msg-delivery--${delivery.state}`}
+            className={`msg-receipt msg-delivery msg-delivery--${deliveryStateKey(delivery)}`}
             title={deliveryTitle(delivery)}
             aria-label={deliveryTitle(delivery)}
             tabIndex={0}
@@ -172,7 +175,7 @@ export function MessageStatus({ receipts, readers, unread, display, deliveries =
                 {deliveries.map((delivery) => (
                   <li
                     key={delivery.id}
-                    className={`msg-status-name msg-delivery--${delivery.state}`}
+                    className={`msg-status-name msg-delivery--${deliveryStateKey(delivery)}`}
                     title={deliveryTitle(delivery)}
                     aria-label={deliveryTitle(delivery)}
                     tabIndex={0}

@@ -1,7 +1,7 @@
 // #421: D1-authoritative retention policy + DO alarm physical deletion.
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { ChannelDO } from "../src/do";
+import { type ChannelDO, DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS } from "../src/do";
 import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 describe("channel retention policy (#421)", () => {
@@ -141,6 +141,14 @@ describe("channel retention policy (#421)", () => {
     const owner = await seedToken("agent", uniq("owner"), { owner: account });
     const slug = await createChannel(owner.token);
     const target = await seedToken("agent", uniq("target"), { owner: account, channelScope: slug });
+    // #667：暂停接待让这条 queued 投递成为 owner 主动持债的持久工作——10 分钟排队超时闸会跳过它，
+    // 于是仍能验证 30 天 delivery_expired 兜底与 7 天终态保留这条更慢的路径（未暂停的死目标已由
+    // undelivered_timeout 在 10 分钟收敛，另有独立用例覆盖）。
+    const paused = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/pause`, owner.token, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(paused.status).toBe(200);
     const sent = await postMessage(slug, owner.token, `@${target.name} keep the history, expire the work`);
     const seq = ((await sent.json()) as { seq: number }).seq;
     const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
@@ -157,7 +165,8 @@ describe("channel retention policy (#421)", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       const initialAlarm = await state.storage.getAlarm();
       expect(initialAlarm).not.toBeNull();
-      expect(Math.abs(initialAlarm! - (createdAt + 30 * 24 * 60 * 60 * 1000))).toBeLessThan(1_000);
+      // onStart 现在先挂更近的排队超时闸（issue #667）；30 天兜底仍在，只是不再是最近的候选。
+      expect(Math.abs(initialAlarm! - (createdAt + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS))).toBeLessThan(1_000);
       state.storage.sql.exec(
         "UPDATE directed_deliveries SET created_at = ?, updated_at = ? WHERE message_seq = ?",
         now - 31 * 24 * 60 * 60 * 1000,
