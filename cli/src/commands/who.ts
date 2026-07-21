@@ -20,7 +20,10 @@ List who is in a channel, tiered by how you can reach them:
                                        or it was seen resuming after an @-mention
                 · wakeable unverified  self-declared serve/watch the server has NOT
                                        verified — may or may not actually wake up
-  ○ recent    seen lately, no wake layer; mention delivers, wake not guaranteed
+  ○ recent    seen lately, no wake layer; mention delivers, wake not guaranteed.
+              A "⚠ unreachable" tag flags the genuinely-dead subset: no live wake
+              channel AND stale — the mention only lands in history and will wake
+              no one (JSON: "unreachable":true). Prove otherwise: party wake test @name
 A "⏳ busy" tag means the target is serially handling a wake (e.g. a long run): it
 is reachable but a reply will be slow — an ask that times out means "busy", not
 "offline", so do not re-@ it. "N queued" shows how many wakes are already waiting.
@@ -35,7 +38,7 @@ session name), so mention the "@handle" shown here — not a UUID session name.
 Options:
   --channel C   read channel C instead of the bound channel
   --json        emit one JSON object per line
-                (name/kind/tier/wake/wake_unverified/busy/queue_depth/waiting_owner_count/current_task/task_started_at/heartbeat_at/activity/listening/runner_health/agent_session/account/handle/display_name/age_ms/read_seq)`;
+                (name/kind/tier/unreachable/wake/wake_unverified/busy/queue_depth/waiting_owner_count/current_task/task_started_at/heartbeat_at/activity/listening/runner_health/agent_session/account/handle/display_name/age_ms/read_seq)`;
 
 const STALE_MS = 60_000; // 与 DO presence 扫描一致
 const DEAD_MS = 14 * 24 * 60 * 60 * 1000; // 14 天没露面视为幽灵，不再列
@@ -56,6 +59,11 @@ interface Row {
   age_ms: number;
   connection_count?: number;
   read_seq?: number; // 读到的最大 seq（Phase 2）；无游标 = 不逐帧流式读，不标注
+  // #664：recent（○）档把「最近露过面、只是没保证唤醒」与「真·死了、@ 落历史无人应」混在一起，
+  // 误导人以为 recent = 还能叫醒。这里对真正不可达的子集单独标注：不在线 + 无活 wake 通道
+  // （offline + 无 wake layer / 适配器陈旧）+ 已陈旧（>STALE_MS）。判定同 send 侧 unreachableOf、
+  // 走 autoWakeReachable 权威口径。仅 recent 档、命中时带出；JSON 追加字段（向后兼容，不改旧字段）。
+  unreachable?: true;
   // 人为暂停接待（#180）：与 offline 视觉区分——不是「掉线丢了」，是「人主动按下暂停」。
   // 暂停期该 agent 被 @ 也不唤醒（webhook 不投、serve/watch 自我抑制），消息仍进历史。
   paused?: true;
@@ -114,6 +122,9 @@ export function classify(e: PresenceEntry, now: number): Row | null {
   // 即降级 recent；webhook 由服务端投递，仍可离线 wakeable。避免被 harness kill 的 watch --once 永久假在线。
   else if (wstate !== "offline" && wakeReachable && age <= DEAD_MS) tier = "wakeable";
   else tier = "recent";
+  // #664：recent 档里真正不可达的子集——不在线、不可自动唤醒、且已陈旧（>STALE_MS，非刚断线）。
+  // 与 send 侧 unreachableOf 同口径；只标 recent，别把「online/wakeable/刚断线」误标死。
+  const unreachable = tier === "recent" && !wakeReachable && age >= STALE_MS;
   if (tier !== "online") {
     // 暂停是人主动设的、有意保留的状态：不当人类/幽灵清掉，始终列出，让人看得见「谁被按了暂停」。
     if (!paused && kind === "human") return null; // 围观的人类只在线才列
@@ -123,6 +134,7 @@ export function classify(e: PresenceEntry, now: number): Row | null {
     name: e.name,
     kind,
     tier,
+    ...(unreachable ? { unreachable: true as const } : {}),
     ...(paused ? { paused: true as const, ...(typeof e.resume_at === "number" ? { resume_at: e.resume_at } : {}) } : {}),
     ...(wake === undefined ? {} : { wake }),
     // #191：可唤醒但未经服务端验证（自报的 serve/watch，服务端从没观测到它被 @ 后 resume）如实标注。
@@ -356,7 +368,9 @@ export async function run(argv: string[]): Promise<number> {
           ? ` · ${r.wake_unverified === true ? "unverified" : "verified"}${r.wake ? ` (${r.wake})` : ""}`
           : "";
       const age = r.tier === "online" ? "" : ` (${humanAge(r.age_ms)})`;
-      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${identityNote(r)}${busyNote(r)}${waitingOwnerNote(r)}${taskNote(r, now)}${activityNote(r, now)}${livenessNote(r)}${sessionNote(r)}${wake}${read}${duplicate}${age}`);
+      // #664：recent 档里真·不可达的（无活 wake 通道 + 陈旧）单独标出，别和「最近露面、或许在轮询」混淆。
+      const unreach = r.unreachable === true ? " · ⚠ unreachable (mention lands in history only)" : "";
+      console.log(`${DOT[r.tier]} ${r.tier.padEnd(8)} ${r.name}  [${r.kind}]${identityNote(r)}${busyNote(r)}${waitingOwnerNote(r)}${taskNote(r, now)}${activityNote(r, now)}${livenessNote(r)}${sessionNote(r)}${wake}${unreach}${read}${duplicate}${age}`);
     }
     return 0;
   } catch (e) {

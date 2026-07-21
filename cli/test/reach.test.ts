@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { applyLiveConnection, type PresenceEntry } from "@agentparty/shared";
-import { busyTimeoutHint, formatReach, formatReachLine, reachOf } from "../src/reach";
+import { busyTimeoutHint, formatReach, formatReachLine, formatUnreachable, reachOf, unreachableOf } from "../src/reach";
+
+const HOUR = 60 * 60 * 1000;
 
 const NOW = 1_000_000_000;
 
@@ -160,6 +162,71 @@ describe("busyTimeoutHint (#103)", () => {
 
   test("目标离线（查不到）→ null，不无中生有", () => {
     expect(busyTimeoutHint(["ghost"], [], NOW)).toBeNull();
+  });
+});
+
+// #664：@ 目标既不在线也无活 wake 通道 → 只落历史、不会唤醒任何人。send 据此打非阻断 warn，
+// 并支撑 --require-wakeable 的非零退出。判定严格镜像 reachOf 的 online/wakeable 门限。
+describe("unreachableOf (#664)", () => {
+  test("offline + no wake layer + stale (88h) → no_wake, carries age", () => {
+    const u = unreachableOf("kyc-claude", [p({ name: "kyc-claude", state: "offline", wake: { kind: "none" }, last_seen: NOW - 88 * HOUR })], NOW);
+    expect(u).not.toBeNull();
+    expect(u?.reason).toBe("no_wake");
+    expect(u?.ageMs).toBe(88 * HOUR);
+  });
+
+  test("offline with no wake field at all + stale → no_wake", () => {
+    const u = unreachableOf("bot", [p({ name: "bot", state: "offline", last_seen: NOW - 10 * HOUR })], NOW);
+    expect(u?.reason).toBe("no_wake");
+  });
+
+  test("stale serve/watch adapter (13m, supervisor dead) → stale_adapter, carries wake kind", () => {
+    const serve = unreachableOf("bot", [p({ name: "bot", state: "offline", wake: { kind: "serve" }, last_seen: NOW - 780_000 })], NOW);
+    expect(serve?.reason).toBe("stale_adapter");
+    expect(serve?.wake).toBe("serve");
+  });
+
+  test("online (fresh) → null, never warns on a connected target even with no wake layer", () => {
+    expect(unreachableOf("bot", [p({ name: "bot", wake: { kind: "none" } })], NOW)).toBeNull();
+  });
+
+  test("live connection short-circuits freshness → null even if last_seen stale", () => {
+    // 服务端 applyLiveConnection 会把有活连接的行 state 从 offline 提升为 waiting，所以真实 presence 里
+    // live=true 必伴随非 offline state；此时当在线处理，@ 直达，不告警。
+    expect(unreachableOf("bot", [p({ name: "bot", state: "waiting", wake: { kind: "none" }, live: true, last_seen: NOW - 88 * HOUR })], NOW)).toBeNull();
+  });
+
+  test("auto-wakeable webhook (offline) → null, mention truly wakes it", () => {
+    expect(unreachableOf("hook", [p({ name: "hook", state: "offline", wake: { kind: "webhook" }, last_seen: NOW - 2 * HOUR })], NOW)).toBeNull();
+  });
+
+  test("fresh serve → null (supervisor alive)", () => {
+    expect(unreachableOf("bot", [p({ name: "bot", state: "offline", wake: { kind: "serve" } })], NOW)).toBeNull();
+  });
+
+  test("just disconnected (< STALE_MS) with no wake → null: grace before calling it dead", () => {
+    expect(unreachableOf("bot", [p({ name: "bot", state: "offline", wake: { kind: "none" }, last_seen: NOW - 30_000 })], NOW)).toBeNull();
+  });
+
+  test("offline human → null: @-ing a human is async notify, not a broken wake", () => {
+    expect(unreachableOf("leo", [p({ name: "leo", kind: "human", state: "offline", wake: { kind: "none" }, last_seen: NOW - 88 * HOUR })], NOW)).toBeNull();
+  });
+
+  test("not in presence at all → null: name already server-validated (#663), no reliable signal", () => {
+    expect(unreachableOf("ghost", [], NOW)).toBeNull();
+  });
+
+  test("format: no_wake line names the target, age, and the wake-test remedy (issue #664 shape)", () => {
+    const line = formatUnreachable({ name: "kyc-claude", ageMs: 88 * HOUR, reason: "no_wake" });
+    expect(line).toContain("kyc-claude has no live wake channel");
+    expect(line).toContain("last_seen 88h ago");
+    expect(line).toContain("mention delivered to history only");
+    expect(line).toContain("party wake test @kyc-claude");
+  });
+
+  test("format: stale_adapter line names the adapter kind", () => {
+    const line = formatUnreachable({ name: "bot", ageMs: 13 * 60 * 1000, reason: "stale_adapter", wake: "serve" });
+    expect(line).toContain("bot's serve adapter looks dead");
   });
 });
 

@@ -172,6 +172,10 @@ export const EXIT_WORKFLOW_GUARD = 8;
 // 速率限制（429，issue #122）：退避后再试，别立刻连打。
 // 之前同样塌缩成 exit 1，agent 无从判断该等还是该停。
 export const EXIT_RATE_LIMITED = 9;
+// send --mention --require-wakeable（issue #664）：消息已成功发出，但至少一个被 @ 的目标既不在线、
+// 也无活的 wake 通道（离线 + 无 wake layer / 适配器陈旧），@ 只落进历史、不会唤醒任何人。严格模式下
+// 用独立非零码让调用方能编程判定「派发未落地」，而不是把成功发送误当完全失败（消息确实发出去了）。
+export const EXIT_UNREACHABLE = 10;
 
 // ---- 基础类型 ----
 

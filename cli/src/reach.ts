@@ -63,6 +63,64 @@ export function formatReachLine(rs: Reachability[]): string {
   return "→ " + rs.map(formatReach).join("  ·  ");
 }
 
+// #664：`--mention X` 时 X 既不在线也无活 wake 通道——@ 只落进历史、永远不会唤醒任何人。发送方
+// 之前对此零反馈（reach 行仅在 TTY/--reach 下出，agent 循环里静默）。这里给一个独立的、非阻断的
+// 「不可达」判定，供 send 在 stderr 打醒目 warning，并支撑 --require-wakeable 的非零退出。
+// 判定严格镜像 reachOf/who.classify 的 online / wakeable 门限（同 autoWakeReachable 权威口径），
+// 只对「不在线 + 不可自动唤醒 + 已陈旧」的目标告警，避免误伤刚断线（<STALE_MS）或在线的目标。
+export interface Unreachable {
+  name: string;
+  // 距最近一次露面的毫秒；无 last_seen/ts 时为 null（几乎不出现，presence 行通常带 ts）。
+  ageMs: number | null;
+  // 声明的 wake 类型（用于文案区分「压根没 wake 通道」与「适配器陈旧」）；缺省即无。
+  wake?: WakeKind;
+  // no_wake：wake=none/缺失，压根没有唤醒路径；stale_adapter：声明了 serve/watch 但心跳陈旧（supervisor 大概率已死）。
+  reason: "no_wake" | "stale_adapter";
+}
+
+// 返回该 @ 目标的不可达详情，或 null（在线 / 可自动唤醒 / 刚断线未过 STALE / 不在 presence / 人类）。
+// 不在 presence：#663 已让服务端硬校验显式 --mention 名字，走到这里名字必然合法；缺 presence 行
+// 说明该身份从未在频道露面，无可靠信号，从简不告警。人类会话异步看通知，@ 离线人类不算「白发」，跳过。
+export function unreachableOf(name: string, presence: PresenceEntry[], now: number): Unreachable | null {
+  const e = presence.find((p) => p.name === name);
+  if (e === undefined) return null;
+  if (e.kind === "human") return null;
+  const seen = e.last_seen ?? e.ts ?? 0;
+  const age = now - seen;
+  // online：与 reachOf/who 一致——当前有活 WS 连接（live）或新鲜即视为在线，@ 直达，不告警。
+  if (e.state !== "offline" && (e.live === true || age < STALE_MS)) return null;
+  // 可自动唤醒且未越幽灵线：webhook 服务端投递、或 serve/watch 心跳新鲜 → 叫得醒，不告警。
+  if (e.wake?.kind !== undefined && autoWakeReachable(e, now, STALE_MS) && age <= DEAD_MS) return null;
+  // 刚断线（<STALE_MS）：给一个宽限，可能马上重连，先不判死。
+  if (age < STALE_MS) return null;
+  const wake = e.wake?.kind;
+  const reason: Unreachable["reason"] = wake === undefined || wake === "none" ? "no_wake" : "stale_adapter";
+  return { name, ageMs: seen > 0 ? age : null, ...(wake !== undefined ? { wake } : {}), reason };
+}
+
+// 紧凑的时龄文案：45m / 88h / 15d，用于 warning 里的 last_seen 提示。刻意把「小时」一路显示到 10 天，
+// 因为「88h」比「3d」更能让发送方一眼感到「死太久了」（issue #664 的原始诉求就用小时表达陈旧）。
+function ageText(ageMs: number | null): string {
+  if (ageMs === null) return "last_seen unknown";
+  const s = Math.floor(ageMs / 1000);
+  if (s < 60) return `last_seen ${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `last_seen ${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 240) return `last_seen ${h}h ago`;
+  return `last_seen ${Math.floor(h / 24)}d ago`;
+}
+
+// stderr 上打的一行非阻断 warning。示意：
+//   warn: kyc-claude has no live wake channel (last_seen 88h ago) — mention delivered to history only; run 'party wake test @kyc-claude' to verify
+export function formatUnreachable(u: Unreachable): string {
+  const what =
+    u.reason === "stale_adapter"
+      ? `${u.name}'s ${u.wake ?? "wake"} adapter looks dead`
+      : `${u.name} has no live wake channel`;
+  return `warn: ${what} (${ageText(u.ageMs)}) — mention delivered to history only; run 'party wake test @${u.name}' to verify`;
+}
+
 // ask 超时提示（#103）：party ask 委托 watch，超时只吐裸 TIMEOUT，看不出对方是「忙」还是「失联」。
 // 用 reachOf 查被 @ 的目标此刻是否仍标 busy（serve 正串行处理一条 wake）：若有，返回一行富提示，
 // 让调用方把超时当「忙、回复慢」而非「离线」，别反复 @ 堆重复唤醒。无 busy 目标返回 null，

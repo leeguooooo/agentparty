@@ -60,6 +60,44 @@ describe("who classify（#47：可唤醒判定按 wake.kind 分口径）", () =>
   });
 });
 
+// #664：recent 档把「最近露面、或许在轮询」和「真·死了、@ 落历史无人应」混在一起，误导人以为 recent = 还能叫醒。
+// 对后者（无活 wake 通道 + 陈旧）单独标 unreachable，让人一眼看清「@ 它白发」。
+describe("who classify recent unreachable 标注（#664）", () => {
+  test("offline + 无 wake layer + 陈旧(88h) → recent 且 unreachable", () => {
+    const r = classify(p({ name: "kyc-claude", state: "offline", wake: { kind: "none" }, last_seen: NOW - 88 * 60 * 60 * 1000 }), NOW);
+    expect(r?.tier).toBe("recent");
+    expect(r?.unreachable).toBe(true);
+  });
+
+  test("陈旧的 serve（supervisor 已死）→ recent 且 unreachable（无活 wake 通道）", () => {
+    const r = classify(p({ name: "bot", state: "offline", wake: { kind: "serve" }, last_seen: NOW - 780_000 }), NOW);
+    expect(r?.tier).toBe("recent");
+    expect(r?.unreachable).toBe(true);
+  });
+
+  test("fresh 的 serve → wakeable，不标 unreachable", () => {
+    const r = classify(p({ name: "bot", state: "offline", wake: { kind: "serve" } }), NOW);
+    expect(r?.tier).toBe("wakeable");
+    expect(r?.unreachable).toBeUndefined();
+  });
+
+  test("offline webhook → wakeable，不标 unreachable（服务端投递真能唤醒）", () => {
+    const r = classify(p({ name: "hook", state: "offline", wake: { kind: "webhook" }, last_seen: NOW - 2 * 60 * 60 * 1000 }), NOW);
+    expect(r?.tier).toBe("wakeable");
+    expect(r?.unreachable).toBeUndefined();
+  });
+
+  test("online → 不标 unreachable", () => {
+    expect(classify(p({ name: "bob" }), NOW)?.unreachable).toBeUndefined();
+  });
+
+  test("刚断线(<STALE_MS)且无 wake → recent 但不急着判死，不标 unreachable", () => {
+    const r = classify(p({ name: "bot", state: "offline", wake: { kind: "none" }, last_seen: NOW - 30_000 }), NOW);
+    expect(r?.tier).toBe("recent");
+    expect(r?.unreachable).toBeUndefined();
+  });
+});
+
 describe("who classify 暂停接待（#180：paused 与 offline 视觉/语义区分）", () => {
   test("被暂停的 agent 带出 paused + resume_at，供 who 独立渲染", () => {
     const r = classify(p({ name: "bot", state: "waiting", paused: true, resume_at: NOW + 3_600_000 }), NOW);

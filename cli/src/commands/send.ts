@@ -1,17 +1,17 @@
 // party send — rest 一次性发消息，成功后推进游标
 import { basename } from "node:path";
-import { extractMentionTokens, MAX_MENTIONS, mentionMatchKey, type Attachment } from "@agentparty/shared";
+import { EXIT_UNREACHABLE, extractMentionTokens, MAX_MENTIONS, mentionMatchKey, type Attachment } from "@agentparty/shared";
 import { isHelpArg, parseArgs, str, strArray, unknownFlagError, valueFlagError, type Parsed } from "../args";
 import { advanceCursorPastOwnMessage, resolveChannel, type Config } from "../config";
 import { stripTerminalControls } from "../format";
 import { formatAuthDebugLine, resolveAuthDetailed } from "../oidc-cli";
 import { fetchMe, fetchPresence, handleRestError, postMessage, RestError, uploadAttachment } from "../rest";
-import { formatReachLine, reachOf } from "../reach";
+import { formatReachLine, formatUnreachable, reachOf, unreachableOf } from "../reach";
 import { localStatuslineBase, statuslinePreview, unreadFromCursor, writeStatuslineCache } from "../statusline-cache";
 import { isName, isSlug, parsePositiveIntFlag } from "../validation";
 
-export const sendSpec = { repeatable: ["mention", "attach"], booleans: ["debug-auth", "reach", "no-reach"] };
-const SEND_FLAGS = ["channel", "reply-to", "mention", "attach", "debug-auth", "reach", "no-reach"];
+export const sendSpec = { repeatable: ["mention", "attach"], booleans: ["debug-auth", "reach", "no-reach", "require-wakeable"] };
+const SEND_FLAGS = ["channel", "reply-to", "mention", "attach", "debug-auth", "reach", "no-reach", "require-wakeable"];
 const HELP = `usage: party send <text|-> [--channel C] [--mention name]... [--attach path]... [--reply-to seq] [--debug-auth]
 
 Send one message to a channel. Use "-" as the body to read stdin.
@@ -24,14 +24,22 @@ After a send with --mention, a reachability line prints to stderr — whether ea
 target is ● online / ◐ wakeable / ○ offline (won't reach until it reconnects).
 On by default in an interactive terminal; --reach forces it, --no-reach silences it.
 
+If any mentioned target is neither online nor auto-wakeable (offline with no wake
+layer, or a stale/dead wake adapter), a non-blocking "warn:" line also prints to
+stderr — the send still succeeds, but the mention only lands in history and will not
+wake anyone. This warning shows even without a TTY (agent loops); --no-reach silences
+it. Use --require-wakeable to make such a send exit non-zero (after sending).
+
 Options:
-  --channel C      send to channel C instead of the bound channel
-  --mention name   mention a user or agent; repeatable
-  --attach path    upload a local file and attach it; repeatable (max 25MB each)
-  --reply-to seq   attach this message as a reply to seq
-  --reach          show mention reachability even when not a TTY (agent loops)
-  --no-reach       never show mention reachability
-  --debug-auth     print resolved auth/config source to stderr`;
+  --channel C         send to channel C instead of the bound channel
+  --mention name      mention a user or agent; repeatable
+  --attach path       upload a local file and attach it; repeatable (max 25MB each)
+  --reply-to seq      attach this message as a reply to seq
+  --reach             show mention reachability even when not a TTY (agent loops)
+  --no-reach          never show mention reachability (also silences the warn line)
+  --require-wakeable  exit non-zero if any mentioned target is not auto-wakeable
+                      (the message is still sent; the warn line always prints)
+  --debug-auth        print resolved auth/config source to stderr`;
 
 // 附件上限与文件名规则与 worker 侧保持一致（#176）：本地先挡一刀，给出比服务端 413 更贴切的文案。
 const ATTACH_SIZE_LIMIT = 25 * 1024 * 1024;
@@ -332,21 +340,50 @@ export async function run(argv: string[]): Promise<number> {
   if (typeof result === "number") return result;
   const attachNote = input.attachPaths.length > 0 ? ` (+${input.attachPaths.length} attachment${input.attachPaths.length > 1 ? "s" : ""})` : "";
   console.log(`sent seq=${result.seq}${attachNote}`);
-  await showReach(auth.server, auth.token, parsed, input);
+  const { unreachable } = await showReach(auth.server, auth.token, parsed, input);
+  // #664：--require-wakeable 严格模式——目标不可唤醒时，消息照发（seq 已打），但用独立非零码退出，
+  // 让调用方能编程判定「派发未落地」。非严格模式永远返回 0（warning 只提示、不阻断）。
+  if (parsed.flags["require-wakeable"] === true && unreachable.length > 0) return EXIT_UNREACHABLE;
   return 0;
 }
 
-// 发送后的可达性反馈：@ 的目标现在能不能收到。默认仅交互终端下开（脚本/agent 循环不额外拉 presence），
-// --reach 强开、--no-reach 关。拉不到 presence 不影响已发成功（只是没这行提示）。
-async function showReach(server: string, token: string, parsed: Parsed, input: SendInput): Promise<void> {
-  const want =
+// 发送后的可达性反馈：@ 的目标现在能不能收到。
+// 两条独立输出：
+//  1) reach 行（→ @a ● online · @b ○ offline …）——锦上添花，默认仅交互终端下开，--reach 强开、--no-reach 关。
+//  2) #664 的 "warn:" 行——@ 目标既不在线也无活 wake 通道时的醒目非阻断告警。这是纠错信号而非装饰：
+//     出问题的正是非 TTY 的 agent 循环（reach 行不出，发送方零反馈）。故 warn 行默认常开（含非 TTY），
+//     仅 --no-reach 显式静默；--require-wakeable 时强制打出，好解释随后的非零退出。
+// 返回不可达目标名单，供 --require-wakeable 决定退出码。拉不到 presence 不影响已发成功（只是没这些提示）。
+async function showReach(
+  server: string,
+  token: string,
+  parsed: Parsed,
+  input: SendInput,
+): Promise<{ unreachable: string[] }> {
+  if (input.mentions.length === 0) return { unreachable: [] };
+  const requireWakeable = parsed.flags["require-wakeable"] === true;
+  const wantLine =
     parsed.flags.reach === true ? true : parsed.flags["no-reach"] === true ? false : Boolean(process.stdout.isTTY);
-  if (!want || input.mentions.length === 0) return;
+  // warn 行：--require-wakeable 强制开；否则默认开，仅 --no-reach 静默。
+  const wantWarn = requireWakeable ? true : parsed.flags["no-reach"] !== true;
+  if (!wantLine && !wantWarn) return { unreachable: [] };
+  let presence;
   try {
-    const presence = await fetchPresence(server, token, input.channel);
-    const now = Date.now();
-    console.error(formatReachLine(input.mentions.map((m) => reachOf(m, presence, now))));
+    presence = await fetchPresence(server, token, input.channel);
   } catch {
     /* 锦上添花：presence 拉取失败不报错，消息已发成功 */
+    return { unreachable: [] };
   }
+  const now = Date.now();
+  if (wantLine) console.error(formatReachLine(input.mentions.map((m) => reachOf(m, presence, now))));
+  const unreachable: string[] = [];
+  if (wantWarn) {
+    for (const mention of input.mentions) {
+      const u = unreachableOf(mention, presence, now);
+      if (u === null) continue;
+      console.error(formatUnreachable(u));
+      unreachable.push(u.name);
+    }
+  }
+  return { unreachable };
 }
