@@ -1658,6 +1658,15 @@ export interface SentFrame {
    * 但不再拒发。空则省略（无未解析项）。显式 mentions 的未命中不走这里——那会直接 mention_not_found 报错。
    */
   unresolved_mentions?: string[];
+  /**
+   * 已解析的 agent mention，但服务端权威 presence 判定其 wake 通道当前**不可达**（#665）：offline / 无 wake layer /
+   * 心跳过期（`autoWakeReachable` 为 false）。这类目标 mention 仍照常入 delivery ledger，但不会唤醒对端会话——
+   * 真实案例里一个被 harness reaped 的 `watch --once` 让三条 @ 石沉大海十几分钟，靠人肉兜底才发现。回执带上它，
+   * 让**任意客户端**（不止升级过的 CLI）当场看到「已入队但对端不可唤醒」。与 unresolved_mentions 正交：那些是正文
+   * token 压根没解析到任何身份；这些是解析成功的 agent 目标、只是没有活的 wake 通道。human 目标（human_driven，靠人
+   * 接续、非 wake 故障）与人为 paused 的 agent（#180，有意暂停）不计入。空则省略。
+   */
+  undeliverable_mentions?: string[];
 }
 
 export interface PresenceFrame {

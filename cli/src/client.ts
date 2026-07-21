@@ -316,8 +316,10 @@ function parseServerFrame(value: unknown): ServerFrame | null {
         : null;
     case "sent":
       // unresolved_mentions（#663）：正文便利提取里服务端未能路由的 token，已降级为文本；缺省=无未解析项。
+      // undeliverable_mentions（#665）：路由成功但对端 wake 通道不可达的 agent 目标；缺省=无不可达目标。
       return isPositiveInteger(value.seq) &&
-        (value.unresolved_mentions === undefined || isStringArray(value.unresolved_mentions))
+        (value.unresolved_mentions === undefined || isStringArray(value.unresolved_mentions)) &&
+        (value.undeliverable_mentions === undefined || isStringArray(value.undeliverable_mentions))
         ? asServerFrame(value)
         : null;
     case "presence":

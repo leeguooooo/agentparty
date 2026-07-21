@@ -21,6 +21,7 @@ import {
   DECISION_RESPONDER_OWNER_LIMIT,
   MAX_CONNECTIONS_PER_CHANNEL,
   PRESENCE_TIMEOUT_MS,
+  autoWakeReachable,
   RATE_LIMIT_PER_MIN,
   RETAIN_N,
   TEMP_IDLE_ARCHIVE_MS,
@@ -208,6 +209,11 @@ type SendSuccessOutcome =
       atomicEffects?: AtomicDeliveryEffects;
       /** 正文便利提取未能路由、降级为文本的原始 token（#663）；回执 SentFrame.unresolved_mentions 的来源，空=省略。 */
       unresolvedMentions?: string[];
+      /**
+       * 已解析、路由成功的 agent 目标，但服务端权威 presence 判定其 wake 通道当前不可达（#665，autoWakeReachable=false）；
+       * 回执 SentFrame.undeliverable_mentions 的来源，空=省略。人为 paused（#180）不计入。
+       */
+      undeliverableMentions?: string[];
     };
 
 type SendOutcome =
@@ -2578,6 +2584,10 @@ export class ChannelDO extends Server<Env> {
         seq: out.seq,
         ...(out.unresolvedMentions !== undefined && out.unresolvedMentions.length > 0
           ? { unresolved_mentions: out.unresolvedMentions }
+          : {}),
+        // undeliverable_mentions（#665）：路由成功但对端 wake 通道不可达的 agent 目标，供发送方当场知情。
+        ...(out.undeliverableMentions !== undefined && out.undeliverableMentions.length > 0
+          ? { undeliverable_mentions: out.undeliverableMentions }
           : {}),
       });
       // 广播必须紧跟 INSERT，中间不能有任何 await（#114）：
@@ -6011,6 +6021,10 @@ export class ChannelDO extends Server<Env> {
         ...(out.unresolvedMentions !== undefined && out.unresolvedMentions.length > 0
           ? { unresolved_mentions: out.unresolvedMentions }
           : {}),
+        // #665：路由成功但对端 wake 通道不可达的 agent 目标；所有 REST 客户端据此当场知情，不止升级过的 CLI。
+        ...(out.undeliverableMentions !== undefined && out.undeliverableMentions.length > 0
+          ? { undeliverable_mentions: out.undeliverableMentions }
+          : {}),
         ...(sent.completion_review === undefined ? {} : { completion_review: sent.completion_review }),
         ...(sent.decision_request === undefined
           ? {}
@@ -6735,6 +6749,24 @@ export class ChannelDO extends Server<Env> {
     };
   }
 
+  // #665：路由到 agent 的 mention，但对端 wake 通道当前不可达——消息只入 delivery ledger、不会唤醒会话。
+  // 据服务端权威 presence（DO 本就持有）当场算出这些「投递不到」的目标，经回执透给发送方，别再让 @ 石沉大海
+  // 靠人肉兜底。判定复用 autoWakeReachable（issue #47 统一口径，不另造逻辑）：offline / 无 wake layer / 心跳过期
+  // 均为不可达；webhook 恒可达、live 或新鲜的 serve/watch 可达。
+  //   • 人为 paused（#180）：有意暂停接待，不是 wake 故障，跳过——否则每次 @ 一个暂停的 agent 都误报。
+  //   • 无 presence 记录：从未上报过 wake layer 的身份，本函数不臆断（可能是刚建、异步补齐中），保守不标。
+  // human 目标天然不入 deliveryTargets（只有 agent 目标拿持久 delivery），故人类不会被误标。
+  private undeliverableAgentMentions(deliveryTargets: string[], now: number): string[] {
+    const undeliverable: string[] = [];
+    for (const target of deliveryTargets) {
+      const entry = this.presenceFor(target);
+      if (entry === null) continue;
+      if (entry.paused === true) continue;
+      if (!autoWakeReachable(entry, now)) undeliverable.push(target);
+    }
+    return undeliverable;
+  }
+
   // 校验 → 分配 seq → 落库 → 修剪/presence，返回待广播帧
   private async handleSend(
     identity: Identity,
@@ -7284,6 +7316,8 @@ export class ChannelDO extends Server<Env> {
       const entry = this.presenceFor(identity.name);
       frames.push(entry ? { type: "presence", ...entry } : { type: "presence", name: identity.name, state: frame.state, note: frame.note, ts: now });
     }
+    // #665：路由成功但 wake 通道不可达的 agent 目标，据当前权威 presence 当场算出，回执透给发送方。
+    const undeliverableMentions = this.undeliverableAgentMentions(deliveryTargets, now);
     stagedOutcome = {
       ok: true,
       seq,
@@ -7291,6 +7325,7 @@ export class ChannelDO extends Server<Env> {
       deliveryTargets,
       deliveryTargetOwners,
       ...(unresolvedBodyMentions.length > 0 ? { unresolvedMentions: unresolvedBodyMentions } : {}),
+      ...(undeliverableMentions.length > 0 ? { undeliverableMentions } : {}),
     };
     });
     if (decisionPreconditionFailure !== null) return decisionPreconditionFailure;
