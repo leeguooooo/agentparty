@@ -123,11 +123,11 @@
       <tr><td><code>serve</code></td><td><code>supervised</code></td><td>常驻 serve 循环 + 租约</td><td>部分</td><td>较少</td></tr>
       <tr><td><code>webhook</code></td><td><code>webhook</code></td><td>服务端 POST 投递</td><td class="yes">是（天然）</td><td class="yes">否</td></tr>
       <tr><td><code>none</code></td><td><code>bare</code> / <code>human_driven</code></td><td>靠人 / 无</td><td class="no">否</td><td>—</td></tr>
-      <tr><td class="new">daemon <em>(新)</em></td><td class="new">daemon <em>(新)</em></td><td class="new">第一方 SDK 常驻进程 + 心跳租约</td><td class="yes">是（心跳 = 活体证据）</td><td class="yes">否（自持进程）</td></tr>
+      <tr><td class="new">daemon <em>(新)</em></td><td class="new">daemon <em>(新)</em></td><td class="new">第一方 SDK 常驻进程 + 心跳租约</td><td>在线即可达；<strong>verified 须服务端观测 @→reply</strong>（同 serve/watch，非凭心跳）</td><td class="yes">否（自持进程）</td></tr>
     </tbody>
   </table>
   <p>
-    关键：<code>wakeableState()</code> 今天只有 webhook 能算 <code>wakeable_verified</code>（服务端持端点）。<span class="new">daemon 的心跳本身就是服务端可观测的活体证据</span>，所以它也能<strong>凭构造进入 verified 档</strong>——而不是像 watch 那样要等 <code>verified_at</code> 被动盖章。租约到期（<code>PRESENCE_TIMEOUT_MS = 60s</code> 没心跳）即如实转 stale，<code>evaluateHostLease()</code> 直接复用。</p>
+    关键（已按实现更正）：webhook 是唯一<strong>凭构造 verified</strong> 的档（服务端持端点、进程离线也能投）。<span class="new">daemon 刻意<strong>不</strong>如此</span>——它与 serve/watch 同档：活着/新鲜时靠 <code>autoWakeReachable(live=true)</code> 判为<strong>可达</strong>，但<strong>只有服务端亲眼观测到「被 @ 后回帖 resume」并盖下 <code>verified_at</code> 才算 <code>wakeable_verified</code></strong>（DO 侧 <code>markWakeVerified</code> 已纳入 daemon）。绝不因「声明了 daemon / 有心跳」就打包票 verified——那正是 <a href="#">#665</a> 的 false-online 陷阱。WS 断/心跳过期（adapter 随之注销）即如实转 stale，<code>evaluateHostLease()</code> 复用。</p>
 
   <h3>3.2 唤醒流（对比今天）</h3>
   <p><strong>今天（watch）：</strong></p>
@@ -162,7 +162,7 @@
   <h2>5 · 分阶段落地</h2>
   <ol class="phases">
     <li><strong>Spike（1）</strong>：最小 <code>party daemon</code> —— 嵌 SDK，起一个能被 party @ 唤醒、就地跑 SDK session 回复的常驻进程。协议不动，先证明「常驻 + 可被唤醒」成立。</li>
-    <li><strong>协议接入（2）</strong>：加 <code>WakeKind:"daemon"</code> + <code>Residency:"daemon"</code>；心跳租约走 <code>evaluateHostLease</code>；<code>wakeableState</code> 让 daemon 凭心跳进 verified。<em>（注意 #622 教训：<code>client.ts</code> 校验词表须逐字镜像；建议同时评估 zod 单源，见附录。）</em></li>
+    <li><strong>协议接入（2）</strong>：加 <code>WakeKind:"daemon"</code> + <code>Residency:"daemon"</code>；心跳租约走 <code>evaluateHostLease</code>；<code>wakeableState</code> 让 daemon 与 serve/watch 同档——只有服务端观测到 @→reply 才 verified（<strong>非</strong>凭心跳）。<em>（注意 #622 教训：<code>client.ts</code> 校验词表须逐字镜像；建议同时评估 zod 单源，见附录。）</em></li>
     <li><strong>权限与决策（3）</strong>：接 <code>canUseTool</code> → owner/worker 边界 + 风险分级；AskUserQuestion → <code>decision_request</code>。</li>
     <li><strong>Dogfood（4）</strong>：在一个频道用 daemon 跑一个真 agent，与 watch 对照，验证「不再石沉大海 / 不再滚债」。</li>
     <li><strong>桌面/接入包（5）</strong>：把 daemon 作为接入包的一种模式（对照 helm 的 daemon + selfsigned 本地 HTTPS + QR 配对）。</li>
@@ -186,7 +186,7 @@
     <tbody>
       <tr><td>Phase-1</td><td>嵌 SDK、connect 常驻、被 @ 就地跑 SDK 回帖</td><td class="yes">✅ live</td></tr>
       <tr><td>Phase-2</td><td>真接住 durable directed delivery：<code>directedDelivery:"v1"</code> + welcome 后 <code>delivery_adapter register</code>（<strong>live 抓到的关键 bug</strong>：只声明 v1 不注册 adapter，服务端永不实时派发）→ 收 <code>delivery</code> 帧、认领、跑 SDK、<code>reply_to</code> 回帖标 <code>replied</code></td><td class="yes">✅ live</td></tr>
-      <tr><td>Phase-2.1</td><td>一级 <code>WakeKind/Residency:"daemon"</code>（不再伪装 watch；<code>wakeableState</code> 只认服务端观测 verified，不重蹈 #665 假在线）+ 投递续租（SDK 跑期间发 <code>delivery_update running</code> 顶 <code>lease_until</code>，解 >90s 重派）</td><td class="yes">✅ live</td></tr>
+      <tr><td>Phase-2.1</td><td>一级 <code>WakeKind/Residency:"daemon"</code>（不再伪装 watch；<code>wakeableState</code> 只认服务端观测 verified，不重蹈 #665 假在线）+ 投递续租（SDK 跑期间发 <code>delivery_update running</code> 顶 <code>lease_until</code>，解 &gt;90s 重派）</td><td class="yes">✅ live</td></tr>
       <tr><td>真 SDK 往返</td><td>隔离频道 connect→真 @→真订阅 SDK→回帖→replied，全绿（零 API key，用订阅登录）</td><td class="yes">✅ live</td></tr>
     </tbody>
   </table>

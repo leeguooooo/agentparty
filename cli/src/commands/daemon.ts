@@ -107,6 +107,11 @@ export interface DaemonOptions {
  * 懒加载（dynamic import）保证只有真跑 daemon 才载入 SDK——注入了 mock 的单测永远不会触碰它。
  */
 export function createSdkRunner(options?: Record<string, unknown>): SdkRunner {
+  // #691 评审(Major)：无头 daemon 必须显式设 permissionMode。SDK 默认 'default' 会在 headless（无 TTY、
+  // 未提供 canUseTool）下遇到需批准的工具时挂起/行为不定。'dontAsk' = 不提示、未预批的工具一律拒绝——
+  // experimental daemon 只产文本、绝不被一条 @ 触发任意工具执行（安全）。完整的 owner/worker 边界权限模型
+  // （canUseTool → 三方边界、allowedTools、scope options）见 Phase-2.2 #692；调用方可覆盖本默认。
+  const sdkOptions: Record<string, unknown> = { permissionMode: "dontAsk", ...(options ?? {}) };
   return {
     async run(prompt: string, ctx: SdkRunContext): Promise<string> {
       const { query } = await import("@anthropic-ai/claude-agent-sdk");
@@ -116,7 +121,7 @@ export function createSdkRunner(options?: Record<string, unknown>): SdkRunner {
       let final = "";
       // Query 是 AsyncGenerator<SDKMessage>：迭代到 type:"result" 拿终值。
       // success 携带 result:string；error 变体携带 errors:string[]，抛出交给上层回帖失败提示。
-      for await (const message of query({ prompt: framed, ...(options ? { options } : {}) })) {
+      for await (const message of query({ prompt: framed, options: sdkOptions })) {
         if (message.type === "result") {
           if (message.subtype === "success") {
             final = message.result;
