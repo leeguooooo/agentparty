@@ -16,6 +16,8 @@ import { Markdown } from "../components/Markdown";
 import { MessageCard } from "../components/MessageCard";
 import { MentionHeaderNotice, type MentionToastItem } from "../components/MentionToast";
 import { PresenceBar } from "../components/PresenceBar";
+import { ChannelFocusBar } from "../components/ChannelFocusBar";
+import { computeChannelFocus, pendingDecisionsFromMessages } from "../lib/channelFocus";
 import { AttachmentList } from "../components/AttachmentList";
 import { OrgTreePreview } from "../components/OrgTreePreview";
 import {
@@ -4058,6 +4060,19 @@ export function ChannelPage({
     t,
   ).length;
 
+  // 频道常驻焦点栏（#682）：跨成员把任务台账 + presence/status + 未闭合决策聚成「球在谁手里」。
+  // teamNow 已每秒推进（团队面板复用），焦点的 staleness/时间判定跟着刷新，无需另起计时器。
+  const channelFocus = useMemo(
+    () => computeChannelFocus({
+      presence: Object.values(state.presence),
+      tasks,
+      decisions: pendingDecisionsFromMessages(state.messages),
+      viewer: { name: state.self, account: accountKey, canModerate },
+      now: teamNow,
+    }),
+    [state.presence, state.messages, state.self, tasks, accountKey, canModerate, teamNow],
+  );
+
   const setAgentMode = useCallback((mode: AgentFilterMode) => {
     setAgentFilter((current) => ({ ...current, mode }));
   }, []);
@@ -4238,6 +4253,12 @@ export function ChannelPage({
             onAuthFailed={onAuthFailed}
           />
         ) : null}
+      />
+      <ChannelFocusBar
+        focus={channelFocus}
+        viewerIsModerator={canModerate}
+        onOpenTask={() => openPanel("tasks")}
+        onJumpSeq={jumpToMention}
       />
       {kickError !== null && <p className="banner banner--red">{kickError}</p>}
       {pauseError !== null && <p className="banner banner--red">{pauseError}</p>}

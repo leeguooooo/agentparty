@@ -2659,6 +2659,135 @@
   overflow-wrap: anywhere;
 }
 
+/* 频道常驻焦点栏（#682）：进频道第一屏就看到「球在谁手里、在等谁、谁在等我」。
+   墨线硬边 + 米纸底，三态各自语气色；「在等你」区块用主色珊瑚红把 owner 的目光钉住。 */
+.channel-focus-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 2px;
+  padding: 8px 10px;
+  border: 1.6px solid var(--d-ink);
+  border-radius: 0;
+  background: var(--t-panel2);
+  box-shadow: 3px 3px 0 var(--d-shadow);
+}
+.focus-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.focus-heading {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--t-muted);
+}
+.focus-line {
+  min-width: 0;
+  color: var(--t-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.focus-counts {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--t-dim);
+}
+.focus-waiting-label,
+.focus-me-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--t-muted);
+}
+.focus-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.focus-item {
+  min-width: 0;
+}
+.focus-item-btn {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
+.focus-item-btn:hover .focus-item-name,
+.focus-item--drill:hover .focus-item-name {
+  text-decoration: underline;
+}
+.focus-item-btn,
+.focus-item > :not(button) {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+.focus-dot {
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+}
+.focus-dot--working { color: var(--p-working); }
+.focus-dot--blocked { color: var(--p-blocked); }
+.focus-dot--waiting_decision { color: var(--t-purple); }
+.focus-dot--stalled { color: var(--t-muted); }
+.focus-item-name {
+  flex: none;
+  font-weight: 600;
+  color: var(--t-text);
+}
+.focus-item-label {
+  min-width: 0;
+  flex: 1;
+  color: var(--t-body);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.focus-item-state {
+  flex: none;
+  padding: 0 6px;
+  font-size: 10px;
+  border: 1.2px solid currentColor;
+  border-radius: 0;
+}
+.focus-item-state--working { color: var(--p-working); background: var(--d-green-soft); }
+.focus-item-state--blocked { color: var(--p-blocked); background: var(--d-red-soft); }
+.focus-item-state--waiting_decision { color: var(--t-purple); background: var(--d-blue-soft); }
+.focus-item-state--stalled { color: var(--t-muted); background: var(--t-panel); }
+/* 「在等你」区块：珊瑚红左描边 + 软底，owner 一眼扫到 */
+.focus-me {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 8px;
+  border-left: 3px solid var(--t-accent);
+  background: var(--d-red-soft);
+}
+.focus-me-label { color: var(--t-accent); font-weight: 700; }
+.focus-item-me-badge {
+  flex: none;
+  padding: 0 6px;
+  font-size: 9.5px;
+  color: var(--t-accent-ink);
+  background: var(--t-accent);
+}
+
 /* 频道搜索行：server-side retained-history search + sender/time filters */
 .chan-search-panel {
   display: flex;
