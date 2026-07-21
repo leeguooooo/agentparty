@@ -228,6 +228,31 @@ describe("unreachableOf (#664)", () => {
     const line = formatUnreachable({ name: "bot", ageMs: 13 * 60 * 1000, reason: "stale_adapter", wake: "serve" });
     expect(line).toContain("bot's serve adapter looks dead");
   });
+
+  // #664：paused（#180）= owner 主动暂停接待，被 @ 也不唤醒。unreachableOf 之前只看 wake/autoWakeReachable，
+  // paused 目标即便有可用 adapter 也会逃过告警——修复：paused 优先于 adapter 判定，独立 reason=paused。
+  test("paused agent with an otherwise-reachable (fresh webhook) adapter → paused, overrides wake reachability", () => {
+    const u = unreachableOf("held", [p({ name: "held", state: "offline", paused: true, wake: { kind: "webhook" } })], NOW);
+    expect(u).not.toBeNull();
+    expect(u?.reason).toBe("paused");
+    expect(u?.wake).toBe("webhook");
+  });
+
+  test("paused agent with no wake layer → paused (not no_wake)", () => {
+    const u = unreachableOf("held", [p({ name: "held", state: "offline", paused: true, wake: { kind: "none" }, last_seen: NOW - 88 * HOUR })], NOW);
+    expect(u?.reason).toBe("paused");
+  });
+
+  test("paused but genuinely online (live) → null: live connection still receives, pause check is after the online gate", () => {
+    expect(unreachableOf("held", [p({ name: "held", state: "waiting", paused: true, live: true })], NOW)).toBeNull();
+  });
+
+  test("format: paused line says paused / 被 @ 也不唤醒 and keeps the wake-test remedy", () => {
+    const line = formatUnreachable({ name: "held", ageMs: 5 * 60 * 1000, reason: "paused" });
+    expect(line).toContain("held is paused, 被 @ 也不唤醒");
+    expect(line).toContain("mention delivered to history only");
+    expect(line).toContain("party wake test @held");
+  });
 });
 
 describe("formatting", () => {

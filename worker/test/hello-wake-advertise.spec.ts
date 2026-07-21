@@ -69,9 +69,14 @@ describe("hello.wake_kind 带内 watch presence 声明 (#675)", () => {
     expect((await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name)?.wake?.kind).toBe("watch");
 
     ws.close();
-    // 断连回收后 wake_kind 撤销（markOffline 对 wake_kind='watch' 清零）。
-    await new Promise((r) => setTimeout(r, 50));
-    const after = (await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name);
+    // 断连回收后 wake_kind 撤销（markOffline 对 wake_kind='watch' 清零）。固定 50ms 等待在 CI 上会抖：
+    // 有界轮询直到 presence 里的 wake.kind 消失（最多 ~2s），既不 flaky 也不掩盖真回归。
+    let after: PresenceEntry | undefined;
+    for (let i = 0; i < 40; i++) {
+      after = (await fetchPresence(slug, agent.token)).find((p) => p.name === agent.name);
+      if ((after?.wake?.kind ?? undefined) === undefined) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
     expect(after?.wake?.kind ?? undefined).toBeUndefined();
   });
 });

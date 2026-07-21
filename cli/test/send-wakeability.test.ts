@@ -106,6 +106,26 @@ describe("party send --mention wakeability warning (#664)", () => {
     expect(r.stdout).toContain("sent seq=");
   });
 
+  test("paused target (#180) → warn 'paused, 被 @ 也不唤醒', message still sent, exit 0", async () => {
+    // 有一个新鲜 webhook adapter（本可服务端投递），但 paused → 被 @ 也不唤醒，仍应告警。
+    restMock = presenceMock([{ name: "held-bot", paused: true, wake: { kind: "webhook" }, last_seen: Date.now() - 2 * HOUR, ts: Date.now() - 2 * HOUR }]);
+    writeCfg(restMock.url);
+    const r = await runCli(["send", "恢复后看下", "--channel", "dev", "--mention", "held-bot"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("sent seq=");
+    expect(r.stderr).toContain("warn:");
+    expect(r.stderr).toContain("held-bot is paused, 被 @ 也不唤醒");
+  });
+
+  test("--require-wakeable + paused target → exit EXIT_UNREACHABLE, message still sent", async () => {
+    restMock = presenceMock([{ name: "held-bot", paused: true, wake: { kind: "webhook" }, last_seen: Date.now() - 2 * HOUR, ts: Date.now() - 2 * HOUR }]);
+    writeCfg(restMock.url);
+    const r = await runCli(["send", "恢复后看下", "--channel", "dev", "--mention", "held-bot", "--require-wakeable"]);
+    expect(r.code).toBe(EXIT_UNREACHABLE);
+    expect(r.stdout).toContain("sent seq=");
+    expect(r.stderr).toContain("held-bot is paused");
+  });
+
   test("--no-reach silences the warn line (message still sent, exit 0)", async () => {
     restMock = presenceMock([{ name: "kyc-claude", wake: { kind: "none" } }]);
     writeCfg(restMock.url);

@@ -1081,6 +1081,35 @@ describe("排队超时收敛为终态（issue #667）", () => {
     });
   }
 
+  async function currentAlarm(slug: string): Promise<number | null> {
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    return runInDurableObject(stub, async (_i: ChannelDO, state) => state.storage.getAlarm());
+  }
+
+  it("paused 目标的超时排队投递不会把 alarm 钉在 now+1000 空转", async () => {
+    const sender = await seedToken("agent", uniq("sender"));
+    const target = await seedToken("agent", uniq("paused-target"));
+    const slug = await createChannel(sender.token);
+    const paused = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/pause`, sender.token, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(paused.status).toBe(200);
+    const posted = await sendMention(slug, sender.token, target.name, `@${target.name} held while paused`);
+    const queued = (await deliveryRows(slug))[0]!;
+    expect(queued).toMatchObject({ message_seq: posted.seq, state: "queued" });
+
+    // 把 queued 回填到超时线之外后跑 alarm：paused 目标永不被 failStale 收敛，若排队超时闸仍把它算进候选，
+    // 候选落在过去 → 被 max(min, now+1000) 钉到 now+1000，导致每秒空转。
+    await backdateAndSweep(slug, queued.id);
+
+    // 仍 queued（owner 持债，不被误判），且 alarm 不再是每秒重挂：应落在长期 retention/lease 线（created_at + 30d）附近。
+    expect((await deliveryRows(slug))[0]).toMatchObject({ id: queued.id, state: "queued" });
+    const alarm = await currentAlarm(slug);
+    expect(alarm).not.toBeNull();
+    expect(alarm! - Date.now()).toBeGreaterThan(60_000);
+  });
+
   it("对无唤醒通道的死目标，排队超时后转 failed(undelivered) 并广播 delivery_state", async () => {
     const sender = await seedToken("agent", uniq("sender"));
     const target = await seedToken("agent", uniq("dead-target"));

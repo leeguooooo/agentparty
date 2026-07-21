@@ -28,7 +28,8 @@ If any mentioned target is neither online nor auto-wakeable (offline with no wak
 layer, or a stale/dead wake adapter), a non-blocking "warn:" line also prints to
 stderr — the send still succeeds, but the mention only lands in history and will not
 wake anyone. This warning shows even without a TTY (agent loops); --no-reach silences
-it. Use --require-wakeable to make such a send exit non-zero (after sending).
+it — except under --require-wakeable, which always prints the warn line (so the non-zero
+exit is explained). Use --require-wakeable to make such a send exit non-zero (after sending).
 
 Options:
   --channel C         send to channel C instead of the bound channel
@@ -36,9 +37,11 @@ Options:
   --attach path       upload a local file and attach it; repeatable (max 25MB each)
   --reply-to seq      attach this message as a reply to seq
   --reach             show mention reachability even when not a TTY (agent loops)
-  --no-reach          never show mention reachability (also silences the warn line)
+  --no-reach          never show mention reachability (also silences the warn line,
+                      UNLESS --require-wakeable is set, which forces the warn line)
   --require-wakeable  exit non-zero if any mentioned target is not auto-wakeable
-                      (the message is still sent; the warn line always prints)
+                      (the message is still sent; the warn line always prints —
+                      this overrides --no-reach's silencing of the warn line)
   --debug-auth        print resolved auth/config source to stderr`;
 
 // 附件上限与文件名规则与 worker 侧保持一致（#176）：本地先挡一刀，给出比服务端 413 更贴切的文案。
