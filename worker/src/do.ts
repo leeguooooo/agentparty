@@ -316,7 +316,7 @@ const WORKFLOW_GUARD_WINDOW = 8;
 // explicitly off, active delivery capability/lineage expires after 30 days and its terminal audit
 // row is retained for another 7 days. This is far above the hours-long offline replay contract while
 // keeping permanently offline agents and abandoned owner questions bounded.
-const DIRECTED_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+export const DIRECTED_DELIVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const DIRECTED_DELIVERY_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 // #667：一条 @ 一旦落 `queued`（无任何 serve/watch/webhook adapter 可领取）就永不收敛——发送方
 // 永远看到 ⏳「已排队」，分不清「还在等」「送到了没醒」还是「永远送不到」。给排队态一个超时闸：
@@ -2584,8 +2584,15 @@ export class ChannelDO extends Server<Env> {
         return;
       }
       // 幂等去重命中（#98）：只回 sent（原 seq），不重复广播/唤醒。ws 发送目前不带 key，故常态为 false。
+      // #665：即便是重试命中，也要把（按当前 presence 重算的）undeliverable_mentions 带回，避免首发 ack 丢失后静默漏掉不可唤醒目标。
       if (out.deduped) {
-        this.sendFrame(connection, { type: "sent", seq: out.seq });
+        this.sendFrame(connection, {
+          type: "sent",
+          seq: out.seq,
+          ...(out.undeliverableMentions !== undefined && out.undeliverableMentions.length > 0
+            ? { undeliverable_mentions: out.undeliverableMentions }
+            : {}),
+        });
         return;
       }
       const sent = out.frames[0] as MsgFrame;
@@ -3384,8 +3391,17 @@ export class ChannelDO extends Server<Env> {
       candidates.push(Number(oldestActiveDelivery.t) + DIRECTED_DELIVERY_MAX_AGE_MS);
     }
     // #667：排队超时闸。取最老的 queued 行，到点跑 failStaleQueuedDeliveries 收敛未送达的 @。
+    // 但 paused（#180）目标的 queued 行永不被 failStaleQueuedDeliveries 收敛（owner 主动持债），
+    // 若把它算进候选，10 分钟过后每秒重挂 now+1000 空转唤醒 DO——故与 skip 条件对齐，排除 paused 目标。
     const oldestQueued = this.ctx.storage.sql
-      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state = 'queued'")
+      .exec(
+        `SELECT MIN(d.created_at) AS t FROM directed_deliveries d
+          WHERE d.state = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM presence p
+               WHERE p.name = d.target_name AND p.paused_at IS NOT NULL
+            )`,
+      )
       .one();
     if (oldestQueued.t !== null) {
       candidates.push(Number(oldestQueued.t) + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS);
@@ -3555,7 +3571,9 @@ export class ChannelDO extends Server<Env> {
          updated_at = excluded.updated_at,
          wake_verified_at = CASE WHEN presence.wake_kind IS 'watch' THEN presence.wake_verified_at ELSE NULL END,
          wake_kind = 'watch',
-         residency = COALESCE(presence.residency, 'supervised')`,
+         -- wake_kind='watch' 与 residency 必须同为 supervised：直接写死，别用 COALESCE 保留旧的非 supervised 残值，
+         -- 否则会产出 wake=watch + residency=<非supervised> 的协议不一致组合。
+         residency = 'supervised'`,
       name,
       sessionId,
       ts,
@@ -4883,8 +4901,16 @@ export class ChannelDO extends Server<Env> {
       .one().t;
     if (active !== null) candidates.push(Number(active) + DIRECTED_DELIVERY_MAX_AGE_MS);
     // #667：DO 水合后也要重挂排队超时闸，否则驱逐/迁移后陈旧的 queued 行再无扫描把它收敛。
+    // 同 scheduleNextAlarm：排除 paused（#180）目标，避免其永不收敛的 queued 行触发每秒空转重挂。
     const oldestQueued = this.ctx.storage.sql
-      .exec("SELECT MIN(created_at) AS t FROM directed_deliveries WHERE state = 'queued'")
+      .exec(
+        `SELECT MIN(d.created_at) AS t FROM directed_deliveries d
+          WHERE d.state = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM presence p
+               WHERE p.name = d.target_name AND p.paused_at IS NOT NULL
+            )`,
+      )
       .one().t;
     if (oldestQueued !== null) candidates.push(Number(oldestQueued) + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS);
     const terminal = this.ctx.storage.sql
@@ -6888,7 +6914,19 @@ export class ChannelDO extends Server<Env> {
             };
           }
         }
-        return { ok: true, seq: Number(priorRow.seq), frames: [this.rowToFrame(priorRow)], deduped: true };
+        // #665：幂等命中（重试）也要重算 undeliverable_mentions——首发的 sent ack 可能已丢，
+        // 用存库的 delivery_targets_json 对齐当前 presence 重算，让重发仍能给发送方当场知情。
+        const dedupUndeliverable = this.undeliverableAgentMentions(
+          parseStoredTargetNames(priorRow.delivery_targets_json),
+          Date.now(),
+        );
+        return {
+          ok: true,
+          seq: Number(priorRow.seq),
+          frames: [this.rowToFrame(priorRow)],
+          deduped: true,
+          ...(dedupUndeliverable.length > 0 ? { undeliverableMentions: dedupUndeliverable } : {}),
+        };
       }
     }
     const payload = frame.kind === "message" ? frame.body : frame.note;

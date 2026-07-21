@@ -74,8 +74,9 @@ export interface Unreachable {
   ageMs: number | null;
   // 声明的 wake 类型（用于文案区分「压根没 wake 通道」与「适配器陈旧」）；缺省即无。
   wake?: WakeKind;
-  // no_wake：wake=none/缺失，压根没有唤醒路径；stale_adapter：声明了 serve/watch 但心跳陈旧（supervisor 大概率已死）。
-  reason: "no_wake" | "stale_adapter";
+  // no_wake：wake=none/缺失，压根没有唤醒路径；stale_adapter：声明了 serve/watch 但心跳陈旧（supervisor 大概率已死）；
+  // paused：owner 主动暂停接待（#180），被 @ 也不唤醒——有唤醒通道也无用。
+  reason: "no_wake" | "stale_adapter" | "paused";
 }
 
 // 返回该 @ 目标的不可达详情，或 null（在线 / 可自动唤醒 / 刚断线未过 STALE / 不在 presence / 人类）。
@@ -89,6 +90,12 @@ export function unreachableOf(name: string, presence: PresenceEntry[], now: numb
   const age = now - seen;
   // online：与 reachOf/who 一致——当前有活 WS 连接（live）或新鲜即视为在线，@ 直达，不告警。
   if (e.state !== "offline" && (e.live === true || age < STALE_MS)) return null;
+  // #664：paused（#180）优先于任何 wake 通道判定——owner 主动暂停接待，被 @ 也不唤醒，
+  // 即便声明了 serve/watch/webhook 也不会响应，故直接判不可达（distinct reason=paused）供发送方知情。
+  if (e.paused === true) {
+    const wake = e.wake?.kind;
+    return { name, ageMs: seen > 0 ? age : null, ...(wake !== undefined ? { wake } : {}), reason: "paused" };
+  }
   // 可自动唤醒且未越幽灵线：webhook 服务端投递、或 serve/watch 心跳新鲜 → 叫得醒，不告警。
   if (e.wake?.kind !== undefined && autoWakeReachable(e, now, STALE_MS) && age <= DEAD_MS) return null;
   // 刚断线（<STALE_MS）：给一个宽限，可能马上重连，先不判死。
@@ -115,9 +122,11 @@ function ageText(ageMs: number | null): string {
 //   warn: kyc-claude has no live wake channel (last_seen 88h ago) — mention delivered to history only; run 'party wake test @kyc-claude' to verify
 export function formatUnreachable(u: Unreachable): string {
   const what =
-    u.reason === "stale_adapter"
-      ? `${u.name}'s ${u.wake ?? "wake"} adapter looks dead`
-      : `${u.name} has no live wake channel`;
+    u.reason === "paused"
+      ? `${u.name} is paused, 被 @ 也不唤醒`
+      : u.reason === "stale_adapter"
+        ? `${u.name}'s ${u.wake ?? "wake"} adapter looks dead`
+        : `${u.name} has no live wake channel`;
   return `warn: ${what} (${ageText(u.ageMs)}) — mention delivered to history only; run 'party wake test @${u.name}' to verify`;
 }
 

@@ -1,7 +1,7 @@
 // #421: D1-authoritative retention policy + DO alarm physical deletion.
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { type ChannelDO, DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS } from "../src/do";
+import { type ChannelDO, DIRECTED_DELIVERY_MAX_AGE_MS, DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS } from "../src/do";
 import { api, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 describe("channel retention policy (#421)", () => {
@@ -144,6 +144,8 @@ describe("channel retention policy (#421)", () => {
     // #667：暂停接待让这条 queued 投递成为 owner 主动持债的持久工作——10 分钟排队超时闸会跳过它，
     // 于是仍能验证 30 天 delivery_expired 兜底与 7 天终态保留这条更慢的路径（未暂停的死目标已由
     // undelivered_timeout 在 10 分钟收敛，另有独立用例覆盖）。
+    // 关键：既然 failStale 永远跳过 paused 目标，排队超时闸就绝不能把它算进 alarm 候选——否则 10 分钟
+    // 到点后每秒空转重挂（本用例正守住这条：初始 alarm 应落在 30 天 delivery_expired 兜底，而非 10 分钟线）。
     const paused = await api(`/api/channels/${slug}/presence/${encodeURIComponent(target.name)}/pause`, owner.token, {
       method: "POST",
       body: JSON.stringify({}),
@@ -165,8 +167,11 @@ describe("channel retention policy (#421)", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       const initialAlarm = await state.storage.getAlarm();
       expect(initialAlarm).not.toBeNull();
-      // onStart 现在先挂更近的排队超时闸（issue #667）；30 天兜底仍在，只是不再是最近的候选。
-      expect(Math.abs(initialAlarm! - (createdAt + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS))).toBeLessThan(1_000);
+      // #667：paused 目标的 queued 行被排队超时闸排除（否则 10 分钟后每秒空转），故初始 alarm 落在
+      // 30 天 delivery_expired 兜底，而非 10 分钟排队超时线。
+      expect(Math.abs(initialAlarm! - (createdAt + DIRECTED_DELIVERY_MAX_AGE_MS))).toBeLessThan(1_000);
+      // 且明确不是 10 分钟排队超时线（回归守卫：paused 不再触发短周期重挂）。
+      expect(Math.abs(initialAlarm! - (createdAt + DIRECTED_DELIVERY_QUEUED_TIMEOUT_MS))).toBeGreaterThan(1_000);
       state.storage.sql.exec(
         "UPDATE directed_deliveries SET created_at = ?, updated_at = ? WHERE message_seq = ?",
         now - 31 * 24 * 60 * 60 * 1000,

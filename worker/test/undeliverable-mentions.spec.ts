@@ -196,6 +196,80 @@ describe("#665 undeliverable agent mentions (server-authoritative wakeability tr
     senderWs.close();
   });
 
+  it("REST 幂等重试命中也重算并带出 undeliverable_mentions（首发 ack 丢了不静默漏）", async () => {
+    const acct = "u665-rest-idem@leeguoo.com";
+    const sender = await seedToken("human", uniq("sender"), { owner: acct });
+    const slug = await createChannel(sender.token);
+    const agent = await seedToken("agent", uniq("idembot"), { channelScope: slug });
+
+    const observer = await WsClient.open(slug, sender.token);
+    await completeCapabilityHello(observer);
+    const watch = await WsClient.open(slug, agent.token);
+    await completeCapabilityHello(watch);
+    watch.send({
+      type: "send",
+      kind: "status",
+      state: "waiting",
+      note: "watching",
+      mentions: [],
+      residency: "supervised",
+      wake: { kind: "watch" },
+    });
+    await watch.nextOfType("sent");
+    await closeAndAwaitOffline(watch, observer, agent.name);
+
+    const key = `idem-${crypto.randomUUID()}`;
+    const body = JSON.stringify({ kind: "message", body: `@${agent.name} ping`, mentions: [agent.name], reply_to: null, idempotency_key: key });
+    const first = await api(`/api/channels/${slug}/messages`, sender.token, { method: "POST", body });
+    expect(first.status).toBe(200);
+    const firstJson = (await first.json()) as SentJson;
+    expect(firstJson.undeliverable_mentions).toEqual([agent.name]);
+
+    // 同 key 重试 → 幂等命中（同 seq），但仍须重算 undeliverable_mentions 带回，不静默丢失。
+    const retry = await api(`/api/channels/${slug}/messages`, sender.token, { method: "POST", body });
+    expect(retry.status).toBe(200);
+    const retryJson = (await retry.json()) as SentJson;
+    expect(retryJson.seq).toBe(firstJson.seq);
+    expect(retryJson.undeliverable_mentions).toEqual([agent.name]);
+    observer.close();
+  });
+
+  it("WS 幂等重试命中的 sent 回执也带 undeliverable_mentions", async () => {
+    const acct = "u665-ws-idem@leeguoo.com";
+    const sender = await seedToken("human", uniq("sender"), { owner: acct });
+    const slug = await createChannel(sender.token);
+    const agent = await seedToken("agent", uniq("wsidembot"), { channelScope: slug });
+
+    const senderWs = await WsClient.open(slug, sender.token);
+    await completeCapabilityHello(senderWs);
+    const watch = await WsClient.open(slug, agent.token);
+    await completeCapabilityHello(watch);
+    watch.send({
+      type: "send",
+      kind: "status",
+      state: "waiting",
+      note: "watching",
+      mentions: [],
+      residency: "supervised",
+      wake: { kind: "watch" },
+    });
+    await watch.nextOfType("sent");
+    await closeAndAwaitOffline(watch, senderWs, agent.name);
+
+    const key = `idem-${crypto.randomUUID()}`;
+    const frame = { type: "send" as const, kind: "message" as const, body: `@${agent.name} ping`, mentions: [agent.name], reply_to: null, idempotency_key: key };
+    senderWs.send(frame);
+    const firstAck = (await senderWs.nextOfType("sent")) as SentJson;
+    expect(firstAck.undeliverable_mentions).toEqual([agent.name]);
+
+    // 同 key 重发 → 服务端幂等去重命中，回同一 seq，且仍带 undeliverable_mentions。
+    senderWs.send(frame);
+    const retryAck = (await senderWs.nextOfType("sent")) as SentJson;
+    expect(retryAck.seq).toBe(firstAck.seq);
+    expect(retryAck.undeliverable_mentions).toEqual([agent.name]);
+    senderWs.close();
+  });
+
   // 纯函数：证明「租约随心跳过期而失活」的真相由 autoWakeReachable 承载——last_seen 超过 PRESENCE_TIMEOUT_MS
   // 且无活连接即判不可达。wakeableState 只分类 wake 层（watch=unverified），可达性另由 autoWakeReachable 判，
   // 二者共同构成 who/send 的「wakeable」真相（cli who: wstate!=offline && autoWakeReachable）。

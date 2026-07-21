@@ -807,11 +807,16 @@ export async function run(argv: string[]): Promise<number> {
       const head = tail.at(-1)?.seq ?? Math.max(localCursor, 0);
       const pending: number[] = [];
       let scanCursor = localCursor;
-      while (scanCursor < head && pending.length < WATCH_SKIP_SCAN_LIMIT) {
+      // 报数扫描只 best-effort：以「已扫过的总消息数」为界（对齐 resolveExplicitWatchCursor 的 skipped.length），
+      // 而非只数命中的 @self——否则稀疏 @ 的深积压里 pending 长期为 0，会把几乎整段历史串行翻完（#674 报数不值这代价）。
+      let scanned = 0;
+      while (scanCursor < head && scanned < WATCH_SKIP_SCAN_LIMIT) {
         const page = await fetchMessages(cfg.server, cfg.token, channel, scanCursor, WATCH_SKIP_PAGE_SIZE);
         if (page.length === 0) break;
         for (const m of page) {
-          if (m.seq <= head && m.sender.name !== identity.name && m.mentions.includes(identity.name)) pending.push(m.seq);
+          if (m.seq > head) continue;
+          scanned += 1;
+          if (m.sender.name !== identity.name && m.mentions.includes(identity.name)) pending.push(m.seq);
         }
         const pageLast = page.at(-1)?.seq ?? scanCursor;
         if (pageLast <= scanCursor) break;
