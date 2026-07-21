@@ -32,21 +32,23 @@ function agentLabel(entry: PresenceEntry): string {
   return entry.handle ?? entry.display_name ?? entry.name;
 }
 
-const DISMISS_KEY = "ap:outdatedAgentsNoticeDismissedMin";
+// 按「每个 min 版本」独立记忆 dismissal（#670 评审）：忽略 0.4.0 不会顶掉 0.3.0 的忽略；
+// 服务端回退到某个曾被忽略的旧 min 时不再骚扰。用版本后缀 key，而非单一覆盖值。
+const DISMISS_KEY_PREFIX = "ap:outdatedAgentsNoticeDismissedMin:";
 
-function readDismissedMin(): string | null {
+function isDismissed(min: string): boolean {
   try {
-    if (typeof sessionStorage === "undefined") return null;
-    return sessionStorage.getItem(DISMISS_KEY);
+    if (typeof sessionStorage === "undefined") return false;
+    return sessionStorage.getItem(DISMISS_KEY_PREFIX + min) === "1";
   } catch {
-    return null;
+    return false;
   }
 }
 
-function persistDismissedMin(min: string): void {
+function persistDismissed(min: string): void {
   try {
     if (typeof sessionStorage === "undefined") return;
-    sessionStorage.setItem(DISMISS_KEY, min);
+    sessionStorage.setItem(DISMISS_KEY_PREFIX + min, "1");
   } catch {
     // sessionStorage 不可用（隐私模式/无 DOM）时静默——本会话内的 React state 仍能隐藏。
   }
@@ -56,8 +58,8 @@ export function OutdatedAgentsNotice({ presence, accountKey, onUpgrade, minVersi
   const t = useT();
   const hookMin = useMinClientVersion();
   const min = minVersion !== undefined ? minVersion : hookMin;
-  // 按 min 记忆「已忽略」：换了 min（发了新版）dismissal 自然失效、重新提醒，避免每次刷新骚扰。
-  const [dismissedMin, setDismissedMin] = useState<string | null>(readDismissedMin);
+  // 本会话内点过「忽略」的 min 集合；与 sessionStorage 的持久记忆并用（后者覆盖跨挂载/刷新）。
+  const [dismissedMins, setDismissedMins] = useState<Set<string>>(() => new Set());
 
   const outdated = useMemo<OutdatedAgent[]>(() => {
     if (accountKey === null || min === null) return [];
@@ -72,8 +74,9 @@ export function OutdatedAgentsNotice({ presence, accountKey, onUpgrade, minVersi
     return rows.sort((a, b) => a.label.localeCompare(b.label));
   }, [presence, accountKey, min]);
 
-  // 空态一律不渲染：min 未知 / 无过时 agent / 本 min 已被忽略。
-  if (min === null || outdated.length === 0 || dismissedMin === min) return null;
+  // 空态一律不渲染：min 未知 / 无过时 agent / 本 min 已被忽略（本会话或已持久化）。
+  const dismissed = min !== null && (dismissedMins.has(min) || isDismissed(min));
+  if (min === null || outdated.length === 0 || dismissed) return null;
 
   const title =
     outdated.length === 1
@@ -88,8 +91,8 @@ export function OutdatedAgentsNotice({ presence, accountKey, onUpgrade, minVersi
           type="button"
           className="d-btn outdated-agents-notice-dismiss"
           onClick={() => {
-            setDismissedMin(min);
-            persistDismissedMin(min);
+            persistDismissed(min);
+            setDismissedMins((s) => new Set(s).add(min));
           }}
         >
           {t("OutdatedAgentsNotice.dismiss")}

@@ -99,6 +99,22 @@ test("点关闭后即隐藏（本会话不再骚扰）", () => {
   expect(root.findAllByType("div")).toHaveLength(0);
 });
 
+test("dismissal 按 min 独立记忆：关掉 0.3.0 后升到 0.4.0 仍提示，回退 0.3.0 不再骚扰（#670）", () => {
+  // 关掉当前 min=0.3.0
+  let root = render({ presence: mixedPresence, accountKey: MINE, minVersion: "0.3.0" });
+  expect(labels(root).length).toBe(1);
+  act(() => byClass(root, "outdated-agents-notice-dismiss")[0]!.props.onClick());
+  expect(root.findAllByType("div")).toHaveLength(0);
+  // 服务端升到新 min=0.4.0：这是不同版本，应重新提示（不被 0.3.0 的忽略顶掉）。
+  root = render({ presence: mixedPresence, accountKey: MINE, minVersion: "0.4.0" });
+  expect(labels(root).length).toBeGreaterThan(0);
+  act(() => byClass(root, "outdated-agents-notice-dismiss")[0]!.props.onClick());
+  expect(root.findAllByType("div")).toHaveLength(0);
+  // 服务端回退到曾被忽略的 0.3.0：不再提示（每个 min 的忽略独立持久）。
+  root = render({ presence: mixedPresence, accountKey: MINE, minVersion: "0.3.0" });
+  expect(root.findAllByType("div")).toHaveLength(0);
+});
+
 test("每个过时 agent 有升级 CTA，点击回调带 agent name", () => {
   const opened: string[] = [];
   const root = render({ presence: mixedPresence, accountKey: MINE, minVersion: "0.3.0", onUpgrade: (name) => opened.push(name) });
