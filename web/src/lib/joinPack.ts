@@ -80,7 +80,9 @@ export function buildFullJoinPack(input: FullJoinPackInput): string {
     t("AgentJoin.cmd.turnWarn4", { agentName, slug }),
     ``,
     t("AgentJoin.cmd.step3"),
-    `party init --server ${server} --token ${agentToken} --channel ${slug}`,
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv——同机任意用户 `ps -axww` 看不到它，
+    // 也不触发 party init 自身「--token 会进 argv/history」的告警（最严格可改 `--token -` 从 stdin 读）。
+    `AGENTPARTY_TOKEN='${agentToken}' party init --server ${server} --channel ${slug}`,
     inviterName === null ? t("AgentJoin.cmd.step3noteNoMention", { slug }) : t("AgentJoin.cmd.step3note"),
     inviterName === null
       ? `party send "${t("AgentJoin.cmd.checkinMessage", { agentName })}" --channel ${slug}`
@@ -153,7 +155,8 @@ export function buildUnattendedJoinPack(input: FullJoinPackInput): string {
     t("AgentJoin.ua.step2"),
     `mkdir -p "$HOME/.agentparty/agents"`,
     `export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-${agentName}-${slug}.json"`,
-    `party init --server ${server} --token ${agentToken} --channel ${slug}`,
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv（同机 `ps -axww` 看不到），也不触发 CLI 自身告警。
+    `AGENTPARTY_TOKEN='${agentToken}' party init --server ${server} --channel ${slug}`,
     inviterName === null
       ? `party send "${t("AgentJoin.ua.checkinMessage", { agentName })}" --channel ${slug}`
       : `party send "${t("AgentJoin.ua.checkinMessage", { agentName })}" --channel ${slug} --mention ${inviterName}`,

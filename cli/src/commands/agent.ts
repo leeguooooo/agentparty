@@ -84,7 +84,10 @@ export async function run(argv: string[]): Promise<number> {
       const res = await createAgent(account.server, account.token, name, channelScope);
       // 明文 token 只出现这一次
       console.log(JSON.stringify(res));
-      console.error(`give it to the agent: party init --server ${account.server} --token ${res.token}`);
+      // token 走 AGENTPARTY_TOKEN 环境变量传入，不进 argv：同机任意用户 `ps -axww` 看不到它（#676）。
+      console.error(
+        `give it to the agent (token via env, not argv): AGENTPARTY_TOKEN='${res.token}' party init --server ${account.server}`,
+      );
       return 0;
     }
 

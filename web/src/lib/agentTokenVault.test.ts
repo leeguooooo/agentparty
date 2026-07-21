@@ -16,6 +16,9 @@ describe("buildMinimalAgentCommand", () => {
       'export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-desktop-worker-release-room.json"',
     );
     expect(command).not.toContain("TMPDIR");
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv——命令里不得再出现明文 `--token ap`
+    expect(command).toContain("AGENTPARTY_TOKEN='ap_fixture' party init --server https://agentparty.example.com");
+    expect(command).not.toContain("--token ap_fixture");
     const guardIndex = command.indexOf("AgentParty onboarding scope: join the existing channel #release-room");
     expect(guardIndex).toBeGreaterThan(-1);
     expect(guardIndex).toBeLessThan(command.indexOf("party init "));
@@ -122,8 +125,9 @@ describe("buildMinimalAgentCommand", () => {
     });
 
     expect(command).toContain(
-      "party init --server https://agentparty.leeguoo.com --token ap_fixture --channel demo",
+      "AGENTPARTY_TOKEN='ap_fixture' party init --server https://agentparty.leeguoo.com --channel demo",
     );
+    expect(command).not.toContain("--token ap_fixture");
     expect(command).not.toContain("tauri://localhost");
   });
 });

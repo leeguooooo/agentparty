@@ -69,7 +69,9 @@ describe("party invite --mode", () => {
     expect(r.code).toBe(0);
     // a readonly token was minted and it is the one the invitee inits with
     expect(minted.some((m) => m.role === "readonly")).toBe(true);
-    expect(r.stdout).toMatch(/party init .*--token ap_readonly/);
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量，不写进 argv——可拷贝命令里不得再有明文 `--token ap`
+    expect(r.stdout).toMatch(/AGENTPARTY_TOKEN='ap_readonly\d*' party init --server .* --channel watchroom/);
+    expect(r.stdout).not.toContain("--token ap_readonly");
     const watchGuardIndex = r.stdout.indexOf("AgentParty onboarding scope: join the existing channel #watchroom");
     expect(watchGuardIndex).toBeGreaterThan(-1);
     expect(watchGuardIndex).toBeLessThan(r.stdout.indexOf("party init "));
@@ -85,7 +87,8 @@ describe("party invite --mode", () => {
     const r = await runInvite(["Part Room", "--slug", "partroom", "--mode", "participate", "--server", server]);
     expect(r.code).toBe(0);
     expect(minted.some((m) => m.role === "agent")).toBe(true);
-    expect(r.stdout).toMatch(/party init .*--token ap_agenttok/);
+    expect(r.stdout).toMatch(/AGENTPARTY_TOKEN='ap_agenttok\d*' party init --server .* --channel partroom/);
+    expect(r.stdout).not.toContain("--token ap_agenttok");
     const participateGuardIndex = r.stdout.indexOf("AgentParty onboarding scope: join the existing channel #partroom");
     expect(participateGuardIndex).toBeGreaterThan(-1);
     expect(participateGuardIndex).toBeLessThan(r.stdout.indexOf("party init "));
@@ -98,7 +101,8 @@ describe("party invite --mode", () => {
     const server = startRest();
     const r = await runInvite(["Def Room", "--slug", "defroom", "--server", server]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/party init .*--token ap_agenttok/);
+    expect(r.stdout).toMatch(/AGENTPARTY_TOKEN='ap_agenttok\d*' party init --server .* --channel defroom/);
+    expect(r.stdout).not.toContain("--token ap_agenttok");
     expect(r.stdout).toMatch(/party send .*报到/);
   });
 

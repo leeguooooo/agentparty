@@ -175,8 +175,9 @@ describe("AgentTokens copy join pack (#584)", () => {
     expect(pack).toContain(`need=${realVault.MIN_CLI}; have=`);
     expect(pack).toContain('AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-legacy-bot-demo.json"');
     expect(pack).toContain("claude mcp add party-legacy-bot --env");
-    expect(pack).toContain("--token ap_old_token");
-    expect(pack).toContain("party init --server https://party.example");
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv——可拷贝命令里不得再有明文 `--token ap`
+    expect(pack).toContain("AGENTPARTY_TOKEN='ap_old_token' party init --server https://party.example");
+    expect(pack).not.toContain("--token ap_old_token");
     // ……而且是与「＋ 让 agent 加入」同构的【完整包】：charter 快照 + 待命/唤醒指引 + 参与指引，
     // 不是只有 init/check-in 的最小包（否则新 agent 报到完就不知道怎么挂 watch/serve）。
     expect(pack).toContain("# read the pinned rules before posting");

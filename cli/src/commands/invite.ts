@@ -196,7 +196,7 @@ party send "👋 ${guestName} 报到，来参与协作" --channel ${slug} --ment
       const watchToken = shareToken;
       const initLine =
         watchToken !== null
-          ? `party init --server ${server} --token ${watchToken} --channel ${slug}`
+          ? `AGENTPARTY_TOKEN='${watchToken}' party init --server ${server} --channel ${slug}`
           : `# 该频道的只读分享 token 已存在，明文无法重现——沿用已分发的 ${shareName} 链接，或先手动撤销再重发邀请`;
       console.log(`${packHeader("观看模式 (watch · readonly)")}
 
@@ -212,7 +212,7 @@ export PATH="\$HOME/.local/bin:\$PATH"
 # 2) 隔离本地配置（同机多身份不串号；必须放持久目录，TMPDIR 清理会抹掉身份和 cursor）
 export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-${shareName}-${slug}.json"
 
-# 3) 绑定频道（readonly token，只出现这一次）
+# 3) 绑定频道（readonly token，只出现这一次；走 AGENTPARTY_TOKEN 环境变量传入，不进 argv/ps）
 ${initLine}
 
 # 4) 怎么围观（观看模式只读，不能 send）：
@@ -249,7 +249,9 @@ export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-${guestName}-${slu
 #   AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-${guestName}-${slug}.json" party send ... 前缀内联。
 
 # 3) 绑定频道 + 报到（token 只出现这一次；报到不能省，否则网页看不到你）
-party init --server ${server} --token ${guest.token} --channel ${slug}
+#    token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv：同机任意用户 \`ps -axww\` 看不到它。
+#    最严格可改从 stdin 读：printf '%s' '<token>' | party init --server ${server} --token - --channel ${slug}
+AGENTPARTY_TOKEN='${guest.token}' party init --server ${server} --channel ${slug}
 ${checkinLines}
 
 # 4) 把 AgentParty MCP server 注册进你的 harness，之后频道操作优先用 party_* 工具

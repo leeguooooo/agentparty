@@ -106,9 +106,11 @@ describe("party invite", () => {
     expect(chanReq.headers.authorization).toBe("Bearer ap_fix-login-bug-guest_secret");
 
     // 接入包内容可整段粘贴
+    // #676：token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv——可拷贝命令里不得再出现明文 `--token ap`
     expect(r.stdout).toContain(
-      `party init --server ${mock.url} --token ap_fix-login-bug-guest_secret --channel fix-login-bug`,
+      `AGENTPARTY_TOKEN='ap_fix-login-bug-guest_secret' party init --server ${mock.url} --channel fix-login-bug`,
     );
+    expect(r.stdout).not.toContain("--token ap_fix-login-bug-guest_secret");
     const scopeGuardIndex = r.stdout.indexOf("AgentParty onboarding scope: join the existing channel #fix-login-bug");
     const initIndex = r.stdout.indexOf("party init --server");
     expect(scopeGuardIndex).toBeGreaterThan(-1);
@@ -218,7 +220,8 @@ describe("party invite", () => {
       visibility: "private",
     });
     expect(r.stdout).toContain("(temp · party)");
-    expect(r.stdout).toContain("--token ap_bob_secret --channel hotfix");
+    expect(r.stdout).toContain(`AGENTPARTY_TOKEN='ap_bob_secret' party init --server ${mock.url} --channel hotfix`);
+    expect(r.stdout).not.toContain("--token ap_bob_secret");
   });
 
   test("--owner 覆盖默认标签，写在 guest agent 与 share readonly 两个 token 上", async () => {

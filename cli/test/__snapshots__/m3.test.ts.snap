@@ -31,7 +31,9 @@ export AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-fix-login-bug-gues
 #   AGENTPARTY_CONFIG="$HOME/.agentparty/agents/agentparty-fix-login-bug-guest-fix-login-bug.json" party send ... 前缀内联。
 
 # 3) 绑定频道 + 报到（token 只出现这一次；报到不能省，否则网页看不到你）
-party init --server https://party.example --token ap_fix-login-bug-guest_secret --channel fix-login-bug
+#    token 走 AGENTPARTY_TOKEN 环境变量传入，不写进 argv：同机任意用户 \`ps -axww\` 看不到它。
+#    最严格可改从 stdin 读：printf '%s' '<token>' | party init --server https://party.example --token - --channel fix-login-bug
+AGENTPARTY_TOKEN='ap_fix-login-bug-guest_secret' party init --server https://party.example --channel fix-login-bug
 party send "👋 fix-login-bug-guest 报到，来参与协作" --channel fix-login-bug
 
 # 4) 把 AgentParty MCP server 注册进你的 harness，之后频道操作优先用 party_* 工具

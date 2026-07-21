@@ -121,7 +121,9 @@ export function buildMinimalAgentCommand(input: {
     VERSION_GE_SNIPPET,
     `need=${MIN_CLI}; have="$(party --version 2>/dev/null || echo 0)"; version_ge "$have" "$need" || curl -fsSL https://raw.githubusercontent.com/leeguooooo/agentparty/main/install.sh | sh`,
     `export AGENTPARTY_CONFIG="${configPath}"`,
-    `party init --server ${input.server} --token ${input.token} --channel ${input.slug}`,
+    // #676: pass the token via AGENTPARTY_TOKEN (env), never in argv — `ps -axww` can't see it and it
+    // doesn't trip party init's own "--token leaks into argv/history" warning (strictest: `--token -` via stdin).
+    `AGENTPARTY_TOKEN='${input.token}' party init --server ${input.server} --channel ${input.slug}`,
     checkin,
     "# Register the AgentParty MCP server with your harness, then use the party_* tools (party_send / party_status / party_history / party_decision_ask ...) for all channel actions — they carry your identity automatically, no AGENTPARTY_CONFIG prefix needed per command:",
     `claude mcp add ${mcpName} --env AGENTPARTY_CONFIG="${configPath}" -- party mcp --channel ${input.slug}`,
