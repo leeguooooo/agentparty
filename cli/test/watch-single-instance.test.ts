@@ -200,6 +200,66 @@ describe("runWatch 接线 (#195)", () => {
     }
   });
 
+  test("--ensure：同身份已挂时幂等退出 0（no-op），不建 WS，不报 exit 10 (#669)", async () => {
+    const d = dir();
+    let connections = 0;
+    const server = startMockServer((f, sock) => {
+      if (f.type !== "hello") return;
+      connections++;
+      sock.send(welcomeFrame(0, "me"));
+    });
+    try {
+      writeFileSync(join(d, "watch-dev.lock"), JSON.stringify({ pid: process.pid, channel: "dev" }));
+      const lines: string[] = [];
+      const code = await runWatch({
+        server: server.url,
+        token: "ap_tok",
+        channel: "dev",
+        since: 0,
+        timeoutSec: 2,
+        follow: false,
+        mentionsOnly: true,
+        once: true,
+        lockDir: d,
+        ensure: true,
+        out: (l) => lines.push(l),
+        backoffBaseMs: 20,
+      });
+      expect(code).toBe(0); // 幂等：不是 exit 10
+      expect(connections).toBe(0); // 仍不建 WS（活着的 watcher 在消费）
+      expect(lines.some((l) => l.includes("already attached") && l.includes("no-op"))).toBe(true);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("不带 --ensure：同身份已挂仍保留 exit 10 硬拒 (#669 回归)", async () => {
+    const d = dir();
+    const server = startMockServer((f, sock) => {
+      if (f.type !== "hello") return;
+      sock.send(welcomeFrame(0, "me"));
+    });
+    try {
+      writeFileSync(join(d, "watch-dev.lock"), JSON.stringify({ pid: process.pid, channel: "dev" }));
+      const code = await runWatch({
+        server: server.url,
+        token: "ap_tok",
+        channel: "dev",
+        since: 0,
+        timeoutSec: 2,
+        follow: false,
+        mentionsOnly: true,
+        once: true,
+        lockDir: d,
+        out: () => {},
+        backoffBaseMs: 20,
+      });
+      expect(code).toBe(EXIT_ALREADY_WATCHING);
+    } finally {
+      server.stop();
+    }
+  });
+
   test("--allow-multiple 是逃生舱：明知故犯时放行", async () => {
     const d = dir();
     writeFileSync(join(d, "watch-dev.lock"), JSON.stringify({ pid: process.pid, channel: "dev" }));

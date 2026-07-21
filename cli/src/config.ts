@@ -76,6 +76,12 @@ export interface StuckWake {
   source?: "serve" | "watch";
   /** watch 首次输出时看到的频道 head；重放时会再探测并取较新者。 */
   channel_last_seq?: number;
+  /**
+   * #668/#674：这条唤醒债**首次**产生的时刻（epoch ms）。重放不刷新它——据此判定债过期：
+   * 超过 WATCH_WAKE_DEBT_MAX_AGE_MS 的 pending wake 自动降级为 history-only（不再回放），
+   * 几天前早已别处处理过的 @ 不该反复叫醒任何人。
+   */
+  first_wake_ts?: number;
   /** 首次显式快进时跳过的 mentions，随 pending wake 一起保留。 */
   skipped_mention_seqs?: number[];
 }
@@ -680,6 +686,37 @@ export function ackWatchStuck(channel: string, expectedSeq?: number, cwd?: strin
     result = { outcome: "cleared", seq: stuck.seq };
     const { stuck: _dropped, ...rest } = cur;
     return rest;
+  }, cwd);
+  return result;
+}
+
+/**
+ * 批量排空（#668/#674）：把游标一次性推进到 throughSeq，并清掉 throughSeq 及之前的 watch 唤醒债，
+ * 让 agent 明确「这些我不处理了，从现在起只看新的」。取代逐条 ack + 逐条重挂的 O(n) 空转。
+ * serve 源债绝不触碰（误清=静默丢 @，#198 红线）：遇到 serve 债时**只推进游标、保留债**并回报。
+ * 校验与写入同处一个跨进程临界区，避免读后写误吞窗口内新落的债（#599 评审同款）。
+ */
+export type DrainWatchStuckOutcome =
+  | { outcome: "drained"; clearedSeq: number | null; cursor: number }
+  | { outcome: "serve_owned"; seq: number; source: string; cursor: number };
+
+export function drainWatchStuck(channel: string, throughSeq: number, cwd?: string): DrainWatchStuckOutcome {
+  let result: DrainWatchStuckOutcome = { outcome: "drained", clearedSeq: null, cursor: 0 };
+  updateChannelCursor(channel, (cur) => {
+    const nextCursor = Math.max(cur.cursor, throughSeq);
+    const stuck = cur.stuck;
+    // serve 债：只推进游标，绝不清债。serve 会用自己的租约语义把它投出去。
+    if (stuck !== undefined && stuck.source !== "watch") {
+      result = { outcome: "serve_owned", seq: stuck.seq, source: stuck.source ?? "unknown", cursor: nextCursor };
+      const next: ChannelCursor = { ...cur, cursor: nextCursor };
+      return next;
+    }
+    const clearsDebt = stuck !== undefined && stuck.seq <= throughSeq;
+    result = { outcome: "drained", clearedSeq: clearsDebt ? stuck!.seq : null, cursor: nextCursor };
+    const next: ChannelCursor = { ...cur, cursor: nextCursor };
+    // 债 seq 高于排空点（例如刚落一条更靠后的债）就保留，不误清。
+    if (clearsDebt) delete next.stuck;
+    return next;
   }, cwd);
   return result;
 }

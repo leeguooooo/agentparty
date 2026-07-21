@@ -12,6 +12,7 @@ import { acquireInstanceLock, defaultInstanceLockDir, instanceLockTarget } from 
 import { isHelpArg, parseArgs, str, unknownFlagError, valueFlagError } from "../args";
 import { connect } from "../client";
 import {
+  drainWatchStuck,
   loadCursor,
   loadRevCursor,
   loadStuck,
@@ -38,13 +39,18 @@ import {
   writeStatuslineCache,
 } from "../statusline-cache";
 
-const WATCH_FLAGS = ["channel", "timeout", "follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest", "since"];
+const WATCH_FLAGS = ["channel", "timeout", "follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest", "since", "ensure", "drain", "status", "no-status", "quiet"];
 const WATCH_SKIP_PAGE_SIZE = 1000;
 const WATCH_SKIP_SCAN_LIMIT = 10_000;
 const WATCH_DELIVERY_ACK_TIMEOUT_MS = 5_000;
 const WATCH_DELIVERY_ACK_POLL_MS = 10;
+/**
+ * #668/#674：pending watch 唤醒债的过期阈值。first_wake_ts 早于 now-该值的债，重挂时自动降级为
+ * history-only（不再回放），并把游标推过它——几天前早已别处处理过的 @ 不该反复叫醒任何人。
+ */
+export const WATCH_WAKE_DEBT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const terminalOutput = (value: string) => stripTerminalControls(value);
-const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow|--once] [--latest|--since seq] [--json] [--allow-multiple]
+const HELP = `usage: party watch [channel|--channel C] [--timeout N] [--mentions-only] [--exclude-self] [--follow|--once] [--latest|--since seq|--drain] [--ensure] [--status|--no-status] [--json] [--allow-multiple]
 
 Watch a channel for new messages. By default this waits up to 240 seconds.
 With --follow, it stays attached unless --timeout N is explicit.
@@ -53,9 +59,17 @@ exits 0. It is only a wake signal while the harness keeps that background task
 alive. Claude Code may kill run_in_background tasks at turn boundaries, so this
 is turn-scoped best effort, not durable unattended presence.
 Re-arm --once with the persisted cursor (omit --latest). If the previous result
-was lost before the agent replied, the pending wake is replayed first.
+was lost before the agent replied, the pending wake is replayed first. A pending
+wake older than 7 days auto-downgrades to history-only (no replay).
+--latest now TRULY attaches at head: it drains any pending unacknowledged wake
+first, then attaches at the current channel head (no backlog replay).
+--drain is a one-shot: it advances the cursor to head and clears all pending
+watch wake debt, then exits — say "I'm caught up, only new messages from here".
 For --mentions-only --once, an uninitialized cursor (0) attaches at the current
 channel head to avoid replaying old mentions. Use --since 0 to request backlog.
+Mount is SILENT by default (no auto waiting-status posted to the timeline);
+"wakeable" presence is advertised in-band (hello.wake_kind), not as a message.
+Pass --status to also post a human-visible waiting status (opt-in).
 Self messages are skipped by default; --exclude-self is accepted as an explicit
 automation hint for scripts that want to document that behavior.
 NOTE: --follow only PRINTS messages. Most harnesses (Codex included) never turn
@@ -74,8 +88,13 @@ Options:
   --exclude-self    explicitly skip this agent's own messages (default)
   --follow          keep watching after the first matching message
   --once            exit 0 right after the first matching message
-  --latest          explicitly skip backlog, attach at the current channel head
+  --latest          skip backlog: drain pending wake debt, then attach at head
   --since seq       explicitly start after seq (mutually exclusive with --latest)
+  --drain           one-shot: advance cursor to head + clear all pending debt, exit 0
+  --ensure          idempotent re-mount: if a same-identity watcher is already
+                    attached, exit 0 ("no-op") instead of exit 10 (for per-turn harnesses)
+  --status          also post a human-visible waiting status on mount (default: silent)
+  --no-status       explicit opt-out of the mount status (alias: --quiet; this is the default)
   --json            emit structured NDJSON frames`;
 
 // --follow 的假在线陷阱（issue #55/#60）：watcher 打印了 mention、presence 也新鲜，但多数
@@ -103,8 +122,9 @@ export const ONCE_REARM_ADVISORY =
   "For unattended presence, use `party serve --runner claude|codex --replay-backlog`.";
 
 export const ONCE_LATEST_ADVISORY =
-  "warning: re-arming `party watch --once` with --latest explicitly discards backlog. " +
-  "Use the persisted cursor (omit --latest); any pending unacknowledged wake will be replayed first.";
+  "warning: re-arming `party watch --once` with --latest explicitly discards backlog: it drains any " +
+  "pending unacknowledged wake (no replay) and attaches at the current channel head. " +
+  "To keep the backlog and replay pending wakes one at a time, omit --latest.";
 
 /** Claude Code 环境：可做回合内 --once，但 run_in_background 可能在回合边界被回收（#454）。 */
 export function isClaudeCodeEnv(env: Record<string, string | undefined> = process.env): boolean {
@@ -147,8 +167,13 @@ export interface WatchOptions {
   allowMultiple?: boolean;
   /** durable delivery running 回执等待上限；生产默认 5s，测试可注入更短时间。 */
   deliveryAckTimeoutMs?: number;
-  // watch 挂上（连上 WS、开始监听）后声明自己「有 watch 唤醒层」的钩子；run() 注入真实实现，测试可省略/替换。
+  // watch 挂上（连上 WS、开始监听）后往时间线发一条 waiting 状态的钩子。#675：默认**不**注入（静默挂载），
+  // 只有 --status 显式要人类可见的广播时才注入 advertiseWatchWake；presence 的「可唤醒」声明改走 advertiseWakeKind。
   advertise?: () => Promise<void>;
+  /** #675：带内 presence 声明「有 watch 唤醒层」，随 hello 上报，不往时间线发消息。 */
+  advertiseWakeKind?: "watch";
+  /** #669：同身份 watcher 已挂时，幂等退出 0（no-op）而非 exit 10 报错，供 harness 每轮例行重挂。 */
+  ensure?: boolean;
 }
 
 async function confirmWatchDeliveryRunning(
@@ -291,10 +316,16 @@ export async function runWatch(o: WatchOptions): Promise<number> {
   const lockTarget = o.lockDir === undefined ? instanceLockTarget(o.server, o.token, o.channel) : o.channel;
   const lock = o.allowMultiple === true ? null : acquireInstanceLock("watch", lockTarget, lockDir);
   if (lock && !lock.ok) {
+    // #669：--ensure 让 harness 的每轮例行重挂在「同身份已挂」时幂等收场（exit 0, no-op），
+    // 不再以 exit 10 报错刷「background task failed」假失败。不带 --ensure 仍保留 exit 10 硬拒。
+    if (o.ensure === true) {
+      out(`watch: already attached (pid ${lock.heldByPid}), no-op`);
+      return 0;
+    }
     out(
       `watch: 已有 watcher 挂在 #${o.channel} 上（pid ${lock.heldByPid}）。` +
         ` 再挂一个会让同一条 @ 触发 N 次唤醒——agent 会把同一条消息回 N 遍，并给 loop guard 上膛。` +
-        ` 要么等它退出，要么 kill ${lock.heldByPid}；确实想并存请加 --allow-multiple。`,
+        ` 要么等它退出，要么 kill ${lock.heldByPid}；确实想并存请加 --allow-multiple 或 --ensure 幂等重挂。`,
     );
     return EXIT_ALREADY_WATCHING;
   }
@@ -306,6 +337,7 @@ export async function runWatch(o: WatchOptions): Promise<number> {
     conn = connect(o.server, o.token, o.channel, o.since, {
       onCursor: o.onCursor,
       ...(acceptsDirectedDelivery ? { directedDelivery: "v1" as const } : {}),
+      ...(o.advertiseWakeKind === "watch" ? { advertiseWakeKind: "watch" as const } : {}),
       sinceRev: o.sinceRev,
       onRevCursor: o.onRevCursor,
       backoffBaseMs: o.backoffBaseMs,
@@ -594,6 +626,7 @@ export async function runWatch(o: WatchOptions): Promise<number> {
           source: "watch",
           channel_last_seq: lastSeq,
           skipped_mention_seqs: o.skippedMentionSeqs ?? [],
+          first_wake_ts: Date.now(),
         });
       }
       if (qualifies) {
@@ -696,7 +729,7 @@ export async function run(argv: string[]): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest"] });
+  const { positionals, flags } = parseArgs(argv, { booleans: ["follow", "once", "mentions-only", "exclude-self", "json", "allow-multiple", "latest", "ensure", "drain", "status", "no-status", "quiet"] });
   if (flags.follow === true && flags.once === true) {
     console.error("--follow and --once are mutually exclusive: follow keeps watching, once exits after the first match");
     return 1;
@@ -705,6 +738,14 @@ export async function run(argv: string[]): Promise<number> {
     console.error("--latest and --since are mutually exclusive");
     return 1;
   }
+  // #675：--status（要人类可见的时间线广播）与 --no-status/--quiet（显式静默，默认即静默）互斥。
+  const wantsTimelineStatus = flags.status === true;
+  const silencedTimelineStatus = flags["no-status"] === true || flags.quiet === true;
+  if (wantsTimelineStatus && silencedTimelineStatus) {
+    console.error("--status and --no-status/--quiet are mutually exclusive");
+    return 1;
+  }
+  const ensure = flags.ensure === true;
   if (flags.since === true) {
     console.error("--since requires a value");
     return 1;
@@ -749,7 +790,89 @@ export async function run(argv: string[]): Promise<number> {
   else if (flags.once === true && isCodexRuntimeEnv()) console.error(ONCE_CODEX_ADVISORY);
   if (flags.once === true && flags.latest === true) console.error(ONCE_LATEST_ADVISORY);
   const localCursor = loadCursor(channel);
+  // #674：--drain 是一次性排空——把游标推到频道 head、清掉全部 pending watch 唤醒债，然后退出，
+  // 让 agent 明确「积压这些我不处理了，从现在起只看新的」。不挂 WS、不等消息，O(1) 收场。
+  if (flags.drain === true) {
+    if (flags.follow === true) {
+      console.error("--drain and --follow are mutually exclusive: drain is a one-shot cursor advance");
+      return 1;
+    }
+    try {
+      // best-effort：探 head，再有界扫描 localCursor→head 之间还压着的 @self（供 agent 知道跳过了什么）。
+      // 与 --latest 不同，drain 不要求「精确从 cursor+1 起」的严格闸——积压本就可能有空洞，扫描只为报数。
+      const [identity, tail] = await Promise.all([
+        fetchMe(cfg.server, cfg.token),
+        fetchRecentMessages(cfg.server, cfg.token, channel, 1),
+      ]);
+      const head = tail.at(-1)?.seq ?? Math.max(localCursor, 0);
+      const pending: number[] = [];
+      let scanCursor = localCursor;
+      while (scanCursor < head && pending.length < WATCH_SKIP_SCAN_LIMIT) {
+        const page = await fetchMessages(cfg.server, cfg.token, channel, scanCursor, WATCH_SKIP_PAGE_SIZE);
+        if (page.length === 0) break;
+        for (const m of page) {
+          if (m.seq <= head && m.sender.name !== identity.name && m.mentions.includes(identity.name)) pending.push(m.seq);
+        }
+        const pageLast = page.at(-1)?.seq ?? scanCursor;
+        if (pageLast <= scanCursor) break;
+        scanCursor = pageLast;
+      }
+      const drained = drainWatchStuck(channel, head);
+      if (flags.json === true) {
+        console.log(
+          JSON.stringify(
+            jsonFrame({
+              type: "watch_drained",
+              channel,
+              cursor: drained.cursor,
+              head,
+              drained_debt_seq: drained.outcome === "drained" ? drained.clearedSeq : null,
+              serve_owned_seq: drained.outcome === "serve_owned" ? drained.seq : null,
+              pending_mentions: pending.length,
+              pending_mention_seqs: pending,
+            }),
+          ),
+        );
+      } else if (drained.outcome === "serve_owned") {
+        console.log(terminalOutput(
+          `watch: 游标已推进到 head seq=${head}（跳过 ${pending.length} 条未读 @：${JSON.stringify(pending)}）；` +
+            ` 但存在 serve 源唤醒债 seq=${drained.seq}，未清除——serve 会用租约语义投递它，别手动丢弃（#198）。`,
+        ));
+      } else {
+        console.log(terminalOutput(
+          `watch: 已排空 #${channel}——游标推进到 head seq=${head}` +
+            (drained.clearedSeq !== null ? `，清除 pending 唤醒债 seq=${drained.clearedSeq}` : "") +
+            `，跳过 ${pending.length} 条未读 @：${JSON.stringify(pending)}。从现在起只唤醒新消息。`,
+        ));
+      }
+      return 0;
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("refusing to skip more than")) {
+        console.error(`error: ${e.message}`);
+        return 1;
+      }
+      return handleRestError(e);
+    }
+  }
   let stuck = loadStuck(channel);
+  // #674：显式 --latest（真的「跳到 head 只看新的」）时，pending 未确认债应当被**排空**而不是先回放，
+  // 否则 --latest 名不副实（旧行为：先重放旧债、等于没跳过）。清 watch 债 + 把游标推进到 head 后，
+  // 落到下方 latest 解析走真正的 head attach。serve 源债仍保留（drainWatchStuck 只推游标、不碰 serve 债）。
+  if (flags.once === true && flags.latest === true && stuck !== null && stuck.source === "watch") {
+    try {
+      const tail = await fetchRecentMessages(cfg.server, cfg.token, channel, 1);
+      const head = Math.max(tail.at(-1)?.seq ?? 0, stuck.channel_last_seq ?? 0, stuck.seq);
+      const drained = drainWatchStuck(channel, head);
+      console.error(terminalOutput(
+        `watch: --latest 排空 pending 唤醒债` +
+          (drained.outcome === "drained" && drained.clearedSeq !== null ? ` seq=${drained.clearedSeq}` : "") +
+          `，游标推进到 head seq=${head}——不再回放旧债，attach 到最新。`,
+      ));
+      stuck = loadStuck(channel);
+    } catch (e) {
+      return handleRestError(e);
+    }
+  }
   // pending wake 比任何显式快进选择都优先。即使调用者误用 --latest，也不能先把仍未被模型
   // 确认的 @ 丢掉。REST 精确补拉后立即退出，避免重新挂起一个可能又被 harness 回收的后台任务。
   if (flags.once === true && stuck !== null) {
@@ -762,10 +885,15 @@ export async function run(argv: string[]): Promise<number> {
     const replayLock =
       flags["allow-multiple"] === true ? null : acquireInstanceLock("watch", replayLockTarget, replayLockDir);
     if (replayLock && !replayLock.ok) {
+      // #669：--ensure 幂等——同身份 watcher 已挂时，重挂不重放（欠账留给活着的那个 watcher），退出 0 no-op。
+      if (ensure) {
+        console.log(`watch: already attached (pid ${replayLock.heldByPid}), no-op`);
+        return 0;
+      }
       console.error(terminalOutput(
         `watch: 已有 watcher 挂在 #${channel} 上（pid ${replayLock.heldByPid}）；` +
           ` 不重放 pending wake seq=${stuck.seq}，避免同一条 @ 被回两遍——欠账已保留。` +
-          ` 等它退出或 kill ${replayLock.heldByPid}；确实想并存请加 --allow-multiple。`,
+          ` 等它退出或 kill ${replayLock.heldByPid}；确实想并存请加 --allow-multiple 或 --ensure 幂等重挂。`,
       ));
       return EXIT_ALREADY_WATCHING;
     }
@@ -787,14 +915,32 @@ export async function run(argv: string[]): Promise<number> {
         ));
         return 1;
       }
+      // #668/#674：债过期降级——first_wake_ts 早于 now-阈值（默认 7 天）的 pending wake 不再回放。
+      // 几天前早已别处处理过的 @ 反复叫醒只有噪音价值。清债 + 把游标推过它（history-only），不作为唤醒。
+      // directed debt（有 delivery_id）不走这条：它由 serve 的租约/retention 语义管，不能本地按时限丢弃。
+      if (
+        stuck.delivery_id === undefined &&
+        typeof stuck.first_wake_ts === "number" &&
+        Date.now() - stuck.first_wake_ts > WATCH_WAKE_DEBT_MAX_AGE_MS
+      ) {
+        const ageDays = Math.floor((Date.now() - stuck.first_wake_ts) / (24 * 60 * 60 * 1000));
+        const drained = drainWatchStuck(channel, stuck.seq);
+        console.error(terminalOutput(
+          `watch: pending 唤醒债 seq=${stuck.seq} 已过期（${ageDays} 天前首次产生，超过 ${Math.floor(WATCH_WAKE_DEBT_MAX_AGE_MS / (24 * 60 * 60 * 1000))} 天阈值）——` +
+            `降级为 history-only，不再回放；游标推进到 seq=${drained.cursor}。补看：party history ${channel} --since ${Math.max(0, stuck.seq - 1)}`,
+        ));
+        // 债已过期清除：stuck=null 落回下方正常 attach 路径（不 return，finally 释放重放锁）。
+        stuck = loadStuck(channel);
+      }
+      // 过期降级后 stuck===null：跳过重放，落回正常 attach（接手更新的积压或新消息）。
       // Directed debt 在 running ACK 前只是 unknown outcome。按旧 seq-only 路径直接重放会与
       // Worker 租约超时后的重新分配并发执行同一 work；保持 debt，重新注册等该 delivery 的新 claim。
-      if (stuck.delivery_id !== undefined && stuck.delivery_acceptance !== "accepted") {
+      if (stuck !== null && stuck.delivery_id !== undefined && stuck.delivery_acceptance !== "accepted") {
         console.error(terminalOutput(
           `watch: directed delivery=${stuck.delivery_id} 尚未确认 running；不会本地回放 seq=${stuck.seq}，` +
             "正在重新挂接，等待服务端重新授予合法 claim。",
         ));
-      } else {
+      } else if (stuck !== null) {
         try {
           // #652：stuck 现在是 let（锁内会被权威重读重新赋值），闭包捕获 let 会被 TS 放宽回可空。
           // 上面已 `if (stuck === null) return 0`，这里锁内的 stuck 必非空——把 seq 固定成 const 供闭包使用。
@@ -851,7 +997,10 @@ export async function run(argv: string[]): Promise<number> {
                 `channel_last_seq=${channelLastSeq} lag=${lag} ` +
                 `skipped_mention_seqs=${JSON.stringify(skippedMentionSeqs)}; ` +
                 `send a reply/status after handling it to clear this debt (or \`party ack --seq ${stuck.seq}\` if it needs no response).` +
-                (lag > 0 ? ` 补上下文：party history ${channel} --since ${stuck.seq}` : ""),
+                (lag > 0
+                  ? ` 补上下文：party history ${channel} --since ${stuck.seq}。` +
+                    ` 深积压不想逐条爬？一次跳到最新：party watch ${channel} --drain（或 party ack ${channel} --all）。`
+                  : ""),
             ));
             console.log(formatMsg(pending));
           }
@@ -932,7 +1081,11 @@ export async function run(argv: string[]): Promise<number> {
     onRevCursor: (r) => saveRevCursor(channel, r),
     statusline: true,
     allowMultiple: flags["allow-multiple"] === true,
-    advertise: () => advertiseWatchWake(auth, channel),
+    ensure,
+    // #675：可唤醒声明改走带内 presence（hello.wake_kind），默认不往时间线发 waiting 状态消息。
+    advertiseWakeKind: "watch",
+    // 只有 --status 显式要人类可见的挂载广播时才往时间线发一条（旧行为，opt-in）。
+    ...(wantsTimelineStatus ? { advertise: () => advertiseWatchWake(auth, channel) } : {}),
   });
   if (flags.once === true && flags.json !== true && code === 0) console.error(ONCE_REARM_ADVISORY);
   return code;

@@ -208,7 +208,7 @@ describe("watch --once pending wake replay (#508)", () => {
     expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).cursors.dev.stuck).toEqual(debt);
   }, 15_000);
 
-  test("重挂先从 REST 重放欠账，--latest 也不能越过，且不再建立 WS", async () => {
+  test("重挂不带 --latest 先从 REST 重放欠账，且不再建立 WS", async () => {
     home = mkdtempSync(join(tmpdir(), "ap-watch-pending-replay-"));
     const pending = msgFrame(10, "@me must survive reaper", { mentions: ["me"] });
     let upgrades = 0;
@@ -250,7 +250,7 @@ describe("watch --once pending wake replay (#508)", () => {
       }),
     );
 
-    const first = await runCli(["watch", "dev", "--once", "--mentions-only", "--latest", "--json"]);
+    const first = await runCli(["watch", "dev", "--once", "--mentions-only", "--json"]);
     expect(first.code).toBe(0);
     expect(upgrades).toBe(0);
     expect(JSON.parse(first.stdout)).toMatchObject({
@@ -263,13 +263,73 @@ describe("watch --once pending wake replay (#508)", () => {
       lag: 0,
       skipped_mention_seqs: [],
     });
-    expect(first.stderr).toContain("--latest explicitly discards backlog");
     expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).cursors.dev.stuck.attempts).toBe(1);
 
     const second = await runCli(["watch", "dev", "--once", "--mentions-only", "--json"]);
     expect(second.code).toBe(0);
     expect(JSON.parse(second.stdout)).toMatchObject({ seq: 10, watch_replay: true, replay_attempt: 2 });
     expect(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).cursors.dev.stuck.attempts).toBe(2);
+  }, 15_000);
+
+  test("--latest 排空 pending 债、attach 到 head、绝不回放旧债 (#674)", async () => {
+    home = mkdtempSync(join(tmpdir(), "ap-watch-latest-drain-"));
+    // head 就是这条 pending（seq10）。--latest 应清债 + 把游标推到 10，然后 attach WS 到 head 等新消息，
+    // 而不是像旧行为那样先把 seq10 回放一遍。
+    const pending = msgFrame(10, "@me stale backlog", { mentions: ["me"] });
+    let upgrades = 0;
+    apiServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/channels/dev/messages") {
+          const since = Number(url.searchParams.get("since") ?? 0);
+          return Response.json({ messages: pending.seq > since ? [pending] : [] });
+        }
+        if (url.pathname === "/api/me") {
+          return Response.json({ name: "me", kind: "agent", role: "agent", email: null, owner: null });
+        }
+        upgrades++;
+        if (srv.upgrade(req, { data: undefined })) return;
+        return new Response("not found", { status: 404 });
+      },
+      websocket: {
+        open(ws) {
+          // 收 hello 前不知 self；直接回 welcome(head=10) 让 --latest attach 到 head，随后无新消息超时退出。
+          ws.send(JSON.stringify(welcomeFrame(10, "me")));
+        },
+        message() {},
+      },
+    });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ server: `http://127.0.0.1:${apiServer.port}`, token: "ap_tok" }),
+    );
+    const dir = join(home, "state", workspaceId(process.cwd()));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "state.json"),
+      JSON.stringify({
+        channel: "dev",
+        cursor: 10,
+        cursors: {
+          dev: {
+            cursor: 10,
+            stuck: { seq: 10, attempts: 0, last_error: "watch wake awaiting agent acknowledgement", source: "watch" },
+          },
+        },
+      }),
+    );
+
+    const result = await runCli(["watch", "dev", "--once", "--mentions-only", "--latest", "--json", "--timeout", "1"]);
+    // 旧行为会先 REST 回放 seq10（不建 WS）；新行为清债后 attach WS 到 head。
+    expect(upgrades).toBeGreaterThanOrEqual(1);
+    expect(result.stdout).not.toContain("watch_replay");
+    expect(result.stderr).toContain("--latest 排空 pending 唤醒债");
+    // pending 债被清、游标推进到 head=10。
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
+    expect(state.cursors.dev.stuck).toBeUndefined();
+    expect(state.cursors.dev.cursor).toBe(10);
   }, 15_000);
 
   test("重放帧重新探测频道 head，并保留首次快进的 mention 元数据 (#508)", async () => {

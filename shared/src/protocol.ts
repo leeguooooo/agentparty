@@ -771,6 +771,13 @@ export interface HelloFrame {
    * 旧客户端不带 → 服务端保持旧行为（全量重放）。
    */
   since_rev?: number;
+  /**
+   * #675：带内 presence 声明「本连接有 watch 唤醒层」（residency=supervised + wake.kind=watch），
+   * 取代原先每次挂载往时间线发一条 waiting 状态消息（per-turn 重挂刷屏、推高 seq）。
+   * 服务端在这条连接的 presence 行上落 wake_kind，最后一条连接断开时由 markOffline 撤销（#454）。
+   * 旧客户端不带 → 服务端不改 wake_kind（保持旧行为）。仅 'watch' 合法；其余值服务端忽略。
+   */
+  wake_kind?: "watch";
 }
 
 /**

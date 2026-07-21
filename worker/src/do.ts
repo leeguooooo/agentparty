@@ -2389,6 +2389,11 @@ export class ChannelDO extends Server<Env> {
       if (clientVersion !== null) {
         this.recordClientVersion(st.name, connection.id, clientVersion, Date.now());
       }
+      // #675：带内 watch presence 声明。取代原先挂载往时间线发 waiting 状态消息（刷屏 + 推高 seq）。
+      // 只 agent 连接可声明可唤醒；wake_kind 断连由 markOffline 撤销。仅 'watch' 合法，其余忽略。
+      if (frame.wake_kind === "watch" && st.kind === "agent") {
+        this.advertiseWatchWakePresence(st.name, connection.id, Date.now());
+      }
       // Finish capability identity before replay. Live broadcasts were withheld while helloPending;
       // DO message handling is serialized, so dispatch + backfill below form one gap-free handoff.
       st = connection.setState({
@@ -3533,6 +3538,27 @@ export class ChannelDO extends Server<Env> {
       sessionId,
       ts,
       clientVersion,
+    );
+    const entry = this.presenceFor(name);
+    if (entry) this.broadcastFrame({ type: "presence", ...entry });
+  }
+
+  // #675：带内声明 watch 唤醒层。取代原先每次挂载往时间线发一条 waiting 状态消息（per-turn
+  // 重挂刷屏、推高 seq）。只在这条连接的 presence 行上落 wake_kind=watch + residency=supervised，
+  // 不落 history、不产生 seq。断开由 markOffline 撤销（#454，wake_kind='watch' 的行断连即清）。
+  // #191：wake_verified_at 绝不吃客户端自报——kind 变了就清空，等服务端观测到 resume 才盖。
+  private advertiseWatchWakePresence(name: string, sessionId: string, ts: number) {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO presence (name, session_id, state, note, updated_at, wake_kind, residency)
+         VALUES (?, ?, 'waiting', NULL, ?, 'watch', 'supervised')
+       ON CONFLICT(name, session_id) DO UPDATE SET
+         updated_at = excluded.updated_at,
+         wake_verified_at = CASE WHEN presence.wake_kind IS 'watch' THEN presence.wake_verified_at ELSE NULL END,
+         wake_kind = 'watch',
+         residency = COALESCE(presence.residency, 'supervised')`,
+      name,
+      sessionId,
+      ts,
     );
     const entry = this.presenceFor(name);
     if (entry) this.broadcastFrame({ type: "presence", ...entry });
