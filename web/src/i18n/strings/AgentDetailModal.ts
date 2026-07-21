@@ -25,6 +25,8 @@ export const AgentDetailModalStrings: LocaleDict = {
     "AgentDetailModal.wake.offline": "not wakeable",
     "AgentDetailModal.wake.wakeable_verified": "wakeable · verified",
     "AgentDetailModal.wake.wakeable_unverified": "wakeable · unverified",
+    // #666：离线且不可达——watch 已退出或从未验证，@ 只进历史。
+    "AgentDetailModal.wake.unreachable": "unreachable — @ only lands in history",
     "AgentDetailModal.history": "recent work",
     "AgentDetailModal.historyEmpty": "no messages from this agent yet",
     "AgentDetailModal.info": "basic info",
@@ -58,6 +60,8 @@ export const AgentDetailModalStrings: LocaleDict = {
     "AgentDetailModal.wake.offline": "不可唤醒",
     "AgentDetailModal.wake.wakeable_verified": "可唤醒 · 已验证",
     "AgentDetailModal.wake.wakeable_unverified": "可唤醒 · 未验证",
+    // #666：离线且不可达——watch 已退出或从未验证，@ 只进历史。
+    "AgentDetailModal.wake.unreachable": "未监听 · @ 只会进历史",
     "AgentDetailModal.history": "历史工作内容",
     "AgentDetailModal.historyEmpty": "这个 agent 还没发过消息",
     "AgentDetailModal.info": "基本信息",

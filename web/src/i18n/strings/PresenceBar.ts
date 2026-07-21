@@ -49,6 +49,10 @@ export const PresenceBarStrings: LocaleDict = {
     "PresenceBar.wake.verified": "⏾ wakeable · verified",
     "PresenceBar.wake.unverified": "⏾ wakeable · unverified",
     "PresenceBar.wake.off": "not wakeable",
+    // #666：离线且不可唤醒（无 wake layer / 被收割的 watch --once / 从未验证）——@ 只进历史。
+    "PresenceBar.unreachable": "⚠ unreachable",
+    "PresenceBar.unreachableTitle":
+      "watch has exited or was never verified wakeable — @-mentions only land in history and may go unhandled",
   },
   zh: {
     "PresenceBar.kickTitle": "踢出 {name}",
@@ -98,6 +102,9 @@ export const PresenceBarStrings: LocaleDict = {
     "PresenceBar.wake.verified": "⏾ 可唤醒 · 已验证",
     "PresenceBar.wake.unverified": "⏾ 可唤醒 · 未验证",
     "PresenceBar.wake.off": "不可唤醒",
+    // #666：离线且不可唤醒（无 wake layer / 被收割的 watch --once / 从未验证）——@ 只进历史。
+    "PresenceBar.unreachable": "⚠ 未监听",
+    "PresenceBar.unreachableTitle": "watch 已退出或从未验证可唤醒；@ 只会进历史，可能不被处理",
   },
 };
 

@@ -3,7 +3,7 @@ import type { PresenceEntry, Sender } from "@agentparty/shared";
 import { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
-import { ACTIVITY_TTL_MS, activityBadge, buildGroups, busyLabel, countLiveGroups, livenessBadge, ownerKey, pauseResumeAt, PresenceBar, taskLabel, waitingOwnerLabel, wakeabilityBadge, type Item } from "./PresenceBar";
+import { ACTIVITY_TTL_MS, activityBadge, buildGroups, busyLabel, countLiveGroups, livenessBadge, ownerKey, pauseResumeAt, PresenceBar, presenceTier, PRESENCE_STALE_MS, taskLabel, unreachableBadge, waitingOwnerLabel, wakeabilityBadge, type Item } from "./PresenceBar";
 
 function item(over: Partial<Item> = {}): Item {
   return {
@@ -136,6 +136,85 @@ describe("wakeabilityBadge (#191 可唤醒·待命 + 服务端校验)", () => {
     expect(wakeabilityBadge(item({ wakeKind: "none" }), NOW)?.key).toBe("PresenceBar.wake.off");
     expect(wakeabilityBadge(item({ wakeKind: "watch", wakeVerifiedAt: NOW, residency: "human_driven" }), NOW)?.tone).toBe("off");
     expect(wakeabilityBadge(item({ wakeKind: "serve", wakeVerifiedAt: NOW, residency: "bare" }), NOW)?.tone).toBe("off");
+  });
+});
+
+// #666：把 CLI `party who` 的三档分级搬到 web，把「离线且不可唤醒」（被收割的 watch --once /
+// 从未验证 / 无 wake layer）从「可唤醒·待命」里拆出来显式标注。tier 复用共享 wakeableState +
+// autoWakeReachable，与 who.ts classify 同口径。
+describe("presenceTier / unreachableBadge (#666 未监听)", () => {
+  const NOW = 10_000_000;
+  const FRESH = NOW - 5_000; // < STALE_MS：新鲜
+  const STALE = NOW - PRESENCE_STALE_MS - 60_000; // 远超 STALE_MS：被收割 / 陈旧
+
+  test("presenceTier：在线 → online（不看 wake）", () => {
+    expect(presenceTier(item({ state: "working" }), NOW)).toBe("online");
+    expect(presenceTier(item({ state: "waiting", wakeKind: null }), NOW)).toBe("online");
+  });
+
+  test("presenceTier：离线 + 无 wake layer → recent（不可唤醒）", () => {
+    expect(presenceTier(item({ state: "offline", wakeKind: null, lastSeen: STALE }), NOW)).toBe("recent");
+    expect(presenceTier(item({ state: "offline", wakeKind: "none", lastSeen: FRESH }), NOW)).toBe("recent");
+  });
+
+  test("presenceTier：离线 + serve/watch + 新鲜 last_seen → wakeable（可达待命）", () => {
+    expect(presenceTier(item({ state: "offline", wakeKind: "watch", wakeVerifiedAt: null, lastSeen: FRESH }), NOW)).toBe(
+      "wakeable",
+    );
+    expect(presenceTier(item({ state: "offline", wakeKind: "serve", wakeVerifiedAt: NOW - 1_000, lastSeen: FRESH }), NOW)).toBe(
+      "wakeable",
+    );
+  });
+
+  test("presenceTier：离线 + watch 声明还在但 last_seen 陈旧（被 harness 收割的 --once）→ recent", () => {
+    expect(presenceTier(item({ state: "offline", wakeKind: "watch", wakeVerifiedAt: null, lastSeen: STALE }), NOW)).toBe(
+      "recent",
+    );
+    // verified_at 新鲜也不能救——freshness 决定当前可达，与 who.ts 同口径（#454）。
+    expect(presenceTier(item({ state: "offline", wakeKind: "watch", wakeVerifiedAt: NOW - 1_000, lastSeen: STALE }), NOW)).toBe(
+      "recent",
+    );
+  });
+
+  test("presenceTier：离线 + webhook → wakeable（服务端投递，天然可达）", () => {
+    expect(presenceTier(item({ state: "offline", wakeKind: "webhook", lastSeen: STALE }), NOW)).toBe("wakeable");
+  });
+
+  test("presenceTier：human_driven / bare 不承诺可唤醒 → recent", () => {
+    expect(
+      presenceTier(item({ state: "offline", wakeKind: "watch", wakeVerifiedAt: NOW, residency: "human_driven", lastSeen: FRESH }), NOW),
+    ).toBe("recent");
+    expect(presenceTier(item({ state: "offline", wakeKind: "serve", residency: "bare", lastSeen: FRESH }), NOW)).toBe("recent");
+  });
+
+  test("unreachableBadge：离线不可唤醒的 agent → 标注未监听", () => {
+    expect(unreachableBadge(item({ kind: "agent", state: "offline", wakeKind: null, lastSeen: STALE }), NOW)).toEqual({
+      key: "PresenceBar.unreachable",
+      titleKey: "PresenceBar.unreachableTitle",
+    });
+    // 被收割的 watch --once 同样标注（这是 #666 的核心：别再假报可唤醒）。
+    expect(
+      unreachableBadge(item({ kind: "agent", state: "offline", wakeKind: "watch", wakeVerifiedAt: null, lastSeen: STALE }), NOW),
+    ).not.toBeNull();
+  });
+
+  test("unreachableBadge：在线 / 可唤醒待命 / paused / 人类 → 不标注", () => {
+    expect(unreachableBadge(item({ kind: "agent", state: "working" }), NOW)).toBeNull();
+    expect(
+      unreachableBadge(item({ kind: "agent", state: "offline", wakeKind: "watch", wakeVerifiedAt: null, lastSeen: FRESH }), NOW),
+    ).toBeNull();
+    // paused 是人主动设的有意状态、已有独立 ⏸ chip，不叠加未监听。
+    expect(
+      unreachableBadge(item({ kind: "agent", state: "offline", paused: true, wakeKind: null, lastSeen: STALE }), NOW),
+    ).toBeNull();
+    // 人类离线本就靠人接续，不算「未监听」。
+    expect(unreachableBadge(item({ kind: "human", state: "offline", wakeKind: null, lastSeen: STALE }), NOW)).toBeNull();
+  });
+
+  test("verified-wakeable 的离线 agent：显示可唤醒，不显示未监听", () => {
+    const it = item({ kind: "agent", state: "offline", wakeKind: "watch", wakeVerifiedAt: NOW - 1_000, lastSeen: FRESH });
+    expect(unreachableBadge(it, NOW)).toBeNull();
+    expect(wakeabilityBadge(it, NOW)).toEqual({ key: "PresenceBar.wake.verified", tone: "on" });
   });
 });
 
@@ -725,5 +804,68 @@ describe("presence a11y (#635 pill 键劫持 / #637 group button role)", () => {
     const section = nodesWithClass(r, "presence-group")[0];
     expect(section?.props.role).toBe("button");
     expect(section?.props["aria-expanded"]).toBe(false);
+  });
+});
+
+// #666：离线且不可唤醒的 agent 必须在页面上显式可见（红色 chip + 空心红点），
+// 别再和「可唤醒·待命」混成一个中性的 offline 点。用 presence（无对应 participant → 离线）驱动渲染。
+describe("presence 未监听/不可唤醒可见性 (#666)", () => {
+  function renderOffline(entry: PresenceEntry): ReactTestRenderer {
+    let next!: ReactTestRenderer;
+    void act(() => {
+      next = create(
+        createElement(
+          LocaleProvider,
+          null,
+          createElement(PresenceBar, {
+            presence: { [entry.name]: entry },
+            participants: [] as Sender[], // 无活连接 → 离线
+            status: "open",
+          }),
+        ),
+      );
+    });
+    renderer = next;
+    openRoster(next);
+    return next;
+  }
+
+  test("离线 + 无 wake layer + 陈旧 last_seen → 渲染未监听 chip + 空心红点", () => {
+    const stale = Date.now() - PRESENCE_STALE_MS - 60_000;
+    const r = renderOffline({ name: "ghost", kind: "agent", state: "offline", note: null, ts: stale, last_seen: stale });
+    expect(nodesWithClass(r, "presence-unreachable").length).toBeGreaterThan(0);
+    expect(nodesWithClass(r, "d-dot--unreachable").length).toBeGreaterThan(0);
+  });
+
+  test("被 harness 收割的 watch --once（wake=watch 但 last_seen 陈旧）→ 也标未监听，不再假报可唤醒", () => {
+    const stale = Date.now() - PRESENCE_STALE_MS - 60_000;
+    const r = renderOffline({
+      name: "ghost",
+      kind: "agent",
+      state: "offline",
+      note: null,
+      ts: stale,
+      last_seen: stale,
+      wake: { kind: "watch" },
+    });
+    expect(nodesWithClass(r, "presence-unreachable").length).toBeGreaterThan(0);
+  });
+
+  test("在线 agent → 不渲染未监听 chip", () => {
+    const r = renderPresence(presenceEntry(), true);
+    expect(nodesWithClass(r, "presence-unreachable")).toHaveLength(0);
+    expect(nodesWithClass(r, "d-dot--unreachable")).toHaveLength(0);
+  });
+
+  test("未监听 chip 跟随中英文 locale", async () => {
+    const stale = Date.now() - PRESENCE_STALE_MS - 60_000;
+    const en = renderOffline({ name: "ghost", kind: "agent", state: "offline", note: null, ts: stale, last_seen: stale });
+    expect(nodesWithClass(en, "presence-unreachable").some((n) => n.children.join("") === "⚠ unreachable")).toBe(true);
+
+    await act(async () => en.unmount());
+    renderer = null;
+    localStorage.setItem("ap_locale", "zh");
+    const zh = renderOffline({ name: "ghost", kind: "agent", state: "offline", note: null, ts: stale, last_seen: stale });
+    expect(nodesWithClass(zh, "presence-unreachable").some((n) => n.children.join("") === "⚠ 未监听")).toBe(true);
   });
 });

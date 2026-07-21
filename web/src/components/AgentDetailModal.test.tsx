@@ -136,6 +136,42 @@ describe("AgentDetailModal (#272)", () => {
     expect(text).toContain("/workspace/agentparty");
   });
 
+  // #666：离线且不可达（被收割的 watch --once / 从未验证）时，wake 事实别再显示「可唤醒·未验证」——
+  // 那会让人误以为叫得醒。改由 autoWakeReachable 判定后如实标 unreachable。
+  test("offline + watch declared but stale last_seen → wake fact reads unreachable, not wakeable", () => {
+    const stale = Date.now() - 10 * 60_000;
+    render({
+      name: "worker-a",
+      display: "worker-a",
+      kind: "agent",
+      owner: null,
+      online: false,
+      presence: presenceEntry({ state: "offline", ts: stale, last_seen: stale, wake: { kind: "watch" } }),
+      messages: [],
+      onClose: () => {},
+    });
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("未监听 · @ 只会进历史");
+    expect(text).not.toContain("可唤醒 · 未验证");
+  });
+
+  test("offline + fresh verified watch → still reads wakeable (not misflagged unreachable)", () => {
+    const now = Date.now();
+    render({
+      name: "worker-a",
+      display: "worker-a",
+      kind: "agent",
+      owner: null,
+      online: false,
+      presence: presenceEntry({ state: "offline", ts: now - 2_000, last_seen: now - 2_000, wake: { kind: "watch", verified_at: now - 1_000 } }),
+      messages: [],
+      onClose: () => {},
+    });
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("可唤醒 · 已验证");
+    expect(text).not.toContain("未监听");
+  });
+
   test("history section lists only that agent's messages", () => {
     const root = render({
       name: "worker-a",

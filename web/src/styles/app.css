@@ -1752,6 +1752,17 @@
   color: var(--d-green);
   background: var(--d-green-soft);
 }
+/* 不可唤醒/未监听（#666）：红色 chip + 空心红点，与「可唤醒·待命」的灰、paused 的琥珀明确区分——
+   watch 已退出或从未验证，@ 只进历史。 */
+.presence-unreachable {
+  border-color: var(--d-red);
+  background: var(--d-red-soft);
+  color: var(--d-red);
+}
+.d-dot--unreachable {
+  background: var(--t-panel2);
+  border-color: var(--d-red);
+}
 .presence-ts { font-size: 10px; font-weight: 400; color: var(--t-dim); }
 .presence-kick {
   flex: none;

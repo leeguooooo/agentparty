@@ -2,7 +2,7 @@
 // 独立看它的工作状态（presence 已有字段）、历史工作内容（本频道已加载消息里过滤出它发的）、
 // 在线状态。不建新后端——所有数据来自调用方已经持有的 presence/messages。
 import type { MsgFrame, PresenceEntry, Sender } from "@agentparty/shared";
-import { wakeableState } from "@agentparty/shared";
+import { autoWakeReachable, wakeableState } from "@agentparty/shared";
 import { useEffect } from "react";
 import { fmtRel } from "../lib/time";
 import { useT } from "../i18n/useT";
@@ -51,6 +51,10 @@ export function AgentDetailModal({ name, display, kind, owner, online, presence,
   const history = filterAgentHistory(messages, name);
   const state = presence !== null && presence.state !== "offline" ? presence.state : online ? "online" : "offline";
   const wake = presence !== null ? wakeableState(presence, now) : null;
+  // #666：wakeableState 只看 wake layer + 服务端校验，不看 freshness——一个被 harness 收割的 watch --once
+  // 会仍报 wakeable_unverified，让人误以为叫得醒。离线且 autoWakeReachable 判不可达时，如实标 unreachable，
+  // 与 PresenceBar 的未监听徽章同口径（watch 已退出 / 从未验证，@ 只进历史）。
+  const unreachable = state === "offline" && wake !== null && wake !== "offline" && !(presence !== null && autoWakeReachable(presence, now));
   const busy = presence?.busy === true;
   const queueDepth = busy && typeof presence?.queue_depth === "number" ? presence.queue_depth : null;
   const waitingOwnerCount =
@@ -141,7 +145,9 @@ export function AgentDetailModal({ name, display, kind, owner, online, presence,
               {wake !== null && (
                 <div className="agent-detail-fact">
                   <dt>{t("AgentDetailModal.wake")}</dt>
-                  <dd className={`t-mono agent-detail-wake agent-detail-wake--${wake}`}>{t(`AgentDetailModal.wake.${wake}`)}</dd>
+                  <dd className={`t-mono agent-detail-wake agent-detail-wake--${unreachable ? "unreachable" : wake}`}>
+                    {t(unreachable ? "AgentDetailModal.wake.unreachable" : `AgentDetailModal.wake.${wake}`)}
+                  </dd>
                 </div>
               )}
             </dl>

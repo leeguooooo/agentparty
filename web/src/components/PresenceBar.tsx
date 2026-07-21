@@ -1,6 +1,6 @@
 // 顶部 presence 条：每参与者一个手绘胶囊（名字 + 蜡笔状态点 + note + 相对时间），
 // 右端挂连接状态。"对方卡在哪"一眼可见（spec §9 第 3 块）。
-import { evaluateHostLease, wakeableState, type ChannelRoleAssignment, type PresenceEntry, type PresenceState, type Sender } from "@agentparty/shared";
+import { autoWakeReachable, evaluateHostLease, PRESENCE_TIMEOUT_MS, wakeableState, type ChannelRoleAssignment, type PresenceEntry, type PresenceState, type Sender } from "@agentparty/shared";
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement } from "react";
 import { agentHue } from "../lib/agentColor";
 import { fmtRel } from "../lib/time";
@@ -230,6 +230,50 @@ export function wakeabilityBadge(item: Item, now: number): { key: string; tone: 
   if (state === "wakeable_verified") return { key: "PresenceBar.wake.verified", tone: "on" };
   if (state === "wakeable_unverified") return { key: "PresenceBar.wake.unverified", tone: "pending" };
   return { key: "PresenceBar.wake.off", tone: "off" };}
+
+// 与 CLI who.ts 的 STALE_MS / DO presence 扫描一致：last_seen 超过它且无活连接即视为不新鲜、不可达。
+// 复用协议侧 freshness 常量，避免前端与 shared 的陈旧判定分叉（#671 评审）。
+export const PRESENCE_STALE_MS = PRESENCE_TIMEOUT_MS;
+
+export type PresenceTier = "online" | "wakeable" | "recent";
+
+// #666：把 CLI `party who` 的三档分级（online / wakeable / recent）搬到 web，让人一眼区分
+// 「离线但可唤醒·待命」（watch --once 的正常 standby）与「离线且不可唤醒」——watch 已被 harness
+// 收割 / 从未验证 / 根本没有 wake layer（@ 它只会进历史、可能没人处理）。判定完全复用共享的
+// wakeableState + autoWakeReachable，与 who.ts classify 同口径：wakeableState 看 wake layer + 服务端
+// 校验，autoWakeReachable 看 freshness/live——两者都成立才算真「可唤醒」，freshness 决定当前可达，
+// 于是被 kill 的 watch --once 会如实落到 recent，而不是永久假在线。
+export function presenceTier(item: Item, now: number, staleMs = PRESENCE_STALE_MS): PresenceTier {
+  // online：与 web 其余口径一致——state 非 offline 即在线（上游已把活连接 live 折叠进 state）。
+  if (item.state !== "offline") return "online";
+  const entry = {
+    ...(item.wakeKind === null
+      ? {}
+      : {
+          wake:
+            item.wakeVerifiedAt === null
+              ? { kind: item.wakeKind }
+              : { kind: item.wakeKind, verified_at: item.wakeVerifiedAt },
+        }),
+    ...(item.residency === null ? {} : { residency: item.residency }),
+    ...(item.lastSeen === null ? {} : { last_seen: item.lastSeen }),
+    ts: item.ts ?? 0,
+  };
+  // bare（无常驻）与 wakeabilityBadge 同待遇：不承诺可唤醒。
+  const wstate = item.residency === "bare" ? "offline" : wakeableState(entry, now);
+  const reachable = item.residency !== "bare" && autoWakeReachable(entry, now, staleMs);
+  return wstate !== "offline" && reachable ? "wakeable" : "recent";
+}
+
+// #666：不可唤醒/未监听徽章。仅当 agent 既非在线、也非可唤醒待命（tier=recent）时显式标注：
+// 它的 watch 已退出或从未验证可唤醒，@ 只会进历史、可能不被处理。paused 是人主动设的有意状态、
+// 已有独立 ⏸ chip，不叠加；人类离线本就靠人接续，不算「未监听」，只对 agent 标。
+export function unreachableBadge(item: Item, now: number): { key: string; titleKey: string } | null {
+  if (item.kind !== "agent") return null;
+  if (item.paused) return null;
+  if (presenceTier(item, now) !== "recent") return null;
+  return { key: "PresenceBar.unreachable", titleKey: "PresenceBar.unreachableTitle" };
+}
 
 function presenceRank(item: Item, now: number): number {
   if (hasActiveHostLease(item, now)) return 0;
@@ -491,6 +535,7 @@ export function PresenceBar({
     const taskText = task === null ? null : t(task.key, task.vars);
     const liveness = livenessBadge(it);
     const activityChip = activityBadge(it, now);
+    const unreachable = unreachableBadge(it, now);
     const taskTitle =
       it.currentTask === null
         ? null
@@ -564,7 +609,9 @@ export function PresenceBar({
         }
         style={{ "--ah": agentHue(it.name) } as CSSProperties}
       >
-        <span className={`d-dot d-dot--${it.state}${it.paused ? " d-dot--paused" : ""}`} />
+        <span
+          className={`d-dot d-dot--${it.state}${it.paused ? " d-dot--paused" : ""}${unreachable !== null ? " d-dot--unreachable" : ""}`}
+        />
         <span className="presence-name">{it.display}</span>
         <span className={`t-mono presence-kind presence-kind--${it.kind}`}>{it.kind}</span>
         {it.paused && (
@@ -617,8 +664,14 @@ export function PresenceBar({
           <span className="t-mono presence-lineage">child:{it.lineage.parent_agent}</span>
         )}
         {full && residency !== null && <span className="t-mono presence-residency">{residency}</span>}
-        {full && wakeability !== null && (
+        {/* #666：真不可唤醒时不再显示「可唤醒·未验证」——那会让人误以为叫得醒；改由下方 unreachable 徽章如实标注。 */}
+        {full && wakeability !== null && unreachable === null && (
           <span className={`t-mono presence-wake presence-wake--${wakeability.tone}`}>{t(wakeability.key)}</span>
+        )}
+        {unreachable !== null && (
+          <span className="t-mono presence-busy presence-unreachable" title={t(unreachable.titleKey)}>
+            {t(unreachable.key)}
+          </span>
         )}
         {full && it.context?.worktree_label !== undefined && (
           <span className="t-mono presence-context">{it.context.worktree_label}</span>
@@ -769,6 +822,7 @@ export function PresenceBar({
             {previewAgents.map((agent) => {
               const agentBusy = busyLabel(agent);
               const agentTask = taskLabel(agent, now);
+              const agentUnreachable = unreachableBadge(agent, now);
               return (
               <span
                 key={agent.name}
@@ -795,7 +849,9 @@ export function PresenceBar({
                     : undefined
                 }
               >
-                <span className={`d-dot d-dot--${agent.state}${agent.paused ? " d-dot--paused" : ""}`} />
+                <span
+                  className={`d-dot d-dot--${agent.state}${agent.paused ? " d-dot--paused" : ""}${agentUnreachable !== null ? " d-dot--unreachable" : ""}`}
+                />
                 <span>{agent.display}</span>
                 <span className={`t-mono presence-agent-kind presence-kind--${agent.kind}`}>{agent.kind}</span>
                 {agent.paused && (
@@ -829,6 +885,14 @@ export function PresenceBar({
                 )}
                 {agentTask !== null && (
                   <span className="t-mono presence-busy presence-busy--chip presence-task">{t(agentTask.key, agentTask.vars)}</span>
+                )}
+                {agentUnreachable !== null && (
+                  <span
+                    className="t-mono presence-busy presence-busy--chip presence-unreachable"
+                    title={t(agentUnreachable.titleKey)}
+                  >
+                    {t(agentUnreachable.key)}
+                  </span>
                 )}
               </span>
               );
