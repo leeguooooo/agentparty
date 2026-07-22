@@ -72,12 +72,15 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
     expect(yml).toMatch(/check:\s*\n\s*name: full check/);
     // 限定在 check job 片段内，且把 check-desktop 一并纳入断言（漏了 desktop 依赖也该红，#723 评审）。
     const fullCheckJob = yml.slice(yml.indexOf("  check:\n"), yml.indexOf("  build:\n"));
-    for (const dep of ["check-cli", "check-cli-types", "check-rest", "check-worker", "check-worker-types", "check-desktop", "version-contract"]) {
+    // changes 必进 needs：它挂了会让所有 check-* skipped（记作通过）= 全跳过全绿漏测（#723 CodeRabbit）。
+    for (const dep of ["changes", "check-cli", "check-cli-types", "check-rest", "check-worker", "check-worker-types", "check-desktop", "version-contract"]) {
       expect(fullCheckJob).toContain(`- ${dep}`);
     }
-    // check-cli-types 不仅进 needs，还要进失败判定（env + for 循环），否则 types 挂了聚合仍绿。
+    // check-cli-types 与 changes 不仅进 needs，还要进失败判定（env + for 循环），否则挂了聚合仍绿。
     expect(fullCheckJob).toContain("R_CLI_TYPES: ${{ needs.check-cli-types.result }}");
+    expect(fullCheckJob).toContain("R_CHANGES: ${{ needs.changes.result }}");
     expect(fullCheckJob).toMatch(/for r in[\s\S]*"\$R_CLI_TYPES"/);
+    expect(fullCheckJob).toMatch(/for r in[\s\S]*"\$R_CHANGES"/);
     expect(fullCheckJob).toContain("if: always()");
   });
 

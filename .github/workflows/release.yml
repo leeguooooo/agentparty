@@ -233,6 +233,7 @@ jobs:
   check:
     name: full check
     needs:
+      - changes
       - check-cli
       - check-cli-types
       - check-rest
@@ -247,6 +248,10 @@ jobs:
     steps:
       - name: aggregate workspace check results
         env:
+          # changes 必进判定：它挂了会让所有 check-* 因缺上游而 skipped，而 skipped 记作通过——
+          # 不纳入的话 paths-filter 一失败就「全跳过 = 全绿」漏测（CodeRabbit #723）。changes 无 if，
+          # 只会 success/failure，纳入循环即可让其失败直接红。
+          R_CHANGES: ${{ needs.changes.result }}
           R_CLI: ${{ needs.check-cli.result }}
           R_CLI_TYPES: ${{ needs.check-cli-types.result }}
           R_REST: ${{ needs.check-rest.result }}
@@ -256,9 +261,9 @@ jobs:
           R_VERSION: ${{ needs.version-contract.result }}
         run: |
           set -euo pipefail
-          echo "cli=$R_CLI cli-types=$R_CLI_TYPES rest=$R_REST worker=$R_WORKER worker-types=$R_WORKER_TYPES desktop=$R_DESKTOP version=$R_VERSION"
+          echo "changes=$R_CHANGES cli=$R_CLI cli-types=$R_CLI_TYPES rest=$R_REST worker=$R_WORKER worker-types=$R_WORKER_TYPES desktop=$R_DESKTOP version=$R_VERSION"
           fail=0
-          for r in "$R_CLI" "$R_CLI_TYPES" "$R_REST" "$R_WORKER" "$R_WORKER_TYPES" "$R_DESKTOP" "$R_VERSION"; do
+          for r in "$R_CHANGES" "$R_CLI" "$R_CLI_TYPES" "$R_REST" "$R_WORKER" "$R_WORKER_TYPES" "$R_DESKTOP" "$R_VERSION"; do
             case "$r" in
               success|skipped) ;;
               *) echo "::error::required check job did not pass: result=$r"; fail=1 ;;
