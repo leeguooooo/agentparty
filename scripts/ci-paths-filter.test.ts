@@ -13,6 +13,12 @@ import { join } from "node:path";
 
 const yml = readFileSync(join(import.meta.dir, "..", ".github", "workflows", "release.yml"), "utf8");
 
+// 整行匹配一条 needs 依赖项——避免前缀误命中：`- check-cli` 不能被 `- check-cli-types`
+// 满足，否则删了必需依赖测试仍绿、发布门禁失守（#723 CodeRabbit）。
+function hasDep(block: string, dep: string): boolean {
+  return new RegExp(`^\\s*- ${dep}\\s*$`, "m").test(block);
+}
+
 describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
   test('required 门禁 job 名字仍是 "full check"（改名会让分支保护的 required check 消失）', () => {
     expect(yml).toContain("name: full check");
@@ -74,7 +80,7 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
     const fullCheckJob = yml.slice(yml.indexOf("  check:\n"), yml.indexOf("  build:\n"));
     // changes 必进 needs：它挂了会让所有 check-* skipped（记作通过）= 全跳过全绿漏测（#723 CodeRabbit）。
     for (const dep of ["changes", "check-cli", "check-cli-types", "check-rest", "check-worker", "check-worker-types", "check-desktop", "version-contract"]) {
-      expect(fullCheckJob).toContain(`- ${dep}`);
+      expect(hasDep(fullCheckJob, dep)).toBe(true);
     }
     // check-cli-types 与 changes 不仅进 needs，还要进失败判定（env + for 循环），否则挂了聚合仍绿。
     expect(fullCheckJob).toContain("R_CLI_TYPES: ${{ needs.check-cli-types.result }}");
@@ -95,19 +101,19 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
     const releaseJob = yml.slice(yml.indexOf("  release:\n"));
     // build（CLI 交叉编译）等非 desktop 的 check + 版本契约，不被最慢的 macOS check-desktop 拖住。
     for (const dep of ["check-cli", "check-cli-types", "check-rest", "check-worker", "check-worker-types", "version-contract"]) {
-      expect(buildJob).toContain(`- ${dep}`);
+      expect(hasDep(buildJob, dep)).toBe(true);
     }
-    expect(buildJob).not.toContain("- check-desktop");
+    expect(hasDep(buildJob, "check-desktop")).toBe(false);
     // 整行负向断言：build 不得回归依赖聚合 check（否则解耦悄悄失效，又被最慢那个拖住）。
     expect(buildJob).not.toMatch(/^\s+- check\s*$/m);
     // desktop 只等 macOS check-desktop + 版本契约。
-    expect(desktopJob).toContain("- check-desktop");
-    expect(desktopJob).toContain("- version-contract");
+    expect(hasDep(desktopJob, "check-desktop")).toBe(true);
+    expect(hasDep(desktopJob, "version-contract")).toBe(true);
     // 同样禁 desktop 回归依赖聚合 check 或 build（否则又被非桌面检查拖慢）。
     expect(desktopJob).not.toMatch(/^\s+- check\s*$/m);
     expect(desktopJob).not.toMatch(/^\s+- build\s*$/m);
     // publish（release）仍 needs build + desktop —— 传递闭包 = 全部 check，"全绿才发布"不变。
-    expect(releaseJob).toContain("- build");
-    expect(releaseJob).toContain("- desktop");
+    expect(hasDep(releaseJob, "build")).toBe(true);
+    expect(hasDep(releaseJob, "desktop")).toBe(true);
   });
 });
