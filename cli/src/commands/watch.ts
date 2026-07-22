@@ -318,8 +318,6 @@ async function emitWatchUpgradeHint(server: string, channel: string): Promise<vo
 export async function runWatch(o: WatchOptions): Promise<number> {
   const rawOut = o.out ?? ((line: string) => console.log(line));
   const out = (line: string) => rawOut(o.json ? line : terminalOutput(line));
-  // #703：非 json 模式且命令层开启时，挂载即 fire-and-forget 探一次升级提示（磁盘节流，不阻塞 attach）。
-  if (o.probeUpgrade === true && !o.json) void emitWatchUpgradeHint(o.server, o.channel);
   // Only the single-shot watcher whose caller can persist and acknowledge directed debt is an
   // actionable v1 adapter. Declare this in the first hello so the Worker never has to guess in the
   // welcome -> register window; observers deliberately omit the capability.
@@ -349,6 +347,10 @@ export async function runWatch(o: WatchOptions): Promise<number> {
     );
     return EXIT_ALREADY_WATCHING;
   }
+  // #703：升级提示放在抢到实例锁之后——只有持锁的那个 watcher 会探测，靠既有实例锁串行化，
+  // 天然消除「两个进程都过节流读取、各自探测」的竞态（#715 评审），无需另造原子租约。
+  // 非 json、命令层开启时才探；fire-and-forget，不阻塞 attach；磁盘节流仍限 6h/次。
+  if (o.probeUpgrade === true && !o.json) void emitWatchUpgradeHint(o.server, o.channel);
   // Capture transport interruptions by generation. A delivery received after an earlier reconnect
   // may proceed, but a disconnect between update and ACK invalidates that exact claim attempt.
   let connectionGeneration = 0;
