@@ -619,13 +619,19 @@ export const openapiDocument = {
                     enum: ["public", "private", "public_watch"],
                     default: "private",
                   },
+                  auto_suffix: {
+                    type: "boolean",
+                    default: false,
+                    description:
+                      "on slug collision, auto-pick the next free variant (slug → slug-2 → slug-3 …) instead of 409; the response slug reflects the actual channel created. ignored for channel-scoped tokens (which must create their exact scope).",
+                  },
                 },
               },
             },
           },
         },
         responses: {
-          "201": { description: "created" },
+          "201": { description: "created (response slug may differ from request when auto_suffix picked a variant)" },
           "400": { description: "invalid slug/kind/mode/visibility" },
           "403": { description: "readonly token" },
           "409": { description: "slug conflict" },

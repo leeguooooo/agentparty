@@ -168,6 +168,39 @@ describe("channels", () => {
     expect((await create()).status).toBe(409);
   });
 
+  it("auto_suffix 撞名自增后缀取下一个空位（#695）", async () => {
+    const { token } = await seedToken("agent");
+    const slug = uniq("dup");
+    const create = (body: Record<string, unknown>) =>
+      api("/api/channels", token, { method: "POST", body: JSON.stringify({ slug, kind: "standing", ...body }) });
+
+    const createdSlug = async (res: Response) => ((await res.json()) as { slug: string }).slug;
+
+    // 首建拿原名
+    const first = await create({});
+    expect(first.status).toBe(201);
+    expect(await createdSlug(first)).toBe(slug);
+
+    // 撞名 + auto_suffix → 201，slug 变体 -2
+    const second = await create({ auto_suffix: true });
+    expect(second.status).toBe(201);
+    expect(await createdSlug(second)).toBe(`${slug}-2`);
+
+    // 再撞 → -3（跳过已占用的 -2）
+    const third = await create({ auto_suffix: true });
+    expect(third.status).toBe(201);
+    expect(await createdSlug(third)).toBe(`${slug}-3`);
+
+    // 不带 auto_suffix 仍是硬 409（老客户端契约不变）
+    expect((await create({})).status).toBe(409);
+
+    // 变体是真频道：出现在频道列表里
+    const list = await api("/api/channels", token);
+    const slugs = ((await list.json()) as { channels: { slug: string }[] }).channels.map((c) => c.slug);
+    expect(slugs).toContain(`${slug}-2`);
+    expect(slugs).toContain(`${slug}-3`);
+  });
+
   it("400 on invalid slug or kind", async () => {
     const { token } = await seedToken("agent");
     const bad = await api("/api/channels", token, {

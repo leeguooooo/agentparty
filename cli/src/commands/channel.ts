@@ -229,7 +229,7 @@ export async function run(argv: string[]): Promise<number> {
         const slug = positionals[1];
         if (!slug) {
           console.error(
-            "usage: party channel create <slug> [--title t] [--temp] [--party] [--public]",
+            "usage: party channel create <slug> [--title t] [--temp] [--party] [--public] [--exact]",
           );
           return 1;
         }
@@ -237,14 +237,18 @@ export async function run(argv: string[]): Promise<number> {
           console.error("slug must match [a-z0-9][a-z0-9-]{0,63}");
           return 1;
         }
-        await createChannel(cfg.server, cfg.token, {
+        // #695：显式建频道时，撞名不再硬失败——默认让服务端自增后缀取下一个空位；
+        // --exact 保留旧行为（撞名 409）。回显真实建出的 slug（可能带后缀）。
+        const created = await createChannel(cfg.server, cfg.token, {
           slug,
           title: str(flags.title),
           kind: flags.temp === true ? "temp" : "standing",
           mode: flags.party === true ? "party" : "normal",
           visibility: flags.public === true ? "public" : "private",
+          auto_suffix: flags.exact !== true,
         });
-        console.log(`created ${slug}`);
+        if (created !== slug) console.log(`created ${created} ("${slug}" was taken)`);
+        else console.log(`created ${created}`);
         return 0;
       }
       case "list": {

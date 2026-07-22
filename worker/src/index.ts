@@ -146,6 +146,19 @@ type AppContext = {
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+// #695 撞名自增后缀：foo → foo-2 → foo-3 …，最多试这么多个空位后放弃（返 409）。
+const SLUG_SUFFIX_MAX_ATTEMPTS = 50;
+// 生成第 n 个后缀候选（n>=2）。SLUG_RE 上限 64 字符：后缀占位后裁基名，结果仍满足 SLUG_RE。
+function suffixedSlug(base: string, n: number): string {
+  const suffix = `-${n}`;
+  const room = Math.max(1, 64 - suffix.length);
+  return `${base.slice(0, room)}${suffix}`;
+}
+// D1/SQLite 的 UNIQUE 约束冲突（撞名）——与真故障（DO/D1 不可达）区分，避免把故障误报成 409。
+function isUniqueConstraintError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT|constraint failed/i.test(message);
+}
 const ROLES: readonly string[] = ["agent", "human", "readonly"] satisfies TokenRole[];
 const KINDS: readonly string[] = ["standing", "temp"] satisfies ChannelKind[];
 const MODES: readonly string[] = ["normal", "party"] satisfies ChannelMode[];
@@ -3672,9 +3685,13 @@ app.get("/api/channels", async (c) => {
 
 app.post("/api/channels", async (c) => {
   const body = (await c.req.json().catch(() => null)) as
-    | { slug?: unknown; title?: unknown; kind?: unknown; mode?: unknown; visibility?: unknown }
+    | { slug?: unknown; title?: unknown; kind?: unknown; mode?: unknown; visibility?: unknown; auto_suffix?: unknown }
     | null;
   const slug = typeof body?.slug === "string" ? body.slug : "";
+  // #695 slug 撞名不再硬 409：显式建频道（party channel create）传 auto_suffix，撞名自动取下一个空位
+  // slug（foo → foo-2 → foo-3 …）。默认关（init 的 create-or-join、invite 的 scoped 建频道都要精确 slug，
+  // 不能被改名），故此处仅当客户端主动请求时才启用，向后完全兼容。
+  const autoSuffix = body?.auto_suffix === true;
   const kind = body?.kind === undefined ? "standing" : body.kind;
   const mode = body?.mode === undefined ? "normal" : body.mode;
   // 默认 private = 零破坏（spec §3.1）
@@ -3738,36 +3755,57 @@ app.post("/api/channels", async (c) => {
       );
     }
   }
-  try {
-    await c.env.DB.prepare(
+  // created_by 记具体铸造者（审计）；owner_account = 创建者账号（ACL 依据）。
+  // legacy token 无 account → owner_account = null（老频道，仅 legacy 过渡放行）。
+  // loop_guard_enabled=1（#96）：新频道开箱即有熔断，否则两个 agent 可在无人值守下
+  // 互相唤醒到天亮（唯一约束仅 30 msg/min）。limit 留空 → 回退 mode 默认 30/200。
+  // 存量频道保持关闭：强开会立刻熔断正在工作的频道。房主可随时 PUT loop-guard 关闭。
+  const insertChannel = (candidate: string) =>
+    c.env.DB.prepare(
       "INSERT INTO channels (slug, title, kind, mode, visibility, created_by, owner_account, created_at, loop_guard_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
-      // created_by 记具体铸造者（审计）；owner_account = 创建者账号（ACL 依据）。
-      // legacy token 无 account → owner_account = null（老频道，仅 legacy 过渡放行）。
-      // loop_guard_enabled=1（#96）：新频道开箱即有熔断，否则两个 agent 可在无人值守下
-      // 互相唤醒到天亮（唯一约束仅 30 msg/min）。limit 留空 → 回退 mode 默认 30/200。
-      // 存量频道保持关闭：强开会立刻熔断正在工作的频道。房主可随时 PUT loop-guard 关闭。
-      .bind(slug, title, kind, mode, visibility, creator.name, creator.account ?? null, now)
+      .bind(candidate, title, kind, mode, visibility, creator.name, creator.account ?? null, now)
       .run();
-  } catch {
-    return c.json(errorBody("conflict", "slug already exists"), 409);
+  // #695：撞名时（且客户端请求 auto_suffix）自增后缀取下一个空位——slug、slug-2、slug-3 …。
+  // INSERT 是唯一真相源：并发下两方算出同一候选，只有一方插入成功，另一方接着试下一个，无需额外锁。
+  // scoped token 建的是它被邀请的那一个精确 slug（见上方 scope 闸），不参与改名；故基于 slug 本身即可。
+  let createdSlug = slug;
+  const maxSuffixAttempts = autoSuffix ? SLUG_SUFFIX_MAX_ATTEMPTS : 1;
+  let inserted = false;
+  for (let attempt = 0; attempt < maxSuffixAttempts; attempt++) {
+    const candidate = attempt === 0 ? slug : suffixedSlug(slug, attempt + 1);
+    try {
+      await insertChannel(candidate);
+      createdSlug = candidate;
+      inserted = true;
+      break;
+    } catch (error) {
+      // 非 auto_suffix：保持历史行为——任何插入失败都当撞名 409，不改老客户端的错误契约。
+      if (!autoSuffix) return c.json(errorBody("conflict", "slug already exists"), 409);
+      // auto_suffix：撞名（UNIQUE 约束）试下一个后缀；非撞名的真故障别误报成 409。
+      if (isUniqueConstraintError(error)) continue;
+      return c.json(errorBody("unavailable", "channel create failed"), 503);
+    }
+  }
+  if (!inserted) {
+    return c.json(errorBody("conflict", `no free slug variant for "${slug}" within ${SLUG_SUFFIX_MAX_ATTEMPTS} tries`), 409);
   }
   if (kind === "temp") {
     try {
       await fetchChannelDO(
         c.env,
-        slug,
+        createdSlug,
         new Request("https://do/internal/init", {
           method: "POST",
           headers: {
-            "x-partykit-room": slug,
+            "x-partykit-room": createdSlug,
             ...channelHeaders({ kind, mode }, c.req.url),
           },
         }),
       );
     } catch {
       await c.env.DB.prepare("DELETE FROM channels WHERE slug = ? AND created_at = ?")
-        .bind(slug, now)
+        .bind(createdSlug, now)
         .run()
         .catch(() => null);
       return c.json(errorBody("unavailable", "temp channel initialization failed"), 503);
@@ -3776,12 +3814,12 @@ app.post("/api/channels", async (c) => {
   await bestEffortRecordManagementAudit(c.env.DB, {
     actor: managementAuditActor(creator),
     action: "channel.create",
-    resource: `channel/${slug}`,
-    channel: slug,
+    resource: `channel/${createdSlug}`,
+    channel: createdSlug,
     timestamp: now,
     metadata: { kind, mode, visibility },
   });
-  return c.json({ slug, title, kind, mode, visibility }, 201);
+  return c.json({ slug: createdSlug, title, kind, mode, visibility }, 201);
 });
 
 app.post("/api/channels/:slug/project-agents", async (c) => {

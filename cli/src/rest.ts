@@ -566,13 +566,18 @@ export async function createChannel(
     kind: ChannelKind;
     mode?: ChannelMode;
     visibility?: ChannelVisibility;
+    // #695：撞名时让服务端自增后缀取下一个空位（slug → slug-2 …），返回真实建出的 slug。
+    // 默认 false：init 的 create-or-join、invite 的 scoped 建频道都要精确 slug，不能被改名。
+    auto_suffix?: boolean;
   },
-): Promise<void> {
-  await req(server, "/api/channels", {
+): Promise<string> {
+  const res = (await req(server, "/api/channels", {
     method: "POST",
     headers: bearerJson(token),
     body: JSON.stringify(body),
-  });
+  })) as { slug?: unknown };
+  // 服务端回真实 slug（auto_suffix 撞名时会与请求不同）；缺字段则回落请求值，兼容老服务端。
+  return typeof res?.slug === "string" ? res.slug : body.slug;
 }
 
 export async function addWebhook(
