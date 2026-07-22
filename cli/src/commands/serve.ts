@@ -5047,6 +5047,21 @@ export async function run(argv: string[]): Promise<number> {
       ...(protocolFlag === undefined ? {} : { protocol: protocolFlag }),
     });
   }
+  // 频道先解析:--stop 需要它,且必须在 runner/on-mention 校验之前处理——否则
+  // `party serve <ch> --stop`（不带 --runner）会先撞上「必须二选一」而永远到不了 --stop(#742 CodeRabbit)。
+  const channel = resolveChannel(str(flags.channel) ?? positionals[0]);
+  if (!channel) {
+    console.error("no channel, pass one or bind with: party init --channel C");
+    return 1;
+  }
+  if (!isSlug(channel)) {
+    console.error("channel must match [a-z0-9][a-z0-9-]{0,63}");
+    return 1;
+  }
+  // #741：只停「本身份」在这个频道跑的 serve,不像 `pkill -f` 那样误杀同机其它 agent 的 serve。
+  if (flags.stop === true) {
+    return stopOwnInstance("serve", server, auth.token, channel, (line) => console.error(line));
+  }
   if ((cmd ? 1 : 0) + (runner ? 1 : 0) !== 1) {
     console.error(
       'choose exactly one of --on-mention or --runner.\n' +
@@ -5061,19 +5076,6 @@ export async function run(argv: string[]): Promise<number> {
   }
   const harness = runner === "codex" || runner === "claude" ? runner : undefined;
   const useSdkRunner = runner === "codex-sdk";
-  const channel = resolveChannel(str(flags.channel) ?? positionals[0]);
-  if (!channel) {
-    console.error("no channel, pass one or bind with: party init --channel C");
-    return 1;
-  }
-  if (!isSlug(channel)) {
-    console.error("channel must match [a-z0-9][a-z0-9-]{0,63}");
-    return 1;
-  }
-  // #741：只停「本身份」在这个频道跑的 serve,不像 `pkill -f` 那样误杀同机其它 agent 的 serve。
-  if (flags.stop === true) {
-    return stopOwnInstance("serve", server, auth.token, channel, (line) => console.error(line));
-  }
   const autoDownloadUpgrade = flags["auto-upgrade"] === true;
   const availableUpgrade = await resolveAvailableUpgrade(server, null, {
     autoDownload: autoDownloadUpgrade,

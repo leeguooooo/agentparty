@@ -93,7 +93,18 @@ export function currentProcessStartedAt(): number {
  */
 export function instanceLockHolderPid(kind: InstanceKind, target: string, dir: string): number | null {
   const holder = readHolder(lockPath(kind, target, dir));
-  return holderAlive(holder) ? holder.pid : null;
+  // 比 holderAlive 更保守:--stop 会真的 SIGTERM,必须**正向确认**这就是原持有者,否则宁可当作
+  // 「没在跑」而不停(#742 CodeRabbit)。holderAlive 在缺出生时间(legacy 锁 / Windows / ps 读不到)时
+  // 会退回「PID 还活着就算同一个」——那正好会把已被系统复用的 PID 误当持有者、误杀无辜进程。
+  if (typeof holder?.pid !== "number" || holder.started_at === undefined) return null;
+  const info = inspectProcess(holder.pid);
+  if (!info.alive || info.startedAt === undefined) return null;
+  return Math.abs(holder.started_at - info.startedAt) <= 2000 ? holder.pid : null;
+}
+
+/** 探测某 pid 的进程出生时间(ms);无法确定则 undefined。用于测试构造与真实进程匹配的锁。 */
+export function processStartedAt(pid: number): number | undefined {
+  return inspectProcess(pid).startedAt;
 }
 
 /**
