@@ -26,11 +26,6 @@ function dir(): string {
   dirs.push(d);
   return d;
 }
-function sleeper(): number {
-  const child = spawn("sleep", ["300"], { stdio: "ignore" });
-  kids.push(child);
-  return child.pid!;
-}
 // 手写一把「属于 pid 的」实例锁(出生时间取真实进程的,以过保守校验)。
 function writeLock(d: string, kind: InstanceKind, target: string, pid: number): void {
   const started_at = processStartedAt(pid);
@@ -75,44 +70,28 @@ describe("instanceLockHolderPid / stopOwnInstance (#741)", () => {
     expect(kill.mock.calls.some(([, sig]) => sig === "SIGTERM")).toBe(false);
   });
 
-  test("真发 SIGTERM:目标进程确实退出(#742)", async () => {
+  test("真 SIGTERM:目标(A)确实退出,同频道另一身份(B)存活;kind 也隔离(#742)", async () => {
     const d = dir();
-    const child = spawn("sleep", ["300"], { stdio: "ignore" });
-    kids.push(child);
-    const exited = new Promise<"exited">((resolve) => child.once("exit", () => resolve("exited")));
-    await new Promise((r) => setTimeout(r, 80)); // 等 ps 能看到子进程
-    writeLock(d, "serve", instanceLockTarget(SERVER, "tokReal", "dev"), child.pid!);
-    expect(stopOwnInstance("serve", SERVER, "tokReal", "dev", () => {}, d)).toBe(0); // 真 SIGTERM,不 mock
+    const childA = spawn("sleep", ["300"], { stdio: "ignore" });
+    const childB = spawn("sleep", ["300"], { stdio: "ignore" });
+    kids.push(childA, childB);
+    const aExited = new Promise<"exited">((resolve) => childA.once("exit", () => resolve("exited")));
+    await new Promise((r) => setTimeout(r, 80)); // 等 ps 能看到子进程的 lstart
+    // A=tokA 的 serve;B=tokB 的 serve;同一频道 dev。
+    writeLock(d, "serve", instanceLockTarget(SERVER, "tokA", "dev"), childA.pid!);
+    writeLock(d, "serve", instanceLockTarget(SERVER, "tokB", "dev"), childB.pid!);
+
+    // 只停 tokA 的 serve——真发 SIGTERM,不 mock。
+    expect(stopOwnInstance("serve", SERVER, "tokA", "dev", () => {}, d)).toBe(0);
     const result = await Promise.race([
-      exited,
+      aExited,
       new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 3000)),
     ]);
-    expect(result).toBe("exited"); // SIGTERM 后进程真的退出了
-  });
+    expect(result).toBe("exited"); // A 真的被 SIGTERM 掉了
+    expect(childB.exitCode).toBeNull(); // B(另一身份)毫发无伤,没被误杀
 
-  test("只 SIGTERM 目标实例:身份(token)与 kind 都隔离,不误伤同频道别人", async () => {
-    const d = dir();
-    const pidA = sleeper();
-    const pidB = sleeper();
-    await new Promise((r) => setTimeout(r, 80)); // 等 ps 能看到子进程的 lstart
-    // A=token 的 serve;B=另一个 token 的 serve;都在同一频道 dev。
-    writeLock(d, "serve", instanceLockTarget(SERVER, "tokA", "dev"), pidA);
-    writeLock(d, "serve", instanceLockTarget(SERVER, "tokB", "dev"), pidB);
-
-    const realKill = process.kill.bind(process);
-    const sigtermed: number[] = [];
-    const kill = spyOn(process, "kill").mockImplementation((pid: number, sig?: string | number) => {
-      if (sig === "SIGTERM") { sigtermed.push(pid); return true; } // 捕获,不真杀(子进程留给 afterEach 清)
-      return realKill(pid, sig as never); // 存活探测(signal 0)走真实实现
-    });
-    spies.push(kill);
-
-    // 只停 token A 的 serve
-    expect(stopOwnInstance("serve", SERVER, "tokA", "dev", () => {}, d)).toBe(0);
-    expect(sigtermed).toEqual([pidA]); // 只有 A,绝不碰 B
-    // 换 kind:同 token 的 watch 没有锁 → 什么都不停
-    sigtermed.length = 0;
+    // 换 kind:tokA 的 watch 没有锁 → 什么都不停,B 依然活。
     expect(stopOwnInstance("watch", SERVER, "tokA", "dev", () => {}, d)).toBe(0);
-    expect(sigtermed).toEqual([]);
+    expect(childB.exitCode).toBeNull();
   });
 });
