@@ -155,6 +155,10 @@ export function Composer({
     return t("WakeReceipt.pre.offline");
   };
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  // 输入法合成护栏（#729）：单靠 keydown 的 isComposing 不够——WebKit/WKWebView（桌面版）
+  // 确认候选时 compositionend 先于确认键的 keydown 触发，那一刻 isComposing 已是 false，
+  // 回车会把半成品误发出去。用一个 ref 顶住合成期，并延到下一帧才放开，盖住那次确认 keydown。
+  const composingRef = useRef(false);
   const activeMentionRef = useRef<HTMLDivElement | null>(null);
   const [menu, setMenu] = useState<MentionMenuState | null>(null);
 
@@ -225,8 +229,23 @@ export function Composer({
     [draft, menu, setDraft],
   );
 
+  const onCompositionStart = () => {
+    composingRef.current = true;
+  };
+  const onCompositionEnd = () => {
+    // WebKit/WKWebView 里确认候选的 compositionend 早于确认键 keydown——保持护栏到本轮事件结束后
+    // 的下一帧再放开，确保那次 Enter 的 keydown 仍被拦住。没有 rAF（测试/SSR）时退回微任务。
+    const release = () => {
+      composingRef.current = false;
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(release);
+    else void Promise.resolve().then(release);
+  };
+
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    // isComposing 或护栏 ref 任一为真都视为合成中：前者覆盖 Chrome（keydown 时仍 true），
+    // 后者覆盖 WebKit（compositionend 先行、keydown 时已 false）。
+    if (e.nativeEvent.isComposing || composingRef.current) return;
     if (menu !== null) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -384,6 +403,8 @@ export function Composer({
         onKeyUp={onKeyUp}
         onClick={(e) => recompute(e.currentTarget.value, e.currentTarget.selectionStart ?? 0)}
         onKeyDown={onKeyDown}
+        onCompositionStart={onCompositionStart}
+        onCompositionEnd={onCompositionEnd}
         onPaste={onPaste}
         onBlur={() => setTimeout(() => setMenu(null), 120)}
       />
