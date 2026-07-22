@@ -585,14 +585,29 @@ pub(crate) fn desktop_duty_log_read(label: String, max_bytes: Option<usize>) -> 
     if label.contains('/') || label.contains("..") {
         return Err("invalid duty label".to_string());
     }
+    use std::io::{Read as _, Seek as _};
     let home = home_dir()?;
     let path = duty_log_path(&home, &label);
-    let cap = max_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
-    match fs::read(&path) {
-        Ok(bytes) => Ok(tail_utf8(&bytes, cap)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!("cannot read duty log: {error}")),
+    let cap = (max_bytes.unwrap_or(64 * 1024).min(1024 * 1024)) as u64;
+    // 只读尾部 cap 字节:launchd 日志无轮转、可能很大,seek 到末尾前 cap 处再读,别整文件进内存。
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(format!("cannot open duty log: {error}")),
+    };
+    let len = file
+        .metadata()
+        .map_err(|error| format!("cannot stat duty log: {error}"))?
+        .len();
+    if len > cap {
+        file.seek(std::io::SeekFrom::Start(len - cap))
+            .map_err(|error| format!("cannot seek duty log: {error}"))?;
     }
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|error| format!("cannot read duty log: {error}"))?;
+    // seek 可能切在多字节字符中间——tail_utf8 前移到字符边界。
+    Ok(tail_utf8(&buf, buf.len()))
 }
 
 #[cfg(test)]

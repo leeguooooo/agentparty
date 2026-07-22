@@ -1,6 +1,6 @@
 // #725：桌面端「常驻 agent 日志」——枚举本机 launchd 常驻实例，点开看它的 serve 日志尾部，
 // 方便排查「设了常驻、@ 没反应」这类问题(日志里能看到 ▶ wake / serve: / runner 报错)。
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { TFunc } from "../i18n/useT";
 import { desktopAgentAdapter, type DesktopAgentAdapter, type DesktopDutyEntry } from "../lib/desktopAgent";
 import "../i18n/strings/ResidentDutyLogs";
@@ -23,6 +23,8 @@ export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter }: Props) {
   const [log, setLog] = useState<string>("");
   const [logBusy, setLogBusy] = useState(false);
   const [logError, setLogError] = useState<string | null>(null);
+  // 请求排序保护:快速切换条目时,只让「最后一次点击」的结果落地,避免慢请求覆盖新选中的日志。
+  const loadSeqRef = useRef(0);
 
   const refreshList = useCallback(async () => {
     setListError(null);
@@ -39,16 +41,20 @@ export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter }: Props) {
 
   const loadLog = useCallback(
     async (label: string) => {
+      const seq = ++loadSeqRef.current;
       setSelected(label);
       setLogBusy(true);
       setLogError(null);
       try {
-        setLog(await adapter.dutyLogRead(label));
+        const text = await adapter.dutyLogRead(label);
+        if (seq !== loadSeqRef.current) return; // 已被更晚的点击取代——丢弃这次结果
+        setLog(text);
       } catch (err) {
+        if (seq !== loadSeqRef.current) return;
         setLog("");
         setLogError(err instanceof Error ? err.message : String(err));
       } finally {
-        setLogBusy(false);
+        if (seq === loadSeqRef.current) setLogBusy(false);
       }
     },
     [adapter],

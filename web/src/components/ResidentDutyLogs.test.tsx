@@ -81,6 +81,26 @@ describe("ResidentDutyLogs (#725)", () => {
     expect(JSON.stringify(r.toJSON())).toContain("serve: online");
   });
 
+  test("快速切换条目:慢请求不覆盖后点击的日志(#734 排序保护)", async () => {
+    const resolvers: Record<string, (v: string) => void> = {};
+    const r = await renderPanel({
+      dutyList: async () => [
+        entry({ label: "com.agentparty.duty.a.one", instanceId: "a:one" }),
+        entry({ label: "com.agentparty.duty.b.two", instanceId: "b:two" }),
+      ],
+      dutyLogRead: (label: string) => new Promise<string>((resolve) => { resolvers[label] = resolve; }),
+    });
+    const items = buttons(r).filter((b) => JSON.stringify(b.props.className).includes("resident-logs-item"));
+    await act(async () => { void items[0]!.props.onClick(); }); // 点 one(未 resolve)
+    await act(async () => { void items[1]!.props.onClick(); }); // 再点 two(未 resolve)
+    // two 先回,再让 one 回——one 是过期请求,不该覆盖 two 的日志
+    await act(async () => { resolvers["com.agentparty.duty.b.two"]!("LOG TWO"); });
+    await act(async () => { resolvers["com.agentparty.duty.a.one"]!("LOG ONE"); });
+    const text = JSON.stringify(r.toJSON());
+    expect(text).toContain("LOG TWO");
+    expect(text).not.toContain("LOG ONE");
+  });
+
   test("无常驻实例 → 空状态", async () => {
     const r = await renderPanel({ dutyList: async () => [], dutyLogRead: async () => "" });
     expect(JSON.stringify(r.toJSON())).toContain("ResidentDutyLogs.empty");

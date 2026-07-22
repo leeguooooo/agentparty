@@ -288,7 +288,7 @@
 .resident-logs-state { font-size: 11px; color: var(--t-dim); }
 .resident-logs-view-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .resident-logs-label { font-size: 11px; color: var(--t-dim); word-break: break-all; }
-.resident-logs-pre { max-height: 320px; overflow: auto; margin: 0; padding: 8px; font-size: 11px; line-height: 1.5; background: var(--t-faint); border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+.resident-logs-pre { max-height: 320px; overflow: auto; margin: 0; padding: 8px; font-size: 11px; line-height: 1.5; background: var(--t-faint); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .desktop-agent { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--t-faint); }
 .desktop-agent-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
