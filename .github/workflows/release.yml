@@ -129,6 +129,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/bun-install
+      # Rust 依赖（tauri/wry/objc2… ~400 crate）编译占了这个 job 的大头；缓存 ~/.cargo + target/
+      # 后每次只增量编译改动，冷编 ~3min → 温编数十秒。key 随 Cargo.lock 变化，工具链升级自动失效。
+      - name: cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
       - name: verify desktop version consistency
         run: |
           set -euo pipefail
@@ -238,7 +244,15 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: check
+    # 解耦门禁：CLI 交叉编译只依赖 CLI/worker/shared/scripts 相关 check + 版本契约，不再等最慢的
+    # macOS check-desktop（~3min）。publish 仍 needs build+desktop，desktop needs check-desktop，
+    # 故 union 仍覆盖全部 check——"全绿才发布"的保证不变，只是各 build 一拿到自己那份绿就开跑。
+    needs:
+      - check-cli
+      - check-rest
+      - check-worker
+      - check-worker-types
+      - version-contract
     runs-on: ubuntu-latest
     permissions:
       contents: read # checkout
@@ -268,13 +282,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.14"
-
-      # 用根 lockfile 装全 workspace，保证 workspace:* 依赖（@agentparty/shared）可解析
-      - name: install deps
-        run: bun install --frozen-lockfile
+      # 复合 action：pin bun 1.3.14 + 缓存 ~/.bun/install/cache + frozen install（与 check 各 job 一致）。
+      - uses: ./.github/actions/bun-install
 
       - name: derive version
         id: ver
@@ -357,7 +366,10 @@ jobs:
   desktop:
     name: build desktop ${{ matrix.asset }}
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: check
+    # 解耦门禁：桌面构建只等 macOS check-desktop + 版本契约，不再被 CLI/worker check 拖住。
+    needs:
+      - check-desktop
+      - version-contract
     runs-on: ${{ matrix.runner }}
     environment:
       name: release
@@ -376,12 +388,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.14"
+      # 复合 action：pin bun 1.3.14 + 缓存 ~/.bun/install/cache + frozen install。
+      - uses: ./.github/actions/bun-install
 
-      - name: install deps
-        run: bun install --frozen-lockfile
+      # release 全量 Rust 编译是这个 job 的大头，缓存 ~/.cargo + target/（按 runner 架构/Cargo.lock 分键，
+      # arm 与 intel 各自成缓存）。冷编数分钟 → 温编增量。
+      - name: cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
 
       - name: prepare and verify desktop sidecar
         env:
