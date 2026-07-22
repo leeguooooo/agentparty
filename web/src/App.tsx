@@ -407,7 +407,9 @@ export function App() {
     replace(`/c/${slug}`);
   }, [path, replace, temporaryHumanToken, t]);
 
-  const switchDesktopOrigin = useCallback(async (origin: string, restoredAccessToken?: string) => {
+  // destination 缺省回 Home；跨实例直达频道时传 `/c/<slug>`，让「切实例」和「落频道」在同一次
+  // replace 里完成——否则先 replace("/") 再由外层微任务 navigate，中间会闪一帧空 channels 的 Home。
+  const switchDesktopOrigin = useCallback(async (origin: string, restoredAccessToken?: string, destination = "/") => {
     const result = restoredAccessToken === undefined
       ? await switchActiveDesktopServer(origin)
       : activateDesktopServerWithAccessToken(origin, restoredAccessToken);
@@ -419,7 +421,7 @@ export function App() {
     setMe(null);
     activateDesktopHumanSession(result.accessToken);
     setDesktopBoot("ready");
-    replace("/");
+    replace(destination);
   }, [activateDesktopHumanSession, replace]);
 
   // 桌面版：外部工具（如 claude-statusbar 的 `cs hud`）通过 agentparty://channel/<slug>?server=<origin>
@@ -437,10 +439,9 @@ export function App() {
         ? link.serverOrigin
         : null;
     if (target !== null) {
-      // 目标是另一台已配对实例：先切服（恢复该实例凭据），成功与否都落到频道页——切服失败也不应
+      // 目标是另一台已配对实例：切服并在同一次 replace 里落到频道页（不闪 Home）。切服失败也不应
       // 把用户卡在原地，退化成在当前实例按 slug 打开即可。
-      void switchDesktopOrigin(target)
-        .then(() => navigate(`/c/${link.slug}`))
+      void switchDesktopOrigin(target, undefined, `/c/${link.slug}`)
         .catch(() => navigate(`/c/${link.slug}`));
     } else {
       navigate(`/c/${link.slug}`);
