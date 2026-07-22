@@ -7,6 +7,7 @@ import {
 import { useT, type TFunc } from "../i18n/useT";
 import "../i18n/strings/DesktopSettings";
 import { DesktopAgentPanel } from "./DesktopAgentPanel";
+import { ResidentDutyLogs } from "./ResidentDutyLogs";
 import { LocalAgentsOverview } from "./LocalAgentsOverview";
 import { desktopAgentAdapter, type DesktopAgentAdapter } from "../lib/desktopAgent";
 import {
@@ -192,6 +193,8 @@ export function DesktopSettingsPanel({
       {/* #700：全局「本机 agent」概览——按频道分组 + 可检索（不限频道）。下方 DesktopAgentPanel 仍是启动器。 */}
       <LocalAgentsOverview t={t} adapter={agentAdapter} />
       <DesktopAgentPanel adapter={agentAdapter} t={t} />
+      {/* #725：常驻(launchd) agent 的日志查看——排查「设了常驻、@ 没反应」。 */}
+      <ResidentDutyLogs t={t} adapter={agentAdapter} />
     </section>
   );
 }

@@ -56,6 +56,7 @@ function adapter(overrides: Partial<DesktopAgentAdapter> = {}): DesktopAgentAdap
     dutyAdopt: async () => {
       throw new Error("duty adopt unavailable");
     },
+    dutyLogRead: async () => "",
     ...overrides,
   };
 }

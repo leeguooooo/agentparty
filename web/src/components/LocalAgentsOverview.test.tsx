@@ -39,6 +39,7 @@ function adapter(over: Partial<DesktopAgentAdapter> = {}): DesktopAgentAdapter {
     dutyPersist: async () => { throw new Error("na"); },
     dutyUnpersist: async () => {},
     dutyAdopt: async () => { throw new Error("na"); },
+    dutyLogRead: async () => "",
     ...over,
   };
 }

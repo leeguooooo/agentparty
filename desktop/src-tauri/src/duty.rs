@@ -124,6 +124,16 @@ pub(crate) fn duty_log_path(home: &Path, label: &str) -> PathBuf {
     home.join(".agentparty/desktop/logs").join(format!("{label}.log"))
 }
 
+/// 取日志尾部 cap 字节，并前移到 UTF-8 字符边界（不截断多字节字符）。#725：桌面看常驻日志。
+fn tail_utf8(bytes: &[u8], cap: usize) -> String {
+    let mut start = bytes.len().saturating_sub(cap);
+    // 0b10xx_xxxx 是 UTF-8 续接字节；从这种字节起会切坏字符，往后挪到一个首字节。
+    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
 pub(crate) fn duty_bin_path(home: &Path) -> PathBuf {
     home.join(".agentparty/desktop/bin/party")
 }
@@ -563,9 +573,43 @@ pub(crate) fn desktop_duty_unpersist(instance_id: String) -> Result<(), String> 
     }
 }
 
+/// 读某个常驻实例的 launchd 日志尾部（#725：桌面排查常驻 agent）。
+/// 只按 label 派生路径、且 label 必须是我们生成的前缀——杜绝任意路径读取。日志不存在时返回空串。
+#[cfg(desktop)]
+#[tauri::command]
+pub(crate) fn desktop_duty_log_read(label: String, max_bytes: Option<usize>) -> Result<String, String> {
+    if !label.starts_with(DUTY_LABEL_PREFIX) {
+        return Err("not a duty label".to_string());
+    }
+    // label 只允许 launchd 合法字符（生成时已限定）——再挡一次 '/' 与 '..' 目录穿越。
+    if label.contains('/') || label.contains("..") {
+        return Err("invalid duty label".to_string());
+    }
+    let home = home_dir()?;
+    let path = duty_log_path(&home, &label);
+    let cap = max_bytes.unwrap_or(64 * 1024).min(1024 * 1024);
+    match fs::read(&path) {
+        Ok(bytes) => Ok(tail_utf8(&bytes, cap)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("cannot read duty log: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{duty_label, duty_plist_content, instance_id_from_label, DutyPlistSpec};
+    use super::{duty_label, duty_plist_content, instance_id_from_label, tail_utf8, DutyPlistSpec};
+
+    #[test]
+    fn tail_utf8_keeps_char_boundary_and_caps_length() {
+        // 多字节内容:每个「日/志」是 3 字节。cap 落在字符中间时应前移到边界,不产生替换符。
+        let full = "abc日志日志".to_string();
+        let bytes = full.as_bytes();
+        let tail = tail_utf8(bytes, 5); // 落在某个多字节字符中间
+        assert!(!tail.contains('\u{FFFD}'), "tail must not split a multibyte char: {tail:?}");
+        assert!(full.ends_with(&tail));
+        assert_eq!(tail_utf8(bytes, 9999), full); // cap 超长 → 原样
+        assert_eq!(tail_utf8(b"", 10), ""); // 空输入
+    }
 
     #[test]
     fn label_maps_colon_to_dot_and_round_trips() {

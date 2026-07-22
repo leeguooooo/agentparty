@@ -59,6 +59,8 @@ export interface DesktopAgentAdapter {
   dutyUnpersist(instanceId: string): Promise<void>;
   /** #616 phase 4：web 无人值守流程一键接管——token 经本机 IPC 直达，绝不进 URL/剪贴板。 */
   dutyAdopt(input: { server: string; token: string; name: string; channel: string; runner: DesktopAgentRunner; workdir?: string }): Promise<DesktopDutyEntry>;
+  /** #725：读某个常驻实例的 launchd 日志尾部（排查「@ 没反应」等）。日志不存在返回空串。 */
+  dutyLogRead(label: string, maxBytes?: number): Promise<string>;
 }
 
 export type DesktopAgentInvoker = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -219,6 +221,13 @@ export function createDesktopAgentAdapter(invoke: DesktopAgentInvoker): DesktopA
         runner: input.runner,
         workdir: input.workdir ?? null,
       }));
+    },
+    async dutyLogRead(label, maxBytes) {
+      const value = await invoke<unknown>("desktop_duty_log_read", {
+        label,
+        maxBytes: maxBytes ?? null,
+      });
+      return typeof value === "string" ? value : "";
     },
   };
 }

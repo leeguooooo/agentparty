@@ -273,6 +273,23 @@
   font-size: 10px;
   line-height: 1.45;
 }
+/* #725：常驻 agent 日志查看器 */
+.resident-logs { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--t-faint); }
+.resident-logs-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.resident-logs-title { margin: 0; font-size: 12px; }
+.resident-logs-lead { margin: 4px 0 8px; font-size: 12px; color: var(--t-dim); }
+.resident-logs-empty { margin: 6px 0; font-size: 12px; color: var(--t-dim); }
+.resident-logs-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.resident-logs-item { display: flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-start; text-align: left; }
+.resident-logs-item--active { border-color: var(--d-blue); color: var(--d-blue); }
+.resident-logs-chan { font-weight: 600; }
+.resident-logs-dot { color: var(--t-faint); font-size: 10px; }
+.resident-logs-dot--on { color: var(--d-green); }
+.resident-logs-state { font-size: 11px; color: var(--t-dim); }
+.resident-logs-view-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.resident-logs-label { font-size: 11px; color: var(--t-dim); word-break: break-all; }
+.resident-logs-pre { max-height: 320px; overflow: auto; margin: 0; padding: 8px; font-size: 11px; line-height: 1.5; background: var(--t-faint); border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+
 .desktop-agent { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--t-faint); }
 .desktop-agent-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .desktop-agent-head strong { font-size: 12px; }
