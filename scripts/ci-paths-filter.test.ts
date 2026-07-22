@@ -77,6 +77,8 @@ describe("release.yml 并行门禁 + CI 拆分不变量 (#247 phase 2)", () => {
       expect(buildJob).toContain(`- ${dep}`);
     }
     expect(buildJob).not.toContain("- check-desktop");
+    // 整行负向断言：build 不得回归依赖聚合 check（否则解耦悄悄失效，又被最慢那个拖住）。
+    expect(buildJob).not.toMatch(/^\s+- check\s*$/m);
     // desktop 只等 macOS check-desktop + 版本契约。
     expect(desktopJob).toContain("- check-desktop");
     expect(desktopJob).toContain("- version-contract");

@@ -135,6 +135,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop/src-tauri
+          # 只让受信任的 ref（main / v* tag）写缓存；PR（含 fork）只读，杜绝不受信任的运行往缓存里
+          # 塞污染的编译产物再被后续 release 命中（#719 评审的供应链加固）。
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
       - name: verify desktop version consistency
         run: |
           set -euo pipefail
@@ -397,6 +400,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop/src-tauri
+          # 只让受信任的 ref（v* tag —— desktop 本就 if: tag）写缓存，PR/fork 只读，防缓存投毒（#719 评审）。
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
 
       - name: prepare and verify desktop sidecar
         env:
