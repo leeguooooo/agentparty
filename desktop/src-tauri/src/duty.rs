@@ -13,7 +13,7 @@ use std::{
 use serde::Serialize;
 
 #[cfg(desktop)]
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 use crate::agent::{validate_channel, validate_runner};
 
@@ -176,16 +176,21 @@ fn duty_loaded(label: &str) -> bool {
 
 /// 把当前 app 内嵌的 party sidecar 拷贝到稳定路径（bundle 路径随 app 更新/挪动失效）。
 #[cfg(desktop)]
-fn ensure_duty_binary(app: &AppHandle, home: &Path) -> Result<PathBuf, String> {
+fn ensure_duty_binary(home: &Path) -> Result<PathBuf, String> {
     let target = duty_bin_path(home);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("cannot create duty bin dir: {error}"))?;
     }
-    // tauri sidecar 的真实路径：<resource>/binaries 之外，运行期在可执行文件旁（externalBin 约定）。
-    let sidecar = app
-        .path()
-        .resolve("party", tauri::path::BaseDirectory::Executable)
-        .map_err(|error| format!("cannot resolve party sidecar path: {error}"))?;
+    // externalBin sidecar 运行期就躺在主可执行文件旁（tauri externalBin 约定）。#696：
+    // 别用 tauri 的 BaseDirectory::Executable —— 它映射到 dirs::executable_dir()（XDG $EXE 目录），
+    // 在 macOS/Windows 上恒为 None → Err(UnknownPath)，正是「cannot resolve party sidecar path:
+    // unknown path」的来源。current_exe() 才是「当前可执行文件」，跨平台都对。
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve current executable: {error}"))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| "current executable has no parent directory".to_string())?;
+    let sidecar = exe_dir.join("party");
     let source = if sidecar.exists() {
         sidecar
     } else {
@@ -292,7 +297,10 @@ pub(crate) async fn desktop_duty_persist(
 /// 共用——校验已由调用方完成。
 #[cfg(all(desktop, target_os = "macos"))]
 async fn duty_persist_inner(
-    app: &AppHandle,
+    // #696：sidecar 定位改用 current_exe() 后这里不再需要 app。仍保留形参（下划线标未用）：两个
+    // 调用命令是注入了 AppHandle 的 #[tauri::command]，继续把 &app 传进来即让命令层的 app 保持「已用」，
+    // 免得彻底删参把 unused 警告冒到命令签名上（macOS 分支会因此 deny(warnings) 失败）。
+    _app: &AppHandle,
     agent_state: &State<'_, crate::agent::AgentManager>,
     config_id: &str,
     channel: &str,
@@ -309,7 +317,7 @@ async fn duty_persist_inner(
     // 先停掉 app 内的同键实例。停不掉（kill 失败/超时后仍活跃）必须中止，不能带病装常驻。
     agent_state.stop_instance_for_duty(&instance_id).await?;
 
-    let party_bin = ensure_duty_binary(app, &home)?;
+    let party_bin = ensure_duty_binary(&home)?;
     let log_path = duty_log_path(&home, &label);
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("cannot create duty log dir: {error}"))?;
