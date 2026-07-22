@@ -1268,6 +1268,8 @@ export function ChannelSearchPanel({
   onJump,
 }: ChannelSearchPanelProps) {
   const t = useT();
+  // #716：纯 seq 号查询——面板给直达按钮，且搜索 effect 会跳过全文检索（见下方 seq 短路）。
+  const seqQuery = seqFromQuery(search);
   const selectHit = (seq: number) => {
     onClose();
     onJump(seq);
@@ -1297,13 +1299,13 @@ export function ChannelSearchPanel({
         )}
       </div>
       {/* #716：搜索框直接输入 seq 号 → 给一个「跳到 #N」直达按钮（定位到聊天），无需先全文检索。 */}
-      {seqFromQuery(search) !== null && (
+      {seqQuery !== null && (
         <button
           type="button"
           className="d-btn chan-search-seq-jump"
-          onClick={() => selectHit(seqFromQuery(search)!)}
+          onClick={() => selectHit(seqQuery)}
         >
-          {t("Channel.search.jumpToSeq", { seq: String(seqFromQuery(search)) })}
+          {t("Channel.search.jumpToSeq", { seq: String(seqQuery) })}
         </button>
       )}
       {query !== "" && (
@@ -4125,6 +4127,13 @@ export function ChannelPage({
 
   useEffect(() => {
     if (q === "") {
+      setSearchHits([]);
+      setSearchLoading(false);
+      setSearchError(null);
+      return;
+    }
+    // #716：纯 seq 号查询走「跳到 #N」直达，不发全文检索——清空旧结果、跳过网络请求（#718 评审）。
+    if (seqFromQuery(q) !== null) {
       setSearchHits([]);
       setSearchLoading(false);
       setSearchError(null);
