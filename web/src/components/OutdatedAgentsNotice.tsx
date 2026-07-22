@@ -36,7 +36,9 @@ function agentLabel(entry: PresenceEntry): string {
 
 // 按「每个目标版本」独立记忆 dismissal（#670 评审）：忽略 0.4.0 不会顶掉 0.3.0 的忽略；
 // 服务端回退到某个曾被忽略的旧版本时不再骚扰。用版本后缀 key，而非单一覆盖值。
-const DISMISS_KEY_PREFIX = "ap:outdatedAgentsNoticeDismissedMin:";
+// #662 起基准从 min 地板改为 latest：键前缀随之从 …DismissedMin 改名为 …DismissedLatest，
+// 与旧 min 语义的持久记录彻底隔离（旧记录以 min 版本为键，绝不会误抑制新的 latest 提醒）。
+const DISMISS_KEY_PREFIX = "ap:outdatedAgentsNoticeDismissedLatest:";
 
 function isDismissed(version: string): boolean {
   try {
