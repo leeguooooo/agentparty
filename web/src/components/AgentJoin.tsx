@@ -11,8 +11,8 @@ import {
   ValidationError,
 } from "../lib/api";
 import { copyText, saveAgentToken } from "../lib/agentTokenVault";
-import { buildJoinPack, type JoinPackMode } from "../lib/joinPack";
-import { desktopAgentAdapter, type DesktopAgentAdapter } from "../lib/desktopAgent";
+import { buildJoinPack, DEFAULT_JOIN_RUNNER, type JoinPackMode } from "../lib/joinPack";
+import { desktopAgentAdapter, type DesktopAgentAdapter, type DesktopAgentRunner } from "../lib/desktopAgent";
 import { isDesktopRuntime, pickDirectory as pickDirectoryDefault } from "../lib/desktopRuntime";
 
 // 桌面版下载/说明页——web 上无人值守引导装桌面版时指过去。
@@ -98,9 +98,12 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
   const t = useT();
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [name, setName] = useState("");
-  // #612：无人值守值守预设——unattended 生成「装 CLI → init → party serve --runner claude」的
-  // 运维脚本，interactive 仍是贴给 agent harness 的完整接入包。
+  // #612：无人值守值守预设——unattended 生成「装 CLI → init → party serve --runner <选中的>」的
+  // 运维脚本（runner 见下方 state，缺省 codex），interactive 仍是贴给 agent harness 的完整接入包。
   const [mode, setMode] = useState<JoinPackMode>("interactive");
+  // #749：无人值守常驻用哪个 runner——曾写死 claude,用户选 codex 被静默忽略。默认 codex,
+  // 与桌面「转为常驻」面板(DesktopAgentPanel)的 picker 默认一致。仅 unattended 模式用到。
+  const [runner, setRunner] = useState<DesktopAgentRunner>(DEFAULT_JOIN_RUNNER);
   // #616 phase 4：桌面 webview 内的无人值守一键接管状态
   const [adoptState, setAdoptState] = useState<"idle" | "busy" | "done" | "error">("idle");
   const [adoptError, setAdoptError] = useState<string | null>(null);
@@ -160,6 +163,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
         server,
         inviterName,
         charter,
+        runner,
         t,
       });
       saveAgentToken({
@@ -169,6 +173,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
         token: agent.token,
         command,
         mode,
+        runner,
         savedAt: Date.now(),
       });
       setCopied(false);
@@ -194,7 +199,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
               : t("AgentJoin.errGeneric");
       setPhase({ kind: "error", message });
     }
-  }, [accountKey, charter, inviterName, mode, name, slug, token, t]);
+  }, [accountKey, charter, inviterName, mode, name, runner, slug, token, t]);
 
   // 无人值守直接运行：选工作目录（不手填、不复制接入包）→ dutyAdopt 就地落成 launchd 常驻。
   const adopt = useCallback(async () => {
@@ -210,7 +215,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
         token: phase.token,
         name: phase.name,
         channel: slug,
-        runner: "claude",
+        runner,
         workdir: dir,
       });
       setAdoptState("done");
@@ -218,7 +223,7 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
       setAdoptState("error");
       setAdoptError(err instanceof Error ? err.message : String(err));
     }
-  }, [adoptState, dutyAdapter, phase, slug, pickDirectory]);
+  }, [adoptState, dutyAdapter, phase, slug, pickDirectory, runner]);
 
   const onCopy = useCallback(async () => {
     if (phase.kind !== "done") return;
@@ -302,6 +307,26 @@ export function AgentJoin({ slug, token, namePrefix, inviterName, charter, accou
                 </label>
               ))}
             </fieldset>
+
+            {/* #749：无人值守常驻的 runner 选择——曾写死 claude,用户选 codex 被忽略。仅 unattended 显示。 */}
+            {mode === "unattended" && (
+              <label className="agent-join-runner">
+                <span className="agent-join-namelabel t-mono">{t("AgentJoin.runnerLabel")}</span>
+                <select
+                  className="t-mono agent-join-runner-select"
+                  name="agent-join-runner"
+                  value={runner}
+                  onChange={(e) => setRunner(e.target.value as DesktopAgentRunner)}
+                  disabled={phase.kind === "loading"}
+                >
+                  {(["codex", "claude", "codex-sdk"] as const).map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
 
             <div className="agent-join-actions">
               <button

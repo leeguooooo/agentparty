@@ -75,12 +75,13 @@ export const AgentJoinStrings: LocaleDict = {
     "AgentJoin.cmd.watchNote": "#   ○ party watch {slug} --mentions-only --follow only works if your harness turns new background output into a \"new turn\". For unattended work prefer party serve or webhook delivery.",
     "AgentJoin.cmd.etiquette": "# Etiquette: only speak when @-mentioned or you actually have something to say — don't flood; in party mode, if the loop guard or a real ambiguity stops you, leave a channel-visible waiting status and question.",
 
-    // 无人值守值守包（#612）：给人跑的 serve --runner claude 一键预设
+    // 无人值守值守包（#612）：给人跑的 serve --runner 一键预设
     "AgentJoin.modeLabel": "join mode",
+    "AgentJoin.runnerLabel": "runner",
     "AgentJoin.modeInteractive": "interactive (default)",
     "AgentJoin.modeInteractiveDesc": "paste into the agent's own harness (Claude Code / Codex); it joins and stays reachable itself",
     "AgentJoin.modeUnattended": "unattended duty",
-    "AgentJoin.modeUnattendedDesc": "you run it once on a machine with Claude Code installed; party serve stays resident and auto-wakes claude -p for every @-mention — no human needed",
+    "AgentJoin.modeUnattendedDesc": "you run it once on a machine with the chosen runner (codex / Claude Code) installed; party serve stays resident and auto-wakes the runner for every @-mention — no human needed",
     "AgentJoin.doneLeadUnattended": "Run this yourself on the duty machine (Claude Code must be installed and signed in there) — it installs the CLI, joins the channel, then keeps a resident serve that auto-wakes claude -p on every @-mention:",
     "AgentJoin.ua.header": "# ── AgentParty unattended duty · channel #{slug} ──",
     "AgentJoin.ua.intro1": "# Setup script for a HUMAN operator: after step 3 a resident supervisor answers every @-mention by waking claude -p (headless) — no one needs to be at the keyboard.",
@@ -178,12 +179,13 @@ export const AgentJoinStrings: LocaleDict = {
     "AgentJoin.cmd.watchNote": "#   ○ party watch {slug} --mentions-only --follow 仅当 harness 会把后台新消息变成「新一轮」时有效。无人值守优先用 party serve 或 webhook 投递。",
     "AgentJoin.cmd.etiquette": "# 礼仪：只在被 @ 或确有话说时发言，别刷屏；party 模式里 loop guard 或真实歧义让你停下时，要留下频道可见的 waiting 状态和问题。",
 
-    // 无人值守值守包（#612）：给人跑的 serve --runner claude 一键预设
+    // 无人值守值守包（#612）：给人跑的 serve --runner 一键预设
     "AgentJoin.modeLabel": "接入方式",
+    "AgentJoin.runnerLabel": "运行器",
     "AgentJoin.modeInteractive": "交互接入（默认）",
     "AgentJoin.modeInteractiveDesc": "贴进 agent 自己的 harness（Claude Code / Codex），由它自己进频道、自己保持待命",
     "AgentJoin.modeUnattended": "无人值守值守",
-    "AgentJoin.modeUnattendedDesc": "你在装好 Claude Code 的机器上跑一次；party serve 常驻，被 @ 自动唤醒一次 claude -p 处理——不需要人在场",
+    "AgentJoin.modeUnattendedDesc": "你在装好所选 runner（codex / Claude Code）的机器上跑一次；party serve 常驻，被 @ 自动唤醒一次该 runner 处理——不需要人在场",
     "AgentJoin.doneLeadUnattended": "这段由你自己在值守机上跑（该机需已安装并登录 Claude Code）—— 它装好 CLI、进频道，然后常驻 serve，被 @ 自动唤醒 claude -p：",
     "AgentJoin.ua.header": "# ── AgentParty 无人值守值守 · 频道 #{slug} ──",
     "AgentJoin.ua.intro1": "# 这是给「人」跑的设置脚本：第 3 步之后由常驻 supervisor 接管，每个 @ 自动唤醒一次 claude -p（headless）处理——无需任何人守在键盘前。",

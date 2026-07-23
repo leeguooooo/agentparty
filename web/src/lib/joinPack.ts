@@ -4,6 +4,7 @@
 // builder 放那边会让组件测试拿到假实现。
 import { AGENT_NAME_RE, charterSnapshotBodyLines, mcpServerName } from "@agentparty/shared/onboarding";
 import type { ChannelCharter } from "./api";
+import type { DesktopAgentRunner } from "./desktopAgent";
 import type { TFunc } from "../i18n/useT";
 import { RELEASE_CLI_VERSION } from "./releaseVersion";
 import "../i18n/strings/AgentJoin";
@@ -42,8 +43,15 @@ export interface FullJoinPackInput {
   inviterName: string;
   /** 生成时刻的频道公告快照；null 则整段省略（包里已指引用 party charter 看最新）。 */
   charter: ChannelCharter | null;
+  /** 无人值守脚本里 `party serve --runner <?>` 的取值；缺省 codex（与桌面「转为常驻」面板默认一致，#749）。
+   *  仅影响 unattended 包；interactive 包贴给 agent 自己的 harness，与 runner 无关。 */
+  runner?: DesktopAgentRunner;
   t: TFunc;
 }
+
+// unattended 脚本的默认 runner：与 DesktopAgentPanel 的 picker 默认一致（codex），
+// 不再写死 claude——#749：AgentJoin 曾无条件 --runner claude，用户选 codex 被静默忽略。
+export const DEFAULT_JOIN_RUNNER: DesktopAgentRunner = "codex";
 
 // 完整接入脚本：init 只写配置不发消息，必须带「报到发言」，否则网页上看不到 agent。
 export function buildFullJoinPack(input: FullJoinPackInput): string {
@@ -123,9 +131,9 @@ export function buildFullJoinPack(input: FullJoinPackInput): string {
   ].join("\n");
 }
 
-// 无人值守值守包（#612 公司大群）：serve --runner claude 的一键预设。serve 的 builtin runner
-// 默认走角色裁剪的 party MCP 工具协议（#581 Phase 2，0.2.127 起提供）；同样以「刚发布版」当闸，
-// 一键预设永远落到最新的 serve/runner，不再手改。
+// 无人值守值守包（#612 公司大群）：serve --runner <codex|claude|codex-sdk> 的一键预设（#749：runner 可选,
+// 缺省 codex）。serve 的 builtin runner 默认走角色裁剪的 party MCP 工具协议（#581 Phase 2，0.2.127 起提供）；
+// 同样以「刚发布版」当闸,一键预设永远落到最新的 serve/runner，不再手改。
 export const MIN_CLI_UNATTENDED = RELEASE_CLI_VERSION;
 
 export type JoinPackMode = "interactive" | "unattended";
@@ -134,11 +142,12 @@ export function buildJoinPack(mode: JoinPackMode, input: FullJoinPackInput): str
   return mode === "unattended" ? buildUnattendedJoinPack(input) : buildFullJoinPack(input);
 }
 
-// 无人值守包给「人」跑而不是贴给 agent：装 CLI → 写身份配置 → party serve --runner claude
-// 常驻，被 @ 即自动唤醒一次 claude -p（headless）处理。与完整接入包同源共享 charter 快照
+// 无人值守包给「人」跑而不是贴给 agent：装 CLI → 写身份配置 → party serve --runner <选中的>
+// 常驻（缺省 codex，#749），被 @ 即自动唤醒一次 headless runner 处理。与完整接入包同源共享 charter 快照
 // 注释化（管理员可控文本绝不落成可执行行）与版本闸三段比较。
 export function buildUnattendedJoinPack(input: FullJoinPackInput): string {
   const { slug, agentName, agentToken, server, charter, t } = input;
+  const runner = input.runner ?? DEFAULT_JOIN_RUNNER;
   const inviterName = AGENT_NAME_RE.test(input.inviterName) ? input.inviterName : null;
   return [
     t("AgentJoin.ua.header", { slug }),
@@ -165,7 +174,7 @@ export function buildUnattendedJoinPack(input: FullJoinPackInput): string {
     t("AgentJoin.ua.step3a"),
     t("AgentJoin.ua.step3b"),
     t("AgentJoin.ua.step3c", { agentName }),
-    `party serve --channel ${slug} --runner claude`,
+    `party serve --channel ${slug} --runner ${runner}`,
     ``,
     t("AgentJoin.ua.note1"),
     t("AgentJoin.ua.note2"),

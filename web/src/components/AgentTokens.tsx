@@ -223,7 +223,7 @@ export function AgentTokens({
   // 重建走 buildFullJoinPack——与「＋ 让 agent 加入」同一份 builder，产物逐字节同构，
   // 含 charter 快照与待命/唤醒指引（只发最小包的话，新 agent 报到完就不知道怎么挂 watch/serve）。
   // #612：unattended 记录重建同款无人值守包（serve --runner claude），别把值守机脚本换成交互包。
-  function freshCommand(record: { name: string; token: string; mode?: JoinPackMode }): string {
+  function freshCommand(record: { name: string; token: string; mode?: JoinPackMode; runner?: DesktopAgentRunner }): string {
     return buildJoinPack(record.mode ?? "interactive", {
       slug,
       agentName: record.name,
@@ -232,6 +232,8 @@ export function AgentTokens({
       server: apiOrigin(),
       inviterName,
       charter,
+      // #749：按生成时选的 runner 重建 unattended 脚本；旧记录无此字段 → buildJoinPack 内落 codex 默认。
+      runner: record.runner,
       t,
     });
   }
@@ -289,6 +291,8 @@ export function AgentTokens({
       token: next.token,
       command,
       mode: findSavedAgentToken(accountKey, slug, name)?.mode,
+      // #749：轮换 token 也要保留已选 runner,否则已选 claude 的 unattended 记录轮换后复制包会回退 codex。
+      runner: findSavedAgentToken(accountKey, slug, name)?.runner,
       savedAt: Date.now(),
     });
     return next.token;

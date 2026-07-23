@@ -219,21 +219,44 @@ describe("AgentJoin 无人值守值守预设 (#612)", () => {
       await r.root.find((node) => node.props.className === "d-btn d-btn--primary" && node.props.onClick).props.onClick();
     });
   }
+  // #749：unattended 的 runner 选择器（仅 unattended 模式渲染）。
+  function pickRunner(r: ReactTestRenderer, value: string) {
+    act(() =>
+      r.root
+        .find((node) => node.props.name === "agent-join-runner")
+        .props.onChange({ target: { value } }),
+    );
+  }
 
-  test("选无人值守 → 生成 serve --runner claude 的运维脚本，vault 记 mode", async () => {
+  test("选无人值守 → 默认生成 serve --runner codex 的运维脚本（#749：不再写死 claude），vault 记 mode+runner", async () => {
     const r = render();
     open(r);
     pickUnattended(r);
     await generate(r);
 
-    const saved = savedAgents[0]! as { command: string; mode?: string };
+    const saved = savedAgents[0]! as { command: string; mode?: string; runner?: string };
     expect(saved.mode).toBe("unattended");
-    expect(saved.command).toContain("party serve --channel demo --runner claude");
+    expect(saved.runner).toBe("codex");
+    expect(saved.command).toContain("party serve --channel demo --runner codex");
+    expect(saved.command).not.toContain("--runner claude");
     expect(saved.command).toContain(`need=${MIN_CLI_UNATTENDED}`);
     expect(saved.command).toContain("party init --server ");
     // 值守机脚本给人跑，不该出现交互包的 harness 步骤
     expect(saved.command).not.toContain("claude mcp add");
     expect(saved.command).not.toContain("party watch");
+  });
+
+  test("选无人值守 + 选 runner=claude → 脚本 --runner claude，vault 记 runner=claude（#749：picker 生效）", async () => {
+    const r = render();
+    open(r);
+    pickUnattended(r);
+    pickRunner(r, "claude");
+    await generate(r);
+
+    const saved = savedAgents[0]! as { command: string; runner?: string };
+    expect(saved.runner).toBe("claude");
+    expect(saved.command).toContain("party serve --channel demo --runner claude");
+    expect(saved.command).not.toContain("--runner codex");
   });
 
   test("无人值守包的 charter 快照仍整体注释化（管理员可控文本不落成可执行行）", async () => {
@@ -269,6 +292,13 @@ describe("AgentJoin 桌面一键接管 (#616 phase 4)", () => {
       r.root
         .find((node) => node.props.name === "agent-join-mode" && node.props.value === "unattended")
         .props.onChange(),
+    );
+  }
+  function pickRunner(r: ReactTestRenderer, value: string) {
+    act(() =>
+      r.root
+        .find((node) => node.props.name === "agent-join-runner")
+        .props.onChange({ target: { value } }),
     );
   }
   async function generate(r: ReactTestRenderer) {
@@ -313,11 +343,45 @@ describe("AgentJoin 桌面一键接管 (#616 phase 4)", () => {
         token: "ap_created",
         name: "leo-demo",
         channel: "demo",
-        runner: "claude",
+        runner: "codex", // #749：默认 codex,不再写死 claude
         workdir: "/picked/dir",
       },
     ]);
     expect(JSON.stringify(renderer!.toJSON())).toContain("resident ✓");
+  });
+
+  test("桌面 + 无人值守 + 选 runner=claude：dutyAdopt 带 runner=claude（#749：picker 驱动接管）", async () => {
+    localStorage.setItem("ap_locale", "en");
+    setApiBase("https://agentparty.leeguoo.com");
+    const adopts: Array<{ runner?: string }> = [];
+    const r = render(undefined, null, {
+      desktopDetect: () => true,
+      pickDirectory: async () => "/picked/dir",
+      dutyAdapter: {
+        dutyAdopt: async (input: { runner?: string }) => {
+          adopts.push(input);
+          return {
+            label: "com.agentparty.duty.x.demo",
+            instanceId: "x:demo",
+            plistPath: "/p",
+            logPath: "/l",
+            loaded: true,
+          };
+        },
+      },
+    });
+    open(r);
+    pickUnattended(r);
+    pickRunner(r, "claude");
+    await generate(r);
+    const adoptBtn = r.root.find(
+      (node) => node.type === "button" && String(node.children[0] ?? "").includes("Choose a folder"),
+    );
+    await act(async () => {
+      await adoptBtn.props.onClick();
+    });
+    expect(adopts).toHaveLength(1);
+    expect(adopts[0]!.runner).toBe("claude");
   });
 
   test("桌面 + 无人值守：取消选目录 → 不 adopt", async () => {
