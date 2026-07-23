@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_ARCHIVED, type MsgFrame } from "@agentparty/shared";
-import { createBuiltinRunner, createSdkRunner, EXIT_WAKE_ABANDON_CIRCUIT, isRunnerEnvFailure, profileChildServeOptions, runServe, WakeBlockedError, type BuiltinRunnerOptions, type RunnerProcess, type ServeOptions } from "../src/commands/serve";
+import { claudeJsonEnvFailure, createBuiltinRunner, createSdkRunner, EXIT_WAKE_ABANDON_CIRCUIT, isRunnerEnvFailure, profileChildServeOptions, runServe, WakeBlockedError, type BuiltinRunnerOptions, type RunnerProcess, type ServeOptions } from "../src/commands/serve";
 import type { StuckWake } from "../src/config";
 import { msgFrame, startMockServer, welcomeFrame, type MockServer } from "./mock-server";
 
@@ -254,6 +254,34 @@ describe("serve wake delivery (#118 / #198)", () => {
       const result: { stdout: string; stderr: string } = { stdout: noise, stderr: "" };
       expect(isRunnerEnvFailure(result)).toBe(false);
     }
+  });
+
+  // #748：claude `-p --output-format json` 的 auth/api 失败落在 **stdout 的结构化 JSON**，stderr 干净——
+  // 只吃结构化字段判 env failure，且绝不误报正常模型输出（不重犯 #693）。
+  test("claudeJsonEnvFailure 认出 claude JSON 里的结构化 auth/api 失败 (#748)", () => {
+    const authExpired = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Failed to authenticate: OAuth session expired and could not be refreshed",
+      terminal_reason: "api_error",
+      session_id: "4f1dc51f-9413-430b-abe7-8436e1637e53",
+    });
+    expect(claudeJsonEnvFailure(authExpired)).toBe(true);
+    // 401 / invalid api key 同样命中
+    expect(claudeJsonEnvFailure(JSON.stringify({ is_error: true, terminal_reason: "api_error", result: "HTTP 401 Unauthorized" }))).toBe(true);
+  });
+
+  test("claudeJsonEnvFailure 不误判正常/非环境失败 (#748 回归护栏，配合 #693)", () => {
+    // 正常成功输出——即便模型正文写了「unauthorized」，is_error:false → 不算环境失败。
+    expect(claudeJsonEnvFailure(JSON.stringify({ is_error: false, terminal_reason: "completed", result: "here is the unauthorized access audit you asked for" }))).toBe(false);
+    // is_error 但非 api_error（如 max turns / 模型侧失败）→ 不算环境失败。
+    expect(claudeJsonEnvFailure(JSON.stringify({ is_error: true, terminal_reason: "max_turns", result: "OAuth session expired" }))).toBe(false);
+    // api_error 但 result 无环境指纹（真·模型/内容错）→ 不算环境失败。
+    expect(claudeJsonEnvFailure(JSON.stringify({ is_error: true, terminal_reason: "api_error", result: "overloaded_error: please retry" }))).toBe(false);
+    // 非 JSON（resume 明文输出）→ 优雅返回 false，交回 stderr 判定。
+    expect(claudeJsonEnvFailure("plain text answer mentioning unauthorized")).toBe(false);
+    expect(claudeJsonEnvFailure("")).toBe(false);
   });
 
   test("a non-environment runner failure keeps environment=false (no false positives)", async () => {

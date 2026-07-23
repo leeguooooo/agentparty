@@ -1653,6 +1653,24 @@ export function isRunnerEnvFailure(result: Pick<RunnerProcessResult, "stderr">):
   return RUNNER_ENV_FAILURE_PATTERNS.some((re) => re.test(result.stderr));
 }
 
+// #748：claude `-p --output-format json` 命中环境性 auth/api 失败时，结构化错误落在 **stdout 的 JSON**
+// （`is_error:true, terminal_reason:"api_error", result:"...OAuth session expired..."`）而非 stderr，exit 1。
+// isRunnerEnvFailure 只扫 stderr（#693 为躲模型输出误报），会把这类漏判成通用「exit-1 / model may have run」：
+// 不标 env failure、不触发 #744 自卸载、频道只显示没头没脑的 exit-1，owner 看不出是凭据过期。
+// 这里只吃**结构化字段**：仅当 `is_error===true && terminal_reason==="api_error"` 且 `result` 命中环境错指纹
+// 才判 env failure——正常模型输出 `is_error:false`（即便正文含「unauthorized」），绝不误报，不重犯 #693。
+export function claudeJsonEnvFailure(stdout: string): boolean {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(stdout) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (body.is_error !== true || body.terminal_reason !== "api_error") return false;
+  const result = typeof body.result === "string" ? body.result : "";
+  return RUNNER_ENV_FAILURE_PATTERNS.some((re) => re.test(result));
+}
+
 function writeSdkSession(path: string, state: SdkWakeSessionState): SdkWakeSessionState {
   return mergeRunnerContinuation(path, state) as SdkWakeSessionState;
 }
@@ -2535,7 +2553,10 @@ export function createBuiltinRunner(opts: BuiltinRunnerOptions): NonNullable<Ser
         const now = opts.now?.() ?? Date.now();
         if (run.result.code !== 0) {
           // #690：认证过期 / 二进制缺失 / 沙箱拒权等环境性失败在模型启动前就崩，别归为「model may have run」。
-          const envFailure = isRunnerEnvFailure(run.result);
+          // #748：claude 的 auth/api 失败落在 stdout 的结构化 JSON（非 stderr），补一条只吃结构化字段的判定。
+          const envFailure =
+            isRunnerEnvFailure(run.result) ||
+            (opts.harness === "claude" && claudeJsonEnvFailure(run.result.stdout));
           appendRunnerLog(
             opts.workdir,
             `${new Date(now).toISOString()} seq=${frame.seq} sid=${shortSid(oldSid)} duration_ms=${now - started} exit=${run.result.code}${envFailure ? " env_failure=true" : ""}`,
