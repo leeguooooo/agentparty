@@ -64,4 +64,14 @@ describe("selfBootoutTerminalDuty (#744)", () => {
     const r = recorder();
     expect(() => selfBootoutTerminalDuty(EXIT_WAKE_ABANDON_CIRCUIT, r.out, { ...base(), spawn: throwing } as never)).not.toThrow();
   });
+
+  test("spawnSync 返回非零/error(不抛)→ 记警告,不静默当成功(#745)", () => {
+    for (const bad of [{ status: 1 }, { error: new Error("ENOENT") }, { signal: "SIGTERM", status: null }]) {
+      const lines: string[] = [];
+      const failSpawn = (() => bad) as never;
+      const did = selfBootoutTerminalDuty(EXIT_AUTH, (l) => lines.push(l), { ...base(), spawn: failSpawn } as never);
+      expect(did).toBe(true);
+      expect(lines.some((l) => l.includes("bootout") && l.includes("失败"))).toBe(true);
+    }
+  });
 });

@@ -286,18 +286,27 @@ export function selfBootoutTerminalDuty(
   // 严格校验注入的 label(@macmini #744 评审):只接受我们自己生成的 duty label(前缀 + launchd 合法字符),
   // 否则拒绝——绝不拿一个猜的/被篡改的 label 去 bootout,免得卸载错的甚至宽泛目标。
   if (!label.startsWith(DUTY_LABEL_PREFIX) || !/^[A-Za-z0-9.-]+$/.test(label)) {
-    out(`serve: 拒绝自卸载——AP_DUTY_LABEL 非法(${label})`);
+    // 不回显未验证的 label 原值(#745 CodeRabbit):非法即无信息价值,还可能是被塞的脏数据。
+    out("serve: 拒绝自卸载——AP_DUTY_LABEL 不是合法的 duty label");
     return false;
   }
   const uid = deps?.uid ?? (typeof process.getuid === "function" ? process.getuid() : null);
   if (uid === null) return false;
+  const target = `gui/${uid}/${label}`;
   const reason = code === EXIT_WAKE_ABANDON_CIRCUIT ? "circuit-breaker" : "auth-revoked";
   out(`serve: 终局退出(${reason}, code=${code})——从 launchd 卸载自身(${label}),不再自动重启;修好后重新「转为常驻」。`);
   // bootout 必须是最后动作(@macmini #744 评审):它可能给 serve 发 SIGTERM,其后不能再有必需的清理/日志。
+  // 必须检查返回值(#745 CodeRabbit):spawnSync 把非零退出/超时/命令找不到写进 result(不总是抛),
+  // 只 try/catch 会静默吞掉——那样日志说「已卸载」但 job 还在、KeepAlive 照样重启,假的安全停机。
   try {
-    (deps?.spawn ?? spawnSync)("launchctl", ["bootout", `gui/${uid}/${label}`], { timeout: 5000 });
-  } catch {
-    /* best-effort:卸载失败也照常退出,退出码仍对 */
+    const result = (deps?.spawn ?? spawnSync)("launchctl", ["bootout", target], { timeout: 5000 });
+    // 成功仅当 status===0 且无 error;非零退出、超时/信号杀(status=null+signal)、命令找不到一律算失败。
+    if (result.error !== undefined || result.status !== 0) {
+      const why = result.error?.message ?? (result.signal != null ? `killed by ${result.signal}` : `exit ${result.status}`);
+      out(`serve: ⚠ launchctl bootout 失败(${why})——自卸载未生效,launchd 可能仍 KeepAlive 重启;请人工:launchctl bootout ${target}`);
+    }
+  } catch (error) {
+    out(`serve: ⚠ launchctl bootout 抛错(${error instanceof Error ? error.message : String(error)})——自卸载未生效;请人工:launchctl bootout ${target}`);
   }
   return true;
 }
