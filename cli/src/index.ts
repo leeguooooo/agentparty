@@ -28,6 +28,7 @@ commands:
   watch     [channel|--channel C] [--timeout N] [--mentions-only] [--follow] [--json]
   ack       [--channel C] [--seq N]                acknowledge a watch wake that needs no reply (#594)
   serve     [channel|--channel C] (--on-mention "<cmd>" | --runner codex|claude|codex-sdk) [--all] | --profile owner/handle
+  bridge    claude|codex [channel|--channel C] [-- <args...>] attach AgentParty to the current interactive harness session
   daemon    [channel|--channel C] [--timeout N]        EXPERIMENTAL (#672 spike): resident runner embedding the Claude Agent SDK; @-mention → in-process SDK session → reply
   mcp                                                structured control plane (not an idle wake provider)
   lark      notify on|off|status [--channel C]       send channel @mentions to your Lark/Feishu account
@@ -106,6 +107,13 @@ export async function main(argv: string[]): Promise<number> {
       return (await import("./commands/ack")).run(rest);
     case "serve":
       return (await import("./commands/serve")).run(rest);
+    case "bridge":
+      return (await import("./commands/bridge")).run(rest);
+    // Internal stdio subprocess spawned by `party bridge claude`. It remains
+    // hidden from top-level help so users enter through the version/capability
+    // preflight and interactive launcher.
+    case "claude-channel":
+      return (await import("./commands/claude-channel")).run(rest);
     case "daemon":
       return (await import("./commands/daemon")).run(rest);
     case "mcp":

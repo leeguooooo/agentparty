@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentParty #746 · 交互会话桥接架构</title>
+  <style>
+    :root {
+      --fg: #202124;
+      --muted: #667085;
+      --accent: #2457c5;
+      --border: #d8dde6;
+      --soft: #f5f7fa;
+      --code: #edf1f6;
+      --ok: #166534;
+      --warn: #9a3412;
+    }
+    * { box-sizing: border-box; }
+    body {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 2rem 1.4rem 5rem;
+      color: var(--fg);
+      font: 16px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    header { margin-bottom: 2rem; padding-bottom: 1.2rem; border-bottom: 3px solid var(--accent); }
+    h1 { margin: 0 0 .5rem; font-size: 1.8rem; line-height: 1.25; }
+    h2 { margin-top: 2.4rem; padding-left: .65rem; border-left: 4px solid var(--accent); font-size: 1.25rem; }
+    h3 { margin-top: 1.5rem; font-size: 1.05rem; }
+    p, li { max-width: 94ch; }
+    a { color: var(--accent); }
+    code { padding: .08em .3em; border-radius: 3px; background: var(--code); font: .88em "SFMono-Regular", Menlo, Consolas, monospace; }
+    pre { overflow-x: auto; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--code); font-size: .82rem; line-height: 1.55; }
+    pre code { padding: 0; background: transparent; }
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: .91rem; }
+    th, td { padding: .58rem .68rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--soft); }
+    .meta { color: var(--muted); font-size: .9rem; }
+    .good { color: var(--ok); font-weight: 650; }
+    .pending { color: var(--warn); font-weight: 650; }
+    aside { margin: 1rem 0; padding: .8rem 1rem; border-left: 4px solid var(--accent); background: var(--soft); }
+    .flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: .5rem; margin: 1rem 0; }
+    .flow span { padding: .7rem .5rem; border: 1px solid var(--border); background: var(--soft); text-align: center; font-size: .88rem; }
+    .flow span + span::before { content: "→ "; color: var(--accent); font-weight: 700; }
+    footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .88rem; }
+    @media (max-width: 800px) {
+      body { padding-inline: .8rem; }
+      table { display: block; overflow-x: auto; }
+      .flow { grid-template-columns: 1fr; }
+      .flow span + span::before { content: "↓ "; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>交互会话桥接：把频道消息送进当前 Claude / Codex 会话</h1>
+    <p class="meta">Issue #746 · 2026-07-24 · 本机核验 Claude Code 2.1.218 / Codex CLI 0.144.4</p>
+  </header>
+
+  <main>
+    <section aria-labelledby="decision">
+      <h2 id="decision">产品结论</h2>
+      <aside>
+        <strong>#746 是 AgentParty 的核心产品能力，不是“不计划在本仓实现”的上游缺口。</strong>
+        两个 harness 都已有可用原语；AgentParty 必须补齐会话适配、单写仲裁和自己的持久投递账本。
+      </aside>
+      <p class="meta">
+        上游能力依据：
+        <a href="https://code.claude.com/docs/en/channels">Claude Code Channels</a>、
+        <a href="https://code.claude.com/docs/en/channels-reference">Channels reference</a>、
+        <a href="https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md">Codex app-server protocol</a>。
+      </p>
+      <table>
+        <thead>
+          <tr><th>Harness</th><th>同会话主路径</th><th>本仓责任</th><th>当前 slice</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Claude Code ≥ 2.1.80</td>
+            <td>专用 <code>claude/channel</code> capability</td>
+            <td>启动器、Channel MCP adapter、投递租约、linked reply</td>
+            <td class="good">已实现并有单测</td>
+          </tr>
+          <tr>
+            <td>Claude Agent SDK</td>
+            <td>单个 <code>query(AsyncIterable)</code></td>
+            <td>原生 Channel 被版本或组织策略禁用时的自有 runner fallback</td>
+            <td class="pending">后续接线；不冒充 stock TUI 同会话</td>
+          </tr>
+          <tr>
+            <td>Codex app-server</td>
+            <td><code>thread/resume</code> + <code>turn/start</code>/<code>turn/steer</code></td>
+            <td>让 Unix-remote TUI 与频道输入统一经过单写 proxy；稳定 client id 正向对账</td>
+            <td class="good">可运行 proxy、接线与 mock integration 已实现</td>
+          </tr>
+          <tr>
+            <td>PTY / transcript JSONL</td>
+            <td>不采用</td>
+            <td>禁止按键注入、禁止直接改 transcript、禁止并发 resume 进程</td>
+            <td class="good">启动与仲裁均 fail closed</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="negative-control">
+      <h2 id="negative-control">普通 MCP notification 是负向对照，不是矛盾结论</h2>
+      <p>
+        <a href="./mcp-notification-idle-wake-spike.html">#553 idle-wake 实验</a>证明的是：
+        普通 logging、resource 和 tool-list notification 在 turn 结束后不会创建新模型 turn。
+        Claude Channels 是 Claude Code 明确定义的另一条 harness 输入协议：
+        server 声明 <code>experimental["claude/channel"]</code>，再发
+        <code>notifications/claude/channel</code>。实现不得把两者混在一起。
+      </p>
+      <p>
+        即使专用 Channel notification 的 transport write 成功，也只代表 claim-only 事件交给客户端
+        队列，不代表正文已释放，更不代表模型已完成工作。因此 AgentParty delivery 继续保持
+        <code>running</code> 并续租，直到当前会话按稳定 receipt 完成 claim → accept，再调用 linked
+        reply tool，且 REST 回帖携带原消息 <code>reply_to</code> 成功。
+      </p>
+    </section>
+
+    <section aria-labelledby="claude">
+      <h2 id="claude">Claude 原生 Channel 链路</h2>
+      <div class="flow" aria-label="Claude Channel 投递时序">
+        <span>频道定向 delivery</span>
+        <span>Worker running + token fencing</span>
+        <span>claim-only Channel notification</span>
+        <span>party_channel_claim 返回 receipt + 正文</span>
+        <span>party_channel_accept 先落 WAL</span>
+        <span>当前会话执行一次</span>
+        <span>party_channel_reply 完成 delivery</span>
+      </div>
+      <pre><code>party bridge claude [channel|--channel C] [-- &lt;claude args...&gt;]
+
+Claude child MCP config:
+  capabilities.experimental["claude/channel"] = {}
+  capabilities.tools = {}
+
+Notification:
+  method = "notifications/claude/channel"
+  params.content = "execution_id=delivery-id; call party_channel_claim"
+  params.meta = { channel, seq, sender, delivery_id, execution_id }
+
+Current-session tools:
+  party_channel_claim(execution_id) → stable claim_receipt + full body
+  party_channel_accept(execution_id, claim_receipt) → durable acceptance
+  party_channel_reply(seq, body) → linked REST reply</code></pre>
+      <h3>边界</h3>
+      <ul>
+        <li>启动前检查 Claude Code 版本；低于 2.1.80 明确失败。</li>
+        <li>组织策略拒绝 development Channels 时，由 Claude 明确报错；AgentParty 不偷偷启用 PTY 或第二个 resume 进程。</li>
+        <li>adapter 与 <code>party serve</code> 共用同身份、同频道实例锁，避免两个消费者双执行。</li>
+        <li>只有服务端认证会员发给当前 target 的 claimed delivery 能进入会话；自己的消息不自唤醒。</li>
+        <li>权限 relay 不在首期开放。后续必须 owner 身份绑定，不能让频道任意发送者批准本机工具。</li>
+      </ul>
+      <h3>持久状态边界</h3>
+      <p>
+        <code>harness_issued</code> 不是跨 adapter 通用的“正文已写入”缩写，必须结合具体 harness 解释。
+        Claude 的 claim-gated 路径先只发送 execution id；Codex 则在唯一 writer 真正调用
+        <code>turn/start</code> 或 <code>turn/steer</code> 前才进入该阶段。
+      </p>
+      <table>
+        <thead><tr><th>Adapter / phase</th><th>正文边界</th><th>崩溃或断线后的规则</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Claude claim-only <code>harness_issued</code></td>
+            <td>只把 execution id 交给 harness；频道正文仍未释放</td>
+            <td>只有 phase、attempt、lease epoch/token 等 journal 快照精确匹配，且 Worker 明确返回 <code>replay_safe</code>，才可恢复；<code>superseded_safe</code> 只清理旧的 pre-body debt，绝不重新 claim 旧 attempt</td>
+          </tr>
+          <tr>
+            <td>Claude <code>harness_accepted</code></td>
+            <td>正文已经交给当前 Claude 会话</td>
+            <td>不得重放；保留 reply debt，等待同一 execution 的精确晚到回复</td>
+          </tr>
+          <tr>
+            <td>Codex <code>harness_issued</code> / <code>harness_accepted</code></td>
+            <td>已经抵达实际 writer 边界，可能已写入 app-server</td>
+            <td>除非 writer 明确证明尚未写入并安全回滚，否则不得重发；未知结果进入 late-reply-only 对账</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="codex">
+      <h2 id="codex">Codex app-server 单写协议</h2>
+      <p>
+        <code>thread/resume</code> 能让多个连接重入同一个 running thread，但“都能读状态”不等于“都能写”。
+        Codex 的 <code>turn/start</code> 会先替换活动 task。AgentParty proxy 必须成为唯一写者，
+        TUI 和频道输入都经过同一个串行仲裁器。
+      </p>
+      <div class="flow" aria-label="Codex 单写代理拓扑">
+        <span>Codex Unix WebSocket TUI</span>
+        <span>AgentParty 单写 proxy</span>
+        <span>仲裁 turn 状态</span>
+        <span>私有 app-server stdio</span>
+        <span>linked channel reply</span>
+      </div>
+      <pre><code>party bridge codex [channel|--channel C] [--codex-bin PATH] [-- &lt;codex args...&gt;]
+
+binary resolution:
+  --codex-bin / AGENTPARTY_CODEX_BIN
+  → child PATH / user-local + Homebrew
+  → Codex.app / ChatGPT.app bundled binary
+
+transport:
+  codex --remote unix://&lt;0600 bridge socket&gt;
+  bridge → codex app-server --stdio
+
+resident runner / desktop:
+  party serve --runner codex [--codex-bin PATH]
+  → same absolute-binary + child-PATH resolver
+  → fail before advertising ready when the executable is unavailable</code></pre>
+      <pre><code>UNKNOWN ── positive clientId reconciliation ──▶ ACCEPTED
+   │
+   └─ cold restart + bounded full read still absent（不是“未执行”证明）
+      └─ delivery = terminal_unknown；保留 durable reply debt / 原 bearer
+         ├─ exact late completion ──▶ linked reply
+         └─ 仅解冻单写仲裁器；原输入永不重放
+
+IDLE ── turn/start ──▶ ACTIVE_NORMAL(turn_id)
+                         │
+                         ├─ turn/steer(expectedTurnId)
+                         └─ Review / Compact：有界排队至 completed</code></pre>
+      <table>
+        <thead><tr><th>观察状态</th><th>频道输入动作</th><th>禁止动作</th></tr></thead>
+        <tbody>
+          <tr><td><code>idle</code></td><td><code>turn/start</code></td><td>并发第二个 start</td></tr>
+          <tr><td>normal active + 已知 turn id</td><td><code>turn/steer(expectedTurnId)</code></td><td>用 start 抢占</td></tr>
+          <tr><td>Review / Compact</td><td>进入有界队列，等待 completed</td><td>steer 失败后降级 start</td></tr>
+          <tr><td>active 但 turn id 不可确认</td><td>fail closed，排队并重新 resume/read</td><td>凭两个客户端各自看到 idle 就 start</td></tr>
+          <tr><td>RPC 响应丢失</td><td>扫描 <code>userMessage.clientId</code> 做正向 accepted 对账；冷重启全量扫描仍缺失时，保留 <code>terminal_unknown</code> reply debt，只解冻单写仲裁器，并继续接受同一 client id 的精确晚到完成</td><td>因历史中缺失 clientId 就推断未执行、重发，或把 delivery 当普通 failed / abandoned 删除</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Review / Compact 依靠 app-server 结构化错误
+        <code>codexErrorInfo.activeTurnNotSteerable.turnKind</code>，不解析英文错误文案。
+        每个 AgentParty delivery 使用稳定的 <code>clientUserMessageId=agentparty:&lt;delivery-id&gt;</code>；
+        本地 journal 自己去重，因为 Codex 只存这个关联字段，并不提供幂等语义。
+        未找到 client id 不能把原输入重发：进程硬崩溃可能落在外部副作用与持久历史之间，
+        所以 absence 不是“未执行”的证明，也不是安全的负向幂等证明。冷重启完成 resume + 有界全量 read
+        后仍缺失时，bridge 可放行仲裁器处理后续独立工作，但必须保留 <code>terminal_unknown</code>
+        journal、原 delivery bearer 和 reply debt；它仍可由同一 client id 的精确晚到 completed history
+        结算一条 linked reply。这个解冻动作不把 delivery 标为普通 <code>failed</code> 或
+        <code>abandoned</code>，也不授权重发原正文。对账完成前，后续 start/steer、interrupt、review、
+        compact 与队列 flush 全部冻结。
+      </p>
+      <p>
+        <code>thread/start</code>、<code>thread/resume</code>、<code>thread/fork</code> 与频道
+        <code>submit</code> 共用 session lane；fork 返回的新 thread 会立即重建 arbiter。
+        未结算 delivery 或 <code>waiting_owner</code> continuation 存在时拒绝切离原 thread。
+        continuation 以 <code>work_id + continuation_ref</code> 绑定原 thread；只有精确匹配的
+        <code>owner_answer</code> 才能重新注入。linked REST reply 以 delivery identity 派生稳定
+        idempotency key，响应丢失时安全重试同一逻辑回复。
+      </p>
+      <p>
+        app-server 发给前端的审批、用户输入和 elicitation 请求会在 TUI 离线时有界保存，并在
+        TUI 重新完成 initialize 后重放。proxy 给每个 backend request 分配跨 generation 唯一的
+        frontend id，并维持双向映射；若 app-server 进程重启，即使原始 request id 从 0 复用，
+        旧 TUI 响应也无法命中新请求。<code>serverRequest/resolved</code> 同样改写回 frontend id。
+        恢复由 <code>thread/resume</code> 重新发出有效请求，完成前设为写屏障。
+      </p>
+    </section>
+
+    <section aria-labelledby="recovery-fencing">
+      <h2 id="recovery-fencing">断线恢复、token fencing 与单活 successor</h2>
+      <p>
+        每次连接恢复都绑定当前 connection generation、delivery attempt、lease epoch 和 lease token。
+        例如 token 依次从 A 旋转为 B、再旋转为 C 时，延迟返回的 A 或 B 恢复结果既不能移除 C 的
+        recovery gate，也不能重新取得当前 delivery 所有权。journal 只有在恢复请求看到的 phase 与租约
+        快照仍然精确一致时，才允许发布 <code>replay_safe</code>；任何阶段推进或 token 变化都使旧请求失效。
+      </p>
+      <p>
+        Worker 保留已轮换 token 的恢复历史，用 <code>superseded_safe</code> 明确关闭旧 attempt，
+        而不是让它再次 claim。对同一逻辑 delivery，任一时刻最多只有一个 <code>claimed</code> /
+        <code>running</code> successor；若旧的 <code>terminal_unknown</code> 获得精确
+        <code>replay_safe</code>，但新的 successor 已在执行，旧项必须先进入 durable queue，
+        等当前 successor 结算后再推进，禁止出现双活正文执行。所有 post-harness 状态都不走此重放路径，
+        只保留精确晚到回复能力。
+      </p>
+    </section>
+
+    <section aria-labelledby="acceptance">
+      <h2 id="acceptance">本 slice 验收与后续</h2>
+      <table>
+        <thead><tr><th>能力</th><th>自动回归</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr><td>Claude 版本边界与启动 argv</td><td>版本解析、最低版本、dev/source 自命令、参数透传</td><td class="good">覆盖</td></tr>
+          <tr><td>Claude durable delivery</td><td>running、稳定 receipt 的 claim → accept 两阶段正文闸门、精确 replay-safe 恢复、post-write unknown 保留 debt、linked reply、REST 失败可重试、plain/directed 去重</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex 单写</td><td>idle start、active steer、同时写入只有一个 start</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex 不可 steer</td><td>Review/Compact 有界排队、stale turn 重同步、未知 turn fail closed</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex unknown outcome</td><td>实际 writer 边界后不重发；正向对账；历史缺失不作负向证明；冷重启保留 terminal_unknown debt 和精确晚到回复，同时解冻后续独立工作</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex thread / continuation 归属</td><td>start/resume/fork 与 submit 串行；waiting_owner 绑定 work/ref/thread；owner_answer 精确恢复</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex linked reply</td><td>delivery 派生固定幂等键；REST 丢响应自动重试；replied / waiting_owner ACK 分流</td><td class="good">覆盖</td></tr>
+          <tr><td>Codex Unix WebSocket + stdio proxy</td><td>真实子进程 JSON-RPC、单 TUI、server request 离线重放、跨 generation request id 隔离、断线恢复屏障、同帧流 Worker running ACK</td><td class="good">自动化覆盖；真实 app-server 初始化探针通过</td></tr>
+          <tr><td>跨连接 delivery recovery</td><td>A→B→C token/generation fencing、旧恢复结果隔离、精确 replay-safe CAS、单活 successor 与 durable 排队</td><td class="good">覆盖</td></tr>
+          <tr><td>GUI / launchd Codex 发现</td><td>精简 PATH、AGENTPARTY_CODEX_BIN、用户目录、Homebrew、Codex.app / ChatGPT.app；bridge、serve、profile 与桌面 sidecar 共用同一 resolver</td><td class="good">自动化覆盖；本机精简 PATH 版本探针通过</td></tr>
+          <tr><td>Codex live dogfood</td><td>真实 TUI 收频道消息、busy steer、Review/Compact 排队、linked reply</td><td class="pending">发布前人工验收</td></tr>
+          <tr><td>Claude SDK streaming fallback</td><td>Channel 禁用场景的独立 runner 验收</td><td class="pending">下一实现 slice</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    本文记录产品协议和已落代码边界；“本地单测通过”不等于已发布或真实 harness live dogfood。
+  </footer>
+</body>
+</html>

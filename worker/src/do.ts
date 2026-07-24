@@ -64,6 +64,7 @@ import {
   type DecisionState,
   type DirectedDelivery,
   type DirectedDeliveryCause,
+  type DeliveryRecoverFrame,
   type DeliveryUpdateFrame,
   type PublicDirectedDelivery,
   type HostDecision,
@@ -138,6 +139,8 @@ interface ConnState {
   // 只有显式声明能消费 delivery + delivery_update v1 的连接，才可领取 durable work。
   // 旧 serve 仍可观察 raw mention，但不能仅凭 serve_lease claim 被误当成 v1 executor。
   directedDeliveryV1?: boolean;
+  /** Socket negotiated token-fenced delivery recovery. */
+  deliveryRecoveryV1?: boolean;
   /** New sockets do not receive live message frames until hello establishes replay/capabilities. */
   helloPending?: boolean;
   /** Highest message cursor declared by hello on this socket; legacy once may only reserve newer raw work. */
@@ -1364,8 +1367,23 @@ function parseDeliveryUpdateFrame(input: unknown): DeliveryUpdateFrame | null {
   const workId = optionalText(f.work_id, DELIVERY_WORK_ID_LIMIT);
   const continuationRef = optionalText(f.continuation_ref, DELIVERY_CONTINUATION_REF_LIMIT);
   const requestId = optionalText(f.request_id, 128);
+  const leaseToken = optionalText(f.lease_token, 128);
   const error = optionalText(f.error, DECISION_REASON_LIMIT);
-  if (workId === null || continuationRef === null || requestId === null || error === null) return null;
+  if (workId === null || continuationRef === null || requestId === null || leaseToken === null || error === null) {
+    return null;
+  }
+  const leaseEpoch = f.lease_epoch === undefined
+    ? undefined
+    : typeof f.lease_epoch === "number" && Number.isSafeInteger(f.lease_epoch) && f.lease_epoch > 0
+      ? f.lease_epoch
+      : null;
+  if (leaseEpoch === null) return null;
+  const attempt = f.attempt === undefined
+    ? undefined
+    : typeof f.attempt === "number" && Number.isSafeInteger(f.attempt) && f.attempt > 0
+      ? f.attempt
+      : null;
+  if (attempt === null) return null;
   const replySeq =
     f.reply_seq === undefined
       ? undefined
@@ -1380,11 +1398,62 @@ function parseDeliveryUpdateFrame(input: unknown): DeliveryUpdateFrame | null {
     type: "delivery_update",
     delivery_id: f.delivery_id,
     ...(requestId === undefined ? {} : { request_id: requestId }),
+    ...(attempt === undefined ? {} : { attempt }),
+    ...(leaseEpoch === undefined ? {} : { lease_epoch: leaseEpoch }),
+    ...(leaseToken === undefined ? {} : { lease_token: leaseToken }),
     state: f.state,
     ...(workId === undefined ? {} : { work_id: workId }),
     ...(continuationRef === undefined ? {} : { continuation_ref: continuationRef }),
     ...(replySeq === undefined ? {} : { reply_seq: replySeq }),
     ...(error === undefined ? {} : { error }),
+  };
+}
+
+function parseDeliveryRecoverFrame(input: unknown): DeliveryRecoverFrame | null {
+  if (typeof input !== "object" || input === null) return null;
+  const f = input as Record<string, unknown>;
+  if (f.type !== "delivery_recover") return null;
+  const text = (value: unknown, limit = 128): string | null =>
+    typeof value === "string" && value.length > 0 && value.length <= limit ? value : null;
+  const deliveryId = text(f.delivery_id);
+  const requestId = text(f.request_id);
+  const leaseToken = text(f.lease_token);
+  const nextLeaseToken = text(f.next_lease_token);
+  const attempt =
+    typeof f.attempt === "number" && Number.isSafeInteger(f.attempt) && f.attempt > 0
+      ? f.attempt
+      : null;
+  const leaseEpoch =
+    typeof f.lease_epoch === "number" && Number.isSafeInteger(f.lease_epoch) && f.lease_epoch > 0
+      ? f.lease_epoch
+      : null;
+  const replaySafe =
+    f.replay_safe === undefined
+      ? undefined
+      : f.replay_safe === true
+        ? true
+        : null;
+  if (
+    deliveryId === null ||
+    requestId === null ||
+    leaseToken === null ||
+    nextLeaseToken === null ||
+    attempt === null ||
+    leaseEpoch === null ||
+    replaySafe === null ||
+    leaseToken === nextLeaseToken
+  ) {
+    return null;
+  }
+  return {
+    type: "delivery_recover",
+    delivery_id: deliveryId,
+    request_id: requestId,
+    attempt,
+    lease_epoch: leaseEpoch,
+    lease_token: leaseToken,
+    next_lease_token: nextLeaseToken,
+    ...(replaySafe === true ? { replay_safe: true as const } : {}),
   };
 }
 
@@ -1797,9 +1866,15 @@ export class ChannelDO extends Server<Env> {
       cause TEXT NOT NULL,
       state TEXT NOT NULL,
       attempt INTEGER NOT NULL DEFAULT 0,
+      lease_epoch INTEGER NOT NULL DEFAULT 0,
+      lease_token TEXT,
+      previous_lease_epoch INTEGER,
+      previous_lease_attempt INTEGER,
+      previous_lease_token TEXT,
       lease_connection_id TEXT,
       last_lease_connection_id TEXT,
       lease_adapter TEXT,
+      last_lease_adapter TEXT,
       lease_until INTEGER,
       work_id TEXT,
       continuation_ref TEXT,
@@ -1827,6 +1902,11 @@ export class ChannelDO extends Server<Env> {
       // column already exists
     }
     try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN last_lease_adapter TEXT");
+    } catch {
+      // column already exists
+    }
+    try {
       sql.exec("ALTER TABLE directed_deliveries ADD COLUMN parent_delivery_id TEXT");
     } catch {
       // column already exists
@@ -1835,6 +1915,27 @@ export class ChannelDO extends Server<Env> {
       sql.exec("ALTER TABLE directed_deliveries ADD COLUMN terminal_reason TEXT");
     } catch {
       // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0");
+    } catch {
+      // column already exists
+    }
+    try {
+      sql.exec("ALTER TABLE directed_deliveries ADD COLUMN lease_token TEXT");
+    } catch {
+      // column already exists
+    }
+    for (const ddl of [
+      "ALTER TABLE directed_deliveries ADD COLUMN previous_lease_epoch INTEGER",
+      "ALTER TABLE directed_deliveries ADD COLUMN previous_lease_attempt INTEGER",
+      "ALTER TABLE directed_deliveries ADD COLUMN previous_lease_token TEXT",
+    ]) {
+      try {
+        sql.exec(ddl);
+      } catch {
+        // column already exists
+      }
     }
     sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_target_state ON directed_deliveries(target_name, state, message_seq)",
@@ -1845,6 +1946,15 @@ export class ChannelDO extends Server<Env> {
     sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_directed_deliveries_lease ON directed_deliveries(state, lease_until)",
     );
+    sql.exec(`CREATE TABLE IF NOT EXISTS directed_delivery_lease_history (
+      delivery_id TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      lease_epoch INTEGER NOT NULL,
+      lease_token TEXT NOT NULL,
+      superseded_at INTEGER NOT NULL,
+      PRIMARY KEY (delivery_id, attempt, lease_epoch, lease_token),
+      FOREIGN KEY (delivery_id) REFERENCES directed_deliveries(id) ON DELETE CASCADE
+    )`);
     sql.exec(
       `UPDATE messages
           SET delivery_targets_json = COALESCE((
@@ -2339,6 +2449,7 @@ export class ChannelDO extends Server<Env> {
       last_seq: this.lastSeq(),
       last_rev_seq: this.lastRevSeq(),
       directed_delivery: "v1",
+      delivery_recovery: "v1",
       owner_decision_binding: "v1",
       ...(this.charterRev() > 0 ? { charter_rev: this.charterRev() } : {}),
       presence: this.presenceList(),
@@ -2443,6 +2554,8 @@ export class ChannelDO extends Server<Env> {
       // Capability is sticky for the lifetime of this socket. A later cursor refresh from a caller
       // that omits optional fields must not silently downgrade an already-proven executor.
       const nextDirectedDeliveryV1 = st.directedDeliveryV1 === true || frame.directed_delivery === "v1";
+      const nextDeliveryRecoveryV1 =
+        st.deliveryRecoveryV1 === true || frame.delivery_recovery === "v1";
       const clientVersion = parseClientVersion(frame.client_version);
       const since = typeof frame.since === "number" && frame.since > 0 ? Math.floor(frame.since) : 0;
       if (clientVersion !== null) {
@@ -2463,6 +2576,7 @@ export class ChannelDO extends Server<Env> {
       st = connection.setState({
         ...st,
         directedDeliveryV1: nextDirectedDeliveryV1,
+        deliveryRecoveryV1: nextDeliveryRecoveryV1,
         ...(clientVersion === null ? {} : { clientVersion }),
         helloSince: Math.max(st.helloSince ?? 0, since),
         helloPending: false,
@@ -2565,6 +2679,33 @@ export class ChannelDO extends Server<Env> {
       }
       this.sendFrame(connection, { type: "delivery_adapter", adapter: "watch", registered: true });
       await this.dispatchNextDirectedDelivery(st.name);
+      return;
+    }
+    if (frame.type === "delivery_recover") {
+      const recovery = parseDeliveryRecoverFrame(frame);
+      const outcome = recovery === null
+        ? undefined
+        : this.recoverDirectedDelivery(st, connection.id, recovery, Date.now());
+      if (recovery === null || outcome === undefined) {
+        badRequest();
+      } else {
+        const row = outcome.row;
+        this.sendFrame(connection, {
+          type: "delivery_recovery",
+          delivery_id: String(row.id),
+          request_id: recovery.request_id,
+          result: outcome.result,
+          state: String(row.state) as DirectedDelivery["state"],
+          attempt: Number(row.attempt),
+          lease_epoch: Number(row.lease_epoch),
+          ...(outcome.result === "recovered"
+            ? {
+                lease_token: String(row.lease_token),
+                lease_until: Number(row.lease_until),
+              }
+            : {}),
+        });
+      }
       return;
     }
     if (frame.type === "delivery_update") {
@@ -4111,7 +4252,6 @@ export class ChannelDO extends Server<Env> {
     row: Record<string, unknown>,
     msg: MsgFrame,
   ) {
-    const delivery = this.rowToDirectedDelivery(row);
     if (await this.isParticipantRemoved(hook.name, hook.targetOwner)) {
       this.removeParticipantDeliveryAdapters(hook.name, Date.now());
       return;
@@ -4125,6 +4265,7 @@ export class ChannelDO extends Server<Env> {
       }
       return;
     }
+    const delivery = this.rowToDirectedDelivery(row, false);
     const payload = JSON.stringify({
       ...msg,
       channel: this.name,
@@ -9301,7 +9442,10 @@ export class ChannelDO extends Server<Env> {
 
   // ---- 持久定向投递（issue #551）----
 
-  private rowToDirectedDelivery(row: Record<string, unknown>): DirectedDelivery {
+  private rowToDirectedDelivery(
+    row: Record<string, unknown>,
+    includeRecoveryOwnership = true,
+  ): DirectedDelivery {
     const storedCause = String(row.cause) as DirectedDelivery["cause"];
     const attempt = Number(row.attempt);
     return {
@@ -9311,6 +9455,12 @@ export class ChannelDO extends Server<Env> {
       cause: attempt > 1 && storedCause !== "owner_answer" ? "retry" : storedCause,
       state: String(row.state) as DirectedDelivery["state"],
       attempt,
+      ...(includeRecoveryOwnership
+        ? {
+            lease_epoch: Number(row.lease_epoch ?? 0),
+            lease_token: String(row.lease_token ?? ""),
+          }
+        : {}),
       lease_until: row.lease_until === null || row.lease_until === undefined ? null : Number(row.lease_until),
       work_id: row.work_id === null || row.work_id === undefined ? null : String(row.work_id),
       continuation_ref:
@@ -9846,6 +9996,18 @@ export class ChannelDO extends Server<Env> {
         .toArray()[0];
       if (active !== undefined) return;
       const now = Date.now();
+      if (typeof queued.lease_token === "string" && queued.lease_token.length > 0) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR IGNORE INTO directed_delivery_lease_history (
+             delivery_id, attempt, lease_epoch, lease_token, superseded_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+          String(queued.id),
+          Number(queued.attempt),
+          Number(queued.lease_epoch),
+          String(queued.lease_token),
+          now,
+        );
+      }
       if (
         matchingServe.length === 0 &&
         matchingWatch.length === 0 &&
@@ -9860,6 +10022,10 @@ export class ChannelDO extends Server<Env> {
         const legacyClaim = this.ctx.storage.sql.exec(
           `UPDATE directed_deliveries
               SET state = 'running', attempt = attempt + 1,
+                  previous_lease_epoch = CASE WHEN lease_token IS NULL THEN previous_lease_epoch ELSE lease_epoch END,
+                  previous_lease_attempt = CASE WHEN lease_token IS NULL THEN previous_lease_attempt ELSE attempt END,
+                  previous_lease_token = COALESCE(lease_token, previous_lease_token),
+                  lease_epoch = lease_epoch + 1, lease_token = NULL,
                   lease_connection_id = ?, last_lease_connection_id = ?,
                   lease_adapter = 'legacy_serve', lease_until = ?, last_error = NULL,
                   terminal_reason = NULL, updated_at = ?
@@ -9884,13 +10050,19 @@ export class ChannelDO extends Server<Env> {
       const webhookHolder = adapter === "webhook" ? matchingWebhooks[0] : undefined;
       const holderId = connectionHolder?.id ?? this.webhookHolderId(webhookHolder!.registrationId);
       const leaseUntil = now + (adapter === "webhook" ? DIRECTED_WEBHOOK_LEASE_MS : DIRECTED_DELIVERY_LEASE_MS);
+      const leaseToken = crypto.randomUUID();
       const claim = this.ctx.storage.sql.exec(
         `UPDATE directed_deliveries
             SET state = 'claimed', attempt = attempt + 1,
+                previous_lease_epoch = CASE WHEN lease_token IS NULL THEN previous_lease_epoch ELSE lease_epoch END,
+                previous_lease_attempt = CASE WHEN lease_token IS NULL THEN previous_lease_attempt ELSE attempt END,
+                previous_lease_token = COALESCE(lease_token, previous_lease_token),
+                lease_epoch = lease_epoch + 1, lease_token = ?,
                 lease_connection_id = ?, last_lease_connection_id = ?,
                 lease_adapter = ?, lease_until = ?, last_error = NULL,
                 terminal_reason = NULL, updated_at = ?
           WHERE id = ? AND target_owner = ? AND state = 'queued'`,
+        leaseToken,
         holderId,
         holderId,
         adapter,
@@ -9943,6 +10115,17 @@ export class ChannelDO extends Server<Env> {
     const targets = new Set<string>();
     for (const row of rows) {
       const targetName = String(row.target_name);
+      // A v1 holder received an unforgeable reconnect token before it could
+      // acknowledge `running`. Keep the claim reserved until its fixed lease
+      // deadline so a restarted bridge can CAS-rebind it. Requeueing on socket
+      // close would rotate ownership underneath the durable client journal.
+      if (
+        String(row.state) === "claimed" &&
+        typeof row.lease_token === "string" &&
+        row.lease_token.length > 0
+      ) {
+        continue;
+      }
       targets.add(targetName);
       if (
         String(row.state) === "running" &&
@@ -10141,6 +10324,369 @@ export class ChannelDO extends Server<Env> {
     return this.identityMatchesDeliveryTarget(identity, row) && String(row.state) === "running";
   }
 
+  private fenceRecoveredDeliveryConnection(
+    identity: ConnState,
+    connectionId: string,
+    adapter: string,
+    previousConnectionId: string,
+  ): boolean {
+    if (previousConnectionId !== "" && previousConnectionId !== connectionId) {
+      for (const candidate of this.getConnections<ConnState>()) {
+        if (candidate.id === previousConnectionId) {
+          candidate.close(1012, "delivery ownership recovered by replacement");
+          break;
+        }
+      }
+    }
+    if (adapter === "watch") {
+      for (const candidate of this.getConnections<ConnState>()) {
+        if (candidate.id !== connectionId) continue;
+        const candidateState = candidate.state;
+        if (
+          candidateState?.kind !== "agent" ||
+          candidateState.name !== identity.name ||
+          candidateState.watchCandidate !== true ||
+          this.identityDeliveryPrincipal(candidateState) !== this.identityDeliveryPrincipal(identity)
+        ) {
+          return false;
+        }
+        candidate.setState({
+          ...candidateState,
+          // Zero stays ahead of normal watch registration sequence numbers,
+          // preserving the recovered owner for subsequent queued work.
+          watchClaimSeq: 0,
+        });
+        return true;
+      }
+      return false;
+    }
+    if (adapter !== "serve") return false;
+    let foundRecoveringConnection = false;
+    for (const candidate of this.getConnections<ConnState>()) {
+      const candidateState = candidate.state;
+      if (
+        candidateState?.kind !== "agent" ||
+        candidateState.name !== identity.name ||
+        candidateState.serveCandidate !== true ||
+        this.identityDeliveryPrincipal(candidateState) !== this.identityDeliveryPrincipal(identity)
+      ) {
+        continue;
+      }
+      const held = candidate.id === connectionId;
+      if (held) foundRecoveringConnection = true;
+      const nextState = {
+        ...candidateState,
+        // A recovery token is a stronger fence than soft arrival order.
+        // Zero stays ahead of all normal claim sequence numbers.
+        ...(held ? { serveClaimSeq: 0 } : {}),
+        serveLeaseHeld: held,
+      };
+      candidate.setState(nextState);
+      this.sendFrame(candidate, {
+        type: "serve_lease",
+        name: identity.name,
+        held,
+      });
+    }
+    return foundRecoveringConnection;
+  }
+
+  private recoverDirectedDelivery(
+    identity: ConnState,
+    connectionId: string,
+    recovery: DeliveryRecoverFrame,
+    now: number,
+  ): {
+    result: "recovered" | "superseded_safe" | "terminal" | "terminal_unknown";
+    row: Record<string, unknown>;
+  } | undefined {
+    let row = this.directedDeliveryRow(recovery.delivery_id);
+    if (
+      row === undefined ||
+      identity.kind !== "agent" ||
+      identity.deliveryRecoveryV1 !== true ||
+      !this.identityMatchesDeliveryTarget(identity, row)
+    ) {
+      return undefined;
+    }
+    const state = String(row.state);
+    const adapter = String(row.lease_adapter ?? row.last_lease_adapter ?? "");
+    const leaseUntil = Number(row.lease_until ?? 0);
+    const currentToken = String(row.lease_token ?? "");
+    const previousConnectionId = String(
+      row.lease_connection_id ?? row.last_lease_connection_id ?? "",
+    );
+    const matchesCurrent =
+      Number(row.attempt) === recovery.attempt &&
+      Number(row.lease_epoch) === recovery.lease_epoch &&
+      (currentToken === recovery.lease_token || currentToken === recovery.next_lease_token);
+    const matchesHistory = this.ctx.storage.sql
+      .exec(
+        `SELECT 1 AS found FROM directed_delivery_lease_history
+          WHERE delivery_id = ? AND attempt = ? AND lease_epoch = ?
+            AND lease_token IN (?, ?)
+          LIMIT 1`,
+        recovery.delivery_id,
+        recovery.attempt,
+        recovery.lease_epoch,
+        recovery.lease_token,
+        recovery.next_lease_token,
+      )
+      .toArray()[0] !== undefined;
+    if (!matchesCurrent && !matchesHistory) {
+      return undefined;
+    }
+    // A historical token only proves that this process once owned the same
+    // logical delivery. It must not make an already-settled row look merely
+    // superseded: clients deliberately retain post-harness debt on
+    // superseded_safe, which would otherwise keep a replied/waiting_owner or
+    // policy/retract failure alive forever. Unknown-outcome failures remain
+    // below because the current generation may still revive them with an
+    // exact replay-safe claim.
+    if (
+      state === "replied" ||
+      state === "waiting_owner" ||
+      (state === "failed" && String(row.terminal_reason ?? "") !== "unknown_outcome")
+    ) {
+      return { result: "terminal", row };
+    }
+    if (matchesCurrent && currentToken !== "") {
+      // Every successful current-token rotation becomes durable history before
+      // the row changes. This makes A→B→C reconnects converge: a delayed A
+      // process receives superseded_safe instead of an unauthoritative
+      // bad_request after C owns the same attempt/epoch.
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO directed_delivery_lease_history (
+           delivery_id, attempt, lease_epoch, lease_token, superseded_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+        recovery.delivery_id,
+        recovery.attempt,
+        recovery.lease_epoch,
+        currentToken,
+        now,
+      );
+    }
+    const replaySafeUnknown =
+      recovery.replay_safe === true &&
+      matchesCurrent &&
+      (
+        (state === "running" && leaseUntil <= now) ||
+        (state === "failed" && String(row.terminal_reason ?? "") === "unknown_outcome")
+      );
+    if (replaySafeUnknown) {
+      if (
+        (adapter === "watch" && identity.watchCandidate !== true) ||
+        (adapter === "serve" && identity.serveCandidate !== true) ||
+        (adapter !== "watch" && adapter !== "serve")
+      ) {
+        return undefined;
+      }
+      if (state === "failed") {
+        const successor = this.ctx.storage.sql
+          .exec(
+            `SELECT id FROM directed_deliveries
+              WHERE target_name = ? AND target_owner = ? AND id <> ?
+                AND state IN ('claimed', 'running')
+              ORDER BY message_seq
+              LIMIT 1`,
+            identity.name,
+            this.identityDeliveryPrincipal(identity),
+            recovery.delivery_id,
+          )
+          .toArray()[0];
+        if (successor !== undefined) {
+          // The alarm may already have released a later row. Never revive the
+          // older pre-harness debt as a second active task; place it back in
+          // message order behind the current obligation. Its old journal may
+          // now clear as superseded_safe because Worker delivery is durable.
+          this.ctx.storage.sql.exec(
+            `UPDATE directed_deliveries
+                SET state = 'queued', lease_connection_id = NULL,
+                    lease_adapter = NULL, lease_until = NULL,
+                    last_error = NULL, terminal_reason = NULL, updated_at = ?
+              WHERE id = ? AND state = 'failed'
+                AND terminal_reason = 'unknown_outcome'
+                AND attempt = ? AND lease_epoch = ?
+                AND lease_token IN (?, ?)`,
+            now,
+            recovery.delivery_id,
+            recovery.attempt,
+            recovery.lease_epoch,
+            recovery.lease_token,
+            recovery.next_lease_token,
+          );
+          const deferred = this.directedDeliveryRow(recovery.delivery_id);
+          if (deferred === undefined || String(deferred.state) !== "queued") return undefined;
+          this.broadcastDirectedDelivery(deferred);
+          return { result: "superseded_safe", row: deferred };
+        }
+      }
+      const nextLeaseUntil = now + DIRECTED_DELIVERY_LEASE_MS;
+      this.ctx.storage.sql.exec(
+        `UPDATE directed_deliveries
+            SET state = 'claimed',
+                last_lease_connection_id = COALESCE(lease_connection_id, last_lease_connection_id),
+                last_lease_adapter = COALESCE(lease_adapter, last_lease_adapter),
+                lease_connection_id = ?, lease_adapter = ?, lease_token = ?,
+                lease_until = ?, last_error = NULL, terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND target_name = ? AND target_owner = ?
+            AND attempt = ? AND lease_epoch = ?
+            AND lease_token IN (?, ?)
+            AND (
+              (state = 'running' AND lease_until <= ?)
+              OR (state = 'failed' AND terminal_reason = 'unknown_outcome')
+            )`,
+        connectionId,
+        adapter,
+        recovery.next_lease_token,
+        nextLeaseUntil,
+        now,
+        recovery.delivery_id,
+        identity.name,
+        this.identityDeliveryPrincipal(identity),
+        recovery.attempt,
+        recovery.lease_epoch,
+        recovery.lease_token,
+        recovery.next_lease_token,
+        now,
+      );
+      const revived = this.directedDeliveryRow(recovery.delivery_id);
+      if (
+        revived === undefined ||
+        String(revived.state) !== "claimed" ||
+        String(revived.lease_connection_id ?? "") !== connectionId ||
+        String(revived.lease_token ?? "") !== recovery.next_lease_token
+      ) {
+        return undefined;
+      }
+      if (!this.fenceRecoveredDeliveryConnection(
+        identity,
+        connectionId,
+        adapter,
+        previousConnectionId,
+      )) {
+        return undefined;
+      }
+      this.broadcastDirectedDelivery(revived);
+      this.broadcastPresenceFor(identity.name);
+      this.ctx.waitUntil(this.ensureAlarmAt(nextLeaseUntil));
+      return { result: "recovered", row: revived };
+    }
+    if ((!matchesCurrent && matchesHistory) || state === "queued" || (state === "claimed" && leaseUntil <= now)) {
+      return { result: "superseded_safe", row };
+    }
+    if (state === "running" && leaseUntil <= now) {
+      if (
+        (adapter === "watch" && identity.watchCandidate !== true) ||
+        (adapter === "serve" && identity.serveCandidate !== true) ||
+        (adapter !== "watch" && adapter !== "serve")
+      ) {
+        return undefined;
+      }
+      // Running proves that the harness was authorized to start. Once that
+      // lease expires, replay is no longer known-safe even if the alarm that
+      // normally performs this transition has not fired yet. Make recovery
+      // itself the authoritative expiry gate so callers never discard a live
+      // reply path based on a misleading superseded_safe result.
+      const terminal = this.transitionDirectedDeliveryTerminal(
+        recovery.delivery_id,
+        "failed",
+        now,
+        {
+          error: "runner ownership lost after task start; outcome unknown, not auto-retried",
+          terminalReason: "unknown_outcome",
+          expectedStates: ["running"],
+          dispatchNext: false,
+        },
+      );
+      row = terminal ?? this.directedDeliveryRow(recovery.delivery_id);
+      if (row === undefined || String(row.state) !== "failed") return undefined;
+      if (
+        (adapter === "watch" || adapter === "serve") &&
+        !this.fenceRecoveredDeliveryConnection(
+          identity,
+          connectionId,
+          adapter,
+          previousConnectionId,
+        )
+      ) {
+        return undefined;
+      }
+      this.dispatchNextDirectedDelivery(identity.name, previousConnectionId || undefined);
+      this.broadcastPresenceFor(identity.name);
+      return { result: "terminal_unknown", row };
+    }
+    if (state === "failed") {
+      return {
+        result: String(row.terminal_reason ?? "") === "unknown_outcome"
+          ? "terminal_unknown"
+          : "terminal",
+        row,
+      };
+    }
+    if (state === "replied" || state === "waiting_owner") {
+      return { result: "terminal", row };
+    }
+    if (state !== "claimed" && state !== "running") return undefined;
+    if (
+      (adapter === "watch" && identity.watchCandidate !== true) ||
+      (adapter === "serve" && identity.serveCandidate !== true) ||
+      (adapter !== "watch" && adapter !== "serve")
+    ) {
+      return undefined;
+    }
+
+    const nextLeaseUntil = now + DIRECTED_DELIVERY_LEASE_MS;
+    this.ctx.storage.sql.exec(
+      `UPDATE directed_deliveries
+          SET last_lease_connection_id = lease_connection_id,
+              lease_connection_id = ?, lease_token = ?, lease_until = ?, updated_at = ?
+        WHERE id = ? AND target_name = ? AND target_owner = ?
+          AND state IN ('claimed', 'running')
+          AND attempt = ? AND lease_epoch = ? AND lease_until > ?
+          AND lease_token IN (?, ?)`,
+      connectionId,
+      recovery.next_lease_token,
+      nextLeaseUntil,
+      now,
+      recovery.delivery_id,
+      identity.name,
+      this.identityDeliveryPrincipal(identity),
+      recovery.attempt,
+      recovery.lease_epoch,
+      now,
+      recovery.lease_token,
+      recovery.next_lease_token,
+    );
+    const recovered = this.directedDeliveryRow(recovery.delivery_id);
+    if (
+      recovered === undefined ||
+      String(recovered.lease_connection_id ?? "") !== connectionId ||
+      String(recovered.lease_token ?? "") !== recovery.next_lease_token ||
+      Number(recovered.lease_epoch) !== recovery.lease_epoch ||
+      Number(recovered.attempt) !== recovery.attempt ||
+      (String(recovered.state) !== "claimed" && String(recovered.state) !== "running")
+    ) {
+      return undefined;
+    }
+
+    // Recovery is stronger than either adapter's soft arrival ordering: the
+    // unforgeable token proves this exact in-flight assignment.
+    if (!this.fenceRecoveredDeliveryConnection(
+      identity,
+      connectionId,
+      adapter,
+      previousConnectionId,
+    )) {
+      return undefined;
+    }
+
+    this.broadcastDirectedDelivery(recovered);
+    this.broadcastPresenceFor(identity.name);
+    this.ctx.waitUntil(this.ensureAlarmAt(nextLeaseUntil));
+    return { result: "recovered", row: recovered };
+  }
+
   private applyDirectedDeliveryUpdate(
     identity: ConnState,
     connectionId: string,
@@ -10151,9 +10697,19 @@ export class ChannelDO extends Server<Env> {
     if (row === undefined || !this.identityMatchesDeliveryTarget(identity, row)) return false;
     if (update.work_id !== undefined && update.work_id !== String(row.work_id ?? "")) return false;
     if (update.continuation_ref !== undefined && update.continuation_ref !== String(row.continuation_ref ?? "")) return false;
+    if (update.attempt !== undefined && update.attempt !== Number(row.attempt)) return false;
+    if (update.lease_epoch !== undefined && update.lease_epoch !== Number(row.lease_epoch)) return false;
+    if (update.lease_token !== undefined && update.lease_token !== String(row.lease_token ?? "")) return false;
     const oldState = String(row.state);
     const ownsCurrentLease = String(row.lease_connection_id ?? "") === connectionId;
     const ownsFormerLease = String(row.last_lease_connection_id ?? "") === connectionId;
+    const ownsLeaseToken =
+      update.lease_token !== undefined &&
+      update.lease_epoch !== undefined &&
+      update.attempt !== undefined &&
+      update.lease_token === String(row.lease_token ?? "") &&
+      update.lease_epoch === Number(row.lease_epoch) &&
+      update.attempt === Number(row.attempt);
     // handleSend can persist the question and detach the lease before the runner's success receipt
     // arrives. ACK a same-principal no-op and return the authoritative waiting_owner row; never let
     // the generic replied receipt erase the human handoff.
@@ -10277,6 +10833,19 @@ export class ChannelDO extends Server<Env> {
   ): Record<string, unknown> | undefined {
     const before = this.directedDeliveryRow(deliveryId);
     if (before === undefined) return undefined;
+    // An owner answer and every waiting_owner ancestor are one logical state transition. Keep the
+    // child terminal update and lineage settlement in the same SQLite commit even when this gate is
+    // reached directly from a websocket receipt, lease expiry, or webhook failure. Callers that
+    // already own an atomic delivery transaction reuse it; otherwise recurse once under capture so
+    // broadcasts and dispatch happen only after the commit succeeds.
+    if (String(before.cause) === "owner_answer" && this.atomicDeliveryEffects === null) {
+      let terminal: Record<string, unknown> | undefined;
+      const effects = this.captureAtomicDeliveryEffects(() => {
+        terminal = this.transitionDirectedDeliveryTerminal(deliveryId, terminalState, now, options);
+      });
+      this.flushAtomicDeliveryEffects(effects);
+      return terminal;
+    }
     const beforeState = String(before.state);
     if (beforeState === "failed" && terminalState === "replied" && !this.isFailedDeliveryRevivable(before)) {
       return undefined;
@@ -10324,6 +10893,7 @@ export class ChannelDO extends Server<Env> {
       `UPDATE directed_deliveries
           SET state = ?,
               last_lease_connection_id = COALESCE(lease_connection_id, last_lease_connection_id),
+              last_lease_adapter = COALESCE(lease_adapter, last_lease_adapter),
               lease_connection_id = NULL, lease_adapter = NULL, lease_until = NULL,
               reply_seq = COALESCE(?, reply_seq), last_error = ?, terminal_reason = ?, updated_at = ?
         WHERE ${clauses.join(" AND ")}`,

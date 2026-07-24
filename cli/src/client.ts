@@ -257,6 +257,8 @@ function isDirectedDelivery(value: unknown): boolean {
     DELIVERY_CAUSES.has(String(value.cause)) &&
     DELIVERY_STATES.has(String(value.state)) &&
     isNonNegativeInteger(value.attempt) &&
+    (value.lease_epoch === undefined || isPositiveInteger(value.lease_epoch)) &&
+    (value.lease_token === undefined || typeof value.lease_token === "string") &&
     (value.lease_until === null || isFiniteNumber(value.lease_until)) &&
     (value.work_id === null || typeof value.work_id === "string") &&
     (value.continuation_ref === null || typeof value.continuation_ref === "string") &&
@@ -300,7 +302,8 @@ function parseServerFrame(value: unknown): ServerFrame | null {
         Array.isArray(value.presence) &&
         value.presence.every(isPresenceEntry) &&
         (value.read_cursors === undefined || (Array.isArray(value.read_cursors) && value.read_cursors.every(isReadCursor))) &&
-        (value.directed_delivery === undefined || value.directed_delivery === "v1")
+        (value.directed_delivery === undefined || value.directed_delivery === "v1") &&
+        (value.delivery_recovery === undefined || value.delivery_recovery === "v1")
         ? asServerFrame(value)
         : null;
     case "participants":
@@ -351,6 +354,19 @@ function parseServerFrame(value: unknown): ServerFrame | null {
         (value.request_id === undefined || typeof value.request_id === "string")
         ? asServerFrame(value)
         : null;
+    case "delivery_recovery":
+      return typeof value.delivery_id === "string" &&
+        typeof value.request_id === "string" &&
+        ["recovered", "superseded_safe", "terminal", "terminal_unknown"].includes(String(value.result)) &&
+        DELIVERY_STATES.has(String(value.state)) &&
+        isPositiveInteger(value.attempt) &&
+        isPositiveInteger(value.lease_epoch) &&
+        (value.lease_token === undefined || typeof value.lease_token === "string") &&
+        (value.lease_until === undefined || isFiniteNumber(value.lease_until)) &&
+        (value.result !== "recovered" ||
+          (typeof value.lease_token === "string" && isFiniteNumber(value.lease_until)))
+        ? asServerFrame(value)
+        : null;
     default:
       return null;
   }
@@ -360,6 +376,8 @@ export interface ConnectOptions {
   onCursor?: (cursor: number) => void;
   /** Declare that this connection consumes durable directed-delivery v1 frames. */
   directedDelivery?: "v1";
+  /** Negotiate token-fenced ownership recovery for durable delivery. */
+  deliveryRecovery?: "v1";
   /**
    * #675/#688：带内声明「本连接有唤醒层」。设值时 hello 带上 wake_kind，服务端在 presence 落对应 wake_kind，
    * 无需往时间线发 waiting 状态消息。断开由 markOffline 撤销。
@@ -617,6 +635,7 @@ export function connect(
         since_rev: revCursor,
         client_version: pkg.version,
         ...(opts.directedDelivery === "v1" ? { directed_delivery: "v1" as const } : {}),
+        ...(opts.deliveryRecovery === "v1" ? { delivery_recovery: "v1" as const } : {}),
         ...(opts.advertiseWakeKind !== undefined ? { wake_kind: opts.advertiseWakeKind } : {}),
       }));
       // External status callbacks may synchronously send an actionable frame on reconnect. Publish

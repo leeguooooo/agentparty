@@ -65,6 +65,7 @@ describe("cli subprocess", () => {
       "logout",
       "agent",
       "serve",
+      "bridge",
       "mcp",
       "lark",
       "task",

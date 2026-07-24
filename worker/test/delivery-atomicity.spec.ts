@@ -384,6 +384,79 @@ describe("delivery transaction atomicity", () => {
     }
   });
 
+  it.each(["replied", "failed"] as const)(
+    "rolls back owner-answer %s together with its waiting_owner ancestor, then retries once",
+    async (terminalState) => {
+      const context = await setupPendingDecision();
+      try {
+        const resolved = await respond(context.slug, context.owner.token, context.question.seq);
+        expect(resolved.status).toBe(200);
+        const ownerAnswer = await context.serve.nextOfType("delivery");
+        expect(ownerAnswer.delivery.cause).toBe("owner_answer");
+
+        await installTrigger(
+          context.slug,
+          `CREATE TRIGGER fail_owner_answer_ancestor_close
+             BEFORE UPDATE OF state ON directed_deliveries
+             WHEN OLD.state = 'waiting_owner' AND NEW.state IN ('replied', 'failed')
+             BEGIN SELECT RAISE(ABORT, 'injected owner answer ancestor failure'); END`,
+        );
+
+        const transition = async () => {
+          const stub = env.CHANNELS.get(env.CHANNELS.idFromName(context.slug));
+          return runInDurableObject(stub, async (instance: ChannelDO) => {
+            const gate = instance as unknown as {
+              transitionDirectedDeliveryTerminal(
+                id: string,
+                state: "replied" | "failed",
+                now: number,
+                options: {
+                  replySeq?: number;
+                  error?: string;
+                  expectedStates: string[];
+                },
+              ): Record<string, unknown> | undefined;
+            };
+            return gate.transitionDirectedDeliveryTerminal(
+              ownerAnswer.delivery.id,
+              terminalState,
+              Date.now(),
+              {
+                ...(terminalState === "replied"
+                  ? { replySeq: ownerAnswer.delivery.message_seq }
+                  : { error: "injected terminal failure" }),
+                expectedStates: ["claimed"],
+              },
+            );
+          });
+        };
+
+        await expect(transition()).rejects.toThrow("injected owner answer ancestor failure");
+        let deliveries = await deliveryRows(context.slug);
+        expect(deliveries.find((row) => row.id === ownerAnswer.delivery.id)?.state).toBe("claimed");
+        expect(deliveries.find((row) => row.id === context.source.delivery.id)?.state).toBe(
+          "waiting_owner",
+        );
+
+        await dropTrigger(context.slug, "fail_owner_answer_ancestor_close");
+        await expect(transition()).resolves.toMatchObject({
+          id: ownerAnswer.delivery.id,
+          state: terminalState,
+        });
+        deliveries = await deliveryRows(context.slug);
+        expect(deliveries.find((row) => row.id === ownerAnswer.delivery.id)?.state).toBe(
+          terminalState,
+        );
+        expect(deliveries.find((row) => row.id === context.source.delivery.id)?.state).toBe(
+          terminalState,
+        );
+      } finally {
+        await dropTrigger(context.slug, "fail_owner_answer_ancestor_close");
+        context.serve.close();
+      }
+    },
+  );
+
   it("lets only one concurrent decision CAS append the idempotent response", async () => {
     const context = await setupPendingDecision();
     try {

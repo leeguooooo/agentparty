@@ -682,7 +682,7 @@ describe("持久定向投递（issue #551）", () => {
     serve.close();
   });
 
-  it("holder 断连后同一 delivery 回到 queued 并由 standby 接管", async () => {
+  it("holder 断连后保留可恢复 claim，到固定租约过期才由 standby 接管", async () => {
     const sender = await seedToken("agent", uniq("sender"));
     const target = await seedToken("agent", uniq("target"));
     const slug = await createChannel(sender.token);
@@ -697,6 +697,25 @@ describe("持久定向投递（issue #551）", () => {
     const firstAttempt = await holder.nextOfType("delivery");
     holder.close();
     expect((await standby.nextOfType("serve_lease")).held).toBe(true);
+
+    // v1 delivery carries an unforgeable recovery token. A socket close alone cannot prove that
+    // the old process failed before persisting/starting it, so the Worker reserves this exact claim
+    // for reconnect instead of immediately creating a second active holder. Once the fixed lease
+    // expires, the ordinary claimed-state retry is safe and the elected standby receives attempt 2.
+    expect((await deliveryRows(slug))[0]).toMatchObject({
+      id: firstAttempt.delivery.id,
+      state: "claimed",
+      attempt: 1,
+    });
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE directed_deliveries SET lease_until = ? WHERE id = ?",
+        Date.now() - 1,
+        firstAttempt.delivery.id,
+      );
+      await instance.onAlarm();
+    });
     const retry = await standby.nextOfType("delivery");
     expect(retry.delivery).toMatchObject({
       id: firstAttempt.delivery.id,

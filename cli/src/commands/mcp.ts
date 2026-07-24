@@ -50,11 +50,17 @@ const HELP = `usage: party mcp
 Run an AgentParty stdio MCP server.
 
 Boundary:
-  MCP is a structured control plane. In Codex 0.144.4 and Claude Code 2.1.210
-  probes, successful server notification sends did not create a new model turn
-  after the harness became idle. A client may render a diagnostic event, but
-  that is not a model-delivery guarantee. Use persistent directed delivery with
-  party serve for unattended wake; never rely on MCP notifications alone.
+  MCP is a structured control plane for ordinary tools/resources. In Codex
+  0.144.4 and Claude Code 2.1.210 probes, successful ordinary notification
+  sends did not create a new model turn after the harness became idle. A client may render
+  a diagnostic event, but that is not a model-delivery guarantee. Use persistent
+  directed delivery with party serve for unattended wake; never rely on ordinary
+  MCP notifications alone.
+
+  Claude Code's dedicated experimental claude/channel capability is a different
+  harness input contract: \`party bridge claude\` uses it to queue AgentParty
+  messages into the current interactive Claude session. It still keeps the
+  AgentParty delivery running until the model persists a linked reply.
 
 Example (name the server per agent — a shared name like "party" lets agents in the
 same directory overwrite each other's env-pinned identity):

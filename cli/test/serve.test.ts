@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { EXIT_ARCHIVED, type Attachment, type DirectedDelivery, type MsgFrame } from "@agentparty/shared";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -1369,6 +1369,32 @@ describe("managed front protocol", () => {
 });
 
 describe("builtin runner", () => {
+  test("codex uses one resolved absolute binary instead of trusting the runner PATH", async () => {
+    const { post } = postRecorder();
+    const workdir = tempDir();
+    const calls: string[][] = [];
+    const runProcess: RunnerProcess = async (args) => {
+      calls.push(args);
+      const out = args[args.indexOf("-o") + 1]!;
+      writeFileSync(out, "resolved answer\n");
+      return { code: 0, stdout: `session id: ${uuid(0)}\n`, stderr: "" };
+    };
+
+    await createBuiltinRunner({
+      server: "http://agentparty.test",
+      token: "ap_tok",
+      channel: "dev",
+      harness: "codex",
+      codexBinary: process.execPath,
+      workdir,
+      runProcess,
+      post,
+    })(triggerFrame(700), runnerCtx());
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.slice(0, 2)).toEqual([realpathSync(process.execPath), "exec"]);
+  });
+
   test("codex cold-starts, persists the session id, then resumes it on the next wake", async () => {
     const { post } = postRecorder();
     const workdir = tempDir();
@@ -2231,6 +2257,32 @@ describe("builtin runner", () => {
       console.error = oldError;
     }
     expect(errors.join("\n")).toContain("choose exactly one of --on-mention or --runner");
+  });
+
+  test("--codex-bin is rejected unless the selected resident runner is codex", async () => {
+    const home = tempDir();
+    writeFileSync(join(home, "config.json"), JSON.stringify({ server: "http://127.0.0.1:1", token: "ap_tok" }));
+    const oldHome = process.env.AGENTPARTY_HOME;
+    const errors: string[] = [];
+    const oldError = console.error;
+    process.env.AGENTPARTY_HOME = home;
+    console.error = (line?: unknown) => errors.push(String(line));
+    try {
+      expect(
+        await runServeCommand([
+          "dev",
+          "--runner",
+          "claude",
+          "--codex-bin",
+          process.execPath,
+        ]),
+      ).toBe(1);
+    } finally {
+      if (oldHome === undefined) delete process.env.AGENTPARTY_HOME;
+      else process.env.AGENTPARTY_HOME = oldHome;
+      console.error = oldError;
+    }
+    expect(errors.join("\n")).toContain("--codex-bin requires --runner codex");
   });
 });
 

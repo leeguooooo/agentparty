@@ -799,6 +799,8 @@ export interface HelloFrame {
    * be selected as the executor for a durable delivery lease.
    */
   directed_delivery?: "v1";
+  /** This connection implements token-fenced delivery recovery v1. */
+  delivery_recovery?: "v1";
   /** CLI package version。可选以兼容旧客户端；服务端会忽略非法值。 */
   client_version?: string;
   /**
@@ -962,11 +964,39 @@ export interface DeliveryUpdateFrame {
   delivery_id: string;
   /** Ephemeral per-update correlation token. It is echoed only on the direct ACK, never persisted. */
   request_id?: string;
+  /** Exact assignment attempt copied from the holder-only delivery frame. */
+  attempt?: number;
+  /** Exact assignment fence copied from the holder-only delivery frame. */
+  lease_epoch?: number;
+  /** Exact reconnect ownership proof copied from the holder-only delivery frame. */
+  lease_token?: string;
   state: "running" | "waiting_owner" | "replied" | "failed";
   work_id?: string;
   continuation_ref?: string;
   reply_seq?: number;
   error?: string;
+}
+
+/**
+ * Rebind unfinished v1 work to a replacement WebSocket. The client generates
+ * and persists `next_lease_token` before sending this CAS. Accepting either the
+ * old or already-rotated token makes ACK-loss retries idempotent while the
+ * rotation fences the previous socket.
+ */
+export interface DeliveryRecoverFrame {
+  type: "delivery_recover";
+  delivery_id: string;
+  request_id: string;
+  attempt: number;
+  lease_epoch: number;
+  lease_token: string;
+  next_lease_token: string;
+  /**
+   * The durable local WAL proves task content was never released to the
+   * harness. Only this pre-harness recovery may explicitly revive an exact
+   * unknown_outcome row; ordinary renew/terminal updates cannot.
+   */
+  replay_safe?: true;
 }
 
 export type ClientFrame =
@@ -977,7 +1007,8 @@ export type ClientFrame =
   | HeartbeatFrame
   | ServeLeaseClaimFrame
   | DeliveryAdapterRegisterFrame
-  | DeliveryUpdateFrame;
+  | DeliveryUpdateFrame
+  | DeliveryRecoverFrame;
 
 // ---- 服务端 → 客户端帧 ----
 
@@ -1014,6 +1045,8 @@ export interface WelcomeFrame {
   read_cursors?: ReadCursor[];
   /** 服务端会把定向 @ 作为独立 delivery 帧重放；新 serve 应以它为唤醒真值，普通 read cursor 仅管阅读。 */
   directed_delivery?: "v1";
+  /** Worker supports token-fenced delivery recovery and authoritative recovery results. */
+  delivery_recovery?: "v1";
   /**
    * 服务端会强制 owner 决策的应答人绑定：owner_decision 携带 expected_decision_responder_owner 时，
    * 只有该 owner 账号本人能应答（在 CAS 里校验）。旧服务端不发这个能力位，会静默丢弃绑定字段——
@@ -1029,6 +1062,10 @@ export interface DirectedDelivery {
   cause: DirectedDeliveryCause;
   state: DirectedDeliveryState;
   attempt: number;
+  /** Monotonic assignment fence; stable across an authenticated reconnect. */
+  lease_epoch?: number;
+  /** Opaque reconnect proof. Never included in public delivery-state frames. */
+  lease_token?: string;
   lease_until: number | null;
   work_id: string | null;
   continuation_ref: string | null;
@@ -1079,6 +1116,21 @@ export interface DeliveryStateFrame {
   delivery: PublicDirectedDelivery;
   /** Present only on the direct ACK for a delivery_update carrying the same token. */
   request_id?: string;
+}
+
+/** Correlated authoritative result for a delivery ownership recovery CAS. */
+export interface DeliveryRecoveryResultFrame {
+  type: "delivery_recovery";
+  delivery_id: string;
+  request_id: string;
+  result: "recovered" | "superseded_safe" | "terminal" | "terminal_unknown";
+  state: DirectedDeliveryState;
+  attempt: number;
+  lease_epoch: number;
+  /** Present only for result=recovered. */
+  lease_token?: string;
+  /** Present only for result=recovered. */
+  lease_until?: number;
 }
 
 export interface ParticipantsFrame {
@@ -1848,4 +1900,5 @@ export type ServerFrame =
   | ServeLeaseFrame
   | DeliveryAdapterRegisteredFrame
   | DirectedDeliveryFrame
-  | DeliveryStateFrame;
+  | DeliveryStateFrame
+  | DeliveryRecoveryResultFrame;

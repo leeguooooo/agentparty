@@ -106,7 +106,11 @@ export function welcomeFrame(lastSeq: number, self = "me", readCursors?: Array<{
 // A welcome that advertises directed-delivery v1 — the server routes real agent @-mentions as durable
 // `delivery` frames only after this negotiation (see cli/src/commands/serve.ts + daemon.ts).
 export function welcomeDirectedFrame(lastSeq: number, self = "me") {
-  return { ...welcomeFrame(lastSeq, self), directed_delivery: "v1" };
+  return {
+    ...welcomeFrame(lastSeq, self),
+    directed_delivery: "v1",
+    delivery_recovery: "v1",
+  };
 }
 
 // A durable directed-delivery frame: `{ delivery, message }` where message is the @-mention MsgFrame and
@@ -135,6 +139,8 @@ export function deliveryFrame(
       cause: "mention",
       state: over.state ?? "claimed",
       attempt: 1,
+      lease_epoch: 1,
+      lease_token: `lease-${over.id ?? seq}`,
       lease_until: now + 90_000,
       work_id: over.work_id ?? `work-${seq}`,
       continuation_ref: over.continuation_ref ?? `cont-${seq}`,
