@@ -1,25 +1,21 @@
 import type { CollaborationRole } from "@agentparty/shared";
 
-// issue #281：整个频道的组织/汇报结构应该可以「预览」。#168 已经在 DivisionBoard 的每一行
-// 上标出了「汇报给谁 / 谁是主负责人」，但那是逐行的碎片；这里把同一份 presence/lineage 数据
-// 折成一棵可整体查看的汇报树——根是频道主负责人（role=host），子节点是通过
-// lineage.parent_agent 汇报上来的 agent，递归嵌套。纯函数、无 React 依赖，便于回归。
-//
-// 数据只来自现有的 presence/lineage/role/昵称，不新造后端模型。真正的「管理层级」（超出
-// spawn-lineage 的正式汇报线）需要后端支持，现有数据做不到，见 #168 交接说明——那是后续项。
+// issue #281 + #370：整个频道的正式组织/汇报结构应该可以「预览」。
+// channel_roles assignment 是唯一权威来源；presence 自报和 runtime lineage 只描述运行时事实，
+// 不能提升为正式角色、负责人或汇报线。纯函数、无 React 依赖，便于回归。
 
 export interface OrgMemberInput {
   /** roster 里的唯一标识（agent/session name 或 UUID） */
   name: string;
   /** 展示名，已在上层解析过昵称（#165）/SSO display */
   display: string;
-  /** 协作角色；host 视为频道主负责人（频道 lead） */
+  /** 协作角色；只有 source=assigned 时，host 才是频道主负责人（频道 lead） */
   role: CollaborationRole | null;
-  /** 汇报对象 = presence.lineage.parent_agent；无则 null */
+  /** 正式汇报对象 = channel_roles.reports_to；非 assigned source 会被忽略 */
   reportsTo: string | null;
   kind?: "agent" | "human";
   accountLabel?: string | null;
-  source?: "assigned" | "self" | "unassigned";
+  source: "assigned" | "self" | "unassigned";
 }
 
 export interface OrgTreeNode {
@@ -31,9 +27,9 @@ export interface OrgTreeNode {
   source: "assigned" | "self" | "unassigned";
   /** 原始汇报对象（可能指向本频道之外/不存在的名字） */
   reportsTo: string | null;
-  /** reportsTo 指向的名字不在本频道 roster 里（跨频道/未知汇报线，#168 已有同款红色提示） */
+  /** reportsTo 指向的名字不是本频道正式 assignment（跨频道/未确认汇报线） */
   reportsToExternal: boolean;
-  /** 是否频道主负责人（role=host） */
+  /** 是否频道主负责人（source=assigned 且 role=host） */
   isLead: boolean;
   /** 该节点在汇报树里的深度（结构根 = 0，逐级 +1）。#168 跨级判定基于此 */
   depth: number;
@@ -55,8 +51,20 @@ export interface OrgTree {
   memberCount: number;
 }
 
+function isAssignedMember(member: OrgMemberInput): boolean {
+  return member.source === "assigned";
+}
+
+function formalRole(member: OrgMemberInput): CollaborationRole | null {
+  return isAssignedMember(member) ? member.role : null;
+}
+
+function formalReportsTo(member: OrgMemberInput): string | null {
+  return isAssignedMember(member) ? member.reportsTo : null;
+}
+
 function isLeadMember(member: OrgMemberInput): boolean {
-  return member.role === "host";
+  return isAssignedMember(member) && member.role === "host";
 }
 
 export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
@@ -68,17 +76,23 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
   const uniqueMembers = [...byName.values()];
 
   // 解析每个成员的「有效父节点」：
-  // - host（频道 lead）一律锚定到顶层（父 = null），保证主负责人永远是根，即便它自己也挂了 lineage
+  // - host（频道 lead）一律锚定到顶层（父 = null），保证主负责人永远是根，即便 assignment 里误设了 reports_to
   // - 汇报给自己（parent === name）视为「没有上级」，不做自环
-  // - 汇报对象不在本频道 roster 里 → 也当作顶层（父 = null），但保留 reportsTo 以便标注 external
+  // - 汇报对象不是本频道正式 assignment → 也当作顶层（父 = null），但保留 reportsTo 以便标注未确认
+  // - self/unassigned 的 runtime lineage 不构成正式汇报边，统一视为无上级
   const parentOf = new Map<string, string | null>();
   for (const member of uniqueMembers) {
     if (isLeadMember(member)) {
       parentOf.set(member.name, null);
       continue;
     }
-    const parent = member.reportsTo;
-    const valid = parent !== null && parent !== member.name && byName.has(parent);
+    const parent = formalReportsTo(member);
+    const parentMember = parent === null ? undefined : byName.get(parent);
+    const valid =
+      parent !== null &&
+      parent !== member.name &&
+      parentMember !== undefined &&
+      isAssignedMember(parentMember);
     parentOf.set(member.name, valid ? parent : null);
   }
 
@@ -105,8 +119,12 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
   const build = (name: string, depth: number): OrgTreeNode => {
     visited.add(name);
     const member = byName.get(name)!;
+    const reportsTo = formalReportsTo(member);
+    const reportTarget = reportsTo === null ? undefined : byName.get(reportsTo);
     const reportsToExternal =
-      member.reportsTo !== null && member.reportsTo !== name && !byName.has(member.reportsTo);
+      reportsTo !== null &&
+      reportsTo !== name &&
+      (reportTarget === undefined || !isAssignedMember(reportTarget));
     const children = sortNames(childrenNames.get(name) ?? [])
       .filter((child) => !visited.has(child))
       .map((child) => build(child, depth + 1));
@@ -121,11 +139,11 @@ export function buildOrgTree(members: OrgMemberInput[]): OrgTree {
     return {
       name: member.name,
       display: member.display,
-      role: member.role,
+      role: formalRole(member),
       kind: member.kind ?? "agent",
       accountLabel: member.accountLabel ?? null,
-      source: member.source ?? (member.role === null ? "unassigned" : "assigned"),
-      reportsTo: member.reportsTo,
+      source: member.source,
+      reportsTo,
       reportsToExternal,
       isLead: isLeadMember(member),
       depth,

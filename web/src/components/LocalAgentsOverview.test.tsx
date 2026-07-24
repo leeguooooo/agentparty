@@ -135,14 +135,130 @@ test("statusAll 与 dutyList 都不可用 → 显示不可用文案", async () =
 test("停止活跃实例调 stopInstance；卸载常驻调 dutyUnpersist", async () => {
   const stopped: string[] = [];
   const unloaded: string[] = [];
+  let instances = [inst({ name: "planner", channel: "ops", state: "running", instanceId: "a:ops" })];
   const root = await render(adapter({
-    statusAll: async () => [inst({ name: "planner", channel: "ops", state: "running", instanceId: "a:ops" })],
+    statusAll: async () => instances,
     dutyList: async () => [duty({ instanceId: "d:ops", loaded: true })],
-    stopInstance: async (id) => { stopped.push(id); return inst({ state: "stopped" }); },
+    stopInstance: async (id) => {
+      stopped.push(id);
+      instances = [];
+      return inst({ state: "stopped", instanceId: id });
+    },
     dutyUnpersist: async (id) => { unloaded.push(id); },
   }));
-  await act(async () => { byClass(root, "local-agents-stop")[0]!.props.onClick(); await Promise.resolve(); });
+  await act(async () => {
+    byClass(root, "local-agents-stop")[0]!.props.onClick();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(byClass(root, "local-agents-stop")).toHaveLength(0);
   await act(async () => { byClass(root, "local-agents-unload")[0]!.props.onClick(); await Promise.resolve(); });
   expect(stopped).toEqual(["a:ops"]);
   expect(unloaded).toEqual(["d:ops"]);
+});
+
+test("旧常驻 job 显示依赖诊断，并用原 runner/workdir/repo 一键修复", async () => {
+  const persisted: unknown[] = [];
+  let entries = [duty({
+    instanceId: "cfg:ops",
+    runner: "codex",
+    workdir: "/workspace",
+    repo: "https://example.com/repo.git",
+    runnerExecutable: "/Users/leo/.local/bin/codex",
+    dependencyState: "repair-required",
+  })];
+  const root = await render(adapter({
+    dutyList: async () => entries,
+    dutyPersist: async (input) => {
+      persisted.push(input);
+      entries = [duty({
+        ...entries[0],
+        runner: "codex",
+        dependencyState: "ready",
+      })];
+      return entries[0]!;
+    },
+  }));
+
+  expect(JSON.stringify(renderer!.toJSON())).toContain("still relies on launchd PATH");
+  await act(async () => {
+    byClass(root, "local-agents-repair")[0]!.props.onClick();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(persisted).toEqual([{
+    configId: "cfg",
+    channel: "ops",
+    runner: "codex",
+    workdir: "/workspace",
+    repo: "https://example.com/repo.git",
+  }]);
+  expect(byClass(root, "local-agents-repair")).toHaveLength(0);
+});
+
+test("缺少 runner 时显示安装指引，修复失败不会退化成原始日志", async () => {
+  const root = await render(adapter({
+    dutyList: async () => [duty({
+      instanceId: "cfg:ops",
+      runner: "claude",
+      dependencyState: "missing",
+    })],
+    dutyPersist: async () => {
+      throw new Error("runner_dependency_missing:claude: internal search detail");
+    },
+  }));
+
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Install the CLI, then choose Repair");
+  await act(async () => {
+    byClass(root, "local-agents-repair")[0]!.props.onClick();
+    await Promise.resolve();
+  });
+  const rendered = JSON.stringify(renderer!.toJSON());
+  expect(rendered).toContain("claude CLI is unavailable");
+  expect(rendered).not.toContain("internal search detail");
+});
+
+test("切走期间动作完成会清 busy，且不在隐藏模块里追加刷新", async () => {
+  let finishStop!: (value: DesktopAgentStatus) => void;
+  const stopPromise = new Promise<DesktopAgentStatus>((resolve) => { finishStop = resolve; });
+  let statusLoads = 0;
+  const adapterValue = adapter({
+    statusAll: async () => {
+      statusLoads += 1;
+      return [inst({ name: "planner", channel: "ops", instanceId: "a:ops" })];
+    },
+    stopInstance: async () => stopPromise,
+  });
+
+  const root = await render(adapterValue);
+  await act(async () => {
+    byClass(root, "local-agents-stop")[0]!.props.onClick();
+  });
+  expect(byClass(root, "local-agents-stop")[0]!.props.disabled).toBe(true);
+
+  await act(async () => {
+    renderer!.update(
+      <LocaleProvider>
+        <LocalAgentsOverview active={false} t={t} adapter={adapterValue} scheduler={noScheduler} />
+      </LocaleProvider>,
+    );
+  });
+  await act(async () => {
+    finishStop(inst({ state: "stopped", instanceId: "a:ops" }));
+    await stopPromise;
+  });
+  expect(statusLoads).toBe(1);
+
+  await act(async () => {
+    renderer!.update(
+      <LocaleProvider>
+        <LocalAgentsOverview active t={t} adapter={adapterValue} scheduler={noScheduler} />
+      </LocaleProvider>,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(statusLoads).toBe(2);
+  expect(byClass(renderer!.root, "local-agents-stop")[0]!.props.disabled).toBe(false);
 });

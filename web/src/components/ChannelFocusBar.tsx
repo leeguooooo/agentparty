@@ -9,6 +9,7 @@
 import { useT } from "../i18n/useT";
 import "../i18n/strings/ChannelFocusBar";
 import type { ChannelFocus, FocusItem, FocusItemState } from "../lib/channelFocus";
+import type { PendingDecisionLoadState } from "../lib/pendingDecisions";
 
 // 三态（+stalled）→ 图标/CSS 修饰。owner 扫「等人拍板」，用醒目 ◆；被卡 ■；在做 ●；停滞 ◌（空心=不确定还活着）。
 const STATE_ICON: Record<FocusItemState, string> = {
@@ -25,23 +26,89 @@ function stateLabel(item: FocusItem, t: ReturnType<typeof useT>): string {
   return t(`ChannelFocusBar.state.${item.state}`);
 }
 
+function pendingDecisionStatusKey(
+  state: PendingDecisionLoadState,
+): string | null {
+  const hasData = state.lastSuccessfulData !== null;
+  if (state.error !== null) {
+    if (state.error.kind === "forbidden") return "ChannelFocusBar.decisions.forbidden";
+    if (hasData) return "ChannelFocusBar.decisions.refreshFailed";
+    return "ChannelFocusBar.decisions.loadFailed";
+  }
+  if (!state.loading) return null;
+  return hasData
+    ? "ChannelFocusBar.decisions.refreshing"
+    : "ChannelFocusBar.decisions.loading";
+}
+
+export function PendingDecisionLoadNotice({
+  state,
+  onRetry,
+  onOpenOverview,
+  compact = false,
+}: {
+  state: PendingDecisionLoadState;
+  onRetry?: () => void;
+  onOpenOverview?: () => void;
+  compact?: boolean;
+}) {
+  const t = useT();
+  const statusKey = pendingDecisionStatusKey(state);
+  if (statusKey === null) return null;
+  const text = t(statusKey);
+  return (
+    <span
+      className={compact ? "t-mono focus-decision-load" : "banner banner--yellow"}
+      role={state.error === null ? "status" : "alert"}
+      aria-live="polite"
+      aria-busy={state.loading}
+    >
+      {onOpenOverview === undefined ? (
+        <span>{text}</span>
+      ) : (
+        <button type="button" className="focus-decision-load-open" onClick={onOpenOverview}>
+          {text}
+        </button>
+      )}
+      {state.error !== null && state.error.kind !== "forbidden" && onRetry !== undefined && (
+        <>
+          {" "}
+          <button type="button" className="d-btn focus-decision-retry" onClick={onRetry}>
+            {t("ChannelFocusBar.decisions.retry")}
+          </button>
+        </>
+      )}
+    </span>
+  );
+}
+
 export function ChannelFocusBar({
   focus,
+  decisionState,
   viewerIsModerator = false,
   onOpenTask,
   onJumpSeq,
+  onOpenOverview,
+  onRetryDecisions,
 }: {
   focus: ChannelFocus;
+  decisionState?: PendingDecisionLoadState;
   /** owner/moderator 视角：把「在等你」文案换成「等你拍板」，更贴 owner 最关心的那一类。 */
   viewerIsModerator?: boolean;
   /** 下钻：点 task 派生项 → 打开任务台账（可定位到该 id）。 */
   onOpenTask?: (taskId: number) => void;
   /** 下钻：点 decision 派生项 → 跳到对应消息。 */
   onJumpSeq?: (seq: number) => void;
+  /** 汇总与 +N 进入完整焦点清单；不能把混合的 decision/presence 误送到任务台账。 */
+  onOpenOverview?: () => void;
+  /** 权威 pending-decision 请求失败后保留当前上下文并原地重试。 */
+  onRetryDecisions?: () => void;
 }) {
   const t = useT();
+  const showDecisionLoadState = decisionState !== undefined
+    && (decisionState.loading || decisionState.error !== null);
   // 无 override 焦点 + 无任何在途项 = 什么都不显示（issue：nothing in flight → 不渲染）。
-  if (focus.empty && focus.focus === null) return null;
+  if (focus.empty && focus.focus === null && !showDecisionLoadState) return null;
 
   const drill = (item: FocusItem): (() => void) | undefined => {
     if (item.taskId !== null && onOpenTask !== undefined) return () => onOpenTask(item.taskId!);
@@ -90,12 +157,11 @@ export function ChannelFocusBar({
   };
 
   // 硬两行、永不折（用户反馈）：内联只展开 owner 最关心的「在等你」高亮 chip，且封顶两个；其余全部
-  // 状态压成一个定宽小计数丸 ●3 ■1 ◆1 ◌1，点开进任务台账看全部。这样再忙再窄也不会把可见性开关挤下行。
+  // 状态压成一个定宽小计数丸 ●3 ■1 ◆1 ◌1，点开进完整焦点清单。这样再忙再窄也不会把可见性开关挤下行。
   const WAITING_CAP = 2;
   const waitingShown = focus.waitingOnMe.slice(0, WAITING_CAP);
   const waitingOverflow = focus.waitingOnMe.length - waitingShown.length;
-  const openTasks = onOpenTask; // 计数丸/溢出 +N 一律回到任务台账（Channel 里忽略具体 id，只负责开面板）。
-  const firstTaskId = focus.items.find((item) => item.taskId !== null)?.taskId ?? 0;
+  const openOverview = onOpenOverview;
 
   // 计数丸的分段：非零状态才列，各自带本态语气色圆点，保留「三态视觉可区分」的原契约（#682）。
   const countSegments = ([
@@ -115,6 +181,14 @@ export function ChannelFocusBar({
     <div className="focus-inline" aria-label={t("ChannelFocusBar.aria")}>
       <span className="t-mono focus-heading">{t("ChannelFocusBar.heading")}</span>
       {focus.focus !== null && <span className="focus-line" title={focus.focus}>{focus.focus}</span>}
+      {decisionState !== undefined && (
+        <PendingDecisionLoadNotice
+          state={decisionState}
+          onRetry={onRetryDecisions}
+          onOpenOverview={onOpenOverview}
+          compact
+        />
+      )}
 
       {focus.waitingOnMe.length > 0 && (
         <span className="focus-me" role="group" aria-label={meLabel}>
@@ -123,8 +197,8 @@ export function ChannelFocusBar({
             {waitingShown.map((item) => renderItem(item))}
           </ul>
           {waitingOverflow > 0 && (
-            openTasks !== undefined ? (
-              <button type="button" className="t-mono focus-more" onClick={() => openTasks(firstTaskId)} title={countsTitle}>
+            openOverview !== undefined ? (
+              <button type="button" className="t-mono focus-more" onClick={openOverview} title={countsTitle}>
                 +{waitingOverflow}
               </button>
             ) : (
@@ -135,8 +209,8 @@ export function ChannelFocusBar({
       )}
 
       {countSegments.length > 0 && (
-        openTasks !== undefined ? (
-          <button type="button" className="t-mono focus-counts focus-counts--btn" onClick={() => openTasks(firstTaskId)} title={countsTitle}>
+        openOverview !== undefined ? (
+          <button type="button" className="t-mono focus-counts focus-counts--btn" onClick={openOverview} title={countsTitle}>
             {countSegments.map(([state, n]) => (
               <span key={state} className={`focus-count focus-count--${state}`}>
                 <span className={`focus-dot focus-dot--${state}`} aria-hidden="true">{STATE_ICON[state]}</span>

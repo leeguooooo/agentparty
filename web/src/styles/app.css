@@ -2853,7 +2853,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* 溢出 +N：还有几条「在等你」没展开，点开进任务台账。 */
+/* 溢出 +N：还有几条「在等你」没展开，点开进完整焦点清单。 */
 .focus-more {
   flex: none;
   padding: 0 5px;
@@ -2887,6 +2887,35 @@
 .focus-count--blocked { color: var(--p-blocked); }
 .focus-count--waiting_decision { color: var(--t-purple); }
 .focus-count--stalled { color: var(--t-muted); }
+
+.focus-overview {
+  min-height: 0;
+  overflow-y: auto;
+}
+.focus-overview-manual {
+  display: flex;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--t-faint);
+}
+.focus-overview-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.focus-overview-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+  padding: 10px;
+  border: 1px solid var(--t-faint);
+  background: var(--t-panel);
+}
+.focus-overview-item > p { grid-column: 1; margin: 0; }
+.focus-overview-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.focus-overview-waiting { color: var(--t-accent); }
 
 /* 频道搜索行：server-side retained-history search + sender/time filters */
 .chan-search-panel {
@@ -3836,6 +3865,12 @@
   border-radius: 0;
   box-shadow: 3px 3px 0 var(--d-shadow);
 }
+.joinlink-panel--embedded {
+  position: static;
+  width: 100%;
+  max-width: none;
+  box-shadow: none;
+}
 .joinlink-hint { font-size: 12px; color: var(--t-dim); }
 /* 邀请模式一等选择（#186）：观看(readonly)/参与 */
 .joinlink-mode { display: flex; gap: 6px; }
@@ -4309,6 +4344,15 @@
 }
 .agent-detail-empty {
   color: var(--t-dim);
+}
+.agent-detail-panel {
+  margin-top: 10px;
+  border: 1.5px solid var(--t-border);
+  background: var(--t-panel);
+}
+.agent-detail-assignment-source {
+  color: var(--t-dim);
+  font-size: 11px;
 }
 
 .guard-settings {
@@ -7105,6 +7149,7 @@
 .team-blog-tab-badge--hot { color: var(--t-accent-ink); background: var(--t-accent); border-color: var(--t-accent); font-weight: 700; }
 
 .team-blog-panel { padding-top: 12px; }
+.team-blog-detail-back { margin-bottom: 2px; }
 
 /* #504 参考稿第二增量：分工卡、Agent 状态板和协调页的信息密度。 */
 .team-blog .role-board {
@@ -7239,6 +7284,14 @@
 .team-blog .agent-board-row--offline .agent-board-note { margin: 0; }
 .team-blog .agent-board-row--offline .agent-board-task-list { grid-column: 1 / -1; }
 .team-blog .agent-board-name { display: inline-flex; align-items: center; gap: 7px; font-family: var(--t-mono); }
+.team-blog .agent-board-name--button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.team-blog .agent-board-name--button:hover { color: var(--t-accent); }
 .team-blog .agent-board-lane-empty {
   margin: 0;
   padding: 8px;

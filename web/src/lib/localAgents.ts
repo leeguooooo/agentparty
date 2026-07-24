@@ -63,7 +63,7 @@ export function aggregateLocalAgents(
       kind: "duty",
       channel: channelOfInstanceId(duty.instanceId),
       name: configIdOfInstanceId(duty.instanceId),
-      runner: null,
+      runner: duty.runner ?? null,
       state: duty.loaded ? "loaded" : "unloaded",
       instanceId: duty.instanceId,
       duty,
@@ -77,7 +77,14 @@ export function filterLocalAgents(rows: readonly LocalAgentRow[], query: string)
   const q = query.trim().toLowerCase();
   if (q === "") return [...rows];
   return rows.filter((row) => {
-    const haystack = [row.channel, row.name, row.runner ?? "", row.state, row.kind].join(" ").toLowerCase();
+    const haystack = [
+      row.channel,
+      row.name,
+      row.runner ?? "",
+      row.state,
+      row.kind,
+      row.duty?.dependencyState ?? "",
+    ].join(" ").toLowerCase();
     return haystack.includes(q);
   });
 }

@@ -65,6 +65,7 @@ function renderMessage(
 describe("MessageCard touch and keyboard details (#357)", () => {
   test("identity and stable action metadata render in separate header groups", () => {
     const root = renderMessage();
+    expect(root.findByProps({ id: "msg-10" }).props.tabIndex).toBe(-1);
     const main = root.findByProps({ className: "msg-head-main" });
     const meta = root.findByProps({ className: "msg-head-meta" });
 
@@ -76,6 +77,7 @@ describe("MessageCard touch and keyboard details (#357)", () => {
 
   test("status full detail expands by click and keyboard", () => {
     const root = renderStatus();
+    expect(root.findByProps({ id: "msg-9" }).props.tabIndex).toBe(-1);
     const summary = root.findByProps({ className: "msg-status-summary" });
     expect(summary.props.tabIndex).toBe(0);
     expect(summary.props["aria-expanded"]).toBe(false);

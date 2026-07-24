@@ -5,7 +5,7 @@ import { SELF, env } from "cloudflare:test";
 import { fetchMock } from "./fetch-mock";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canAccessChannel, isChannelModerator, type AclIdentity, type ChannelAcl } from "../src/acl";
-import { ADMIN_HEADERS, api, seedToken, uniq, WsClient } from "./helpers";
+import { ADMIN_HEADERS, api, completeCapabilityHello, seedToken, uniq, WsClient } from "./helpers";
 
 // ── 单元：canAccessChannel v2 全矩阵（账号模型 spec §5.4/§5.5）──────────────────
 
@@ -325,7 +325,7 @@ describe("kick (spec §5)", () => {
     expect(tokenRow?.revoked_at).toBeNull();
   });
 
-  it("remove mode revokes scoped token, clears presence, removes membership, and writes a status trace", async () => {
+  it("remove mode revokes scoped token, clears presence, role and membership, and writes a status trace", async () => {
     const ownerAcct = `${uniq("owner")}@leeguoo.com`;
     const guestAcct = `${uniq("guest")}@leeguoo.com`;
     const owner = await seedToken("agent", uniq("owner"), { owner: ownerAcct });
@@ -334,6 +334,12 @@ describe("kick (spec §5)", () => {
     await env.DB.prepare("INSERT INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, ?, ?)")
       .bind(slug, guestAcct, ownerAcct, Date.now())
       .run();
+    expect(
+      (await api(`/api/channels/${slug}/roles/${guest.name}`, owner.token, {
+        method: "PUT",
+        body: JSON.stringify({ role: "worker", responsibility: "temporary assignment" }),
+      })).status,
+    ).toBe(200);
     // presence 由 status 帧建立（普通 message 不建 presence）——发一条 status 让 guest 进在场名单
     expect(
       (await api(`/api/channels/${slug}/messages`, guest.token, {
@@ -343,12 +349,38 @@ describe("kick (spec §5)", () => {
     ).toBe(200);
     const before = ((await (await api(`/api/channels/${slug}/presence`, owner.token)).json()) as { presence: { name: string }[] }).presence;
     expect(before.map((p) => p.name)).toContain(guest.name);
+    const observer = await WsClient.open(slug, owner.token);
+    await completeCapabilityHello(observer);
+    // Keep the removed identity connected so the test covers connection close/onClose
+    // convergence in addition to deleting an offline database snapshot.
+    const guestWs = await WsClient.open(slug, guest.token);
+    await completeCapabilityHello(guestWs);
 
     const kick = await api(`/api/channels/${slug}/kick`, owner.token, {
       method: "POST",
       body: JSON.stringify({ name: guest.name, mode: "remove" }),
     });
     expect(kick.status).toBe(200);
+    const kickBody = (await kick.json()) as {
+      removal: { type: string; name: string; removed_at: number };
+      broadcasted: boolean;
+    };
+    expect(kickBody.broadcasted).toBe(true);
+    expect(kickBody.removal).toEqual({
+      type: "participant_removed",
+      name: guest.name,
+      removed_at: expect.any(Number),
+    });
+    const removalFrame = await observer.nextOfType("participant_removed");
+    expect(removalFrame).toEqual(kickBody.removal);
+    observer.close();
+
+    const reconnectedObserver = await WsClient.open(slug, owner.token);
+    const authoritativeWelcome = await completeCapabilityHello(reconnectedObserver);
+    expect(authoritativeWelcome.participants.map((participant) => participant.name)).not.toContain(guest.name);
+    expect(authoritativeWelcome.presence.map((entry) => entry.name)).not.toContain(guest.name);
+    reconnectedObserver.close();
+    guestWs.close();
 
     const tokenRow = await env.DB.prepare("SELECT revoked_at FROM tokens WHERE name = ?")
       .bind(guest.name)
@@ -362,6 +394,12 @@ describe("kick (spec §5)", () => {
       .bind(slug, guestAcct)
       .first<{ account: string }>();
     expect(member).toBeNull();
+    const role = await env.DB.prepare(
+      "SELECT agent_name FROM channel_roles WHERE channel_slug = ? AND agent_name = ?",
+    )
+      .bind(slug, guest.name)
+      .first<{ agent_name: string }>();
+    expect(role).toBeNull();
     const history = ((await (await api(`/api/channels/${slug}/messages?since=0`, owner.token)).json()) as { messages: { kind: string; body: string }[] }).messages;
     expect(history).toContainEqual(expect.objectContaining({ kind: "status", body: `removed ${guest.name} from channel` }));
   });

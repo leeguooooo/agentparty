@@ -1,6 +1,11 @@
 // @ts-expect-error Bun executes this test, while the web tsconfig intentionally loads only Vite globals.
 import { describe, expect, test } from "bun:test";
-import { createDesktopAgentAdapter, type DesktopAgentInvoker } from "./desktopAgent";
+import {
+  createDesktopAgentAdapter,
+  dutyDependencyErrorRunner,
+  dutyRepairInput,
+  type DesktopAgentInvoker,
+} from "./desktopAgent";
 
 describe("desktop agent native adapter", () => {
   test("maps the public adapter to the native invoke contract", async () => {
@@ -87,5 +92,49 @@ describe("desktop agent native adapter", () => {
     }));
 
     expect((await adapter.status()).state).toBe("stopping");
+  });
+
+  test("normalizes runner dependency metadata and keeps legacy duty entries repair-safe", async () => {
+    const current = createDesktopAgentAdapter(async () => [{
+      label: "com.agentparty.duty.cfg.ops",
+      instanceId: "cfg:ops",
+      plistPath: "/p",
+      logPath: "/log",
+      loaded: true,
+      runner: "codex",
+      workdir: "/workspace",
+      repo: "https://example.com/repo.git",
+      runnerExecutable: "/Users/leo/.local/bin/codex",
+      dependencyState: "repair-required",
+    }]);
+    const [entry] = await current.dutyList();
+    expect(entry).toMatchObject({
+      runner: "codex",
+      runnerExecutable: "/Users/leo/.local/bin/codex",
+      dependencyState: "repair-required",
+    });
+    expect(dutyRepairInput(entry!)).toEqual({
+      configId: "cfg",
+      channel: "ops",
+      runner: "codex",
+      workdir: "/workspace",
+      repo: "https://example.com/repo.git",
+    });
+
+    const legacy = createDesktopAgentAdapter(async () => [{
+      label: "com.agentparty.duty.cfg.ops",
+      instanceId: "cfg:ops",
+      plistPath: "/p",
+      logPath: "/log",
+      loaded: true,
+    }]);
+    expect(await legacy.dutyList()).toEqual([expect.objectContaining({
+      runner: null,
+      runnerExecutable: null,
+      dependencyState: "unknown",
+    })]);
+    expect(dutyDependencyErrorRunner(
+      new Error("runner_dependency_missing:codex: codex CLI was not found"),
+    )).toBe("codex");
   });
 });

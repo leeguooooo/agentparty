@@ -106,6 +106,26 @@ afterEach(() => {
 });
 
 describe("DivisionBoard roster completeness (#169)", () => {
+  test("self-reported roles stay visible but do not count as confirmed assignments", () => {
+    render(
+      baseProps({
+        identities: [{ name: "runtime-agent", kind: "agent", display: "Runtime Agent", account: "leo" }],
+        presence: {
+          "runtime-agent": presenceEntry({
+            name: "runtime-agent",
+            role: "worker",
+            role_source: "self",
+            note: "runtime claim",
+          }),
+        },
+      }),
+    );
+
+    const count = renderer!.root.find((node) => node.props.className === "t-mono role-board-count");
+    expect(JSON.stringify(count.props.children)).toContain("0");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("自报");
+  });
+
   test("role editing stays collapsed until requested and collapses again after save (#504)", () => {
     let savedName = "";
     render(
@@ -240,9 +260,8 @@ describe("DivisionBoard roster completeness (#169)", () => {
   });
 });
 
-// issue #168：分工要看得出组织架构关系——每个 agent 的汇报人（来自 presence
-// lineage.parent_agent，agentparty 的 dispatch 关系本就是"谁派我我向谁汇报"）、
-// 每个频道的主负责人（已有的 host 分工角色），以及汇报对象是否在本频道可见。
+// issue #168 + #370：分工要看得出正式组织架构关系。唯一权威来源是 channel_roles；
+// presence lineage / self-report 只描述运行时事实，不能提升成正式汇报线或频道负责人。
 describe("DivisionBoard org-structure relationships (#168)", () => {
   function findText(className: string): string[] {
     return renderer!.root
@@ -280,7 +299,7 @@ describe("DivisionBoard org-structure relationships (#168)", () => {
     expect(tree.findAllByType("details")).toHaveLength(0);
   });
 
-  test("a declared role with lineage shows who it reports to", () => {
+  test("runtime lineage is not promoted to a formal reports-to relationship", () => {
     render(
       baseProps({
         roles: [
@@ -295,7 +314,23 @@ describe("DivisionBoard org-structure relationships (#168)", () => {
         },
       }),
     );
-    expect(anyReportText().some((line) => line.includes("leo-claude"))).toBe(true);
+    expect(anyReportText()).toHaveLength(0);
+  });
+
+  test("a declared role shows its formal channel_roles reports_to relationship", () => {
+    render(
+      baseProps({
+        roles: [
+          { name: "lead", role: "host", responsibility: "leads", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "lead" },
+          { name: "worker-a", role: "worker", responsibility: "ships x", reports_to: "lead", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "worker-a" },
+        ],
+        presence: {
+          lead: presenceEntry({ name: "lead", account: "leo" }),
+          "worker-a": presenceEntry({ name: "worker-a", account: "leo" }),
+        },
+      }),
+    );
+    expect(anyReportText().some((line) => line.includes("lead"))).toBe(true);
   });
 
   test("a role with no lineage shows no reporting badge", () => {
@@ -327,19 +362,33 @@ describe("DivisionBoard org-structure relationships (#168)", () => {
     expect(leadTags.length).toBe(1);
   });
 
+  test("a self-reported host is never tagged as the channel lead", () => {
+    render(
+      baseProps({
+        presence: {
+          "self-host": presenceEntry({
+            name: "self-host",
+            account: "leo",
+            role: "host",
+            role_source: "self",
+          }),
+        },
+      }),
+    );
+
+    expect(renderer!.root.findAll((node) => node.props.className === "role-lead-tag t-mono")).toHaveLength(0);
+    const toggle = renderer!.root.find((node) => node.props.className === "d-btn role-org-toggle");
+    act(() => toggle.props.onClick());
+    expect(renderer!.root.findAll((node) => node.props.className === "org-lead-tag t-mono")).toHaveLength(0);
+  });
+
   test("flags when the reporting target isn't part of this channel's roster", () => {
     render(
       baseProps({
         roles: [
-          { name: "worker-a", role: "worker", responsibility: "ships x", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "worker-a" },
+          { name: "worker-a", role: "worker", responsibility: "ships x", reports_to: "someone-not-in-channel", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "worker-a" },
         ],
-        presence: {
-          "worker-a": presenceEntry({
-            name: "worker-a",
-            account: "leo",
-            lineage: { parent_agent: "someone-not-in-channel", root_agent: "someone-not-in-channel", team_id: "t1", depth: 1, expires_at: null },
-          }),
-        },
+        presence: { "worker-a": presenceEntry({ name: "worker-a", account: "leo" }) },
       }),
     );
     const externalHints = renderer!.root.findAll((n) => n.props.className === "role-report role-report--external t-mono");
@@ -351,28 +400,51 @@ describe("DivisionBoard org-structure relationships (#168)", () => {
       baseProps({
         roles: [
           { name: "leo-claude", role: "host", responsibility: "统筹", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "leo-claude" },
-          { name: "worker-a", role: "worker", responsibility: "ships x", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "worker-a" },
+          { name: "worker-a", role: "worker", responsibility: "ships x", reports_to: "leo-claude", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "worker-a" },
         ],
         presence: {
           "leo-claude": presenceEntry({ name: "leo-claude", account: "leo" }),
-          "worker-a": presenceEntry({
-            name: "worker-a",
-            account: "leo",
-            lineage: { parent_agent: "leo-claude", root_agent: "leo-claude", team_id: "t1", depth: 1, expires_at: null },
-          }),
+          "worker-a": presenceEntry({ name: "worker-a", account: "leo" }),
         },
       }),
     );
     const externalHints = renderer!.root.findAll((n) => n.props.className === "role-report role-report--external t-mono");
     expect(externalHints.length).toBe(0);
   });
+
+  test("reports-to editor is only available for confirmed assignments", () => {
+    render(
+      baseProps({
+        canModerate: true,
+        roles: [
+          { name: "assigned-lead", role: "host", responsibility: "统筹", assigned_by: "leo", assigned_at: 1, kind: "agent", account: "leo", display: "assigned-lead" },
+        ],
+        presence: {
+          "assigned-lead": presenceEntry({ name: "assigned-lead", account: "leo" }),
+          "self-host": presenceEntry({ name: "self-host", account: "leo", role: "host", role_source: "self" }),
+          "runtime-only": presenceEntry({ name: "runtime-only", account: "leo" }),
+        },
+        onSetReportsTo: noop,
+      }),
+    );
+
+    const toggle = renderer!.root.find((node) => node.props.className === "d-btn role-org-toggle");
+    act(() => toggle.props.onClick());
+    const selects = renderer!.root.findAll((node) => node.props.className === "org-report-select");
+    expect(selects).toHaveLength(1);
+    expect(String(selects[0]!.props["aria-label"])).toContain("assigned-lead");
+    const optionValues = selects[0]!.findAllByType("option").map((option) => option.props.value);
+    expect(optionValues).not.toContain("self-host");
+    expect(optionValues).not.toContain("runtime-only");
+  });
 });
 
 // issue #150：分工内容应该能一键同步进公告（charter）。这里测的是 DivisionBoard
-// 把当前已声明分工（assigned + self）拼成 markdown 小节、合并进现有公告文本、
+// 把当前正式分工（只含 channel_roles）拼成 markdown 小节、合并进现有公告文本；
+// presence 自报只能作为待确认 claim 展示，不能写成频道正式分工。
 // 再把结果通过 onSyncToCharter 交给上层去落盘——按钮本身不发网络请求。
 describe("DivisionBoard sync-to-charter (#150)", () => {
-  test("syncs typed agent names and drops a stale unresolved owner role", () => {
+  test("syncs only confirmed agent roles and drops self-reports plus stale unresolved owner roles", () => {
     let synced: string | null = null;
     render(
       baseProps({
@@ -391,7 +463,7 @@ describe("DivisionBoard sync-to-charter (#150)", () => {
     );
     const btn = renderer!.root.find((n) => n.props.className === "d-btn role-sync-charter-btn");
     act(() => btn.props.onClick());
-    expect(synced).toContain("**ai-girl-host-codex**（未归属 agent）— host");
+    expect(synced).not.toContain("ai-girl-host-codex");
     expect(synced).toContain("**ai-girl**（未归属 agent）— worker");
     expect(synced).not.toContain("lark:on_owner");
   });
@@ -472,7 +544,14 @@ describe("DivisionBoard auto-sync-to-charter (#150)", () => {
         canModerate: true,
         charterText: "# Team charter\n\nBe kind.",
         roles: [],
-        presence: {},
+        presence: {
+          "self-only": presenceEntry({
+            name: "self-only",
+            role: "worker",
+            role_source: "self",
+            note: "runtime claim only",
+          }),
+        },
         onSyncToCharter: (text: string) => { synced = text; },
       }),
     );

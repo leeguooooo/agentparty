@@ -32,6 +32,16 @@ interface CapturedRequest {
   body: string;
 }
 
+async function waitFor<T>(probe: () => T | null, timeoutMs = 2_000): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = probe();
+    if (value !== null) return value;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 function normalizeRequest(opts: {
   headers?: unknown;
   body?: unknown;
@@ -416,6 +426,7 @@ describe("unified durable directed-delivery adapters", () => {
       target.name,
       "webhook work",
     );
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     const request = captured as unknown as CapturedRequest;
     const payload = JSON.parse(request.body) as {
@@ -634,6 +645,7 @@ describe("unified durable directed-delivery adapters", () => {
       target.name,
       "notify only",
     );
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     const payload = JSON.parse(
       (captured as unknown as CapturedRequest).body,

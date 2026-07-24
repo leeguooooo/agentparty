@@ -21,7 +21,12 @@ function memoryStorage(): Storage {
 }
 
 let renderer: ReactTestRenderer | null = null;
-let keyHandlers: Array<(e: { key: string }) => void> = [];
+interface KeyEventHarness {
+  key: string;
+  shiftKey?: boolean;
+  preventDefault?: () => void;
+}
+let keyHandlers: Array<(e: KeyEventHarness) => void> = [];
 
 function render(props: Parameters<typeof OnboardingGuide>[0] = {}) {
   act(() => {
@@ -45,10 +50,10 @@ beforeEach(() => {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
-      addEventListener: (type: string, fn: (e: { key: string }) => void) => {
+      addEventListener: (type: string, fn: (e: KeyEventHarness) => void) => {
         if (type === "keydown") keyHandlers.push(fn);
       },
-      removeEventListener: (type: string, fn: (e: { key: string }) => void) => {
+      removeEventListener: (type: string, fn: (e: KeyEventHarness) => void) => {
         if (type === "keydown") keyHandlers = keyHandlers.filter((h) => h !== fn);
       },
     },
@@ -61,6 +66,7 @@ afterEach(() => {
     renderer = null;
   }
   Reflect.deleteProperty(globalThis, "window");
+  Reflect.deleteProperty(globalThis, "document");
 });
 
 describe("OnboardingGuide (#146)", () => {
@@ -139,6 +145,70 @@ describe("OnboardingGuide (#146)", () => {
       );
     });
     expect(steps().length).toBe(0);
+  });
+
+  test("claims focus, traps Tab in the guide, and returns focus to the explicit source", () => {
+    const doc: { activeElement: FocusMock | null } = { activeElement: null };
+    class FocusMock {
+      readonly isConnected = true;
+      constructor(readonly name: string, readonly tabIndex = 0) {}
+      focus() { doc.activeElement = this; }
+    }
+    const returnTarget = new FocusMock("settings");
+    const close = new FocusMock("close");
+    const dismiss = new FocusMock("dismiss");
+    const card = Object.assign(new FocusMock("card", -1), {
+      querySelectorAll: () => [close, dismiss],
+    });
+    returnTarget.focus();
+    Object.defineProperty(globalThis, "document", { configurable: true, value: doc });
+
+    act(() => {
+      renderer = create(
+        <LocaleProvider>
+          <OnboardingGuide
+            returnFocusRef={{ current: returnTarget as unknown as HTMLElement }}
+          />
+        </LocaleProvider>,
+        {
+          createNodeMock(element) {
+            const props = element.props as Record<string, unknown>;
+            if (props.className === "d-card onboarding-card") return card;
+            if (props.className === "d-btn onboarding-close") return close;
+            if (props.className === "d-btn onboarding-dismiss") return dismiss;
+            return {};
+          },
+        },
+      );
+    });
+
+    expect(doc.activeElement).toBe(close);
+
+    dismiss.focus();
+    let prevented = false;
+    act(() => {
+      keyHandlers.forEach((handler) => handler({
+        key: "Tab",
+        preventDefault: () => { prevented = true; },
+      }));
+    });
+    expect(prevented).toBe(true);
+    expect(doc.activeElement).toBe(close);
+
+    prevented = false;
+    act(() => {
+      keyHandlers.forEach((handler) => handler({
+        key: "Tab",
+        shiftKey: true,
+        preventDefault: () => { prevented = true; },
+      }));
+    });
+    expect(prevented).toBe(true);
+    expect(doc.activeElement).toBe(dismiss);
+
+    const closeButton = renderer!.root.findByProps({ className: "d-btn onboarding-close" });
+    act(() => closeButton.props.onClick());
+    expect(doc.activeElement).toBe(returnTarget);
   });
 });
 

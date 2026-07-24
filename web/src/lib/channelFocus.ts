@@ -63,7 +63,9 @@ export interface PendingDecision {
   /** 提问者名（球从这里被抛出，在等人类回应）。 */
   asker: string;
   /** 若绑定了指定回应账号（owner-only），据此判「在等我」；服务端可能已从公开投影裁掉，缺省视为任意 moderator 可答。 */
-  expectedResponderOwner: string | null;
+  expectedResponderOwner?: string | null;
+  /** 权威待决端点按当前查看者计算的结果；存在时优先于公开消息的降级推断。 */
+  waitingOnMe?: boolean;
 }
 
 export interface ChannelFocusInput {
@@ -203,8 +205,9 @@ export function computeChannelFocus(input: ChannelFocusInput): ChannelFocus {
   // 3) 未闭合决策 → 「等人拍板」。waitingOnMe：指定了回应账号且匹配本人；或无限定但本人可 moderate（owner 视角）。
   for (const d of decisions) {
     const waitingOnMe =
-      (d.expectedResponderOwner !== null && d.expectedResponderOwner === viewer.account) ||
-      (d.expectedResponderOwner === null && viewer.canModerate);
+      d.waitingOnMe ??
+      ((d.expectedResponderOwner != null && d.expectedResponderOwner === viewer.account) ||
+        (d.expectedResponderOwner == null && viewer.canModerate));
     items.push({
       key: `decision-${d.seq}`,
       name: d.asker,

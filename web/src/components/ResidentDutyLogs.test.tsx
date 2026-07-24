@@ -31,6 +31,12 @@ function entry(over: Partial<DesktopDutyEntry> = {}): DesktopDutyEntry {
 
 let renderer: ReactTestRenderer | null = null;
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage() });
@@ -42,11 +48,14 @@ afterEach(() => {
   renderer = null;
 });
 
-async function renderPanel(adapter: { dutyList: () => Promise<DesktopDutyEntry[]>; dutyLogRead: (label: string) => Promise<string> }): Promise<ReactTestRenderer> {
+async function renderPanel(
+  adapter: { dutyList: () => Promise<DesktopDutyEntry[]>; dutyLogRead: (label: string) => Promise<string> },
+  active = true,
+): Promise<ReactTestRenderer> {
   await act(async () => {
     renderer = create(
       <LocaleProvider>
-        <ResidentDutyLogs t={((k: string) => k) as never} adapter={adapter} />
+        <ResidentDutyLogs t={((k: string) => k) as never} adapter={adapter} active={active} />
       </LocaleProvider>,
     );
   });
@@ -99,6 +108,59 @@ describe("ResidentDutyLogs (#725)", () => {
     const text = JSON.stringify(r.toJSON());
     expect(text).toContain("LOG TWO");
     expect(text).not.toContain("LOG ONE");
+  });
+
+  test("切走再返回时，旧列表请求不能覆盖较新的列表", async () => {
+    const oldList = deferred<DesktopDutyEntry[]>();
+    const currentList = deferred<DesktopDutyEntry[]>();
+    let reads = 0;
+    const adapter = {
+      dutyList: () => {
+        reads += 1;
+        return reads === 1 ? oldList.promise : currentList.promise;
+      },
+      dutyLogRead: async () => "",
+    };
+    const r = await renderPanel(adapter);
+    expect(reads).toBe(1);
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <ResidentDutyLogs t={((k: string) => k) as never} adapter={adapter} active={false} />
+        </LocaleProvider>,
+      );
+    });
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <ResidentDutyLogs t={((k: string) => k) as never} adapter={adapter} active />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+    expect(reads).toBe(2);
+
+    await act(async () => {
+      currentList.resolve([entry({
+        label: "com.agentparty.duty.current",
+        instanceId: "cfg:fresh-channel-923",
+      })]);
+      await currentList.promise;
+      await Promise.resolve();
+    });
+    await act(async () => {
+      oldList.resolve([entry({
+        label: "com.agentparty.duty.stale",
+        instanceId: "cfg:stale-channel-517",
+      })]);
+      await oldList.promise;
+      await Promise.resolve();
+    });
+
+    const text = JSON.stringify(r.toJSON());
+    expect(text).toContain("fresh-channel-923");
+    expect(text).not.toContain("stale-channel-517");
   });
 
   test("无常驻实例 → 空状态", async () => {

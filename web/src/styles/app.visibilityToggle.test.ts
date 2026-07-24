@@ -14,7 +14,7 @@ function ruleBody(selector: string): string {
 }
 
 describe("channel visibility controls layout", () => {
-  test("visibility uses the presence row while management starts at the toolbar's right edge", () => {
+  test("channel management stays at the toolbar's right edge without wrapping content tools", () => {
     expect(ruleBody(".chan-toolstrip")).toContain("flex-wrap: nowrap");
     expect(ruleBody(".chan-toolstrip-content")).toContain("flex-direction: column");
     expect(ruleBody(".chan-toolstrip-content")).toContain("overflow: visible");
@@ -22,7 +22,6 @@ describe("channel visibility controls layout", () => {
     expect(css).toMatch(/\.chan-tool-buttons,\s*\.chan-tool-actions,\s*\.chan-admin-actions,\s*\.chan-admin-group\s*{[^}]*flex-wrap:\s*nowrap;/s);
     expect(ruleBody(".chan-tool-actions")).toContain("justify-content: flex-end");
     expect(ruleBody(".chan-admin-actions")).toContain("margin-left: auto");
-    expect(ruleBody(".presence-channel-controls")).toContain("margin-left: auto");
     expect(ruleBody(".chan-admin-actions")).toContain("gap: 0");
     expect(ruleBody(".chan-admin-group + .chan-admin-group")).toContain("border-left: 1.4px solid var(--t-faint)");
     expect(css).toMatch(/@media \(max-width: 1759px\)[\s\S]*\.chan-tool-btn\s*{[^}]*padding-inline:\s*6px;[^}]*font-size:\s*11\.5px;/s);

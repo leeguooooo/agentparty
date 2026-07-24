@@ -2,9 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import type { TFunc } from "../i18n/useT";
 import {
   desktopAgentAdapter,
+  dutyDependencyErrorRunner,
+  dutyRepairInput,
   type DesktopAgentAdapter,
   type DesktopAgentConfig,
   type DesktopAgentRunner,
+  type DesktopAgentStartInput,
   type DesktopAgentStatus,
   type DesktopDutyEntry,
 } from "../lib/desktopAgent";
@@ -27,6 +30,7 @@ interface Props {
   t: TFunc;
   adapter?: DesktopAgentAdapter;
   scheduler?: DesktopAgentScheduler;
+  active?: boolean;
   // 原生目录选择器（测试可注入）；默认走 tauri dialog。返回 null=非桌面/取消。
   pickDirectory?: (title?: string) => Promise<string | null>;
 }
@@ -38,6 +42,13 @@ function safeError(value: unknown): string {
     .replace(/\b(token|secret|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[token redacted]")
     .replace(/(?:\/[\w.@~-]+)+\/config(?:\.json)?\b/gi, "[config path redacted]");
+}
+
+function dutyOperationError(value: unknown, t: TFunc): string {
+  const runner = dutyDependencyErrorRunner(value);
+  return runner === null
+    ? safeError(value)
+    : t("DesktopSettings.agent.dutyDependencyMissing", { runner });
 }
 
 function isActive(status: DesktopAgentStatus | null): boolean {
@@ -58,7 +69,13 @@ function derivePrimary(instances: DesktopAgentStatus[]): DesktopAgentStatus | nu
   );
 }
 
-export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler = defaultScheduler, pickDirectory = pickDirectoryDefault }: Props) {
+export function DesktopAgentPanel({
+  t,
+  adapter = desktopAgentAdapter,
+  scheduler = defaultScheduler,
+  active = true,
+  pickDirectory = pickDirectoryDefault,
+}: Props) {
   const [configs, setConfigs] = useState<DesktopAgentConfig[] | null>(null);
   const [status, setStatus] = useState<DesktopAgentStatus | null>(null);
   const [instances, setInstances] = useState<DesktopAgentStatus[] | null>(null);
@@ -77,89 +94,131 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
   const [logs, setLogs] = useState<string[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const aliveRef = useRef(true);
+  const mountedRef = useRef(true);
   const operationRef = useRef(false);
+  const initializedRef = useRef(false);
+  const statusRequestSeqRef = useRef(0);
+  const logRequestSeqRef = useRef(0);
   // null=未探测，true/false=statusAll 是否可用（探测一次，之后不再打旧 shell 的未知命令）。
   const multiRef = useRef<boolean | null>(null);
 
-  const fetchStatus = async (): Promise<DesktopAgentStatus | null> => {
+  const fetchStatus = async (): Promise<{
+    requestSeq: number;
+    status: DesktopAgentStatus | null;
+  }> => {
+    const requestSeq = ++statusRequestSeqRef.current;
     if (multiRef.current !== false) {
       try {
         const all = await adapter.statusAll();
         multiRef.current = true;
-        if (aliveRef.current) setInstances(all);
-        return derivePrimary(all);
+        if (aliveRef.current && requestSeq === statusRequestSeqRef.current) setInstances(all);
+        return { requestSeq, status: derivePrimary(all) };
       } catch {
         if (multiRef.current === true) throw new Error("desktop agent status is unavailable");
         multiRef.current = false;
       }
     }
-    return await adapter.status();
+    return { requestSeq, status: await adapter.status() };
   };
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let requestActive = true;
+    if (!active) {
+      aliveRef.current = false;
+      statusRequestSeqRef.current += 1;
+      return () => {
+        requestActive = false;
+        aliveRef.current = false;
+        statusRequestSeqRef.current += 1;
+      };
+    }
     aliveRef.current = true;
-    let active = true;
     void adapter.dutyList().then((entries) => {
-      if (active) setDuties(entries);
+      if (requestActive) setDuties(entries);
     }).catch(() => {
       // 非 macOS / 旧 shell：常驻不可用，静默隐藏
     });
-    void Promise.all([adapter.listConfigs(), fetchStatus()]).then(([nextConfigs, nextStatus]) => {
-      if (!active) return;
+    void Promise.all([adapter.listConfigs(), fetchStatus()]).then(([nextConfigs, snapshot]) => {
+      if (!requestActive || snapshot.requestSeq !== statusRequestSeqRef.current) return;
       setConfigs(nextConfigs);
-      setStatus(nextStatus);
-      const selected = nextConfigs.find((item) => item.configId === nextStatus?.configId) ?? nextConfigs[0];
-      setConfigId(selected?.configId ?? "");
-      setChannel(nextStatus?.channel ?? selected?.channel ?? "");
-      if (RUNNERS.includes(nextStatus?.runner as DesktopAgentRunner)) {
-        setRunner(nextStatus?.runner as DesktopAgentRunner);
+      setStatus(snapshot.status);
+      if (!initializedRef.current) {
+        const selected = nextConfigs.find((item) => item.configId === snapshot.status?.configId) ?? nextConfigs[0];
+        setConfigId(selected?.configId ?? "");
+        setChannel(snapshot.status?.channel ?? selected?.channel ?? "");
+        if (RUNNERS.includes(snapshot.status?.runner as DesktopAgentRunner)) {
+          setRunner(snapshot.status?.runner as DesktopAgentRunner);
+        }
+        initializedRef.current = true;
       }
     }).catch((cause) => {
-      if (!active) return;
+      if (!requestActive) return;
       setError(safeError(cause));
     });
     return () => {
-      active = false;
+      requestActive = false;
       aliveRef.current = false;
+      statusRequestSeqRef.current += 1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adapter, loadAttempt]);
+  }, [active, adapter, loadAttempt]);
 
   const anyActive = isActive(status) || (instances ?? []).some((item) => isActive(item));
 
-  const fetchLogs = async (): Promise<string[]> => {
-    if (logsFor !== null && multiRef.current === true) return await adapter.logsInstance(logsFor);
-    return await adapter.logs();
+  const loadLogs = async (
+    source: string | null,
+    stillRelevant: () => boolean = () => true,
+  ): Promise<void> => {
+    const requestSeq = ++logRequestSeqRef.current;
+    try {
+      const next = source !== null && multiRef.current === true
+        ? await adapter.logsInstance(source)
+        : await adapter.logs();
+      if (mountedRef.current && stillRelevant() && requestSeq === logRequestSeqRef.current) {
+        setLogs(next.map(safeError));
+      }
+    } catch (cause) {
+      if (mountedRef.current && stillRelevant() && requestSeq === logRequestSeqRef.current) {
+        setError(safeError(cause));
+      }
+    }
   };
 
   useEffect(() => {
-    if (!anyActive) return;
-    let active = true;
+    if (!active || busy || !anyActive) return;
+    let polling = true;
     const cancel = scheduler.every(() => {
-      if (!active) return;
-      void fetchStatus().then((next) => {
-        if (active) setStatus(next);
+      if (!polling) return;
+      void fetchStatus().then((snapshot) => {
+        if (polling && snapshot.requestSeq === statusRequestSeqRef.current) {
+          setStatus(snapshot.status);
+        }
       }).catch((cause) => {
-        if (active) setError(safeError(cause));
+        if (polling) setError(safeError(cause));
       });
       if (logsOpen) {
-        void fetchLogs().then((next) => {
-          if (active) setLogs(next.map(safeError));
-        }).catch((cause) => {
-          if (active) setError(safeError(cause));
-        });
+        void loadLogs(logsFor, () => polling);
       }
     }, 2_000);
     return () => {
-      active = false;
+      polling = false;
       cancel();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adapter, anyActive, logsFor, logsOpen, scheduler, status?.state]);
+  }, [active, adapter, anyActive, busy, logsFor, logsOpen, scheduler, status?.state]);
 
   const runOperation = async (operation: () => Promise<DesktopAgentStatus>) => {
     if (operationRef.current) return;
     operationRef.current = true;
+    statusRequestSeqRef.current += 1;
+    logRequestSeqRef.current += 1;
     setBusy(true);
     setError(null);
     setLogs(null);
@@ -170,29 +229,23 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
         // 多实例：任何操作后刷新整表，别让列表与单实例回执漂移。
         if (multiRef.current === true) {
           try {
-            const all = await adapter.statusAll();
-            if (aliveRef.current) {
-              setInstances(all);
-              setStatus(derivePrimary(all));
+            const snapshot = await fetchStatus();
+            if (aliveRef.current && snapshot.requestSeq === statusRequestSeqRef.current) {
+              setStatus(snapshot.status);
             }
           } catch {
             // 刷新失败不吞操作结果；下一轮轮询会补上。
           }
         }
         if (logsOpen) {
-          try {
-            const nextLogs = (await fetchLogs()).map(safeError);
-            if (aliveRef.current) setLogs(nextLogs);
-          } catch (cause) {
-            if (aliveRef.current) setError(safeError(cause));
-          }
+          await loadLogs(logsFor);
         }
       }
     } catch (cause) {
       if (aliveRef.current) setError(safeError(cause));
     } finally {
       operationRef.current = false;
-      if (aliveRef.current) setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -212,52 +265,51 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
       setLogsFor(null);
       setLogs(null);
     }
-    if (!nextOpen) return;
+    if (!nextOpen) {
+      logRequestSeqRef.current += 1;
+      return;
+    }
     // 源从单实例切回聚合时必须重拉；否则命中聚合缓存就跳过。
     if (logs !== null && !wasInstance) return;
     setLogs(null);
     // 显式走聚合 adapter.logs()：此刻 setLogsFor(null) 尚未落到 fetchLogs 闭包里的 logsFor，
     // 直接用 fetchLogs 会读到旧值仍指向实例。
-    try {
-      const nextLogs = (await adapter.logs()).map(safeError);
-      if (aliveRef.current) setLogs(nextLogs);
-    } catch (cause) {
-      if (aliveRef.current) setError(safeError(cause));
-    }
+    await loadLogs(null);
   };
 
-  const persistDuty = async () => {
+  const persistDuty = async (input?: DesktopAgentStartInput) => {
     if (operationRef.current) return;
     operationRef.current = true;
+    statusRequestSeqRef.current += 1;
     setBusy(true);
     setError(null);
     try {
-      await adapter.dutyPersist({
-        configId,
-        channel: channel.trim(),
-        runner,
-        workdir: workdir.trim() === "" ? undefined : workdir.trim(),
-        repo: repo.trim() === "" ? undefined : repo.trim(),
-      });
+      await adapter.dutyPersist(input ?? {
+          configId,
+          channel: channel.trim(),
+          runner,
+          workdir: workdir.trim() === "" ? undefined : workdir.trim(),
+          repo: repo.trim() === "" ? undefined : repo.trim(),
+        });
+      if (!aliveRef.current) return;
       const entries = await adapter.dutyList();
       if (aliveRef.current) setDuties(entries);
       // 转常驻会顺带停掉 app 内同键实例——刷新实例表别让两处状态漂移
       if (multiRef.current === true) {
         try {
-          const all = await adapter.statusAll();
-          if (aliveRef.current) {
-            setInstances(all);
-            setStatus(derivePrimary(all));
+          const snapshot = await fetchStatus();
+          if (aliveRef.current && snapshot.requestSeq === statusRequestSeqRef.current) {
+            setStatus(snapshot.status);
           }
         } catch {
           // 下一轮轮询补上
         }
       }
     } catch (cause) {
-      if (aliveRef.current) setError(safeError(cause));
+      if (aliveRef.current) setError(dutyOperationError(cause, t));
     } finally {
       operationRef.current = false;
-      if (aliveRef.current) setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -268,13 +320,14 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
     setError(null);
     try {
       await adapter.dutyUnpersist(instanceId);
+      if (!aliveRef.current) return;
       const entries = await adapter.dutyList();
       if (aliveRef.current) setDuties(entries);
     } catch (cause) {
       if (aliveRef.current) setError(safeError(cause));
     } finally {
       operationRef.current = false;
-      if (aliveRef.current) setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -282,12 +335,7 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
     setLogsFor(instanceId);
     setLogsOpen(true);
     setLogs(null);
-    try {
-      const nextLogs = (await adapter.logsInstance(instanceId)).map(safeError);
-      if (aliveRef.current) setLogs(nextLogs);
-    } catch (cause) {
-      if (aliveRef.current) setError(safeError(cause));
-    }
+    await loadLogs(instanceId);
   };
 
   const stateLabel = status === null
@@ -376,7 +424,7 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
                 aria-label={t("DesktopSettings.agent.workdirPick")}
                 onClick={() => {
                   void pickDirectory(t("DesktopSettings.agent.workdirPick")).then((dir) => {
-                    if (dir !== null && aliveRef.current) setWorkdir(dir);
+                    if (dir !== null && mountedRef.current) setWorkdir(dir);
                   });
                 }}
               >
@@ -414,24 +462,50 @@ export function DesktopAgentPanel({ t, adapter = desktopAgentAdapter, scheduler 
         <section aria-label={t("DesktopSettings.agent.dutyTitle")} className="desktop-agent-duties">
           <strong className="desktop-agent-duties-title">{t("DesktopSettings.agent.dutyTitle")}</strong>
           <ul className="desktop-agent-instances">
-            {duties.map((entry) => (
-              <li key={entry.label} className="desktop-agent-instance">
-                <span className={`desktop-agent-state desktop-agent-state--${entry.loaded ? "running" : "stopped"}`}>
-                  {t(entry.loaded ? "DesktopSettings.agent.dutyLoaded" : "DesktopSettings.agent.dutyNotLoaded")}
-                </span>
-                <span className="t-mono desktop-agent-instance-name">{entry.instanceId}</span>
-                <span className="t-mono desktop-agent-instance-dir" title={entry.logPath}>{entry.logPath}</span>
-                <button
-                  type="button"
-                  className="d-btn"
-                  aria-label={`${t("DesktopSettings.agent.dutyUnload")} ${entry.instanceId}`}
-                  disabled={busy}
-                  onClick={() => void unpersistDuty(entry.instanceId)}
-                >
-                  {t("DesktopSettings.agent.dutyUnload")}
-                </button>
-              </li>
-            ))}
+            {duties.map((entry) => {
+              const repairInput = dutyRepairInput(entry);
+              const dependencyProblem =
+                entry.dependencyState === "missing" || entry.dependencyState === "repair-required";
+              return (
+                <li key={entry.label} className="desktop-agent-instance">
+                  <span className={`desktop-agent-state desktop-agent-state--${entry.loaded ? "running" : "stopped"}`}>
+                    {t(entry.loaded ? "DesktopSettings.agent.dutyLoaded" : "DesktopSettings.agent.dutyNotLoaded")}
+                  </span>
+                  <span className="t-mono desktop-agent-instance-name">{entry.instanceId}</span>
+                  <span className="t-mono desktop-agent-instance-dir" title={entry.logPath}>{entry.logPath}</span>
+                  {dependencyProblem && (
+                    <span className="desktop-agent-error" role="alert">
+                      {t(
+                        entry.dependencyState === "missing"
+                          ? "DesktopSettings.agent.dutyDependencyMissing"
+                          : "DesktopSettings.agent.dutyDependencyRepair",
+                        { runner: entry.runner ?? "runner" },
+                      )}
+                    </span>
+                  )}
+                  {dependencyProblem && repairInput !== null && (
+                    <button
+                      type="button"
+                      className="d-btn"
+                      aria-label={`${t("DesktopSettings.agent.dutyRepair")} ${entry.instanceId}`}
+                      disabled={busy}
+                      onClick={() => void persistDuty(repairInput)}
+                    >
+                      {t("DesktopSettings.agent.dutyRepair")}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="d-btn"
+                    aria-label={`${t("DesktopSettings.agent.dutyUnload")} ${entry.instanceId}`}
+                    disabled={busy}
+                    onClick={() => void unpersistDuty(entry.instanceId)}
+                  >
+                    {t("DesktopSettings.agent.dutyUnload")}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}

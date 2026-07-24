@@ -20,16 +20,37 @@ interface Props<SectionId extends string> {
   sections: readonly SectionedDialogSection<SectionId>[];
   initialSection: SectionId;
   onClose(): void;
+  onActiveSectionChange?(section: SectionId): void;
+  restoreFocusOnUnmount?: boolean;
   keepMounted?: boolean;
   panelClassName?: string;
 }
 
-function nextTabIndex(key: string, current: number, count: number): number | null {
+type TabOrientation = "horizontal" | "vertical";
+
+function nextTabIndex(
+  key: string,
+  current: number,
+  count: number,
+  orientation: TabOrientation,
+): number | null {
+  if (count === 0) return null;
   if (key === "Home") return 0;
   if (key === "End") return count - 1;
-  if (key === "ArrowDown" || key === "ArrowRight") return (current + 1) % count;
-  if (key === "ArrowUp" || key === "ArrowLeft") return (current - 1 + count) % count;
+  if (
+    (orientation === "vertical" && key === "ArrowDown")
+    || (orientation === "horizontal" && key === "ArrowRight")
+  ) return (current + 1) % count;
+  if (
+    (orientation === "vertical" && key === "ArrowUp")
+    || (orientation === "horizontal" && key === "ArrowLeft")
+  ) return (current - 1 + count) % count;
   return null;
+}
+
+function initialTabOrientation(): TabOrientation {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return "vertical";
+  return window.matchMedia("(max-width: 760px)").matches ? "horizontal" : "vertical";
 }
 
 /**
@@ -46,6 +67,8 @@ export function SectionedDialog<SectionId extends string>({
   sections,
   initialSection,
   onClose,
+  onActiveSectionChange,
+  restoreFocusOnUnmount = true,
   keepMounted = true,
   panelClassName = "",
 }: Props<SectionId>) {
@@ -53,15 +76,30 @@ export function SectionedDialog<SectionId extends string>({
   const [activeSection, setActiveSection] = useState<SectionId>(
     sections.some((section) => section.id === initialSection) ? initialSection : fallbackSection,
   );
+  const [tabOrientation, setTabOrientation] = useState<TabOrientation>(initialTabOrientation);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const tabRefs = useRef(new Map<SectionId, HTMLButtonElement>());
   const onCloseRef = useRef(onClose);
+  const onActiveSectionChangeRef = useRef(onActiveSectionChange);
+  const restoreFocusOnUnmountRef = useRef(restoreFocusOnUnmount);
   onCloseRef.current = onClose;
+  onActiveSectionChangeRef.current = onActiveSectionChange;
+  restoreFocusOnUnmountRef.current = restoreFocusOnUnmount;
 
   useEffect(() => {
     if (sections.some((section) => section.id === activeSection)) return;
     setActiveSection(fallbackSection);
+    onActiveSectionChangeRef.current?.(fallbackSection);
   }, [activeSection, fallbackSection, sections]);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(max-width: 760px)");
+    const syncOrientation = () => setTabOrientation(media.matches ? "horizontal" : "vertical");
+    syncOrientation();
+    media.addEventListener?.("change", syncOrientation);
+    return () => media.removeEventListener?.("change", syncOrientation);
+  }, []);
 
   useEffect(() => {
     const doc = typeof document === "undefined" ? null : document;
@@ -73,7 +111,9 @@ export function SectionedDialog<SectionId extends string>({
         panel.querySelectorAll<HTMLElement>(
           'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
         ),
-      ).filter((element) => element.closest?.("[hidden]") === null);
+      ).filter(
+        (element) => element.tabIndex >= 0 && element.closest?.("[hidden]") === null,
+      );
     };
 
     (tabRefs.current.get(activeSection) ?? focusables()[0] ?? panelRef.current)?.focus?.();
@@ -93,7 +133,13 @@ export function SectionedDialog<SectionId extends string>({
       const first = items[0]!;
       const last = items[items.length - 1]!;
       const active = (doc?.activeElement ?? null) as HTMLElement | null;
-      if (event.shiftKey && (active === first || active === panel)) {
+      const activeIsInsidePanel = active !== null
+        && active.isConnected !== false
+        && (active === panel || panel?.contains(active) === true);
+      if (!activeIsInsidePanel) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && (active === first || active === panel)) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && active === last) {
@@ -104,7 +150,7 @@ export function SectionedDialog<SectionId extends string>({
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("keydown", onKey);
-      previouslyFocused?.focus?.();
+      if (restoreFocusOnUnmountRef.current) previouslyFocused?.focus?.();
     };
     // The dialog's focus lifecycle belongs to mount/unmount. Changing a parent
     // callback identity must not tear down and re-arm the trap.
@@ -115,13 +161,19 @@ export function SectionedDialog<SectionId extends string>({
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentIndex: number,
   ) => {
-    const nextIndex = nextTabIndex(event.key, currentIndex, sections.length);
+    const nextIndex = nextTabIndex(event.key, currentIndex, sections.length, tabOrientation);
     if (nextIndex === null) return;
     event.preventDefault();
     const next = sections[nextIndex];
     if (next === undefined) return;
     setActiveSection(next.id);
+    onActiveSectionChangeRef.current?.(next.id);
     tabRefs.current.get(next.id)?.focus();
+  };
+
+  const selectSection = (section: SectionId) => {
+    setActiveSection(section);
+    onActiveSectionChangeRef.current?.(section);
   };
 
   const titleId = `${idPrefix}-title`;
@@ -148,7 +200,7 @@ export function SectionedDialog<SectionId extends string>({
 
         <div className="settings-layout">
           <nav className="settings-nav" aria-label={navigationLabel}>
-            <div className="settings-tabs" role="tablist" aria-orientation="vertical">
+            <div className="settings-tabs" role="tablist" aria-orientation={tabOrientation}>
               {sections.map((section, index) => {
                 const active = section.id === activeSection;
                 return (
@@ -165,7 +217,7 @@ export function SectionedDialog<SectionId extends string>({
                     aria-selected={active}
                     aria-controls={`${idPrefix}-panel-${section.id}`}
                     tabIndex={active ? 0 : -1}
-                    onClick={() => setActiveSection(section.id)}
+                    onClick={() => selectSection(section.id)}
                     onKeyDown={(event) => selectFromKeyboard(event, index)}
                   >
                     {section.label}

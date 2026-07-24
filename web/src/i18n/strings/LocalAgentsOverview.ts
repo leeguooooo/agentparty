@@ -16,6 +16,7 @@ export const LocalAgentsOverviewStrings: LocaleDict = {
     "LocalAgents.kind.duty": "resident",
     "LocalAgents.count": "{count} agent(s)",
     "LocalAgents.close": "Close",
+    "LocalAgents.actionFailed": "Couldn't complete this local agent action.",
   },
   zh: {
     "LocalAgents.title": "本机 agent",
@@ -30,6 +31,7 @@ export const LocalAgentsOverviewStrings: LocaleDict = {
     "LocalAgents.kind.duty": "常驻",
     "LocalAgents.count": "{count} 个",
     "LocalAgents.close": "关闭",
+    "LocalAgents.actionFailed": "无法完成此本机 agent 操作。",
   },
 };
 

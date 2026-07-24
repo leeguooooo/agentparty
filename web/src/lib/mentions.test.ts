@@ -158,6 +158,71 @@ describe("mentionCandidates", () => {
     expect(filterCandidates(candidates, "evan").map((candidate) => candidate.name)).toEqual(["Evan_Clauder"]);
   });
 
+  test("removed participants stay in history snapshots but are excluded from live mention candidates", () => {
+    const historical = message({
+      name: "removed-agent",
+      kind: "agent",
+      owner: "lark:on_former_member",
+    });
+    const removedNames = new Set(["removed-agent"]);
+    const candidates = mentionCandidates(
+      [],
+      {},
+      "leo",
+      NOW,
+      [{ name: "removed-agent", display: "Former member", kind: "agent" }],
+      [{ name: "removed-agent", kind: "agent", role: "worker" }],
+      [],
+      [historical],
+      removedNames,
+    );
+
+    expect(candidates).toEqual([]);
+    // Removal only changes the addressable projection; message history remains untouched.
+    expect(historical.sender.name).toBe("removed-agent");
+    expect(mentionCandidates([], {}, "leo", NOW, [], [], [], [historical])).toMatchObject([
+      { name: "removed-agent" },
+    ]);
+  });
+
+  test("authoritative roster prevents history-only resurrection after reload and restores an explicit rejoin", () => {
+    const historical = message({
+      name: "returning-agent",
+      kind: "agent",
+      owner: "lark:on_owner",
+    });
+    const currentMembers = new Set(["active-agent"]);
+
+    expect(mentionCandidates(
+      [],
+      {},
+      "leo",
+      NOW,
+      [],
+      [],
+      [],
+      [historical],
+      new Set(),
+      currentMembers,
+    )).toEqual([]);
+
+    currentMembers.add("returning-agent");
+    expect(mentionCandidates(
+      [{ name: "returning-agent", kind: "agent" }],
+      {},
+      "leo",
+      NOW,
+      [],
+      [],
+      [],
+      [historical],
+      new Set(),
+      currentMembers,
+    )).toMatchObject([
+      { name: "returning-agent", group: "lark:on_owner", tier: "online" },
+    ]);
+  });
+
   test("participants-only agent uses its owner instead of falling into unowned agents (#499)", () => {
     const candidates = mentionCandidates([
       { name: "external-live", kind: "agent", owner: "lark:on_cross_company" },

@@ -80,6 +80,8 @@ function render(
   participants: Sender[] = [],
   deliveries: PublicDirectedDelivery[] = [],
   messages: MsgFrame[] = [],
+  onOpenAgentDetail?: (name: string) => void,
+  memberNames?: ReadonlySet<string>,
 ): ReactTestRenderer {
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage({ ap_locale: locale }) });
   let r!: ReactTestRenderer;
@@ -92,6 +94,8 @@ function render(
           tasks={tasks}
           deliveries={deliveries}
           messages={messages}
+          onOpenAgentDetail={onOpenAgentDetail}
+          memberNames={memberNames}
         />
       </LocaleProvider>,
     );
@@ -191,12 +195,47 @@ describe("AgentBoardPanel (#187)", () => {
     expect(txt).toContain("offline");
   });
 
+  test("authoritative roster keeps removed task and delivery targets out of Team", () => {
+    const txt = allText(render(
+      "en",
+      [],
+      [task(1, "removed-agent", "assigned")],
+      [],
+      [delivery("removed-work", "removed-agent", 12, "queued", "stale assignment")],
+      [],
+      undefined,
+      new Set(),
+    ));
+
+    expect(txt).not.toContain("removed-agent");
+    expect(txt).not.toContain("stale assignment");
+    expect(txt).toContain("No agents yet");
+  });
+
   test("participant-only agent is visible and online before its first presence row (#514)", () => {
     const r = render("en", [], [], [{ name: "fresh-agent", kind: "agent" }]);
     const idleLane = r.root.findByProps({ "data-status": "idle" });
     const offlineLane = r.root.findByProps({ "data-status": "offline" });
     expect(treeText(idleLane)).toContain("fresh-agent");
     expect(treeText(offlineLane)).not.toContain("fresh-agent");
+  });
+
+  test("member names route into the shared Team detail instead of opening a nested modal", () => {
+    let opened: string | null = null;
+    const r = render(
+      "en",
+      [presence("alice", { state: "working", live: true })],
+      [],
+      [],
+      [],
+      [],
+      (name) => { opened = name; },
+    );
+
+    const member = r.root.findByProps({ "data-team-member": "alice" });
+    expect(member.type).toBe("button");
+    act(() => member.props.onClick());
+    expect(opened).toBe("alice");
   });
 
   test("treats presence.busy as busy and shows the current message instead of only a status label", () => {

@@ -78,6 +78,30 @@ describe("history rest", () => {
     expect(((await both.json()) as { messages: MsgLike[] }).messages.map((m) => m.seq)).toEqual([1, 2]);
   });
 
+  it("loads an ascending window around an exact historical message anchor", async () => {
+    const { token } = await seedToken("agent");
+    const slug = await createChannel(token);
+    for (let i = 1; i <= 7; i++) {
+      expect((await postMessage(slug, token, `m${i}`)).status).toBe(200);
+    }
+
+    const middle = await api(`/api/channels/${slug}/messages?around=4&limit=5`, token);
+    expect(middle.status).toBe(200);
+    expect(((await middle.json()) as { messages: MsgLike[] }).messages.map((m) => m.seq))
+      .toEqual([2, 3, 4, 5, 6]);
+
+    const edge = await api(`/api/channels/${slug}/messages?around=1&limit=5`, token);
+    expect(((await edge.json()) as { messages: MsgLike[] }).messages.map((m) => m.seq))
+      .toEqual([1, 2, 3, 4, 5]);
+
+    const missing = await api(`/api/channels/${slug}/messages?around=99&limit=5`, token);
+    expect(((await missing.json()) as { messages: MsgLike[] }).messages).toEqual([]);
+
+    const precedence = await api(`/api/channels/${slug}/messages?since=6&before=2&around=4&limit=3`, token);
+    expect(((await precedence.json()) as { messages: MsgLike[] }).messages.map((m) => m.seq))
+      .toEqual([3, 4, 5]);
+  });
+
   it("persists and filters completion artifacts", async () => {
     const { token } = await seedToken("agent");
     const slug = await createChannel(token);

@@ -17,6 +17,7 @@ const TASK_KEYS = [
   "Channel.tasks.detailAria",
   "Channel.tasks.detailOpenAria",
   "Channel.tasks.detailClose",
+  "Channel.tasks.detailBack",
   "Channel.tasks.detailNoDesc",
   "Channel.tasks.solution",
   "Channel.tasks.detail.priority",

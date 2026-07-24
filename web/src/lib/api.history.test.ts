@@ -1,6 +1,6 @@
 // @ts-expect-error Bun executes this test, while the web tsconfig intentionally loads only Vite globals.
 import { afterEach, describe, expect, test } from "bun:test";
-import { AuthError, fetchMessagesWithRetry } from "./api";
+import { AuthError, fetchMessages, fetchMessagesWithRetry } from "./api";
 
 const original = Object.getOwnPropertyDescriptor(globalThis, "fetch");
 
@@ -49,5 +49,27 @@ describe("fetchMessagesWithRetry", () => {
     await expect(fetchMessagesWithRetry("tok", "demo", {}, { attempts: 2, delayMs: 0 }))
       .rejects.toThrow("failed (503)");
     expect(mock.calls()).toBe(2);
+  });
+});
+
+describe("fetchMessages around-seq window", () => {
+  test("requests a bounded window anchored on the target seq", async () => {
+    const urls: string[] = [];
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: async (input: string | URL | Request) => {
+        urls.push(String(input));
+        return Response.json({ messages: [] });
+      },
+    });
+
+    await fetchMessages("tok", "demo", { around: 42, limit: 25 });
+
+    expect(urls).toHaveLength(1);
+    const requested = urls[0]!;
+    expect(requested).toContain("/api/channels/demo/messages?");
+    const search = new URLSearchParams(requested.slice(requested.indexOf("?") + 1));
+    expect(search.get("around")).toBe("42");
+    expect(search.get("limit")).toBe("25");
   });
 });

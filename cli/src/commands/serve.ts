@@ -1901,6 +1901,27 @@ export function claudeHookSettingsJson(execPath: string = process.execPath): str
   });
 }
 
+/**
+ * launchd residents bind the selected builtin CLI to an absolute path at install/repair time.
+ * Keep PATH lookup as a compatibility fallback for terminal-started `party serve`, but never
+ * ignore a malformed explicit binding: that would turn a configuration problem back into a
+ * delayed wake-time `Executable not found` failure.
+ */
+export function builtinRunnerCommand(
+  harness: Exclude<RunnerHarness, "codex-sdk">,
+  env: Record<string, string | undefined>,
+): string {
+  const configured = env.AGENTPARTY_RUNNER_BIN?.trim();
+  if (configured === undefined || configured === "") return harness;
+  if (!isAbsolute(configured)) {
+    throw new WakeBlockedError(
+      `builtin ${harness} runner binding is invalid: AGENTPARTY_RUNNER_BIN must be absolute`,
+      true,
+    );
+  }
+  return configured;
+}
+
 async function runHarness(
   opts: BuiltinRunnerOptions,
   prompt: string,
@@ -1926,6 +1947,7 @@ async function runHarness(
     }
   };
   if (opts.harness === "codex") {
+    const runnerCommand = builtinRunnerCommand("codex", env);
     const outFile = join(opts.workdir, `runner-${seq}-${Date.now()}.out`);
     const schemaArgs = opts.outputSchema === undefined
       ? []
@@ -1950,8 +1972,8 @@ async function runHarness(
     // exec-level flags must precede the `resume` subcommand.  Putting --sandbox after the session
     // id is parsed as a resume-only flag and current Codex rejects the second managed turn.
     const args = sid
-      ? ["codex", "exec", ...flags, "resume", sid, prompt]
-      : ["codex", "exec", ...flags, prompt];
+      ? [runnerCommand, "exec", ...flags, "resume", sid, prompt]
+      : [runnerCommand, "exec", ...flags, prompt];
     const result = await runProcess(args, { cwd, env, signal });
     const text = result.code === 0 && existsSync(outFile) ? readFileSync(outFile, "utf8").trimEnd() : "";
     return { result, text, sessionId: sid ? sid : parseCodexSessionId(result.stdout, result.stderr), outFile };
@@ -1988,10 +2010,11 @@ async function runHarness(
   // 活动上报（#602）：session 级注入 hooks，把模型「正在干什么」经 `party hook report` 落盘，
   // 由外层 serve 心跳捎带进频道 presence。--settings 只作用于本次 session，不碰用户/项目 settings。
   const hookArgs = ["--settings", claudeHookSettingsJson()];
+  const runnerCommand = builtinRunnerCommand("claude", env);
   const args = sid
-    ? ["claude", "-p", "--disallowed-tools", "AskUserQuestion", ...permissionArgs, ...schemaArgs, ...jsonOutputArgs, ...mcpArgs, ...hookArgs, "--resume", sid, prompt]
+    ? [runnerCommand, "-p", "--disallowed-tools", "AskUserQuestion", ...permissionArgs, ...schemaArgs, ...jsonOutputArgs, ...mcpArgs, ...hookArgs, "--resume", sid, prompt]
     : [
-        "claude",
+        runnerCommand,
         "-p",
         "--disallowed-tools",
         "AskUserQuestion",

@@ -174,11 +174,7 @@ describe("Channel i18n source guard (#350)", () => {
     expect(source).toContain("onlineAgentCount");
   });
 
-  test("places visibility on the presence row and right-aligns channel management after content tools", () => {
-    const presence = source.slice(
-      source.indexOf("<PresenceBar"),
-      source.indexOf("<ChannelToolstrip"),
-    );
+  test("keeps content tools before channel management and consolidates admin controls in one panel", () => {
     const toolbar = source.slice(
       source.indexOf("<ChannelToolstrip"),
       source.indexOf("{activePanel !== null"),
@@ -190,28 +186,41 @@ describe("Channel i18n source guard (#350)", () => {
       'openPanel("search")',
       "<AgentJoin",
       "<AgentTokens",
-      "<JoinLink",
-      'openPanel("settings")',
-      'className="d-btn archive-channel-btn"',
+      'openPanel("admin")',
     ];
     const positions = controls.map((control) => toolbar.indexOf(control));
-    const headerControlsStart = presence.indexOf("headerControls={");
-    const headerControlsEndMarker = "\n        ) : null}";
-    const headerControlsEnd = presence.indexOf(headerControlsEndMarker, headerControlsStart);
-    const headerControls = presence.slice(
-      headerControlsStart,
-      headerControlsEnd + headerControlsEndMarker.length,
+    const adminPanel = source.slice(
+      source.indexOf('{activePanel === "admin" && ('),
+      source.indexOf('{activePanel === "search" && searchContent}'),
     );
 
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
-    expect(headerControlsStart).toBeGreaterThanOrEqual(0);
-    expect(headerControlsEnd).toBeGreaterThan(headerControlsStart);
-    expect(headerControls).toContain("<VisibilityToggle");
     expect(toolbar).not.toContain("<VisibilityToggle");
+    expect(toolbar).not.toContain("<JoinLink");
+    expect(toolbar).not.toContain('openPanel("settings")');
+    expect(toolbar).not.toContain("archive-channel-btn");
     expect(toolbar).toContain('className="chan-admin-group chan-admin-group--agents"');
-    expect(toolbar).toContain('className="chan-admin-group chan-admin-group--access"');
     expect(toolbar).toContain('className="chan-admin-group chan-admin-group--channel"');
+    expect(adminPanel).toContain("<ChannelAdminView");
+    expect(adminPanel).toContain("accessControls=");
+    expect(adminPanel).toContain("<VisibilityToggle");
+    expect(adminPanel).toContain("invitationControls=");
+    expect(adminPanel).toContain("<JoinLink");
+    expect(adminPanel).toContain("embedded");
+    expect(adminPanel).toContain("safetyControls=");
+    expect(adminPanel).toContain("<GuardSettingsPanel");
+    expect(adminPanel).toContain("onArchive={archiveCurrentChannel}");
+  });
+
+  test("guards task-ledger refreshes and clears formal assignments after member removal", () => {
+    expect(source).toContain("const taskLedgerRequestRef = useRef(0)");
+    expect(source).toContain("const requestId = ++taskLedgerRequestRef.current");
+    expect(source).toContain("if (requestId !== taskLedgerRequestRef.current) return");
+    expect(source).toContain("if (requestId === taskLedgerRequestRef.current) setTasksLoading(false)");
+    expect(source).toContain(
+      "setChannelRoles((current) => current.filter((role) => role.name !== name))",
+    );
   });
 
   test("reject actions no longer use a browser prompt", () => {

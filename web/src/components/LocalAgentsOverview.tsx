@@ -6,6 +6,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { TFunc } from "../i18n/useT";
 import {
   desktopAgentAdapter,
+  dutyDependencyErrorRunner,
+  dutyRepairInput,
   type DesktopAgentAdapter,
   type DesktopAgentStatus,
   type DesktopDutyEntry,
@@ -25,6 +27,7 @@ interface Props {
   t: TFunc;
   adapter?: DesktopAgentAdapter;
   scheduler?: DesktopAgentScheduler;
+  active?: boolean;
   // 从频道页唤起时预过滤到该频道（点 ①「频道里能管理」）；全局打开则不传，看全部。
   scopeChannel?: string | null;
 }
@@ -33,18 +36,33 @@ function isActive(state: string): boolean {
   return state === "starting" || state === "running" || state === "stopping";
 }
 
-export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, scheduler = defaultScheduler, scopeChannel = null }: Props) {
+export function LocalAgentsOverview({
+  t,
+  adapter = desktopAgentAdapter,
+  scheduler = defaultScheduler,
+  active = true,
+  scopeChannel = null,
+}: Props) {
   // available=null 未探测；false=不可用（非 macOS/旧壳，statusAll 与 dutyList 都失败）。
   const [available, setAvailable] = useState<boolean | null>(null);
   const [instances, setInstances] = useState<DesktopAgentStatus[]>([]);
   const [duties, setDuties] = useState<DesktopDutyEntry[]>([]);
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const aliveRef = useRef(true);
+  const mountedRef = useRef(true);
   const opRef = useRef(false);
   // #707 评审：挂载刷新 / 轮询 / 操作后刷新可并发，早发的请求后到会把新快照覆盖成旧的。
   // 单调序号——只让「最新一次 refresh」的结果落地，乱序完成的旧结果丢弃。
   const refreshSeqRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const refresh = async (): Promise<void> => {
     const seq = ++refreshSeqRef.current;
@@ -77,6 +95,13 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
   };
 
   useEffect(() => {
+    if (!active) {
+      aliveRef.current = false;
+      return () => {
+        aliveRef.current = false;
+        refreshSeqRef.current += 1;
+      };
+    }
     aliveRef.current = true;
     void refresh();
     const cancel = scheduler.every(() => void refresh(), 3_000);
@@ -86,7 +111,7 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
       cancel();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adapter, scheduler]);
+  }, [active, adapter, scheduler]);
 
   const groups = useMemo(() => {
     const rows = aggregateLocalAgents(instances, duties);
@@ -98,14 +123,22 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
     if (opRef.current) return;
     opRef.current = true;
     setBusy(true);
+    setActionError(null);
     try {
       await action();
-      await refresh();
-    } catch {
-      // 就地动作失败：下一轮轮询会纠正显示，不弹错打断概览。
+      if (aliveRef.current) await refresh();
+    } catch (cause) {
+      if (aliveRef.current) {
+        const runner = dutyDependencyErrorRunner(cause);
+        setActionError(
+          runner === null
+            ? t("LocalAgents.actionFailed")
+            : t("DesktopSettings.agent.dutyDependencyMissing", { runner }),
+        );
+      }
     } finally {
       opRef.current = false;
-      if (aliveRef.current) setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
 
@@ -133,6 +166,9 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
             spellCheck={false}
             onChange={(event) => setQuery(event.target.value)}
           />
+          {actionError !== null && (
+            <p className="desktop-agent-error" role="alert">{actionError}</p>
+          )}
 
           {totalRows === 0 ? (
             <p className="local-agents-empty" role="status">
@@ -159,6 +195,19 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
                             ? t(row.duty!.loaded ? "DesktopSettings.agent.dutyLoaded" : "DesktopSettings.agent.dutyNotLoaded")
                             : t(`DesktopSettings.agent.state.${row.state}`)}
                         </span>
+                        {row.kind === "duty" && (
+                          row.duty!.dependencyState === "missing" ||
+                          row.duty!.dependencyState === "repair-required"
+                        ) && (
+                          <span className="desktop-agent-error" role="alert">
+                            {t(
+                              row.duty!.dependencyState === "missing"
+                                ? "DesktopSettings.agent.dutyDependencyMissing"
+                                : "DesktopSettings.agent.dutyDependencyRepair",
+                              { runner: row.duty!.runner ?? "runner" },
+                            )}
+                          </span>
+                        )}
                         {row.kind === "instance" && row.instanceId !== null && isActive(row.state) && (
                           <button
                             type="button"
@@ -171,15 +220,34 @@ export function LocalAgentsOverview({ t, adapter = desktopAgentAdapter, schedule
                           </button>
                         )}
                         {row.kind === "duty" && (
-                          <button
-                            type="button"
-                            className="d-btn local-agents-unload"
-                            disabled={busy}
-                            aria-label={`${t("DesktopSettings.agent.dutyUnload")} ${row.instanceId}`}
-                            onClick={() => void runAction(() => adapter.dutyUnpersist(row.instanceId!))}
-                          >
-                            {t("DesktopSettings.agent.dutyUnload")}
-                          </button>
+                          <>
+                            {(
+                              row.duty!.dependencyState === "missing" ||
+                              row.duty!.dependencyState === "repair-required"
+                            ) && dutyRepairInput(row.duty!) !== null && (
+                              <button
+                                type="button"
+                                className="d-btn local-agents-repair"
+                                disabled={busy}
+                                aria-label={`${t("DesktopSettings.agent.dutyRepair")} ${row.instanceId}`}
+                                onClick={() => {
+                                  const input = dutyRepairInput(row.duty!);
+                                  if (input !== null) void runAction(() => adapter.dutyPersist(input));
+                                }}
+                              >
+                                {t("DesktopSettings.agent.dutyRepair")}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              className="d-btn local-agents-unload"
+                              disabled={busy}
+                              aria-label={`${t("DesktopSettings.agent.dutyUnload")} ${row.instanceId}`}
+                              onClick={() => void runAction(() => adapter.dutyUnpersist(row.instanceId!))}
+                            >
+                              {t("DesktopSettings.agent.dutyUnload")}
+                            </button>
+                          </>
                         )}
                       </li>
                     ))}

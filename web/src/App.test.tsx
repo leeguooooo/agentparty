@@ -216,6 +216,30 @@ beforeEach(() => {
 
 test("desktop separates personal settings from the local-agent control center", async () => {
   const settingsFocus = mock(() => undefined);
+  const onboardingFocus = mock(() => undefined);
+  const bannerFocus = mock(() => undefined);
+  const defaultFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/api/me")) {
+        return new Response(JSON.stringify({
+          name: "human-1",
+          email: "human@example.com",
+          kind: "human",
+          handle: null,
+          display_name: "Human",
+          avatar_url: null,
+          avatar_thumb: null,
+          provider: "oidc",
+          tenant_key: null,
+          role: "human",
+          owner: null,
+        }), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    },
+  });
   localStorage.setItem("ap_onboarded", "1");
   location.pathname = "/c/test-channel";
   location.href = `${activeOrigin}/c/test-channel`;
@@ -223,9 +247,16 @@ test("desktop separates personal settings from the local-agent control center", 
     renderer = create(<LocaleProvider><App /></LocaleProvider>, {
       createNodeMock: (element) => {
         const props = element.props as { className?: string };
-        return element.type === "button" && props.className === "app-settings-btn"
-          ? { focus: settingsFocus, isConnected: true }
-          : {};
+        if (element.type === "button" && props.className === "app-settings-btn") {
+          return { focus: settingsFocus, isConnected: true };
+        }
+        if (element.type === "button" && props.className === "d-btn handle-banner-open") {
+          return { focus: bannerFocus, isConnected: true };
+        }
+        if (element.type === "button" && props.className === "d-btn onboarding-close") {
+          return { focus: onboardingFocus, isConnected: true, tabIndex: 0 };
+        }
+        return {};
       },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -270,10 +301,31 @@ test("desktop separates personal settings from the local-agent control center", 
     typeof node.props.className === "string" && node.props.className.split(/\s+/).includes("settings-onboarding"),
   )[0];
   expect(onboardingButton).toBeTruthy();
+  const focusBeforeHandoff = settingsFocus.mock.calls.length;
   await act(async () => onboardingButton!.props.onClick());
 
   expect(root.findAllByProps({ className: "settings-panel" })).toHaveLength(0);
   expect(root.findByProps({ className: "d-card onboarding-card" })).toBeTruthy();
+  expect(root.findAllByProps({ role: "dialog" })).toHaveLength(1);
+  expect(onboardingFocus).toHaveBeenCalledTimes(1);
+  expect(settingsFocus).toHaveBeenCalledTimes(focusBeforeHandoff);
+
+  await act(async () => root.findByProps({ className: "d-btn onboarding-close" }).props.onClick());
+
+  expect(root.findAllByProps({ className: "d-card onboarding-card" })).toHaveLength(0);
+  expect(settingsFocus).toHaveBeenCalledTimes(focusBeforeHandoff + 1);
+
+  const bannerAction = root.findByProps({ className: "d-btn handle-banner-open" });
+  await act(async () => bannerAction.props.onClick({}));
+  const bannerOnboardingButton = root.findAll((node) =>
+    typeof node.props.className === "string" && node.props.className.split(/\s+/).includes("settings-onboarding"),
+  )[0]!;
+  const settingsFocusBeforeBannerHandoff = settingsFocus.mock.calls.length;
+  await act(async () => bannerOnboardingButton.props.onClick());
+  await act(async () => root.findByProps({ className: "d-btn onboarding-close" }).props.onClick());
+
+  expect(bannerFocus).toHaveBeenCalledTimes(1);
+  expect(settingsFocus).toHaveBeenCalledTimes(settingsFocusBeforeBannerHandoff);
 });
 
 afterEach(async () => {

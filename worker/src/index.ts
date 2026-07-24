@@ -31,6 +31,7 @@ import type {
   ChannelMode,
   CollaborationRole,
   MsgFrame,
+  ParticipantRemovedFrame,
   RestErrorCode,
   TaskAssigneeKind,
   TaskRecord,
@@ -657,8 +658,15 @@ async function mintOrRotateProfileRuntimeToken(
 
 async function mintOrRotateProfileChannelToken(
   db: D1Database,
-  opts: { ownerAccount: string; handle: string; channelScope: string; childName: string },
-): Promise<{ token: string; lineage: AgentLineage } | { conflict: true }> {
+  opts: {
+    ownerAccount: string;
+    handle: string;
+    channelScope: string;
+    childName: string;
+    inviteId: number;
+    runtimeHash: string;
+  },
+): Promise<{ token: string; lineage: AgentLineage } | { conflict: true } | { superseded: true }> {
   const existing = await db
     .prepare("SELECT id, role, owner, channel_scope, parent_agent, revoked_at FROM tokens WHERE name = ?")
     .bind(opts.childName)
@@ -687,49 +695,97 @@ async function mintOrRotateProfileChannelToken(
     depth: 1,
     expires_at: null,
   };
-  if (existing) {
-    await db.prepare(
-      `UPDATE tokens
-          SET hash = ?, role = 'agent', owner = ?, channel_scope = ?,
-              parent_agent = ?, root_agent = ?, team_id = ?, spawn_depth = ?, child_expires_at = ?,
-              created_at = ?, revoked_at = NULL
-        WHERE id = ?`,
+  const authorized = `
+    EXISTS (
+      SELECT 1 FROM channel_agent_invites invite
+       WHERE invite.id = ?
+         AND invite.channel_slug = ?
+         AND invite.owner_account = ?
+         AND invite.profile_handle = ?
+         AND invite.revoked_at IS NULL
     )
-      .bind(
-        hash,
-        opts.ownerAccount,
-        opts.channelScope,
-        lineage.parent_agent,
-        lineage.root_agent,
-        lineage.team_id,
-        lineage.depth,
-        lineage.expires_at,
-        now,
-        existing.id,
-      )
-      .run();
-  } else {
-    await db.prepare(
-      `INSERT INTO tokens (
-         hash, name, role, owner, channel_scope,
-         parent_agent, root_agent, team_id, spawn_depth, child_expires_at,
-         created_at
-       ) VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    AND EXISTS (
+      SELECT 1 FROM tokens runtime
+       WHERE runtime.name = ?
+         AND runtime.hash = ?
+         AND runtime.role = 'agent'
+         AND runtime.owner = ?
+         AND runtime.channel_scope IS NULL
+         AND runtime.revoked_at IS NULL
     )
-      .bind(
-        hash,
-        opts.childName,
-        opts.ownerAccount,
-        opts.channelScope,
-        lineage.parent_agent,
-        lineage.root_agent,
-        lineage.team_id,
-        lineage.depth,
-        lineage.expires_at,
-        now,
-      )
-      .run();
-  }
+    AND NOT EXISTS (
+      SELECT 1 FROM channel_participant_removals removal
+       WHERE removal.channel_slug = ?
+         AND (
+           (removal.principal_type = 'name' AND removal.principal IN (?, ?))
+           OR (removal.principal_type = 'account' AND removal.principal = ?)
+         )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM channel_account_bans WHERE channel_slug = ? AND account = ?
+    )`;
+  const authBinds = [
+    opts.inviteId,
+    opts.channelScope,
+    opts.ownerAccount,
+    opts.handle,
+    opts.handle,
+    opts.runtimeHash,
+    opts.ownerAccount,
+    opts.channelScope,
+    opts.handle,
+    opts.childName,
+    opts.ownerAccount,
+    opts.channelScope,
+    opts.ownerAccount,
+  ];
+  const saved = await db.prepare(
+    `INSERT INTO tokens (
+       hash, name, role, owner, channel_scope,
+       parent_agent, root_agent, team_id, spawn_depth, child_expires_at,
+       created_at
+     )
+     SELECT ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ${authorized}
+     ON CONFLICT(name) DO UPDATE SET
+       hash = excluded.hash,
+       role = excluded.role,
+       owner = excluded.owner,
+       channel_scope = excluded.channel_scope,
+       parent_agent = excluded.parent_agent,
+       root_agent = excluded.root_agent,
+       team_id = excluded.team_id,
+       spawn_depth = excluded.spawn_depth,
+       child_expires_at = excluded.child_expires_at,
+       created_at = excluded.created_at,
+       revoked_at = NULL
+     WHERE (
+       tokens.revoked_at IS NOT NULL
+       OR (
+         tokens.role = 'agent'
+         AND tokens.owner = excluded.owner
+         AND tokens.channel_scope = excluded.channel_scope
+         AND tokens.parent_agent = excluded.parent_agent
+       )
+     )
+       AND ${authorized}`,
+  )
+    .bind(
+      hash,
+      opts.childName,
+      opts.ownerAccount,
+      opts.channelScope,
+      lineage.parent_agent,
+      lineage.root_agent,
+      lineage.team_id,
+      lineage.depth,
+      lineage.expires_at,
+      now,
+      ...authBinds,
+      ...authBinds,
+    )
+    .run();
+  if ((saved.meta.changes ?? 0) === 0) return { superseded: true };
   return { token, lineage };
 }
 
@@ -1179,6 +1235,107 @@ async function persistToken(
   return { token };
 }
 
+async function persistSpawnToken(
+  db: D1Database,
+  opts: {
+    name: string;
+    owner: string;
+    channelScope: string;
+    lineage: AgentLineage;
+    parentName: string;
+    parentHash: string;
+  },
+): Promise<{ token: string } | { conflict: true } | { superseded: true }> {
+  const existing = await db.prepare("SELECT revoked_at FROM tokens WHERE name = ?")
+    .bind(opts.name)
+    .first<{ revoked_at: number | null }>();
+  if (existing?.revoked_at === null) return { conflict: true };
+  if (await db.prepare("SELECT 1 FROM account_profiles WHERE handle = ? COLLATE NOCASE").bind(opts.name).first()) {
+    return { conflict: true };
+  }
+  if (await db.prepare("SELECT 1 FROM agent_nicknames WHERE nickname = ? COLLATE NOCASE").bind(opts.name).first()) {
+    return { conflict: true };
+  }
+
+  const token = randomToken();
+  const tokenHash = await sha256Hex(token);
+  const now = Date.now();
+  const authorized = `
+    EXISTS (
+      SELECT 1 FROM tokens parent
+       WHERE parent.name = ?
+         AND parent.hash = ?
+         AND parent.role = 'agent'
+         AND parent.owner = ?
+         AND parent.channel_scope = ?
+         AND parent.parent_agent IS NULL
+         AND parent.revoked_at IS NULL
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM channel_participant_removals removal
+       WHERE removal.channel_slug = ?
+         AND (
+           (removal.principal_type = 'name' AND removal.principal IN (?, ?))
+           OR (removal.principal_type = 'account' AND removal.principal = ?)
+         )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM channel_account_bans WHERE channel_slug = ? AND account = ?
+    )`;
+  const authBinds = [
+    opts.parentName,
+    opts.parentHash,
+    opts.owner,
+    opts.channelScope,
+    opts.channelScope,
+    opts.parentName,
+    opts.name,
+    opts.owner,
+    opts.channelScope,
+    opts.owner,
+  ];
+  const saved = await db.prepare(
+    `INSERT INTO tokens (
+       hash, name, role, owner, channel_scope,
+       parent_agent, root_agent, team_id, spawn_depth, child_expires_at,
+       created_at
+     )
+     SELECT ?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ${authorized}
+     ON CONFLICT(name) DO UPDATE SET
+       hash = excluded.hash,
+       role = excluded.role,
+       owner = excluded.owner,
+       channel_scope = excluded.channel_scope,
+       parent_agent = excluded.parent_agent,
+       root_agent = excluded.root_agent,
+       team_id = excluded.team_id,
+       spawn_depth = excluded.spawn_depth,
+       child_expires_at = excluded.child_expires_at,
+       created_at = excluded.created_at,
+       revoked_at = NULL
+     WHERE tokens.revoked_at IS NOT NULL
+       AND ${authorized}`,
+  )
+    .bind(
+      tokenHash,
+      opts.name,
+      opts.owner,
+      opts.channelScope,
+      opts.lineage.parent_agent,
+      opts.lineage.root_agent,
+      opts.lineage.team_id,
+      opts.lineage.depth,
+      opts.lineage.expires_at,
+      now,
+      ...authBinds,
+      ...authBinds,
+    )
+    .run();
+  if ((saved.meta.changes ?? 0) === 0) return { superseded: true };
+  return { token };
+}
+
 async function upsertHumanSessionToken(db: D1Database, name: string, owner: string): Promise<{ token: string }> {
   const token = randomToken();
   const hash = await sha256Hex(token);
@@ -1418,6 +1575,114 @@ async function isChannelAccountBanned(db: D1Database, slug: string, account: str
   ).bind(slug, account).first()) !== null;
 }
 
+type ChannelParticipantRemoval = {
+  principal_type: "name" | "account";
+  principal: string;
+  removed_at: number;
+  removal_epoch: string;
+};
+
+async function loadChannelParticipantRemoval(
+  db: D1Database,
+  slug: string,
+  principalType: "name" | "account",
+  principal: string | null | undefined,
+): Promise<ChannelParticipantRemoval | null> {
+  if (principal == null || principal === "") return null;
+  return db.prepare(
+    `SELECT principal_type, principal, removed_at, removal_epoch
+       FROM channel_participant_removals
+      WHERE channel_slug = ? AND principal_type = ? AND principal = ?`,
+  )
+    .bind(slug, principalType, principal)
+    .first<ChannelParticipantRemoval>();
+}
+
+async function isChannelParticipantRemoved(
+  db: D1Database,
+  slug: string,
+  identity: Pick<TokenIdentity, "name" | "account">,
+): Promise<boolean> {
+  const row = await db.prepare(
+    `SELECT 1
+       FROM channel_participant_removals
+      WHERE channel_slug = ?
+        AND (
+          (principal_type = 'name' AND principal = ?)
+          OR (principal_type = 'account' AND ? IS NOT NULL AND principal = ?)
+        )
+      LIMIT 1`,
+  )
+    .bind(slug, identity.name, identity.account ?? null, identity.account ?? null)
+    .first();
+  return row !== null;
+}
+
+function setChannelParticipantRemoval(
+  db: D1Database,
+  input: {
+    slug: string;
+    principalType: "name" | "account";
+    principal: string;
+    restoreAccount?: string | null;
+    removedAt: number;
+    removalEpoch: string;
+    removedBy: string;
+  },
+) {
+  return db.prepare(
+    `INSERT INTO channel_participant_removals
+       (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+  ).bind(
+    input.slug,
+    input.principalType,
+    input.principal,
+    input.restoreAccount ?? null,
+    input.removedAt,
+    input.removalEpoch,
+    input.removedBy,
+  );
+}
+
+async function recordChannelParticipantBinding(
+  db: D1Database,
+  slug: string,
+  identity: Pick<TokenIdentity, "name" | "account" | "kind">,
+): Promise<void> {
+  if (identity.account == null || identity.account === "" || identity.name === "") return;
+  await db.prepare(
+    `INSERT INTO channel_participant_bindings
+       (channel_slug, participant_name, account, participant_kind, observed_at)
+     SELECT ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM channel_participant_removals
+         WHERE channel_slug = ?
+           AND (
+             (principal_type = 'name' AND principal = ?)
+             OR (principal_type = 'account' AND principal = ?)
+           )
+      )
+     ON CONFLICT(channel_slug, participant_name) DO UPDATE SET
+       account = excluded.account,
+       participant_kind = excluded.participant_kind,
+       observed_at = excluded.observed_at`,
+  )
+    .bind(
+      slug,
+      identity.name,
+      identity.account,
+      identity.kind,
+      Date.now(),
+      slug,
+      identity.name,
+      identity.account,
+    )
+    .run();
+}
+
 function channelJoinRequestFromRow(row: ChannelJoinRequestRow) {
   let requesterProfile: Record<string, unknown> = {};
   try {
@@ -1496,6 +1761,7 @@ function optionalBoundedText(value: unknown, maxBytes: number): string | null | 
 }
 
 async function canAccessLoadedChannel(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
+  if (await isChannelParticipantRemoved(db, channel.slug, identity)) return false;
   if (await isChannelAccountBanned(db, channel.slug, identity.account)) return false;
   if (canAccessChannel(identity, channel, await isChannelMember(db, channel.slug, identity.account))) return true;
   if (identity.role !== "agent" || identity.account == null) return false;
@@ -1518,7 +1784,6 @@ async function canAccessLoadedChannel(db: D1Database, identity: TokenIdentity, c
 // 仅 public_watch 频道 DO 才据此拦截；public/private 忽略此位，故对现有频道零行为变化。
 async function canParticipateInChannel(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
   if (identity.role === "readonly") return false;
-  if (await isChannelAccountBanned(db, channel.slug, identity.account)) return false;
   return canAccessLoadedChannel(db, identity, { ...channel, visibility: "private" });
 }
 
@@ -1629,6 +1894,10 @@ function channelHeaders(
 }
 
 async function canConfigureChannel(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
+  if (
+    await isChannelParticipantRemoved(db, channel.slug, identity) ||
+    await isChannelAccountBanned(db, channel.slug, identity.account)
+  ) return false;
   if (isChannelModerator(identity, channel)) return true;
   return (await loadAssignedRole(db, channel.slug, identity)) === "host";
 }
@@ -1689,6 +1958,7 @@ function canByAgentPolicy(
 }
 
 async function canListMembers(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
+  if (!(await canAccessLoadedChannel(db, identity, channel))) return false;
   const perms = channelPerms(channel);
   const isMember = await isChannelMember(db, channel.slug, identity.account);
   if (identity.kind === "agent") {
@@ -1766,6 +2036,8 @@ async function removeChannelMemberAndAgents(
   identity: TokenIdentity,
   removedAt = Date.now(),
 ): Promise<{ memberRemoved: boolean; revokedAgents: number; revokedProjectAgentInvites: number }> {
+  const removalEpoch = crypto.randomUUID();
+  const removedBy = identity.account ?? identity.name;
   const activeTokens = await env.DB.prepare(
     `SELECT name, role, channel_scope
        FROM tokens
@@ -1776,13 +2048,64 @@ async function removeChannelMemberAndAgents(
           OR (role = 'agent' AND (channel_scope IS NULL OR channel_scope = ?))
         )`,
   ).bind(account, slug).all<{ name: string; role: string; channel_scope: string | null }>();
+  const boundParticipants = await env.DB.prepare(
+    `SELECT participant_name AS name, participant_kind AS kind
+       FROM channel_participant_bindings
+      WHERE channel_slug = ? AND account = ?`,
+  ).bind(slug, account).all<{ name: string; kind: "human" | "agent" }>();
   const activeProjectAgentInvites = await env.DB.prepare(
     `SELECT profile_handle
        FROM channel_agent_invites
       WHERE channel_slug = ? AND owner_account = ? AND revoked_at IS NULL`,
   ).bind(slug, account).all<{ profile_handle: string }>();
-  const [removed, revokedAgents, revokedProjectAgents] = await env.DB.batch([
+  const [removed, , , , revokedAgents, revokedProjectAgents] = await env.DB.batch([
     env.DB.prepare("DELETE FROM channel_members WHERE channel_slug = ? AND account = ?").bind(slug, account),
+    setChannelParticipantRemoval(env.DB, {
+      slug,
+      principalType: "account",
+      principal: account,
+      removedAt,
+      removalEpoch,
+      removedBy,
+    }),
+    env.DB.prepare(
+      `DELETE FROM channel_roles
+        WHERE channel_slug = ?
+          AND (
+            owner_account = ?
+            OR agent_name IN (
+              SELECT name
+                FROM tokens
+               WHERE owner = ?
+                 AND (
+                   role = 'human'
+                   OR (role = 'agent' AND (channel_scope IS NULL OR channel_scope = ?))
+                 )
+            )
+          )`,
+    ).bind(slug, account, account, slug),
+    env.DB.prepare(
+      `UPDATE channel_roles
+          SET reports_to = NULL
+        WHERE channel_slug = ?
+          AND reports_to IN (
+            SELECT participant_name
+              FROM channel_participant_bindings
+             WHERE channel_slug = ? AND account = ?
+            UNION
+            SELECT name
+              FROM tokens
+             WHERE owner = ?
+               AND (
+                 role = 'human'
+                 OR (role = 'agent' AND (channel_scope IS NULL OR channel_scope = ?))
+               )
+            UNION
+            SELECT profile_handle
+              FROM channel_agent_invites
+             WHERE channel_slug = ? AND owner_account = ?
+          )`,
+    ).bind(slug, slug, account, account, slug, slug, account),
     env.DB.prepare(
       `UPDATE tokens
           SET revoked_at = ?
@@ -1796,11 +2119,20 @@ async function removeChannelMemberAndAgents(
     env.DB.prepare(
       `INSERT INTO channel_account_bans (channel_slug, account, banned_by, banned_at)
        VALUES (?, ?, ?, ?)
-       ON CONFLICT(channel_slug, account) DO UPDATE SET
+      ON CONFLICT(channel_slug, account) DO UPDATE SET
          banned_by = excluded.banned_by,
          banned_at = excluded.banned_at`,
-    ).bind(slug, account, identity.account ?? identity.name, removedAt),
+    ).bind(slug, account, removedBy, removedAt),
+    env.DB.prepare(
+      "DELETE FROM lark_notify_subscriptions WHERE channel_slug = ? AND account = ?",
+    ).bind(slug, account),
   ]);
+  const effectiveRemoval = await loadChannelParticipantRemoval(env.DB, slug, "account", account);
+  if (effectiveRemoval === null) {
+    throw new Error("channel participant removal did not persist");
+  }
+  const effectiveRemovedAt = effectiveRemoval.removed_at;
+  const effectiveRemovalEpoch = effectiveRemoval.removal_epoch;
   const scopedAgents = activeTokens.results.filter((token) => token.role === "agent" && token.channel_scope === slug);
   await Promise.all([
     ...(removed.meta.changes > 0
@@ -1831,17 +2163,45 @@ async function removeChannelMemberAndAgents(
       timestamp: removedAt,
     })),
   ]);
-  await Promise.all((activeTokens.results ?? []).map(({ name }) =>
-    fetchChannelDO(
+  const affectedNames = [...new Set([
+    ...(activeTokens.results ?? []).map(({ name }) => name),
+    ...(boundParticipants.results ?? []).map(({ name }) => name),
+    ...(activeProjectAgentInvites.results ?? []).map(({ profile_handle }) => profile_handle),
+  ])];
+  await Promise.all(affectedNames.map(async (name) => {
+    await fetchChannelDO(
       env,
       slug,
       new Request("https://do/internal/kick", {
         method: "POST",
-        body: JSON.stringify({ name, mode: "remove" }),
+        body: JSON.stringify({
+          name,
+          mode: "remove",
+          removed_at: effectiveRemovedAt,
+          removal_epoch: effectiveRemovalEpoch,
+          removal_principal_type: "account",
+          removal_principal: account,
+        }),
         headers: { "content-type": "application/json", "x-partykit-room": slug },
       }),
-    ).catch(() => null),
-  ));
+    ).catch(() => null);
+    await fetchChannelDO(
+      env,
+      slug,
+      new Request("https://do/internal/participant-removed", {
+        method: "POST",
+        body: JSON.stringify({
+          type: "participant_removed",
+          name,
+          removed_at: effectiveRemovedAt,
+          removal_epoch: effectiveRemovalEpoch,
+          removal_principal_type: "account",
+          removal_principal: account,
+        }),
+        headers: { "content-type": "application/json", "x-partykit-room": slug },
+      }),
+    ).catch(() => null);
+  }));
   return {
     memberRemoved: removed.meta.changes > 0,
     revokedAgents: revokedAgents.meta.changes,
@@ -1851,6 +2211,7 @@ async function removeChannelMemberAndAgents(
 
 async function canEditCharter(db: D1Database, identity: TokenIdentity, channel: LoadedChannel): Promise<boolean> {
   if (identity.role === "readonly") return false;
+  if (!(await canAccessLoadedChannel(db, identity, channel))) return false;
   const perms = channelPerms(channel);
   const isMember = await isChannelMember(db, channel.slug, identity.account);
   if (identity.kind === "agent") {
@@ -2852,7 +3213,41 @@ app.get("/api/agent-profiles/invites", requireBearer, async (c) => {
   });
 });
 
-app.post("/api/channels/:slug/project-agents/runtime-token", requireBearer, async (c) => {
+const requireActiveChannelParticipant = createMiddleware<AppContext>(async (c, next) => {
+  const slug = c.req.param("slug") ?? "";
+  const identity = c.get("identity");
+  if (
+    slug !== "" &&
+    (
+      await isChannelParticipantRemoved(c.env.DB, slug, identity) ||
+      await isChannelAccountBanned(c.env.DB, slug, identity.account)
+    )
+  ) {
+    return c.json(errorBody("participant_removed", "participant was removed from this channel"), 403);
+  }
+  await next();
+  // Record only identities accepted by the final route, including a successful
+  // WebSocket upgrade. This prevents a denied private-channel request from
+  // poisoning the durable name/account projection. The statement rechecks
+  // tombstones, and projection failure cannot rewrite a committed 2xx into 500.
+  if (
+    slug !== "" &&
+    (c.res.status === 101 || !["GET", "HEAD", "OPTIONS"].includes(c.req.method)) &&
+    (c.res.status === 101 || (c.res.status >= 200 && c.res.status < 400))
+  ) {
+    await recordChannelParticipantBinding(c.env.DB, slug, identity).catch(() => undefined);
+  }
+});
+
+// These guards must be registered before every concrete channel route. Hono
+// middleware is ordered; registering them near the later collection routes
+// would leave the early agent/runtime endpoints unwrapped.
+app.use("/api/channels/:slug", requireBearer);
+app.use("/api/channels/:slug/*", requireBearer);
+app.use("/api/channels/:slug", requireActiveChannelParticipant);
+app.use("/api/channels/:slug/*", requireActiveChannelParticipant);
+
+app.post("/api/channels/:slug/project-agents/runtime-token", async (c) => {
   const identity = c.get("identity");
   const slug = c.req.param("slug");
   if (identity.role !== "agent" || identity.account == null || identity.channel_scope != null) {
@@ -2894,9 +3289,22 @@ app.post("/api/channels/:slug/project-agents/runtime-token", requireBearer, asyn
     .bind(slug, ownerAccount, handle)
     .first<{ id: number }>();
   if (!invite) return c.json(errorBody("forbidden", "project agent profile is not invited to this channel"), 403);
-  const minted = await mintOrRotateProfileChannelToken(c.env.DB, { ownerAccount, handle, channelScope: slug, childName });
+  if (await loadChannelParticipantRemoval(c.env.DB, slug, "name", childName)) {
+    return c.json(errorBody("participant_removed", "the child agent must be explicitly re-added by a moderator"), 409);
+  }
+  const minted = await mintOrRotateProfileChannelToken(c.env.DB, {
+    ownerAccount,
+    handle,
+    channelScope: slug,
+    childName,
+    inviteId: invite.id,
+    runtimeHash: identity.hash,
+  });
   if ("conflict" in minted) {
     return c.json(errorBody("conflict", "child agent name conflicts with an existing identity"), 409);
+  }
+  if ("superseded" in minted) {
+    return c.json(errorBody("participant_removed", "project agent invitation was removed while minting the child"), 409);
   }
   try {
     await fetchChannelDO(
@@ -2992,14 +3400,49 @@ app.delete("/api/channels/:slug/agents/:name", requireBearer, async (c) => {
     return c.json(errorBody("forbidden", "only the agent's owner or a channel moderator can delete it"), 403);
   }
   const now = Date.now();
-  // child token（managed lane / spawn 子身份）随父一起吊销——父死子活会留下无人监管的可用身份。
-  // 撤销前先取 child 名单：child 以自己的身份连接，撤 token 只挡新连接，存活会话必须逐个踢。
-  const children = await c.env.DB.prepare(
-    "SELECT name FROM tokens WHERE channel_scope = ? AND parent_agent = ? AND revoked_at IS NULL",
-  ).bind(slug, name).all<{ name: string }>();
-  // 撤 token 与清成员同一批次原子提交（CodeRabbit #610）：分开写时前者成功后者失败，重试会被
-  // revoked_at IS NULL 的存在性检查挡成 404，成员行就永远清不掉了。
+  const removalEpoch = crypto.randomUUID();
+  const removedBy = identity.account ?? identity.name;
+  // Child discovery and revocation share one D1 transaction. INSERT...SELECT prevents a child
+  // minted between an out-of-transaction snapshot and UPDATE from escaping without a tombstone.
   await c.env.DB.batch([
+    setChannelParticipantRemoval(c.env.DB, {
+      slug,
+      principalType: "name",
+      principal: name,
+      removedAt: now,
+      removalEpoch,
+      removedBy,
+    }),
+    c.env.DB.prepare(
+      `INSERT INTO channel_participant_removals
+         (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+       SELECT ?, 'name', t.name, NULL, ?, ?, ?
+         FROM tokens t
+        WHERE t.channel_scope = ? AND t.parent_agent = ?
+       ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+    ).bind(slug, now, removalEpoch, removedBy, slug, name),
+    c.env.DB.prepare(
+      `UPDATE channel_roles
+          SET reports_to = NULL
+        WHERE channel_slug = ?
+          AND (
+            reports_to = ?
+            OR reports_to IN (
+              SELECT name FROM tokens WHERE channel_scope = ? AND parent_agent = ?
+            )
+          )`,
+    ).bind(slug, name, slug, name),
+    c.env.DB.prepare(
+      `DELETE FROM channel_roles
+        WHERE channel_slug = ?
+          AND (
+            agent_name = ?
+            OR agent_name IN (
+              SELECT name FROM tokens
+               WHERE channel_scope = ? AND parent_agent = ?
+            )
+          )`,
+    ).bind(slug, name, slug, name),
     c.env.DB.prepare(
       `UPDATE tokens SET revoked_at = ?
         WHERE channel_scope = ? AND revoked_at IS NULL
@@ -3009,25 +3452,51 @@ app.delete("/api/channels/:slug/agents/:name", requireBearer, async (c) => {
       "DELETE FROM channel_members WHERE channel_slug = ? AND account = ?",
     ).bind(slug, name),
   ]);
+  const tombstoned = await c.env.DB.prepare(
+    `SELECT principal AS name
+       FROM channel_participant_removals
+      WHERE channel_slug = ? AND principal_type = 'name' AND removal_epoch = ?
+      ORDER BY principal`,
+  ).bind(slug, removalEpoch).all<{ name: string }>();
+  const kickTargets = tombstoned.results.map((target) => target.name);
   // 复用 kick 的 DO 通道，mode=remove：断开存活连接、清 presence、广播 offline——
   // 删除是永久动作，presence 残留会让成员列表继续显示一个已不存在的身份。父与所有 child
   // 会话都要断（token 已死只挡重连，不断已建立的 WS）。失败不回滚撤销（撤销才是事实源），
   // 以 kicked 回给调用方；没踢掉的连接在下次重连时被死 token 挡死。
-  const kickTargets = [name, ...(children.results ?? []).map((child) => child.name)];
   const kickResults = await Promise.all(
-    kickTargets.map((target) =>
-      fetchChannelDO(
+    kickTargets.map(async (target) => {
+      const kicked = await fetchChannelDO(
         c.env,
         slug,
         new Request("https://do/internal/kick", {
           method: "POST",
-          body: JSON.stringify({ name: target, mode: "remove" }),
+          body: JSON.stringify({
+            name: target,
+            mode: "remove",
+            removed_at: now,
+            removal_epoch: removalEpoch,
+          }),
           headers: { "content-type": "application/json", "x-partykit-room": slug },
         }),
       )
         .then((res) => res.ok)
-        .catch(() => false),
-    ),
+        .catch(() => false);
+      await fetchChannelDO(
+        c.env,
+        slug,
+        new Request("https://do/internal/participant-removed", {
+          method: "POST",
+          body: JSON.stringify({
+            type: "participant_removed",
+            name: target,
+            removed_at: now,
+            removal_epoch: removalEpoch,
+          }),
+          headers: { "content-type": "application/json", "x-partykit-room": slug },
+        }),
+      ).catch(() => null);
+      return kicked;
+    }),
   );
   const kicked = kickResults.every(Boolean);
   await bestEffortRecordManagementAudit(c.env.DB, {
@@ -3197,15 +3666,19 @@ app.post("/api/spawn", requireBearer, async (c) => {
     depth: 1,
     expires_at: expiresAt,
   };
-  const result = await persistToken(c.env.DB, {
+  const result = await persistSpawnToken(c.env.DB, {
     name,
-    role: "agent",
     owner: identity.account,
     channelScope: identity.channel_scope,
     lineage,
+    parentName: identity.name,
+    parentHash: identity.hash,
   });
   if ("conflict" in result) {
     return c.json(errorBody("conflict", "token name already exists, revoke it first"), 409);
+  }
+  if ("superseded" in result) {
+    return c.json(errorBody("participant_removed", "parent agent was removed while spawning the child"), 409);
   }
   await bestEffortRecordManagementAudit(c.env.DB, {
     actor: managementAuditActor(identity),
@@ -3287,7 +3760,6 @@ app.delete("/api/tokens/:name", requireAdmin, async (c) => {
 });
 
 app.use("/api/channels", requireBearer);
-app.use("/api/channels/*", requireBearer);
 
 app.get("/api/channels/:slug/management-audit", async (c) => {
   const slug = c.req.param("slug");
@@ -3652,8 +4124,15 @@ app.get("/api/channels", async (c) => {
     : new Set((await c.env.DB.prepare(
         "SELECT channel_slug FROM channel_account_bans WHERE account = ?",
       ).bind(identity.account).all<{ channel_slug: string }>()).results.map((row) => row.channel_slug));
+  const removedSlugs = new Set((await c.env.DB.prepare(
+    `SELECT channel_slug
+       FROM channel_participant_removals
+      WHERE (principal_type = 'name' AND principal = ?)
+         OR (principal_type = 'account' AND ? IS NOT NULL AND principal = ?)`,
+  ).bind(identity.name, identity.account ?? null, identity.account ?? null).all<{ channel_slug: string }>()).results.map((row) => row.channel_slug));
   const visible = results.filter((row) =>
     !bannedSlugs.has(row.slug) &&
+    !removedSlugs.has(row.slug) &&
     (canAccessChannel(identity, row, memberSlugs.has(row.slug)) || projectAgentInviteSlugs.has(row.slug)),
   );
   const channels = await Promise.all(
@@ -3858,6 +4337,18 @@ app.post("/api/channels/:slug/project-agents", async (c) => {
   if (!canInviteProjectAgent(profile.invitable_by, identity.account, ownerAccount)) {
     return c.json(errorBody("forbidden", `this project agent can only be invited by ${profile.invitable_by}`), 403);
   }
+  const moderatorRestore = isChannelModerator(identity, channel);
+  const activeRemoval = await loadChannelParticipantRemoval(c.env.DB, slug, "name", handle);
+  const activeAccountRemoval = await loadChannelParticipantRemoval(c.env.DB, slug, "account", ownerAccount);
+  if (activeAccountRemoval !== null || await isChannelAccountBanned(c.env.DB, slug, ownerAccount)) {
+    return c.json(
+      errorBody("participant_removed", "the owner account must be explicitly re-added before inviting project agents"),
+      409,
+    );
+  }
+  if (activeRemoval && !moderatorRestore) {
+    return c.json(errorBody("participant_removed", "only a channel moderator can restore a removed project agent"), 409);
+  }
 
   const existing = await c.env.DB.prepare(
     `SELECT id, channel_slug, owner_account, profile_handle, invited_by, invited_at
@@ -3877,17 +4368,108 @@ app.post("/api/channels/:slug/project-agents", async (c) => {
       invited_at: number;
     }>();
   if (existing) {
+    if (activeRemoval) {
+      await c.env.DB.prepare(
+        `DELETE FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND removal_epoch = ?
+            AND principal_type = 'name'
+            AND (
+              principal = ?
+              OR principal IN (
+                SELECT name FROM tokens
+                 WHERE owner = ? AND channel_scope = ? AND parent_agent = ?
+              )
+            )`,
+      ).bind(
+        slug,
+        activeRemoval.removal_epoch,
+        handle,
+        ownerAccount,
+        slug,
+        handle,
+      ).run();
+      if (
+        await loadChannelParticipantRemoval(c.env.DB, slug, "name", handle) ||
+        await loadChannelParticipantRemoval(c.env.DB, slug, "account", ownerAccount) ||
+        await isChannelAccountBanned(c.env.DB, slug, ownerAccount)
+      ) {
+        return c.json(errorBody("participant_removed", "project agent restoration was superseded"), 409);
+      }
+    }
+    const stillInvited = await c.env.DB.prepare(
+      `SELECT 1
+         FROM channel_agent_invites
+        WHERE id = ? AND revoked_at IS NULL`,
+    ).bind(existing.id).first();
+    if (
+      stillInvited === null ||
+      await loadChannelParticipantRemoval(c.env.DB, slug, "name", handle) ||
+      await loadChannelParticipantRemoval(c.env.DB, slug, "account", ownerAccount) ||
+      await isChannelAccountBanned(c.env.DB, slug, ownerAccount)
+    ) {
+      return c.json(errorBody("participant_removed", "project agent restoration was superseded"), 409);
+    }
     return c.json({ ...existing, profile: projectAgentProfileFromRow(profile), already_invited: true });
   }
 
   const invitedBy = identity.account ?? identity.name;
   const invitedAt = Date.now();
-  const result = await c.env.DB.prepare(
-    `INSERT INTO channel_agent_invites (channel_slug, owner_account, profile_handle, invited_by, invited_at, revoked_at)
-     VALUES (?, ?, ?, ?, ?, NULL)`,
-  )
-    .bind(slug, ownerAccount, handle, invitedBy, invitedAt)
-    .run();
+  const inviteResults = await c.env.DB.batch([
+    ...(moderatorRestore && activeRemoval !== null
+      ? [c.env.DB.prepare(
+          `DELETE FROM channel_participant_removals
+            WHERE channel_slug = ?
+              AND removal_epoch = ?
+              AND principal_type = 'name'
+              AND (
+                principal = ?
+                OR principal IN (
+                  SELECT name FROM tokens
+                   WHERE owner = ? AND channel_scope = ? AND parent_agent = ?
+                )
+              )`,
+        ).bind(
+          slug,
+          activeRemoval.removal_epoch,
+          handle,
+          ownerAccount,
+          slug,
+          handle,
+        )]
+      : []),
+    c.env.DB.prepare(
+      `INSERT INTO channel_agent_invites (channel_slug, owner_account, profile_handle, invited_by, invited_at, revoked_at)
+       SELECT ?, ?, ?, ?, ?, NULL
+        WHERE NOT EXISTS (
+          SELECT 1
+            FROM channel_participant_removals
+           WHERE channel_slug = ?
+             AND (
+               (principal_type = 'name' AND principal = ?)
+               OR (principal_type = 'account' AND principal = ?)
+             )
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM channel_account_bans WHERE channel_slug = ? AND account = ?
+          )`,
+    ).bind(
+      slug,
+      ownerAccount,
+      handle,
+      invitedBy,
+      invitedAt,
+      slug,
+      handle,
+      ownerAccount,
+      slug,
+      ownerAccount,
+    ),
+  ]);
+  const result = inviteResults[inviteResults.length - 1]!;
+  if ((result.meta.changes ?? 0) === 0) {
+    return c.json(errorBody("participant_removed", "project agent restoration was superseded"), 409);
+  }
   await bestEffortRecordManagementAudit(c.env.DB, {
     actor: managementAuditActor(identity),
     action: "channel.project_agent.invite",
@@ -3928,19 +4510,113 @@ app.delete("/api/channels/:slug/project-agents", async (c) => {
     return c.json(errorBody("forbidden", "only the profile owner or channel moderator can remove a project agent"), 403);
   }
   const revokedAt = Date.now();
-  const result = await c.env.DB.prepare(
-    `UPDATE channel_agent_invites
-        SET revoked_at = ?
-      WHERE channel_slug = ?
-        AND owner_account = ?
-        AND profile_handle = ?
-        AND revoked_at IS NULL`,
-  )
-    .bind(revokedAt, slug, ownerAccount, handle)
-    .run();
-  if (result.meta.changes === 0) {
+  const removalEpoch = crypto.randomUUID();
+  const removedBy = identity.account ?? identity.name;
+  const activeInvite = await c.env.DB.prepare(
+    `SELECT id
+       FROM channel_agent_invites
+      WHERE channel_slug = ? AND owner_account = ? AND profile_handle = ? AND revoked_at IS NULL`,
+  ).bind(slug, ownerAccount, handle).first<{ id: number }>();
+  if (!activeInvite) {
     return c.json(errorBody("not_found", "active project agent invite not found"), 404);
   }
+  // Resolve children inside the same D1 batch that revokes them. A child minted before this
+  // transaction is selected, tombstoned, role-cleaned, and revoked as one authoritative set.
+  const batchResults = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE channel_agent_invites
+          SET revoked_at = ?, removal_epoch = ?
+        WHERE id = ? AND revoked_at IS NULL`,
+    ).bind(revokedAt, removalEpoch, activeInvite.id),
+    c.env.DB.prepare(
+      `INSERT INTO channel_participant_removals
+         (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+       SELECT ?, 'name', ?, NULL, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM channel_agent_invites WHERE id = ? AND removal_epoch = ?
+        )
+       ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+    ).bind(slug, handle, revokedAt, removalEpoch, removedBy, activeInvite.id, removalEpoch),
+    c.env.DB.prepare(
+      `INSERT INTO channel_participant_removals
+         (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+       SELECT ?, 'name', t.name, NULL, ?, ?, ?
+         FROM tokens t
+        WHERE t.owner = ?
+          AND t.role = 'agent'
+          AND t.channel_scope = ?
+          AND t.parent_agent = ?
+          AND EXISTS (
+            SELECT 1 FROM channel_agent_invites WHERE id = ? AND removal_epoch = ?
+          )
+       ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+    ).bind(
+      slug,
+      revokedAt,
+      removalEpoch,
+      removedBy,
+      ownerAccount,
+      slug,
+      handle,
+      activeInvite.id,
+      removalEpoch,
+    ),
+    c.env.DB.prepare(
+      `UPDATE channel_roles
+          SET reports_to = NULL
+        WHERE channel_slug = ?
+          AND (
+            reports_to = ?
+            OR reports_to IN (
+              SELECT name FROM tokens
+               WHERE owner = ? AND role = 'agent' AND channel_scope = ? AND parent_agent = ?
+            )
+          )
+          AND EXISTS (
+            SELECT 1 FROM channel_agent_invites WHERE id = ? AND removal_epoch = ?
+          )`,
+    ).bind(slug, handle, ownerAccount, slug, handle, activeInvite.id, removalEpoch),
+    c.env.DB.prepare(
+      `DELETE FROM channel_roles
+        WHERE channel_slug = ?
+          AND (
+            agent_name = ?
+            OR agent_name IN (
+              SELECT name FROM tokens
+               WHERE owner = ?
+                 AND role = 'agent'
+                 AND channel_scope = ?
+                 AND parent_agent = ?
+            )
+          )
+          AND EXISTS (
+            SELECT 1 FROM channel_agent_invites WHERE id = ? AND removal_epoch = ?
+          )`,
+    ).bind(slug, handle, ownerAccount, slug, handle, activeInvite.id, removalEpoch),
+    c.env.DB.prepare(
+      `UPDATE tokens
+          SET revoked_at = ?
+        WHERE owner = ?
+          AND role = 'agent'
+          AND channel_scope = ?
+          AND parent_agent = ?
+          AND revoked_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM channel_agent_invites WHERE id = ? AND removal_epoch = ?
+          )`,
+    ).bind(revokedAt, ownerAccount, slug, handle, activeInvite.id, removalEpoch),
+  ]);
+  const revokedInvite = batchResults[0];
+  if ((revokedInvite?.meta.changes ?? 0) === 0) {
+    return c.json(errorBody("conflict", "project agent removal was superseded"), 409);
+  }
+  const tombstoned = await c.env.DB.prepare(
+    `SELECT principal AS name
+       FROM channel_participant_removals
+      WHERE channel_slug = ? AND principal_type = 'name' AND removal_epoch = ?
+      ORDER BY principal`,
+  ).bind(slug, removalEpoch).all<{ name: string }>();
+  const removalTargets = tombstoned.results.map((target) => target.name);
   await bestEffortRecordManagementAudit(c.env.DB, {
     actor: managementAuditActor(identity),
     action: "channel.project_agent.remove",
@@ -3948,30 +4624,8 @@ app.delete("/api/channels/:slug/project-agents", async (c) => {
     channel: slug,
     timestamp: revokedAt,
   });
-  const childRows = await c.env.DB.prepare(
-    `SELECT name
-       FROM tokens
-      WHERE owner = ?
-        AND role = 'agent'
-        AND channel_scope = ?
-        AND parent_agent = ?
-        AND revoked_at IS NULL`,
-  )
-    .bind(ownerAccount, slug, handle)
-    .all<{ name: string }>();
-  await c.env.DB.prepare(
-    `UPDATE tokens
-        SET revoked_at = ?
-      WHERE owner = ?
-        AND role = 'agent'
-        AND channel_scope = ?
-        AND parent_agent = ?
-        AND revoked_at IS NULL`,
-  )
-    .bind(revokedAt, ownerAccount, slug, handle)
-    .run();
   await Promise.all(
-    (childRows.results ?? []).map(({ name }) =>
+    removalTargets.filter((name) => name !== handle).map((name) =>
       bestEffortRecordManagementAudit(c.env.DB, {
         actor: managementAuditActor(identity),
         action: "token.revoke",
@@ -3983,17 +4637,36 @@ app.delete("/api/channels/:slug/project-agents", async (c) => {
   );
   try {
     await Promise.all(
-      [handle, ...(childRows.results ?? []).map((row) => row.name)].map((name) =>
-        fetchChannelDO(
+      removalTargets.map(async (name) => {
+        await fetchChannelDO(
           c.env,
           slug,
           new Request("https://do/internal/kick", {
             method: "POST",
-            body: JSON.stringify({ name }),
+            body: JSON.stringify({
+              name,
+              mode: "remove",
+              removed_at: revokedAt,
+              removal_epoch: removalEpoch,
+            }),
             headers: { "content-type": "application/json", "x-partykit-room": slug },
           }),
-        ),
-      ),
+        );
+        await fetchChannelDO(
+          c.env,
+          slug,
+          new Request("https://do/internal/participant-removed", {
+            method: "POST",
+            body: JSON.stringify({
+              type: "participant_removed",
+              name,
+              removed_at: revokedAt,
+              removal_epoch: removalEpoch,
+            }),
+            headers: { "content-type": "application/json", "x-partykit-room": slug },
+          }),
+        );
+      }),
     );
   } catch {
     // Best effort: access is already revoked at the Worker ACL layer.
@@ -4233,8 +4906,16 @@ app.post("/api/channels/:slug/lark-members", async (c) => {
       tenantKey: profile.tenant_key,
     });
     const addedAt = Date.now();
-    const [, inserted] = await c.env.DB.batch([
+    const [, , inserted] = await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channel_account_bans WHERE channel_slug = ? AND account = ?").bind(slug, account),
+      c.env.DB.prepare(
+        `DELETE FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND (
+              (principal_type = 'account' AND principal = ?)
+              OR (principal_type = 'name' AND restore_account = ?)
+            )`,
+      ).bind(slug, account, account),
       c.env.DB.prepare(
         "INSERT OR IGNORE INTO channel_members (channel_slug, account, added_by, added_at) VALUES (?, ?, ?, ?)",
       ).bind(slug, account, identity.account, addedAt),
@@ -4398,18 +5079,142 @@ app.put("/api/channels/:slug/members/:account", async (c) => {
   if (!validAccountParam(account)) {
     return c.json(errorBody("bad_request", "valid account required"), 400);
   }
+  const body = (await c.req.json().catch(() => null)) as { name?: unknown } | null;
+  const restoreName = body?.name === undefined
+    ? null
+    : typeof body.name === "string" && body.name.length > 0 && body.name.length <= 256
+      ? body.name
+      : undefined;
+  if (restoreName === undefined) {
+    return c.json(errorBody("bad_request", "name must be a non-empty participant identity when provided"), 400);
+  }
   const addedBy = identity.account ?? identity.name;
   const addedAt = Date.now();
-  await c.env.DB.batch([
-    c.env.DB.prepare("DELETE FROM channel_account_bans WHERE channel_slug = ? AND account = ?").bind(slug, account),
+  const targetRestoreGuard = `(
+    ? IS NULL
+    OR NOT EXISTS (
+      SELECT 1
+        FROM channel_participant_removals removal
+       WHERE removal.channel_slug = ?
+         AND removal.principal_type = 'name'
+         AND removal.principal = ?
+         AND NOT (
+           COALESCE(removal.restore_account = ?, FALSE)
+           OR EXISTS (
+             SELECT 1
+               FROM channel_participant_bindings binding
+              WHERE binding.channel_slug = removal.channel_slug
+                AND binding.participant_name = removal.principal
+                AND binding.account = ?
+           )
+           OR EXISTS (
+             SELECT 1
+               FROM tokens token
+              WHERE token.name = removal.principal
+                AND token.owner = ?
+                AND (token.channel_scope IS NULL OR token.channel_scope = ?)
+           )
+           OR EXISTS (
+             SELECT 1
+               FROM channel_agent_invites invite
+              WHERE invite.channel_slug = removal.channel_slug
+                AND invite.profile_handle = removal.principal
+                AND invite.owner_account = ?
+           )
+         )
+    )
+  )`;
+  const targetRestoreGuardValues = [restoreName, slug, restoreName, account, account, account, slug, account];
+  const restoreResults = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `DELETE FROM channel_account_bans
+        WHERE channel_slug = ?
+          AND account = ?
+          AND ${targetRestoreGuard}`,
+    ).bind(slug, account, ...targetRestoreGuardValues),
+    c.env.DB.prepare(
+      `DELETE FROM channel_participant_removals
+        WHERE channel_slug = ?
+          AND ${targetRestoreGuard}
+          AND (
+            (principal_type = 'account' AND principal = ?)
+            OR (principal_type = 'name' AND restore_account = ?)
+            OR (
+              principal_type = 'name'
+              AND ? IS NOT NULL
+              AND principal = ?
+              AND (
+                restore_account = ?
+                OR EXISTS (
+                  SELECT 1
+                  FROM channel_participant_bindings binding
+                   WHERE binding.channel_slug = channel_participant_removals.channel_slug
+                     AND binding.participant_name = channel_participant_removals.principal
+                     AND binding.account = ?
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM tokens token
+                   WHERE token.name = channel_participant_removals.principal
+                     AND token.owner = ?
+                     AND (token.channel_scope IS NULL OR token.channel_scope = ?)
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM channel_agent_invites invite
+                   WHERE invite.channel_slug = channel_participant_removals.channel_slug
+                     AND invite.profile_handle = channel_participant_removals.principal
+                     AND invite.owner_account = ?
+                )
+              )
+            )
+          )`,
+    ).bind(
+      slug,
+      ...targetRestoreGuardValues,
+      account,
+      account,
+      restoreName,
+      restoreName,
+      account,
+      account,
+      account,
+      slug,
+      account,
+    ),
     c.env.DB.prepare(
       `INSERT INTO channel_members (channel_slug, account, added_by, added_at)
-       VALUES (?, ?, ?, ?)
+       SELECT ?, ?, ?, ?
+        WHERE ${targetRestoreGuard}
        ON CONFLICT(channel_slug, account) DO UPDATE SET
          added_by = excluded.added_by,
          added_at = excluded.added_at`,
-    ).bind(slug, account, addedBy, addedAt),
+    ).bind(slug, account, addedBy, addedAt, ...targetRestoreGuardValues),
   ]);
+  if (Number(restoreResults[2]?.meta.changes ?? 0) === 0) {
+    return c.json(
+      errorBody("participant_removed", "that name requires its agent-specific moderator restore path"),
+      409,
+    );
+  }
+  const residualRemoval = await c.env.DB.prepare(
+    `SELECT 1
+       FROM channel_account_bans
+      WHERE channel_slug = ? AND account = ?
+      UNION ALL
+     SELECT 1
+       FROM channel_participant_removals
+      WHERE channel_slug = ?
+        AND (
+          (principal_type = 'account' AND principal = ?)
+          OR (principal_type = 'name' AND restore_account = ?)
+          OR (? IS NOT NULL AND principal_type = 'name' AND principal = ?)
+        )
+      LIMIT 1`,
+  ).bind(slug, account, slug, account, account, restoreName, restoreName).first();
+  if (residualRemoval !== null) {
+    return c.json(errorBody("participant_removed", "participant restoration was superseded"), 409);
+  }
   await bestEffortRecordManagementAudit(c.env.DB, {
     actor: managementAuditActor(identity),
     action: "channel.member.add",
@@ -5149,6 +5954,25 @@ app.post("/api/channels/:slug/join-requests/:id/review", async (c) => {
           WHERE channel_slug = ?
             AND account = (SELECT account FROM channel_join_requests WHERE id = ? AND slug = ?)`,
       ).bind(slug, id, slug),
+      c.env.DB.prepare(
+        `DELETE FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND (
+              (
+                principal_type = 'account'
+                AND principal = (SELECT account FROM channel_join_requests WHERE id = ? AND slug = ?)
+              )
+              OR (
+                principal_type = 'name'
+                AND (
+                  restore_account = (SELECT account FROM channel_join_requests WHERE id = ? AND slug = ?)
+                  OR principal = (
+                    SELECT source_token_name FROM channel_join_requests WHERE id = ? AND slug = ?
+                  )
+                )
+              )
+            )`,
+      ).bind(slug, id, slug, id, slug, id, slug),
     ]);
     changed = results[0]?.meta.changes ?? 0;
   } else {
@@ -5406,6 +6230,32 @@ app.get("/api/channels/:slug/messages", async (c) => {
   );
 });
 
+app.get("/api/channels/:slug/pending-decisions", async (c) => {
+  const slug = c.req.param("slug");
+  const channel = await loadChannel(c.env.DB, slug);
+  if (!channel) return c.json(errorBody("not_found", "channel not found"), 404);
+  const identity = c.get("identity");
+  if (!(await canAccessLoadedChannel(c.env.DB, identity, channel))) {
+    return c.json(errorBody("forbidden", "not allowed in this channel"), 403);
+  }
+  const search = new URL(c.req.url).search;
+  return fetchMutableChannelDO(
+    c.env,
+    slug,
+    new Request(`https://do/internal/pending-decisions${search}`, {
+      headers: {
+        "x-partykit-room": slug,
+        "x-ap-name": identity.name,
+        "x-ap-kind": identity.kind,
+        "x-ap-role": identity.role,
+        "x-ap-archived": channel.archived_at !== null ? "1" : "0",
+        ...(identity.owner ? { "x-ap-owner": identity.owner } : {}),
+        ...(isChannelModerator(identity, channel) ? { "x-ap-moderator": "1" } : {}),
+      },
+    }),
+  );
+});
+
 app.get("/api/channels/:slug/presence", async (c) => {
   // party who：从终端看谁在线/可唤醒/最近（分档由 CLI 做）。与 messages 同样的 ACL 门，防粉丝窥私有频道。
   const slug = c.req.param("slug");
@@ -5470,6 +6320,39 @@ app.get("/api/channels/:slug/identities", async (c) => {
     }
   }
 
+  // Legacy/imported DO rows may predate sender_owner. Reattach the strongest
+  // channel-scoped ownership evidence before applying account tombstones.
+  const identityOwnership = await c.env.DB.prepare(
+    `SELECT name, account
+       FROM (
+         SELECT participant_name AS name, account, 1 AS priority
+           FROM channel_participant_bindings
+          WHERE channel_slug = ?
+         UNION ALL
+         SELECT name, owner AS account, 2 AS priority
+           FROM tokens
+          WHERE owner IS NOT NULL
+            AND revoked_at IS NULL
+            AND (channel_scope IS NULL OR channel_scope = ?)
+         UNION ALL
+         SELECT name, owner AS account, 3 AS priority
+           FROM tokens
+          WHERE owner IS NOT NULL
+            AND (channel_scope IS NULL OR channel_scope = ?)
+       )
+      ORDER BY priority`,
+  ).bind(slug, slug, slug).all<{ name: string; account: string }>();
+  const accountByName = new Map<string, string>();
+  for (const row of identityOwnership.results) {
+    const key = row.name.toLocaleLowerCase();
+    if (!accountByName.has(key)) accountByName.set(key, row.account);
+  }
+  for (const entry of [...identities.values()]) {
+    if (entry.account !== undefined) continue;
+    const account = accountByName.get(entry.name.toLocaleLowerCase());
+    if (account !== undefined) add({ ...entry, account });
+  }
+
   const humanAccounts = new Set(
     [...identities.values()]
       .filter((identity) => identity.kind === "human" && identity.account !== undefined)
@@ -5491,7 +6374,27 @@ app.get("/api/channels/:slug/identities", async (c) => {
     }
   }
 
-  return c.json({ identities: [...identities.values()].sort((a, b) => a.name.localeCompare(b.name)) });
+  const removals = await c.env.DB.prepare(
+    `SELECT principal_type, principal
+       FROM channel_participant_removals
+      WHERE channel_slug = ?`,
+  )
+    .bind(slug)
+    .all<{ principal_type: "name" | "account"; principal: string }>();
+  const removedNames = new Set(
+    removals.results.filter((row) => row.principal_type === "name").map((row) => row.principal.toLocaleLowerCase()),
+  );
+  const removedAccounts = new Set(
+    removals.results.filter((row) => row.principal_type === "account").map((row) => row.principal.toLocaleLowerCase()),
+  );
+  return c.json({
+    identities: [...identities.values()]
+      .filter((entry) =>
+        !removedNames.has(entry.name.toLocaleLowerCase()) &&
+        (entry.account === undefined || !removedAccounts.has(entry.account.toLocaleLowerCase())),
+      )
+      .sort((a, b) => a.name.localeCompare(b.name)),
+  });
 });
 
 app.get("/api/channels/:slug/search", async (c) => {
@@ -6206,6 +7109,19 @@ app.get("/api/channels/:slug/roles", async (c) => {
        FROM channel_roles cr
        LEFT JOIN tokens t ON t.name = cr.agent_name AND t.revoked_at IS NULL
       WHERE cr.channel_slug = ?
+        AND NOT EXISTS (
+          SELECT 1
+            FROM channel_participant_removals r
+           WHERE r.channel_slug = cr.channel_slug
+             AND (
+               (r.principal_type = 'name' AND r.principal = cr.agent_name)
+               OR (
+                 r.principal_type = 'account'
+                 AND COALESCE(t.owner, cr.owner_account) IS NOT NULL
+                 AND r.principal = COALESCE(t.owner, cr.owner_account)
+               )
+             )
+        )
       ORDER BY cr.agent_name`,
   )
     .bind(slug)
@@ -6252,7 +7168,23 @@ app.put("/api/channels/:slug/roles/:name", async (c) => {
     }
     if (reportsTo !== null) {
       const edgeRows = await c.env.DB.prepare(
-        "SELECT agent_name, reports_to FROM channel_roles WHERE channel_slug = ?",
+        `SELECT cr.agent_name, cr.reports_to
+           FROM channel_roles cr
+           LEFT JOIN tokens t ON t.name = cr.agent_name AND t.revoked_at IS NULL
+          WHERE cr.channel_slug = ?
+            AND NOT EXISTS (
+              SELECT 1
+                FROM channel_participant_removals r
+               WHERE r.channel_slug = cr.channel_slug
+                 AND (
+                   (r.principal_type = 'name' AND r.principal = cr.agent_name)
+                   OR (
+                     r.principal_type = 'account'
+                     AND COALESCE(t.owner, cr.owner_account) IS NOT NULL
+                     AND r.principal = COALESCE(t.owner, cr.owner_account)
+                   )
+                 )
+            )`,
       )
         .bind(slug)
         .all<{ agent_name: string; reports_to: string | null }>();
@@ -6277,14 +7209,48 @@ app.put("/api/channels/:slug/roles/:name", async (c) => {
   // 角色按账号锚定（#101）：绑定到该 name 当前【存活】token 的 owner。
   // 若无存活 token（预分配「先分工再铸 token」）→ null，等 persistToken 在首次铸造时认领绑定。
   const liveOwner = await c.env.DB.prepare(
-    "SELECT owner FROM tokens WHERE name = ? AND revoked_at IS NULL",
+    "SELECT owner FROM tokens WHERE name = ? ORDER BY (revoked_at IS NULL) DESC, created_at DESC LIMIT 1",
   )
     .bind(name)
     .first<{ owner: string | null }>();
   const ownerAccount = liveOwner?.owner ?? null;
-  await c.env.DB.prepare(
+  const savedRole = await c.env.DB.prepare(
     `INSERT INTO channel_roles (channel_slug, agent_name, role, assigned_by, assigned_at, responsibility, owner_account, reports_to)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM channel_participant_removals
+         WHERE channel_slug = ?
+           AND (
+             (principal_type = 'name' AND principal = ?)
+             OR (principal_type = 'account' AND ? IS NOT NULL AND principal = ?)
+           )
+      )
+        AND (
+          ? IS NULL
+          OR EXISTS (
+            SELECT 1
+              FROM channel_roles manager
+              LEFT JOIN tokens manager_token
+                ON manager_token.name = manager.agent_name AND manager_token.revoked_at IS NULL
+             WHERE manager.channel_slug = ?
+               AND manager.agent_name = ?
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM channel_participant_removals manager_removal
+                  WHERE manager_removal.channel_slug = manager.channel_slug
+                    AND (
+                      (manager_removal.principal_type = 'name'
+                        AND manager_removal.principal = manager.agent_name)
+                      OR (
+                        manager_removal.principal_type = 'account'
+                        AND COALESCE(manager_token.owner, manager.owner_account) IS NOT NULL
+                        AND manager_removal.principal = COALESCE(manager_token.owner, manager.owner_account)
+                      )
+                    )
+               )
+          )
+        )
      ON CONFLICT(channel_slug, agent_name) DO UPDATE SET
        role = excluded.role,
        assigned_by = excluded.assigned_by,
@@ -6293,8 +7259,27 @@ app.put("/api/channels/:slug/roles/:name", async (c) => {
        owner_account = COALESCE(excluded.owner_account, channel_roles.owner_account),
        reports_to = ${reportsToProvided ? "excluded.reports_to" : "channel_roles.reports_to"}`,
   )
-    .bind(slug, name, role, identity.name, assignedAt, responsibility.value, ownerAccount, reportsTo)
+    .bind(
+      slug,
+      name,
+      role,
+      identity.name,
+      assignedAt,
+      responsibility.value,
+      ownerAccount,
+      reportsTo,
+      slug,
+      name,
+      ownerAccount,
+      ownerAccount,
+      reportsTo,
+      slug,
+      reportsTo,
+    )
     .run();
+  if (savedRole.meta.changes === 0) {
+    return c.json(errorBody("participant_removed", "the participant must be explicitly re-added before assigning a role"), 409);
+  }
   await fetchChannelDO(
     c.env,
     slug,
@@ -7259,7 +8244,8 @@ app.post("/api/channels/:slug/archive", async (c) => {
 
 type KickMode = "disconnect" | "remove";
 
-// 踢人（spec §5 防滥用 MVP）：默认只把某 name 的存活 ws 踢下线；remove 额外撤销本频道 scoped token。
+// 踢人（spec §5 防滥用 MVP）：disconnect 只关闭存活 ws；remove 先把持久撤权事实写入 D1，
+// 再做 DO 清理/广播。这样 unscoped token、public channel 和广播失败都不能让被移除者回魂。
 app.post("/api/channels/:slug/kick", async (c) => {
   const slug = c.req.param("slug");
   const channel = await loadChannel(c.env.DB, slug);
@@ -7280,51 +8266,357 @@ app.post("/api/channels/:slug/kick", async (c) => {
   if (name === channel.created_by || name === channel.owner_account) {
     return c.json(errorBody("forbidden", "channel owner cannot kick themselves"), 403);
   }
-  if (mode === "remove") {
-    const now = Date.now();
-    const revoked = await c.env.DB.prepare(
-      "UPDATE tokens SET revoked_at = ? WHERE channel_scope = ? AND name = ? AND revoked_at IS NULL",
-    )
-      .bind(now, slug, name)
-      .run();
-    if (revoked.meta.changes > 0) {
-      await bestEffortRecordManagementAudit(c.env.DB, {
-        actor: managementAuditActor(c.get("identity")),
-        action: "token.revoke",
-        resource: `token/${name}`,
-        channel: slug,
-        timestamp: now,
-      });
-    }
+  if (mode === "disconnect") {
+    const res = await fetchChannelDO(
+      c.env,
+      slug,
+      new Request("https://do/internal/kick", {
+        method: "POST",
+        body: JSON.stringify({ name }),
+        headers: { "content-type": "application/json", "x-partykit-room": slug },
+      }),
+    );
+    if (!res.ok) return c.json(errorBody("unavailable", "kick coordination failed"), 503);
+    return c.json({ ok: true });
   }
-  const res = await fetchChannelDO(
-    c.env,
-    slug,
-    new Request("https://do/internal/kick", {
-      method: "POST",
-      body: JSON.stringify(mode === "remove" ? { name, mode } : { name }),
-      headers: { "content-type": "application/json", "x-partykit-room": slug },
+
+  const removedAt = Date.now();
+  const removalEpoch = crypto.randomUUID();
+  const removedBy = c.get("identity").account ?? c.get("identity").name;
+  const knownOwners = await c.env.DB.prepare(
+    `WITH token_owners AS (
+       SELECT owner AS account, MAX(CASE WHEN role = 'human' THEN 1 ELSE 0 END) AS is_human
+         FROM tokens
+        WHERE name = ? AND owner IS NOT NULL AND revoked_at IS NULL
+        GROUP BY owner
+     ),
+     bound_owner AS (
+       SELECT account, CASE participant_kind WHEN 'human' THEN 1 ELSE 0 END AS is_human
+         FROM channel_participant_bindings
+        WHERE channel_slug = ? AND participant_name = ?
+     )
+     SELECT account, is_human FROM token_owners
+     UNION ALL
+     SELECT account, is_human FROM bound_owner
+      WHERE NOT EXISTS (SELECT 1 FROM token_owners)
+     UNION ALL
+     SELECT account, 1 AS is_human
+       FROM channel_members
+      WHERE channel_slug = ? AND account = ?
+        AND NOT EXISTS (SELECT 1 FROM token_owners)
+        AND NOT EXISTS (SELECT 1 FROM bound_owner)`,
+  )
+    .bind(name, slug, name, slug, name)
+    .all<{ account: string; is_human: number }>();
+  const initialAccounts = [...new Set(knownOwners.results.map((row) => row.account))]
+    .filter((account) => account !== channel.owner_account && validAccountParam(account))
+    .slice(0, 16);
+  const restoreAccount = knownOwners.results.find((row) => row.is_human === 1)?.account ?? null;
+  const firstBatch = [
+    setChannelParticipantRemoval(c.env.DB, {
+      slug,
+      principalType: "name",
+      principal: name,
+      restoreAccount,
+      removedAt,
+      removalEpoch,
+      removedBy,
     }),
-  );
-  if (!res.ok) return c.json(errorBody("unavailable", "kick coordination failed"), 503);
-  if (mode === "remove") {
-    const kicked = (await res.json().catch(() => null)) as { owners?: unknown } | null;
-    const owners = Array.isArray(kicked?.owners) ? kicked.owners.filter((owner): owner is string => typeof owner === "string") : [];
-    const accounts = [...new Set([name, ...owners])].slice(0, 16);
-    const placeholders = accounts.map(() => "?").join(", ");
-    await c.env.DB.prepare(
+    ...initialAccounts.map((account) => c.env.DB.prepare(
+      `INSERT INTO channel_participant_removals
+         (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+       SELECT ?, 'account', ?, NULL, removed_at, removal_epoch, removed_by
+         FROM channel_participant_removals
+        WHERE channel_slug = ? AND principal_type = 'name' AND principal = ?
+       ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+    ).bind(slug, account, slug, name)),
+    ...initialAccounts.map((account) => c.env.DB.prepare(
+      `INSERT INTO channel_account_bans (channel_slug, account, banned_by, banned_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(channel_slug, account) DO UPDATE SET
+         banned_by = excluded.banned_by,
+         banned_at = excluded.banned_at`,
+    ).bind(slug, account, removedBy, removedAt)),
+    c.env.DB.prepare(
+      "UPDATE tokens SET revoked_at = ? WHERE channel_scope = ? AND name = ? AND revoked_at IS NULL",
+    ).bind(removedAt, slug, name),
+    c.env.DB.prepare(
+      `UPDATE channel_agent_invites
+          SET revoked_at = ?
+        WHERE channel_slug = ? AND profile_handle = ? AND revoked_at IS NULL`,
+    ).bind(removedAt, slug, name),
+    c.env.DB.prepare(
+      "UPDATE channel_roles SET reports_to = NULL WHERE channel_slug = ? AND reports_to = ?",
+    ).bind(slug, name),
+    c.env.DB.prepare(
+      "DELETE FROM channel_roles WHERE channel_slug = ? AND agent_name = ?",
+    ).bind(slug, name),
+    c.env.DB.prepare(
       `DELETE FROM channel_members
         WHERE channel_slug = ?
           AND (? IS NULL OR account != ?)
           AND (
-            account IN (${placeholders})
+            account = ?
             OR account IN (SELECT owner FROM tokens WHERE name = ? AND owner IS NOT NULL)
           )`,
-    )
-      .bind(slug, channel.owner_account, channel.owner_account, ...accounts, name)
-      .run();
+    ).bind(slug, channel.owner_account, channel.owner_account, name, name),
+  ];
+  const firstResults = await c.env.DB.batch(firstBatch);
+  const revoked = firstResults[firstResults.length - 5];
+  const removedRole = firstResults[firstResults.length - 2];
+  if ((revoked?.meta.changes ?? 0) > 0) {
+    await bestEffortRecordManagementAudit(c.env.DB, {
+      actor: managementAuditActor(c.get("identity")),
+      action: "token.revoke",
+      resource: `token/${name}`,
+      channel: slug,
+      timestamp: removedAt,
+    });
   }
-  return c.json({ ok: true });
+  if ((removedRole?.meta.changes ?? 0) > 0) {
+    await bestEffortRecordManagementAudit(c.env.DB, {
+      actor: managementAuditActor(c.get("identity")),
+      action: "channel.role.remove",
+      resource: `channel/${slug}/roles/${name}`,
+      channel: slug,
+      timestamp: removedAt,
+    });
+  }
+  const effectiveRemoval = await loadChannelParticipantRemoval(c.env.DB, slug, "name", name);
+  if (effectiveRemoval === null) {
+    return c.json(errorBody("unavailable", "participant removal authority is unavailable"), 503);
+  }
+  const effectiveRemovedAt = effectiveRemoval.removed_at;
+  const effectiveRemovalEpoch = effectiveRemoval.removal_epoch;
+  // Close the owner-resolution race with successful requests that were already
+  // in flight when the name tombstone committed. Binding writes after this
+  // commit are themselves conditioned on the tombstone being absent.
+  const authoritativeOwners = await c.env.DB.prepare(
+    `WITH token_owners AS (
+       SELECT owner AS account, MAX(CASE WHEN role = 'human' THEN 1 ELSE 0 END) AS is_human
+         FROM tokens
+        WHERE name = ? AND owner IS NOT NULL
+          AND (revoked_at IS NULL OR revoked_at = ?)
+        GROUP BY owner
+     ),
+     bound_owner AS (
+       SELECT account, CASE participant_kind WHEN 'human' THEN 1 ELSE 0 END AS is_human
+         FROM channel_participant_bindings
+        WHERE channel_slug = ? AND participant_name = ?
+     )
+     SELECT account, is_human FROM token_owners
+     UNION ALL
+     SELECT account, is_human FROM bound_owner
+      WHERE NOT EXISTS (SELECT 1 FROM token_owners)
+     UNION ALL
+     SELECT account, 1 AS is_human
+       FROM channel_members
+      WHERE channel_slug = ? AND account = ?
+        AND NOT EXISTS (SELECT 1 FROM token_owners)
+        AND NOT EXISTS (SELECT 1 FROM bound_owner)`,
+  )
+    .bind(name, removedAt, slug, name, slug, name)
+    .all<{ account: string; is_human: number }>();
+  const postCommitAccounts = [...new Set(authoritativeOwners.results.map((row) => row.account))]
+    .filter((account) => account !== channel.owner_account && validAccountParam(account))
+    .slice(0, 16);
+  const postCommitHumanOwner = authoritativeOwners.results.find((row) => row.is_human === 1)?.account;
+  if (postCommitAccounts.length > 0 || postCommitHumanOwner !== undefined) {
+    await c.env.DB.batch([
+      ...(postCommitHumanOwner === undefined
+        ? []
+        : [c.env.DB.prepare(
+            `UPDATE channel_participant_removals
+                SET restore_account = ?
+              WHERE channel_slug = ?
+                AND principal_type = 'name'
+                AND principal = ?
+                AND removal_epoch = ?`,
+          ).bind(postCommitHumanOwner, slug, name, effectiveRemovalEpoch)]),
+      ...postCommitAccounts.map((account) => c.env.DB.prepare(
+        `INSERT INTO channel_participant_removals
+           (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+         SELECT ?, 'account', ?, NULL, removed_at, removal_epoch, removed_by
+           FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND principal_type = 'name'
+            AND principal = ?
+            AND removal_epoch = ?
+         ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+      ).bind(slug, account, slug, name, effectiveRemovalEpoch)),
+      ...postCommitAccounts.map((account) => c.env.DB.prepare(
+        `INSERT INTO channel_account_bans (channel_slug, account, banned_by, banned_at)
+         SELECT ?, ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM channel_participant_removals
+             WHERE channel_slug = ?
+               AND principal_type = 'name'
+               AND principal = ?
+               AND removal_epoch = ?
+          )
+         ON CONFLICT(channel_slug, account) DO UPDATE SET
+           banned_by = excluded.banned_by,
+           banned_at = excluded.banned_at`,
+      ).bind(slug, account, removedBy, effectiveRemovedAt, slug, name, effectiveRemovalEpoch)),
+      ...postCommitAccounts.map((account) => c.env.DB.prepare(
+        `DELETE FROM channel_members
+          WHERE channel_slug = ? AND account = ?
+            AND EXISTS (
+              SELECT 1 FROM channel_participant_removals
+               WHERE channel_slug = ?
+                 AND principal_type = 'name'
+                 AND principal = ?
+                 AND removal_epoch = ?
+            )`,
+      ).bind(slug, account, slug, name, effectiveRemovalEpoch)),
+    ]);
+  }
+
+  let kicked: { owners?: unknown; human_owners?: unknown } | null = null;
+  try {
+    const kickResponse = await fetchChannelDO(
+      c.env,
+      slug,
+      new Request("https://do/internal/kick", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          mode,
+          removed_at: effectiveRemovedAt,
+          removal_epoch: effectiveRemovalEpoch,
+        }),
+        headers: { "content-type": "application/json", "x-partykit-room": slug },
+      }),
+    );
+    if (kickResponse.ok) {
+      kicked = (await kickResponse.json().catch(() => null)) as
+        | { owners?: unknown; human_owners?: unknown }
+        | null;
+    }
+  } catch {
+    // D1 is authoritative. A DO outage cannot undo revocation.
+  }
+  const observedOwners = Array.isArray(kicked?.owners)
+    ? kicked.owners.filter((owner): owner is string =>
+        typeof owner === "string" &&
+        owner !== channel.owner_account &&
+        validAccountParam(owner) &&
+        !initialAccounts.includes(owner) &&
+        !postCommitAccounts.includes(owner))
+    : [];
+  const observedHumanOwner = Array.isArray(kicked?.human_owners)
+    ? kicked.human_owners.find((owner): owner is string =>
+        typeof owner === "string" &&
+        owner !== channel.owner_account &&
+        validAccountParam(owner))
+    : undefined;
+  if (observedOwners.length > 0) {
+    await c.env.DB.batch([
+      ...(observedHumanOwner === undefined
+        ? []
+        : [c.env.DB.prepare(
+            `UPDATE channel_participant_removals
+                SET restore_account = ?
+              WHERE channel_slug = ?
+                AND principal_type = 'name'
+                AND principal = ?
+                AND removal_epoch = ?`,
+          ).bind(observedHumanOwner, slug, name, effectiveRemovalEpoch)]),
+      ...observedOwners.map((account) => c.env.DB.prepare(
+        `INSERT INTO channel_participant_removals
+           (channel_slug, principal_type, principal, restore_account, removed_at, removal_epoch, removed_by)
+         SELECT ?, 'account', ?, NULL, removed_at, removal_epoch, removed_by
+           FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND principal_type = 'name'
+            AND principal = ?
+            AND removal_epoch = ?
+         ON CONFLICT(channel_slug, principal_type, principal) DO NOTHING`,
+      ).bind(slug, account, slug, name, effectiveRemovalEpoch)),
+      ...observedOwners.map((account) => c.env.DB.prepare(
+        `INSERT INTO channel_account_bans (channel_slug, account, banned_by, banned_at)
+         SELECT ?, ?, ?, ?
+          WHERE EXISTS (
+            SELECT 1 FROM channel_participant_removals
+             WHERE channel_slug = ?
+               AND principal_type = 'name'
+               AND principal = ?
+               AND removal_epoch = ?
+          )
+         ON CONFLICT(channel_slug, account) DO UPDATE SET
+           banned_by = excluded.banned_by,
+           banned_at = excluded.banned_at`,
+      ).bind(slug, account, removedBy, effectiveRemovedAt, slug, name, effectiveRemovalEpoch)),
+      ...observedOwners.map((account) => c.env.DB.prepare(
+        `DELETE FROM channel_members
+          WHERE channel_slug = ? AND account = ?
+            AND EXISTS (
+              SELECT 1 FROM channel_participant_removals
+               WHERE channel_slug = ?
+                 AND principal_type = 'name'
+                 AND principal = ?
+                 AND removal_epoch = ?
+            )`,
+      ).bind(slug, account, slug, name, effectiveRemovalEpoch)),
+    ]);
+  }
+
+  const removal = {
+    type: "participant_removed",
+    name,
+    removed_at: effectiveRemovedAt,
+  } satisfies ParticipantRemovedFrame;
+  let broadcasted = false;
+  try {
+    const removalBroadcast = await fetchChannelDO(
+      c.env,
+      slug,
+      new Request("https://do/internal/participant-removed", {
+        method: "POST",
+        body: JSON.stringify({ ...removal, removal_epoch: effectiveRemovalEpoch }),
+        headers: { "content-type": "application/json", "x-partykit-room": slug },
+      }),
+    );
+    if (removalBroadcast.ok) {
+      const result = (await removalBroadcast.json().catch(() => null)) as { broadcasted?: unknown } | null;
+      broadcasted = result?.broadcasted === true;
+    }
+  } catch {
+    // Return the authoritative frame to the requester; peers converge on reconnect.
+  }
+  const currentRemoval = await loadChannelParticipantRemoval(c.env.DB, slug, "name", name);
+  const removalAccounts = [...new Set([...initialAccounts, ...postCommitAccounts, ...observedOwners])];
+  const activeAccountRemoval = removalAccounts.length === 0
+    ? null
+    : await c.env.DB.prepare(
+        `SELECT removed_at, removal_epoch
+           FROM channel_participant_removals
+          WHERE channel_slug = ?
+            AND principal_type = 'account'
+            AND principal IN (${removalAccounts.map(() => "?").join(", ")})
+          ORDER BY removed_at DESC
+          LIMIT 1`,
+      )
+        .bind(slug, ...removalAccounts)
+        .first<{ removed_at: number; removal_epoch: string }>();
+  const authoritativeRemoval = [currentRemoval, activeAccountRemoval]
+    .filter((row): row is NonNullable<typeof row> => row !== null)
+    .sort((left, right) => right.removed_at - left.removed_at)[0] ?? null;
+  if (authoritativeRemoval === null) {
+    return c.json({ ok: true, removal: null, broadcasted: false, restored: true });
+  }
+  const authoritativeFrame = authoritativeRemoval.removal_epoch === effectiveRemovalEpoch
+    ? removal
+    : {
+        type: "participant_removed",
+        name,
+        removed_at: authoritativeRemoval.removed_at,
+      } satisfies ParticipantRemovedFrame;
+  return c.json({
+    ok: true,
+    removal: authoritativeFrame,
+    broadcasted: authoritativeRemoval.removal_epoch === effectiveRemovalEpoch && broadcasted,
+  });
 });
 
 type AgentReceptionController = "moderator" | "host";
@@ -7335,6 +8627,10 @@ async function agentReceptionController(
   identity: TokenIdentity,
   channel: LoadedChannel,
 ): Promise<AgentReceptionController | null> {
+  if (
+    await isChannelParticipantRemoved(db, slug, identity) ||
+    await isChannelAccountBanned(db, slug, identity.account)
+  ) return null;
   if (isChannelModerator(identity, channel)) return "moderator";
   if (identity.kind !== "agent" || identity.role !== "agent") return null;
   if (identity.channel_scope != null && identity.channel_scope !== slug) return null;

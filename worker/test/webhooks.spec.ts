@@ -17,6 +17,16 @@ interface CapturedRequest {
   body: string;
 }
 
+async function waitFor<T>(probe: () => T | null, timeoutMs = 2_000): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = probe();
+    if (value !== null) return value;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 // undici mock 回调里的 headers/body 形态因版本而异，统一归一化
 function normalize(opts: { headers?: unknown; body?: unknown }): CapturedRequest {
   const headers: Record<string, string> = {};
@@ -422,6 +432,7 @@ describe("webhooks", () => {
       });
 
     expect((await sendMessage(slug, token, "@hermes wake up", ["hermes"])).status).toBe(200);
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     const { headers, body } = captured as unknown as CapturedRequest;
 
@@ -474,6 +485,7 @@ describe("webhooks", () => {
     });
     expect(res.status).toBe(200);
 
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     const { headers, body } = captured as unknown as CapturedRequest;
     const payload = JSON.parse(body) as Record<string, unknown>;
@@ -521,6 +533,7 @@ describe("webhooks", () => {
       });
     expect((await sendStatus(slug, token, "working", "claiming the status lane")).status).toBe(200);
 
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     const payload = JSON.parse((captured as unknown as CapturedRequest).body) as Record<string, unknown>;
     expect(payload).toMatchObject({
@@ -563,6 +576,7 @@ describe("webhooks", () => {
     expect((await sendStatus(slug, token, "blocked", "need owner token")).status).toBe(200);
     expect((await sendStatus(slug, token, "done", "ready for review")).status).toBe(200);
 
+    await waitFor(() => captured.length >= 2 ? captured : null);
     expect(captured).toHaveLength(2);
     expect(captured[0]).toMatchObject({ type: "status", state: "blocked", note: "need owner token" });
     expect(captured[1]).toMatchObject({ type: "status", state: "done", note: "ready for review" });
@@ -616,6 +630,7 @@ describe("webhooks", () => {
         return "ok";
       });
     expect((await sendMessage(slug, token, "broadcast to all")).status).toBe(200);
+    await waitFor(() => captured);
     expect(captured).not.toBeNull();
     expect(
       (JSON.parse((captured as unknown as CapturedRequest).body) as { body: string }).body,

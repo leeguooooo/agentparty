@@ -47,6 +47,9 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.dutyLoaded": "resident",
     "DesktopSettings.agent.dutyNotLoaded": "not loaded",
     "DesktopSettings.agent.dutyUnload": "Remove",
+    "DesktopSettings.agent.dutyRepair": "Repair",
+    "DesktopSettings.agent.dutyDependencyMissing": "{runner} CLI is unavailable to this resident duty. Install the CLI, then choose Repair.",
+    "DesktopSettings.agent.dutyDependencyRepair": "This resident duty still relies on launchd PATH. Choose Repair to bind {runner} to an absolute executable.",
   },
   zh: {
     "DesktopSettings.control.label": "应用设置",
@@ -94,6 +97,9 @@ export const DesktopSettingsStrings: LocaleDict = {
     "DesktopSettings.agent.dutyLoaded": "常驻中",
     "DesktopSettings.agent.dutyNotLoaded": "未加载",
     "DesktopSettings.agent.dutyUnload": "卸载",
+    "DesktopSettings.agent.dutyRepair": "修复",
+    "DesktopSettings.agent.dutyDependencyMissing": "此常驻任务找不到 {runner} CLI。请先安装对应 CLI，再点“修复”。",
+    "DesktopSettings.agent.dutyDependencyRepair": "此常驻任务仍依赖 launchd 的 PATH。点击“修复”，将 {runner} 绑定到确定的绝对路径。",
   },
 };
 

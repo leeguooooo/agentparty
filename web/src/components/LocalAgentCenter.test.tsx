@@ -68,19 +68,21 @@ describe("LocalAgentCenter", () => {
     expect(html.match(/role="tab"/g)).toHaveLength(3);
     expect(html).toContain('id="local-agent-center-panel-overview"');
     expect(html).toContain("local-agents");
-    expect(html).not.toContain("desktop-agent");
-    expect(html).not.toContain("resident-logs");
+    expect(html).toContain("desktop-agent");
+    expect(html).toContain("resident-logs");
   });
 
-  test("mounts only the selected operational module", () => {
+  test("keeps module state mounted while hiding inactive operational panels", () => {
     const launcher = render("launcher");
     expect(launcher).toContain("desktop-agent");
-    expect(launcher).not.toContain("local-agents");
-    expect(launcher).not.toContain("resident-logs");
+    expect(launcher).toContain('id="local-agent-center-panel-overview" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-overview" hidden=""');
+    expect(launcher).toContain('id="local-agent-center-panel-launcher" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-launcher"');
+    expect(launcher).toContain('id="local-agent-center-panel-logs" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-logs" hidden=""');
 
     const logs = render("logs");
     expect(logs).toContain("resident-logs");
-    expect(logs).not.toContain("local-agents");
-    expect(logs).not.toContain("desktop-agent");
+    expect(logs).toContain('id="local-agent-center-panel-overview" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-overview" hidden=""');
+    expect(logs).toContain('id="local-agent-center-panel-launcher" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-launcher" hidden=""');
+    expect(logs).toContain('id="local-agent-center-panel-logs" class="settings-module" role="tabpanel" aria-labelledby="local-agent-center-tab-logs"');
   });
 });

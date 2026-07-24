@@ -40,6 +40,178 @@ function delivery(over: Partial<DirectedDelivery> = {}): DirectedDelivery {
 }
 
 describe("channel state", () => {
+  test("authoritative participant removal clears live snapshots, blocks late presence, and permits a live rejoin", () => {
+    const populated = {
+      ...initialChannelState,
+      participants: [
+        { name: "removed-agent", kind: "agent" as const },
+        { name: "retained-human", kind: "human" as const },
+      ],
+      presence: {
+        "removed-agent": { name: "removed-agent", kind: "agent" as const, state: "offline" as const, note: null, ts: 10 },
+        "retained-human": { name: "retained-human", kind: "human" as const, state: "working" as const, note: null, ts: 11 },
+      },
+    };
+
+    const next = channelReducer(populated, {
+      type: "frame",
+      frame: { type: "participant_removed", name: "removed-agent", removed_at: 20 },
+    });
+
+    expect(next.participants.map((participant) => participant.name)).toEqual(["retained-human"]);
+    expect(next.presence).toEqual({
+      "retained-human": populated.presence["retained-human"],
+    });
+    expect(next.removedParticipants).toEqual({ "removed-agent": 20 });
+
+    const afterLatePresence = channelReducer(next, {
+      type: "frame",
+      frame: {
+        type: "presence",
+        name: "removed-agent",
+        kind: "agent",
+        state: "offline",
+        note: null,
+        ts: 21,
+      },
+    });
+    expect(afterLatePresence).toBe(next);
+
+    const afterAuthoritativeRejoin = channelReducer(afterLatePresence, {
+      type: "frame",
+      frame: {
+        type: "participants",
+        participants: [
+          { name: "removed-agent", kind: "agent" },
+          { name: "retained-human", kind: "human" },
+        ],
+      },
+    });
+    expect(afterAuthoritativeRejoin.participants.map((participant) => participant.name)).toEqual([
+      "removed-agent",
+      "retained-human",
+    ]);
+    expect(afterAuthoritativeRejoin.removedParticipants).toEqual({});
+
+    expect(channelReducer(next, {
+      type: "frame",
+      frame: { type: "participant_removed", name: "removed-agent", removed_at: 20 },
+    })).toBe(next);
+  });
+
+  test("an explicit restored projection releases only the local removal tombstone", () => {
+    const removed = channelReducer(
+      {
+        ...initialChannelState,
+        removedParticipants: { "restored-agent": 42 },
+      },
+      { type: "participant_restored", name: "restored-agent" },
+    );
+
+    expect(removed.removedParticipants).toEqual({});
+    expect(removed.participants).toEqual([]);
+    expect(removed.presence).toEqual({});
+    expect(
+      channelReducer(removed, { type: "participant_restored", name: "unknown-agent" }),
+    ).toBe(removed);
+  });
+
+  test("welcome cannot resurrect a removed participant from an offline presence snapshot", () => {
+    const removed = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "participant_removed", name: "removed-agent", removed_at: 20 },
+    });
+    const reconnected = channelReducer(removed, {
+      type: "frame",
+      frame: {
+        type: "welcome",
+        channel: "alpha",
+        self: "moderator",
+        last_seq: 0,
+        presence: [
+          { name: "removed-agent", kind: "agent", state: "offline", note: null, ts: 21 },
+        ],
+        participants: [],
+        read_cursors: [],
+        role: "human",
+        mode: "normal",
+        loop_guard: null,
+      },
+    });
+
+    expect(reconnected.participants).toEqual([]);
+    expect(reconnected.presence).toEqual({});
+    expect(reconnected.removedParticipants).toEqual({ "removed-agent": 20 });
+  });
+
+  test("authoritative welcome replaces stale presence after a client missed the live removal frame", () => {
+    const stale = {
+      ...initialChannelState,
+      participants: [{ name: "removed-agent", kind: "agent" as const }],
+      presence: {
+        "removed-agent": {
+          name: "removed-agent",
+          kind: "agent" as const,
+          state: "offline" as const,
+          note: null,
+          ts: 10,
+        },
+      },
+    };
+    const reconnected = channelReducer(stale, {
+      type: "frame",
+      frame: {
+        type: "welcome",
+        channel: "alpha",
+        self: "moderator",
+        last_seq: 0,
+        presence: [],
+        participants: [],
+        read_cursors: [],
+        role: "human",
+        mode: "normal",
+        loop_guard: null,
+      },
+    });
+
+    expect(reconnected.participants).toEqual([]);
+    expect(reconnected.presence).toEqual({});
+  });
+
+  test("authoritative welcome permits a legitimate same-name rejoin after removal", () => {
+    const removed = channelReducer(initialChannelState, {
+      type: "frame",
+      frame: { type: "participant_removed", name: "returning-agent", removed_at: 20 },
+    });
+    const rejoined = channelReducer(removed, {
+      type: "frame",
+      frame: {
+        type: "welcome",
+        channel: "alpha",
+        self: "moderator",
+        last_seq: 0,
+        presence: [
+          {
+            name: "returning-agent",
+            kind: "agent",
+            state: "online",
+            note: null,
+            ts: 30,
+          },
+        ],
+        participants: [{ name: "returning-agent", kind: "agent" }],
+        read_cursors: [],
+        role: "human",
+        mode: "normal",
+        loop_guard: null,
+      },
+    });
+
+    expect(rejoined.removedParticipants).toEqual({});
+    expect(rejoined.participants.map((participant) => participant.name)).toEqual(["returning-agent"]);
+    expect(rejoined.presence["returning-agent"]?.state).toBe("online");
+  });
+
   test("welcome role clears a previous readonly share-link state when a writable member reconnects", () => {
     const readonly = channelReducer(initialChannelState, {
       type: "frame",

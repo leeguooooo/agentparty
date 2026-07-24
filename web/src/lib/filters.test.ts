@@ -133,20 +133,27 @@ describe("agent filters", () => {
 });
 
 describe("seqFromQuery (#716)", () => {
-  test("纯数字（>0）识别为 seq", () => {
-    expect(seqFromQuery("634")).toBe(634);
-    expect(seqFromQuery("  42 ")).toBe(42);
-    expect(seqFromQuery("007")).toBe(7);
+  test("显式 #<seq>（>0）识别为消息定位", () => {
+    expect(seqFromQuery("#634")).toBe(634);
+    expect(seqFromQuery("  #42 ")).toBe(42);
+    expect(seqFromQuery("#007")).toBe(7);
   });
-  test("非纯数字 / 0 / 空 → null（走全文检索）", () => {
+  test("裸数字保留为全文查询，不再抢占为消息定位", () => {
+    expect(seqFromQuery("634")).toBeNull();
+    expect(seqFromQuery("  42 ")).toBeNull();
+    expect(seqFromQuery("007")).toBeNull();
+  });
+  test("非显式正整数序号 → null（走全文检索）", () => {
     expect(seqFromQuery("")).toBeNull();
-    expect(seqFromQuery("0")).toBeNull();
+    expect(seqFromQuery("#0")).toBeNull();
     expect(seqFromQuery("hello")).toBeNull();
-    expect(seqFromQuery("12a")).toBeNull();
-    expect(seqFromQuery("-5")).toBeNull();
-    expect(seqFromQuery("1.5")).toBeNull();
+    expect(seqFromQuery("#12a")).toBeNull();
+    expect(seqFromQuery("#-5")).toBeNull();
+    expect(seqFromQuery("#1.5")).toBeNull();
+    expect(seqFromQuery("# 12")).toBeNull();
+    expect(seqFromQuery("##12")).toBeNull();
   });
   test("超出安全整数 → null（不误当 seq）", () => {
-    expect(seqFromQuery("99999999999999999999")).toBeNull();
+    expect(seqFromQuery("#99999999999999999999")).toBeNull();
   });
 });

@@ -539,7 +539,7 @@ function MessageCardImpl({
     ].filter((part): part is string => part !== null);
     const toggleStatus = () => setStatusExpanded((expanded) => !expanded);
     return (
-      <div id={`msg-${msg.seq}`} className="msg-status" data-state={msg.state ?? undefined} style={hueStyle}>
+      <div id={`msg-${msg.seq}`} className="msg-status" data-state={msg.state ?? undefined} style={hueStyle} tabIndex={-1}>
         <span
           className="msg-status-summary"
           title={statusFullDetail !== "" ? statusFullDetail : undefined}
@@ -598,6 +598,7 @@ function MessageCardImpl({
       id={`msg-${msg.seq}`}
       className={"d-card msg-card" + (mine ? " msg-card--own" : "")}
       style={hueStyle}
+      tabIndex={-1}
       onContextMenu={
         canShowActions
           ? (event) => {

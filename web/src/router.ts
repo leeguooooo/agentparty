@@ -1,5 +1,15 @@
-// 极简 history 路由：/ 与 /c/:slug 两条，导航时保留 ?t=（分享链接直达频道）
+// 极简 history 路由：/ 与 /c/:slug 两条。跨路由只保留 ?t= 分享凭据；
+// agent / completion 等频道内视图参数不能泄漏到另一个频道。
 import { useCallback, useEffect, useState } from "react";
+
+export function routeNavigationTarget(to: string, currentSearch: string): string {
+  if (/[?#]/.test(to)) return to;
+  const shareToken = new URLSearchParams(currentSearch).get("t");
+  if (shareToken === null || shareToken === "") return to;
+  const params = new URLSearchParams();
+  params.set("t", shareToken);
+  return `${to}?${params.toString()}`;
+}
 
 export function useRoute(): [string, (to: string) => void, (to: string) => void] {
   const [path, setPath] = useState(() => location.pathname);
@@ -12,7 +22,7 @@ export function useRoute(): [string, (to: string) => void, (to: string) => void]
 
   const navigate = useCallback((to: string) => {
     if (to === location.pathname) return;
-    history.pushState(null, "", to + location.search);
+    history.pushState(null, "", routeNavigationTarget(to, location.search));
     setPath(to);
   }, []);
 

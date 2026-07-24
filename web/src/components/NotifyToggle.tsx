@@ -1,7 +1,7 @@
 // 被@浏览器通知的铃铛开关（Task C2）。opt-in 是全局设置（跨频道生效），落 localStorage；
 // 真正的“要不要弹”判定在纯函数 shouldNotify（lib/notify.ts）里，本组件只管开关本身：
 // 读/写 opt-in、申请浏览器通知权限、把结果上报给持有 optin state 的应用 header。
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useT } from "../i18n/useT";
 import { FeatureTip } from "./FeatureTip";
 import { isDesktopRuntime, requestDesktopNotificationPermission } from "../lib/desktopRuntime";
@@ -48,8 +48,10 @@ interface Props {
 export function NotifyToggle({ optin, onChange }: Props) {
   const t = useT();
   const [hint, setHint] = useState<string | null>(null);
+  const requestRef = useRef(0);
 
   const toggle = () => {
+    const requestId = ++requestRef.current;
     setHint(null);
     if (optin) {
       // 关闭：立即生效
@@ -62,7 +64,7 @@ export function NotifyToggle({ optin, onChange }: Props) {
     onChange(true);
     // 系统通知只是额外能力；拒绝/不支持不回滚页内通知，只提示降级。
     void requestNotifySystemPermission().then((granted) => {
-      if (!granted) setHint(t("Channel.notify.inAppOnly"));
+      if (requestId === requestRef.current && !granted) setHint(t("Channel.notify.inAppOnly"));
     });
   };
 

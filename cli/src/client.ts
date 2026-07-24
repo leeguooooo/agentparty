@@ -305,6 +305,13 @@ function parseServerFrame(value: unknown): ServerFrame | null {
         : null;
     case "participants":
       return Array.isArray(value.participants) && value.participants.every(isSender) ? asServerFrame(value) : null;
+    case "participant_removed":
+      return typeof value.name === "string" &&
+        value.name.length > 0 &&
+        isFiniteNumber(value.removed_at) &&
+        value.removed_at > 0
+        ? asServerFrame(value)
+        : null;
     case "msg":
     case "status":
       return isMessageFrame(value) ? asServerFrame(value) : null;

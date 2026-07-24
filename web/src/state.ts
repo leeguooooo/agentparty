@@ -18,6 +18,8 @@ export interface ChannelState {
   participants: Sender[];
   mode: ChannelMode;
   presence: Record<string, PresenceEntry>;
+  /** 权威成员删除墓碑：防止迟到的 offline presence / participants 快照把已移除成员重新加回。 */
+  removedParticipants: Record<string, number>;
   messages: MsgFrame[]; // 按 seq 升序、已去重
   /** 定向 @ 的可靠投递状态；按 delivery id 保存，updated_at 只前进不回退。 */
   directedDeliveries: Record<string, PublicDirectedDelivery>;
@@ -43,6 +45,7 @@ export const initialChannelState: ChannelState = {
   participants: [],
   mode: "normal",
   presence: {},
+  removedParticipants: {},
   messages: [],
   directedDeliveries: {},
   mentionSenders: {},
@@ -63,6 +66,7 @@ export type ChannelAction =
   | { type: "status"; status: SocketStatus }
   | { type: "fatal"; reason: FatalReason }
   | { type: "guard_reset" }
+  | { type: "participant_restored"; name: string }
   | { type: "send_failed"; message: string } // 本地发送失败（断线窗口），与 error 帧同走红条
   | { type: "trim"; keep: number }; // IM 窗口上限：贴底时丢弃最老的已加载消息（上翻可重新拉回）
 
@@ -81,6 +85,12 @@ export function channelReducer(state: ChannelState, action: ChannelAction): Chan
     }
     case "guard_reset":
       return { ...state, loopGuard: null, loopGuardBaselineSeq: null, sendError: null };
+    case "participant_restored": {
+      if (!Object.hasOwn(state.removedParticipants, action.name)) return state;
+      const removedParticipants = { ...state.removedParticipants };
+      delete removedParticipants[action.name];
+      return { ...state, removedParticipants };
+    }
     case "send_failed":
       return { ...state, sendError: action.message };
     case "fatal":
@@ -210,8 +220,15 @@ function rememberMentionSender(
 function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
   switch (frame.type) {
     case "welcome": {
-      const presence = { ...state.presence };
-      for (const p of frame.presence) presence[p.name] = p;
+      // welcome 是当前连接从 DO 拿到的完整权威快照，不能与旧连接的 presence 合并；
+      // 否则断线期间错过 participant_removed 的客户端会把旧 ghost 永久留在页面里。
+      const removedParticipants = { ...state.removedParticipants };
+      for (const participant of frame.participants) delete removedParticipants[participant.name];
+      const presence: Record<string, PresenceEntry> = {};
+      for (const p of frame.presence) {
+        if (Object.hasOwn(removedParticipants, p.name)) continue;
+        presence[p.name] = p;
+      }
       const readCursors = { ...state.readCursors };
       for (const c of frame.read_cursors ?? []) {
         const prev = readCursors[c.name];
@@ -221,8 +238,11 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
         ...state,
         self: frame.self,
         mode: frame.mode ?? state.mode,
-        participants: frame.participants,
+        participants: frame.participants.filter(
+          (participant) => !Object.hasOwn(removedParticipants, participant.name),
+        ),
         presence,
+        removedParticipants,
         readCursors,
         // welcome 是连接身份的权威来源。只读分享链接不闪输入框；重新以成员身份连接时也必须清掉旧只读状态。
         readonly: frame.role === "readonly",
@@ -246,8 +266,42 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
         },
       };
     }
-    case "participants":
-      return { ...state, participants: frame.participants };
+    case "participants": {
+      // A participants frame is the DO's current live roster. Seeing a name
+      // here after participant_removed is an authenticated same-name rejoin,
+      // so release the session tombstone for already-connected observers.
+      const removedParticipants = { ...state.removedParticipants };
+      for (const participant of frame.participants) delete removedParticipants[participant.name];
+      return {
+        ...state,
+        participants: frame.participants,
+        removedParticipants,
+      };
+    }
+    case "participant_removed": {
+      const previousRemovedAt = state.removedParticipants[frame.name];
+      const removedAt = Math.max(previousRemovedAt ?? 0, frame.removed_at);
+      const participants = state.participants.filter((participant) => participant.name !== frame.name);
+      const hadPresence = Object.hasOwn(state.presence, frame.name);
+      const tombstoneChanged = previousRemovedAt !== removedAt;
+      if (
+        participants.length === state.participants.length
+        && !hadPresence
+        && !tombstoneChanged
+      ) {
+        return state;
+      }
+      const presence = { ...state.presence };
+      delete presence[frame.name];
+      return {
+        ...state,
+        participants,
+        presence,
+        removedParticipants: tombstoneChanged
+          ? { ...state.removedParticipants, [frame.name]: removedAt }
+          : state.removedParticipants,
+      };
+    }
     case "msg":
     case "status": {
       const next: ChannelState = {
@@ -306,6 +360,7 @@ function applyFrame(state: ChannelState, frame: ServerFrame): ChannelState {
       return directedDeliveries === null ? state : { ...state, directedDeliveries };
     }
     case "presence":
+      if (Object.hasOwn(state.removedParticipants, frame.name)) return state;
       return {
         ...state,
         presence: {

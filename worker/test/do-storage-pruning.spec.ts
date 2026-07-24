@@ -14,6 +14,8 @@ import { describe, expect, it } from "vitest";
 import type { ChannelDO } from "../src/do";
 import { WsClient, api, createChannel, seedToken } from "./helpers";
 
+const PARTICIPANT_REMOVAL_META_RETENTION_MS = 24 * 60 * 60 * 1000;
+
 // 触发一次真实请求以确保 DO onStart 已建表（与生产路径一致），返回 stub。
 async function bootDO(slug: string, token: string) {
   expect((await api(`/api/channels/${slug}/read-cursors`, token)).status).toBe(200);
@@ -54,6 +56,79 @@ function insertCursorRow(state: DurableObjectState, name: string, seq: number, u
 }
 
 describe("DO storage pruning (#128)", () => {
+  it("participant removal cache: schedules expiry on write and restores it on hydration", async () => {
+    const { token } = await seedToken("agent");
+    const slug = await createChannel(token);
+    const stub = await bootDO(slug, token);
+
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      const runtime = instance as unknown as {
+        removeParticipantDeliveryAdapters(name: string, now: number): void;
+      };
+      const removedAt = Date.now();
+      await state.storage.deleteAlarm();
+      runtime.removeParticipantDeliveryAdapters("removed-agent", removedAt);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const writeAlarm = await state.storage.getAlarm();
+      expect(writeAlarm).not.toBeNull();
+      expect(
+        Math.abs(writeAlarm! - (removedAt + PARTICIPANT_REMOVAL_META_RETENTION_MS)),
+      ).toBeLessThan(1_000);
+
+      await state.storage.deleteAlarm();
+      instance.onStart();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const hydrationAlarm = await state.storage.getAlarm();
+      expect(hydrationAlarm).not.toBeNull();
+      expect(
+        Math.abs(hydrationAlarm! - (removedAt + PARTICIPANT_REMOVAL_META_RETENTION_MS)),
+      ).toBeLessThan(1_000);
+    });
+  });
+
+  it("participant removal cache: prunes stale meta rows and keeps fresh rows", async () => {
+    const { token } = await seedToken("agent");
+    const slug = await createChannel(token);
+    const stub = await bootDO(slug, token);
+
+    await runInDurableObject(stub, async (instance: ChannelDO, state) => {
+      const now = Date.now();
+      const stale = now - 7 * 24 * 60 * 60 * 1000;
+      state.storage.sql.exec(
+        `INSERT INTO meta (key, value) VALUES
+           ('participant-removal:stale', ?),
+           ('removed-presence:stale', ?),
+           ('participant-removal:fresh', ?),
+           ('removed-presence:fresh', ?),
+           ('unrelated:test', 'keep')`,
+        String(stale),
+        String(stale),
+        String(now),
+        String(now),
+      );
+
+      await instance.onAlarm();
+
+      const keys = state.storage.sql
+        .exec(
+          `SELECT key FROM meta
+            WHERE key LIKE 'participant-removal:%'
+               OR key LIKE 'removed-presence:%'
+               OR key = 'unrelated:test'
+            ORDER BY key`,
+        )
+        .toArray()
+        .map((row) => String(row.key));
+      expect(keys).toEqual([
+        "participant-removal:fresh",
+        "removed-presence:fresh",
+        "unrelated:test",
+      ]);
+    });
+  });
+
   it("wake_delivery_ledger: prunes rows past the retention window, keeps budget-window rows", async () => {
     const { token } = await seedToken("agent");
     const slug = await createChannel(token);

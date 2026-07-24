@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import type { MsgFrame, PresenceEntry } from "@agentparty/shared";
 import { LocaleProvider } from "../i18n/locale";
-import { AgentDetailModal, filterAgentHistory } from "./AgentDetailModal";
+import { AgentDetailModal, AgentDetailPanel, filterAgentHistory } from "./AgentDetailModal";
 
 // issue #272（审计重开）：单 Agent 详情弹窗——点某个 agent 能看到它的工作状态、
 // 历史工作内容、在线状态，而不再只有频道级平铺看板。
@@ -51,14 +51,39 @@ function render(props: Parameters<typeof AgentDetailModal>[0]) {
   return renderer!.root;
 }
 
-let fakeWindow: EventTarget | null = null;
+function renderPanel(props: Parameters<typeof AgentDetailPanel>[0]) {
+  localStorage.setItem("ap_locale", "zh");
+  act(() => {
+    renderer = create(
+      <LocaleProvider>
+        <AgentDetailPanel {...props} />
+      </LocaleProvider>,
+    );
+  });
+  return renderer!.root;
+}
+
+class TrackingWindow extends EventTarget {
+  keydownListenerAdds = 0;
+
+  override addEventListener(
+    type: string,
+    callback: EventListenerOrEventListenerObject | null,
+    options?: AddEventListenerOptions | boolean,
+  ): void {
+    if (type === "keydown") this.keydownListenerAdds += 1;
+    super.addEventListener(type, callback, options);
+  }
+}
+
+let fakeWindow: TrackingWindow | null = null;
 
 beforeEach(() => {
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { configurable: true, value: true });
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: memoryStorage() });
   // component listens on window for Esc-to-close (see ChannelPanelModal's established pattern) —
   // bun's runtime has no DOM, so stand in a real EventTarget (supports add/removeEventListener + dispatchEvent).
-  fakeWindow = new EventTarget();
+  fakeWindow = new TrackingWindow();
   Object.defineProperty(globalThis, "window", { configurable: true, value: fakeWindow });
 });
 
@@ -191,6 +216,86 @@ describe("AgentDetailModal (#272)", () => {
     const text = JSON.stringify(renderer!.toJSON());
     expect(text).toContain("did the thing");
     expect(text).not.toContain("unrelated message from someone else");
+  });
+
+  test("inline panel has no dialog chrome and installs no global keyboard listener", () => {
+    const root = renderPanel({
+      name: "worker-a",
+      display: "worker-a",
+      kind: "agent",
+      owner: null,
+      online: true,
+      presence: null,
+      messages: [],
+    });
+
+    expect(root.findAll((node) => node.props.role === "dialog")).toHaveLength(0);
+    expect(root.findAll((node) => node.props.className === "channel-panel-scrim")).toHaveLength(0);
+    expect(fakeWindow!.keydownListenerAdds).toBe(0);
+  });
+
+  test("formal assignment replaces conflicting self-reported presence role and lineage", () => {
+    renderPanel({
+      name: "worker-a",
+      display: "worker-a",
+      kind: "agent",
+      owner: null,
+      online: true,
+      presence: presenceEntry({
+        role: "host",
+        lineage: {
+          parent_agent: "presence-lead",
+          root_agent: "presence-root",
+          team_id: "presence-team",
+          depth: 1,
+          expires_at: null,
+        },
+      }),
+      assignment: {
+        role: "reviewer",
+        responsibility: "owns release approval",
+        reportsTo: "formal-lead",
+        source: "assigned",
+      },
+      messages: [],
+    });
+
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("reviewer");
+    expect(text).toContain("owns release approval");
+    expect(text).toContain("formal-lead");
+    expect(text).not.toContain("presence-lead");
+    expect(text).not.toContain('"host"');
+    expect(text).not.toContain("未确认");
+  });
+
+  test("presence self-report is labeled unconfirmed without promoting runtime lineage to reportsTo", () => {
+    renderPanel({
+      name: "worker-a",
+      display: "worker-a",
+      kind: "agent",
+      owner: null,
+      online: true,
+      presence: presenceEntry({
+        role: "worker",
+        role_source: "self",
+        note: "runtime claim",
+        lineage: {
+          parent_agent: "self-reported-lead",
+          root_agent: "self-reported-root",
+          team_id: "self-reported-team",
+          depth: 1,
+          expires_at: null,
+        },
+      }),
+      messages: [],
+    });
+
+    const text = JSON.stringify(renderer!.toJSON());
+    expect(text).toContain("worker");
+    expect(text).toContain("runtime claim");
+    expect(text).not.toContain("self-reported-lead");
+    expect(text).toContain("自报 · 未确认");
   });
 
   test("shows online/offline badge based on the online prop", () => {

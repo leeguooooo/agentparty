@@ -1,9 +1,10 @@
-// #716：搜索框直接输入 seq 号即可定位到该消息。纯数字（去空白后全为数字、>0）识别为 seq 查询，
-// 面板据此给一个「跳到 #N」直达按钮；非纯数字仍走全文检索。前导零/超大值容错：Number 解析 + 有限正整数。
+// 消息定位必须使用显式的 #<seq> 语法；裸数字可能就是用户要全文检索的正文，不能抢占为导航。
+// 去掉外围空白后，仅接受 # + 正整数。前导零/超大值容错：Number 解析 + 有限正整数。
 export function seqFromQuery(search: string): number | null {
   const trimmed = search.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  const seq = Number(trimmed);
+  const match = /^#(\d+)$/.exec(trimmed);
+  if (match === null) return null;
+  const seq = Number(match[1]);
   return Number.isSafeInteger(seq) && seq > 0 ? seq : null;
 }
 

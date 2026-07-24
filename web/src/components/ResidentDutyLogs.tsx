@@ -8,6 +8,7 @@ import "../i18n/strings/ResidentDutyLogs";
 interface Props {
   t: TFunc;
   adapter?: Pick<DesktopAgentAdapter, "dutyList" | "dutyLogRead">;
+  active?: boolean;
 }
 
 // instanceId 形如 "<config_id>:<channel>"；频道名给人看，config 短哈希只作区分。
@@ -16,7 +17,7 @@ function channelOf(entry: DesktopDutyEntry): string {
   return idx >= 0 ? entry.instanceId.slice(idx + 1) : entry.instanceId;
 }
 
-export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter }: Props) {
+export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter, active = true }: Props) {
   const [entries, setEntries] = useState<DesktopDutyEntry[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null); // 选中的 label
@@ -25,15 +26,20 @@ export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter }: Props) {
   const [logError, setLogError] = useState<string | null>(null);
   // 请求排序保护:快速切换条目时,只让「最后一次点击」的结果落地,避免慢请求覆盖新选中的日志。
   const loadSeqRef = useRef(0);
+  const listSeqRef = useRef(0);
+  const listActiveRef = useRef(active);
 
   const refreshList = useCallback(async () => {
+    const seq = ++listSeqRef.current;
     setListError(null);
     try {
       const list = await adapter.dutyList();
+      if (!listActiveRef.current || seq !== listSeqRef.current) return;
       setEntries(list);
       // 选中项若已消失，清掉日志。
       setSelected((current) => (current !== null && list.some((e) => e.label === current) ? current : null));
     } catch (err) {
+      if (!listActiveRef.current || seq !== listSeqRef.current) return;
       setEntries([]);
       setListError(err instanceof Error ? err.message : String(err));
     }
@@ -62,8 +68,17 @@ export function ResidentDutyLogs({ t, adapter = desktopAgentAdapter }: Props) {
   );
 
   useEffect(() => {
+    listActiveRef.current = active;
+    if (!active) {
+      listSeqRef.current += 1;
+      return;
+    }
     void refreshList();
-  }, [refreshList]);
+    return () => {
+      listActiveRef.current = false;
+      listSeqRef.current += 1;
+    };
+  }, [active, refreshList]);
 
   return (
     <div className="resident-logs">

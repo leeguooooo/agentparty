@@ -55,6 +55,8 @@ interface SummarizeTeamsInput {
   participants: Sender[];
   messages: MsgFrame[];
   now?: number;
+  /** Current channel roster. Historical messages cannot recreate members absent from this authority. */
+  memberNames?: ReadonlySet<string>;
 }
 
 interface MemberDraft {
@@ -134,11 +136,19 @@ function summarizeResidency(values: Array<Residency | "unknown">): TeamResidency
   return "mixed";
 }
 
-export function summarizeTeams({ presence, participants, messages, now = Date.now() }: SummarizeTeamsInput): TeamSummary[] {
+export function summarizeTeams({
+  presence,
+  participants,
+  messages,
+  now = Date.now(),
+  memberNames,
+}: SummarizeTeamsInput): TeamSummary[] {
   const members = new Map<string, MemberDraft>();
   const participantByName = new Map(participants.map((sender) => [sender.name, sender]));
+  const included = (name: string) => memberNames === undefined || memberNames.has(name);
 
   for (const sender of participants) {
+    if (!included(sender.name)) continue;
     mergeMember(members, sender.name, {
       lineage: sender.lineage ?? null,
       state: "online",
@@ -148,6 +158,7 @@ export function summarizeTeams({ presence, participants, messages, now = Date.no
   }
 
   for (const msg of messages) {
+    if (!included(msg.sender.name)) continue;
     mergeMember(members, msg.sender.name, {
       lineage: msg.sender.lineage ?? null,
       role: msg.role ?? null,
@@ -156,6 +167,7 @@ export function summarizeTeams({ presence, participants, messages, now = Date.no
   }
 
   for (const entry of Object.values(presence)) {
+    if (!included(entry.name)) continue;
     const connected = participantByName.has(entry.name);
     mergeMember(members, entry.name, {
       lineage: entry.lineage ?? participantByName.get(entry.name)?.lineage ?? null,

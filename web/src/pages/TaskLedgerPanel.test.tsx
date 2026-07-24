@@ -66,6 +66,7 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
 }
 
 type PanelProps = Parameters<typeof TaskLedgerPanel>[0];
+type NodeMockFactory = NonNullable<NonNullable<Parameters<typeof create>[1]>["createNodeMock"]>;
 
 function baseProps(overrides: Partial<PanelProps> = {}): PanelProps {
   return {
@@ -96,16 +97,24 @@ afterEach(async () => {
   if (renderer !== null) await act(async () => renderer?.unmount());
   renderer = null;
   Reflect.deleteProperty(globalThis, "localStorage");
+  Reflect.deleteProperty(globalThis, "window");
 });
 
-function render(locale: "en" | "zh", props: PanelProps): ReactTestRenderer {
+function render(
+  locale: "en" | "zh",
+  props: PanelProps,
+  createNodeMock?: NodeMockFactory,
+): ReactTestRenderer {
   Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: memoryStorage({ ap_locale: locale }),
   });
   let r!: ReactTestRenderer;
   void act(() => {
-    r = create(<LocaleProvider><TaskLedgerPanel {...props} /></LocaleProvider>);
+    r = create(
+      <LocaleProvider><TaskLedgerPanel {...props} /></LocaleProvider>,
+      createNodeMock === undefined ? undefined : { createNodeMock },
+    );
   });
   renderer = r;
   return r;
@@ -338,9 +347,9 @@ describe("TaskLedgerPanel expanded view (#271)", () => {
   });
 });
 
-// #271(c)：点击任务卡标题打开详情弹层（完整 title/desc/meta）。
+// #271(c)：点击任务卡标题进入台账内详情路由（完整 title/desc/meta）。
 describe("TaskLedgerPanel task detail (#271)", () => {
-  test("clicking a task title opens the detail dialog and close dismisses it", async () => {
+  test("uses one in-panel route, focuses Back, and Escape restores the task trigger", async () => {
     const detailed = task({
       id: 7,
       title: "detail-task",
@@ -355,7 +364,17 @@ describe("TaskLedgerPanel task detail (#271)", () => {
         url: "/api/channels/demo/attachments/11111111-1111-1111-1111-111111111111/solution.html",
       },
     });
-    const r = render("en", baseProps({ tasks: [detailed] }));
+    let focused = "";
+    const titleNode = { isConnected: true, focus: () => { focused = "title"; } };
+    const backNode = { isConnected: true, focus: () => { focused = "back"; } };
+    const fakeWindow = new EventTarget();
+    Object.defineProperty(globalThis, "window", { configurable: true, value: fakeWindow });
+    const r = render("en", baseProps({ tasks: [detailed] }), (element) => {
+      const props = element.props as Record<string, unknown>;
+      if (props.className === "task-card-title") return titleNode;
+      if (props.className === "d-btn task-detail-close") return backNode;
+      return {};
+    });
     expect(r.root.findAll((n) => n.props["aria-label"] === "task 7 details")).toHaveLength(0);
     await expandCards(r); // 博客风：卡片内联 solution 展开后才渲染
     expect(r.root.findAll((n) => n.props.className === "task-solution")).toHaveLength(1);
@@ -363,6 +382,10 @@ describe("TaskLedgerPanel task detail (#271)", () => {
 
     await act(async () => { findByAria(r, "Open task 7 details").props.onClick(); });
     findByAria(r, "task 7 details");
+    expect(focused).toBe("back");
+    expect(r.root.findAll((n) => n.props.role === "dialog")).toHaveLength(0);
+    expect(r.root.findAll((n) => n.props["aria-modal"] === true)).toHaveLength(0);
+    expect(r.root.findAll((n) => n.props.className === "task-board")).toHaveLength(0);
     const text = allText(r);
     expect(text).toContain("long description body");
     expect(text).toContain("created by"); // meta 标签只出现在详情里
@@ -371,17 +394,88 @@ describe("TaskLedgerPanel task detail (#271)", () => {
     expect(text).toContain("Solution");
     expect(text).toContain("solution.html");
 
-    await act(async () => {
-      r.root.find((n) => n.props.className === "d-btn task-detail-close").props.onClick();
+    let outerCloseCalls = 0;
+    fakeWindow.addEventListener("keydown", (rawEvent) => {
+      const event = rawEvent as Event & { key: string };
+      if (event.key === "Escape" && !event.defaultPrevented) outerCloseCalls += 1;
     });
+    const escape = new Event("keydown", { cancelable: true }) as Event & { key: string };
+    escape.key = "Escape";
+    await act(async () => {
+      fakeWindow.dispatchEvent(escape);
+    });
+    expect(escape.defaultPrevented).toBe(true);
+    expect(outerCloseCalls).toBe(0);
+    expect(focused).toBe("title");
     expect(r.root.findAll((n) => n.props["aria-label"] === "task 7 details")).toHaveLength(0);
+    expect(r.root.findAll((n) => n.props.className === "task-board")).toHaveLength(1);
   });
 
-  test("detail dialog shows a placeholder when the task has no desc", async () => {
+  test("detail route shows a placeholder when the task has no desc", async () => {
     const r = render("en", baseProps({ tasks: [task({ id: 9, desc: null })] }));
     expect(r.root.findAll((n) => typeof n.props.className === "string" && n.props.className.startsWith("task-solution"))).toHaveLength(0);
     await act(async () => { findByAria(r, "Open task 9 details").props.onClick(); });
     expect(allText(r)).toContain("No details");
+    expect(r.root.find((n) => n.props.className === "d-btn task-detail-close").children.join("")).toContain("Back to tasks");
     expect(r.root.findAll((n) => typeof n.props.className === "string" && n.props.className.startsWith("task-solution"))).toHaveLength(0);
+  });
+});
+
+describe("TaskLedgerPanel external task selection", () => {
+  test("reveals, expands, scrolls and focuses the selected task without resetting filters", async () => {
+    const first = task({ id: 1, title: "alpha-task", assignee: { name: "worker-a", kind: "agent" } });
+    const selected = task({ id: 2, title: "bravo-task", state: "in_progress", assignee: { name: "worker-b", kind: "agent" } });
+    const focusCalls: number[] = [];
+    const scrollCalls: number[] = [];
+    const initialProps = baseProps({ tasks: [first, selected] });
+    const r = render("en", initialProps, (element) => {
+      const props = element.props as Record<string, unknown>;
+      if (element.type !== "li" || typeof props["data-task-id"] !== "number") return {};
+      const id = props["data-task-id"] as number;
+      return {
+        focus: () => focusCalls.push(id),
+        scrollIntoView: () => scrollCalls.push(id),
+      };
+    });
+
+    const search = findByAria(r, "Search tasks");
+    await act(async () => search.props.onChange({ currentTarget: { value: "alpha" } }));
+    expect(allText(r)).toContain("alpha-task");
+    expect(allText(r)).not.toContain("bravo-task");
+
+    await act(async () => {
+      r.update(
+        <LocaleProvider>
+          <TaskLedgerPanel {...initialProps} selectedTaskId={2} />
+        </LocaleProvider>,
+      );
+    });
+
+    expect(findByAria(r, "Search tasks").props.value).toBe("alpha");
+    expect(allText(r)).toContain("alpha-task");
+    expect(allText(r)).toContain("bravo-task");
+    const selectedCard = r.root.findByProps({ "data-task-id": 2 });
+    expect(selectedCard.props.className).toContain("task-card--open");
+    expect(selectedCard.findByProps({ className: "task-card-toggle" }).props["aria-expanded"]).toBe(true);
+    expect(scrollCalls).toEqual([2]);
+    expect(focusCalls).toEqual([2]);
+  });
+
+  test("keeps a selected completed task reachable beyond the collapsed done limit", async () => {
+    const completed = Array.from({ length: 8 }, (_, index) => task({
+      id: index + 1,
+      title: `completed-${index + 1}`,
+      state: "done",
+    }));
+    const r = render("en", baseProps({ tasks: completed, selectedTaskId: 8 }));
+    await act(async () => {});
+
+    const selectedCard = r.root.findByProps({ "data-task-id": 8 });
+    expect(selectedCard.props.className).toContain("task-card--open");
+    expect(allText(r)).toContain("completed-8");
+    expect(r.root.findAll((node) => (
+      typeof node.props.className === "string"
+      && node.props.className.startsWith("task-card task-card--done")
+    ))).toHaveLength(7);
   });
 });

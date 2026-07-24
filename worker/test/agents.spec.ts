@@ -2,8 +2,8 @@
 // owner 恒 = 铸造者的 principal.account（不接受客户端传），role 固定 agent，channel_scope 可选。
 // 铸造门的授权分支与身份来源无关（OIDC 人类 vs 带 owner 的 human ap_ token 走同一判定），
 // OIDC 身份解析本身由 oidc.spec.ts 覆盖，这里用 human ap_ token 驱动账号会话。
-import { SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { SELF, env } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
 import { ADMIN_HEADERS, api, seedToken, uniq } from "./helpers";
 
 // 用 ADMIN 铸一个带 owner 的 human token = 一个账号会话（account = owner）
@@ -419,6 +419,85 @@ describe("project agent profiles", () => {
     expect((await api(`/api/channels/${invitedSlug}/messages`, firstChildBody.token)).status).toBe(401);
     expect((await api(`/api/channels/${invitedSlug}/messages`, runtimeBody.token)).status).toBe(403);
     expect((await api(`/api/channels/${secondSlug}/messages`, secondChildBody.token)).status).toBe(200);
+  });
+
+  it("fails the final project-agent mint CAS when the invite is revoked immediately before persistence", async () => {
+    const owner = `${uniq("project-mint-cas-owner")}@example.com`;
+    const inviter = `${uniq("project-mint-cas-inviter")}@example.com`;
+    const handle = uniq("project-mint-cas-profile");
+    const childName = uniq("project-mint-cas-child");
+    const ownerSession = await humanSession(owner);
+    const inviterSession = await humanSession(inviter);
+    expect((await saveProfile(ownerSession, { handle, runner: "codex-sdk", invitable_by: "anyone" })).status).toBe(201);
+    const slug = uniq("project-mint-cas");
+    expect(
+      (
+        await api("/api/channels", inviterSession, {
+          method: "POST",
+          body: JSON.stringify({ slug, kind: "standing", visibility: "private" }),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await api(`/api/channels/${slug}/project-agents`, inviterSession, {
+          method: "POST",
+          body: JSON.stringify({ owner_account: owner, handle }),
+        })
+      ).status,
+    ).toBe(201);
+    const runtime = await api(`/api/agent-profiles/${encodeURIComponent(handle)}/runtime-token`, ownerSession, {
+      method: "POST",
+    });
+    expect(runtime.status).toBe(201);
+    const runtimeToken = ((await runtime.json()) as { token: string }).token;
+
+    const originalPrepare = env.DB.prepare.bind(env.DB);
+    let intercepted = false;
+    const prepare = vi.spyOn(env.DB, "prepare").mockImplementation((query: string) => {
+      const statement = originalPrepare(query);
+      if (
+        !query.includes("INSERT INTO tokens (") ||
+        !query.includes("SELECT ?, ?, 'agent'") ||
+        !query.includes("FROM channel_agent_invites invite")
+      ) {
+        return statement;
+      }
+      return {
+        bind: (...values: unknown[]) => {
+          const bound = statement.bind(...values);
+          return {
+            run: async () => {
+              intercepted = true;
+              await originalPrepare(
+                `UPDATE channel_agent_invites
+                    SET revoked_at = ?
+                  WHERE channel_slug = ?
+                    AND owner_account = ?
+                    AND profile_handle = ?
+                    AND revoked_at IS NULL`,
+              ).bind(Date.now(), slug, owner, handle).run();
+              return bound.run();
+            },
+          } as D1PreparedStatement;
+        },
+      } as D1PreparedStatement;
+    });
+
+    let response: Response;
+    try {
+      response = await api(`/api/channels/${slug}/project-agents/runtime-token`, runtimeToken, {
+        method: "POST",
+        body: JSON.stringify({ owner_account: owner, handle, name: childName }),
+      });
+    } finally {
+      prepare.mockRestore();
+    }
+
+    expect(intercepted).toBe(true);
+    expect(response!.status).toBe(409);
+    expect(await response!.json()).toMatchObject({ error: { code: "participant_removed" } });
+    expect(await env.DB.prepare("SELECT name FROM tokens WHERE name = ?").bind(childName).first()).toBeNull();
   });
 
   it("allows org-scoped project agent invites only within the owner domain", async () => {

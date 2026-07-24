@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { LocaleProvider } from "../i18n/locale";
 import type { ChannelFocus, FocusItem } from "../lib/channelFocus";
+import type { PendingDecisionLoadState } from "../lib/pendingDecisions";
 import { ChannelFocusBar } from "./ChannelFocusBar";
 
 let renderer: ReactTestRenderer | null = null;
@@ -57,6 +58,17 @@ function focus(overrides: Partial<ChannelFocus> = {}): ChannelFocus {
   };
 }
 
+function decisionState(
+  overrides: Partial<PendingDecisionLoadState> = {},
+): PendingDecisionLoadState {
+  return {
+    lastSuccessfulData: null,
+    loading: false,
+    error: null,
+    ...overrides,
+  };
+}
+
 function render(props: Parameters<typeof ChannelFocusBar>[0]) {
   localStorage.setItem("ap_locale", "en");
   act(() => {
@@ -84,6 +96,87 @@ function classNames(): string[] {
 describe("ChannelFocusBar (#682)", () => {
   test("renders nothing when nothing is in flight and there is no override", () => {
     render({ focus: focus() });
+    expect(renderer!.toJSON()).toBeNull();
+  });
+
+  test("does not disguise the initial decision load as an empty focus bar", () => {
+    render({
+      focus: focus(),
+      decisionState: decisionState({ loading: true }),
+    });
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Loading pending decisions");
+  });
+
+  test("shows a retry action when the first decision load fails", () => {
+    let retries = 0;
+    render({
+      focus: focus(),
+      decisionState: decisionState({ error: { kind: "load_failed" } }),
+      onRetryDecisions: () => { retries += 1; },
+    });
+
+    const retry = renderer!.root.findByProps({ className: "d-btn focus-decision-retry" });
+    act(() => retry.props.onClick());
+    expect(retries).toBe(1);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("could not be loaded");
+  });
+
+  test("keeps stale decision counts visible beside a refresh failure", () => {
+    render({
+      focus: focus({
+        items: [item({
+          key: "decision-7",
+          state: "waiting_decision",
+          seq: 7,
+          taskId: null,
+        })],
+        counts: { working: 0, blocked: 0, waitingDecision: 1, stalled: 0 },
+      }),
+      decisionState: decisionState({
+        lastSuccessfulData: [{
+          seq: 7,
+          prompt: "ship?",
+          asker: "alice",
+          waitingOnMe: false,
+        }],
+        error: { kind: "load_failed" },
+      }),
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain("focus-count--waiting_decision");
+    expect(rendered).toContain("last successful result");
+  });
+
+  test("shows forbidden ahead of stale data and does not offer a meaningless retry", () => {
+    render({
+      focus: focus(),
+      decisionState: decisionState({
+        lastSuccessfulData: [{
+          seq: 7,
+          prompt: "ship?",
+          asker: "alice",
+          waitingOnMe: false,
+        }],
+        error: { kind: "forbidden" },
+      }),
+      onRetryDecisions: () => {
+        throw new Error("forbidden decisions must not be retried");
+      },
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain("not available to this account");
+    expect(rendered).not.toContain("last successful result");
+    expect(renderer!.root.findAllByProps({ className: "d-btn focus-decision-retry" })).toHaveLength(0);
+  });
+
+  test("still renders nothing after a successful genuinely empty decision result", () => {
+    render({
+      focus: focus(),
+      decisionState: decisionState({ lastSuccessfulData: [] }),
+    });
     expect(renderer!.toJSON()).toBeNull();
   });
 
@@ -147,7 +240,7 @@ describe("ChannelFocusBar (#682)", () => {
     render({
       focus: focus({ items: mine, counts: { working: 0, blocked: 0, waitingDecision: 4, stalled: 0 } }),
       viewerIsModerator: true,
-      onOpenTask: (id) => opened.push(id),
+      onOpenOverview: () => opened.push(1),
     });
     // 只展开前两个 chip，其余折成 +N（4 - 2 = 2）。
     const chips = renderer!.root.findAll(
@@ -198,21 +291,20 @@ describe("ChannelFocusBar (#682)", () => {
     expect(jumped).toEqual([9]);
   });
 
-  // 计数丸点开回任务台账（Channel 里忽略具体 id，只负责开面板）。
-  test("counts pill opens the task board via onOpenTask", () => {
-    const opened: number[] = [];
+  test("counts pill opens the mixed focus overview instead of inventing a task destination", () => {
+    let opened = 0;
     render({
       focus: focus({
-        items: [item({ key: "a", name: "Evan", state: "working" })],
-        counts: { working: 1, blocked: 0, waitingDecision: 0, stalled: 0 },
+        items: [item({ key: "decision-9", name: "Evan", state: "waiting_decision", seq: 9 })],
+        counts: { working: 0, blocked: 0, waitingDecision: 1, stalled: 0 },
       }),
-      onOpenTask: (id) => opened.push(id),
+      onOpenOverview: () => { opened += 1; },
     });
     const pill = renderer!.root.findAll(
       (n) => typeof n.props.className === "string" && n.props.className.includes("focus-counts--btn"),
     )[0];
     act(() => { pill!.props.onClick(); });
-    expect(opened.length).toBe(1);
+    expect(opened).toBe(1);
   });
 
   test("shows a manual focus line when host set an override even with no items", () => {

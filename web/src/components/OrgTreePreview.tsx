@@ -3,8 +3,8 @@ import type { TFunc } from "../i18n/useT";
 import type { OrgTree, OrgTreeNode } from "../lib/orgTree";
 
 // issue #281 + #370：频道组织/汇报关系整体预览。DivisionBoard 逐行标注汇报对象，这里折成
-// 一棵可整体查看的组织架构图（办公软件式管理层级）。数据源优先 channel_roles.reports_to
-// （#370 正式管理层级，可跨 owner），回落 lineage。moderator 可就地设「向谁汇报」（可交互）。
+// 一棵可整体查看的组织架构图（办公软件式管理层级）。唯一权威来源是 channel_roles；
+// moderator 只能编辑已有正式 assignment 的「向谁汇报」，自报/未分工节点保持只读。
 // 树构建（含环/孤儿处理）在 lib/orgTree.ts。
 
 interface OrgInteractive {
@@ -41,7 +41,7 @@ function OrgNodeRow({ node, t, interactive }: { node: OrgTreeNode; t: TFunc; int
             {t("Channel.roles.skipLevel", { parent: node.reportsTo })}
           </span>
         )}
-        {interactive?.canModerate && (
+        {interactive?.canModerate && node.source === "assigned" && (
           <select
             className="org-report-select"
             value={node.reportsTo ?? ""}

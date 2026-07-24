@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type ReactNode, useId, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { useT } from "../i18n/useT";
 
 // #504 团队面板「博客风」外壳：把原来一整页长滚动的三段（分工 / Agent 看板 / 协调）
@@ -21,23 +21,76 @@ export interface TeamTabsProps {
   board: ReactNode;
   coordination: ReactNode;
   initialTab?: TeamTab;
+  detail?: ReactNode;
+  detailBackLabel?: string;
+  onBackFromDetail?: () => void;
   // #504：博客风头自带关闭按钮（设计里 关闭 在头右上）。传入后 modal 隐藏它自己的头，避免双 header。
   onClose?: () => void;
 }
 
-export function TeamTabs({ stats, mentionCount, division, board, coordination, initialTab = "division", onClose }: TeamTabsProps) {
+export function TeamTabs({
+  stats,
+  mentionCount,
+  division,
+  board,
+  coordination,
+  initialTab = "division",
+  detail,
+  detailBackLabel = "Back",
+  onBackFromDetail,
+  onClose,
+}: TeamTabsProps) {
   const t = useT();
   const [tab, setTab] = useState<TeamTab>(initialTab);
   const idPrefix = useId();
   const tabRefs = useRef<Record<TeamTab, HTMLButtonElement | null>>({ division: null, board: null, coordination: null });
+  const detailBackRef = useRef<HTMLButtonElement | null>(null);
 
-  const tabs: Array<{ id: TeamTab; no: string; label: string; badge: number | null; badgeHot: boolean }> = [
-    { id: "division", no: "01", label: t("Channel.team.tab.division"), badge: stats.unclaimed > 0 ? stats.unclaimed : null, badgeHot: true },
-    { id: "board", no: "02", label: t("Channel.team.tab.board"), badge: null, badgeHot: false },
-    { id: "coordination", no: "03", label: t("Channel.team.tab.coordination"), badge: mentionCount > 0 ? mentionCount : null, badgeHot: true },
+  const tabs: Array<{
+    id: TeamTab;
+    no: string;
+    label: string;
+    badge: number | null;
+    badgeHot: boolean;
+    content: ReactNode;
+  }> = [
+    {
+      id: "division",
+      no: "01",
+      label: t("Channel.team.tab.division"),
+      badge: stats.unclaimed > 0 ? stats.unclaimed : null,
+      badgeHot: true,
+      content: division,
+    },
+    {
+      id: "board",
+      no: "02",
+      label: t("Channel.team.tab.board"),
+      badge: null,
+      badgeHot: false,
+      content: board,
+    },
+    {
+      id: "coordination",
+      no: "03",
+      label: t("Channel.team.tab.coordination"),
+      badge: mentionCount > 0 ? mentionCount : null,
+      badgeHot: true,
+      content: coordination,
+    },
   ];
-  const panelId = `${idPrefix}-team-panel`;
   const tabId = (id: TeamTab) => `${idPrefix}-team-tab-${id}`;
+  const panelId = (id: TeamTab) => `${idPrefix}-team-panel-${id}`;
+  const showingDetail = detail !== undefined && detail !== null;
+  const detailWasOpenRef = useRef(false);
+  useEffect(() => {
+    if (!detailWasOpenRef.current && showingDetail) {
+      detailBackRef.current?.focus();
+    } else if (detailWasOpenRef.current && !showingDetail) {
+      tabRefs.current[tab]?.focus();
+    }
+    detailWasOpenRef.current = showingDetail;
+  }, [showingDetail, tab]);
   const moveTab = (event: KeyboardEvent<HTMLButtonElement>, direction: -1 | 1) => {
     event.preventDefault();
     const current = tabs.findIndex((entry) => entry.id === tab);
@@ -71,7 +124,12 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
         )}
       </header>
 
-      <nav className="team-blog-tabs" role="tablist" aria-label={t("Channel.tools.team")}>
+      <nav
+        className="team-blog-tabs"
+        role="tablist"
+        aria-label={t("Channel.tools.team")}
+        hidden={showingDetail}
+      >
         {tabs.map((entry) => (
           <button
             key={entry.id}
@@ -80,7 +138,7 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
             type="button"
             role="tab"
             aria-selected={tab === entry.id}
-            aria-controls={panelId}
+            aria-controls={panelId(entry.id)}
             tabIndex={tab === entry.id ? 0 : -1}
             className={"team-blog-tab" + (tab === entry.id ? " team-blog-tab--active" : "")}
             onClick={() => setTab(entry.id)}
@@ -100,11 +158,32 @@ export function TeamTabs({ stats, mentionCount, division, board, coordination, i
         ))}
       </nav>
 
-      <div id={panelId} className="team-blog-panel" role="tabpanel" aria-labelledby={tabId(tab)}>
-        {tab === "division" && division}
-        {tab === "board" && board}
-        {tab === "coordination" && coordination}
-      </div>
+      {tabs.map((entry) => (
+        <div
+          key={entry.id}
+          id={panelId(entry.id)}
+          className="team-blog-panel"
+          role="tabpanel"
+          aria-labelledby={tabId(entry.id)}
+          hidden={showingDetail || tab !== entry.id}
+        >
+          {entry.content}
+        </div>
+      ))}
+
+      {showingDetail && (
+        <div className="team-blog-panel team-blog-detail">
+          <button
+            ref={detailBackRef}
+            type="button"
+            className="d-btn team-blog-detail-back"
+            onClick={onBackFromDetail}
+          >
+            ← {detailBackLabel}
+          </button>
+          {detail}
+        </div>
+      )}
     </section>
   );
 }

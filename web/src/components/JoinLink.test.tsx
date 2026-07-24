@@ -14,9 +14,13 @@ const reviewCalls: Array<{ id: string | number; body: { action: "approve" } | { 
 let pendingRequests: Array<{ id: string | number; state: string; requester_name: string; requester_handle?: string; note: string | null }> = [];
 let pendingError: Error | null = null;
 let joinLinksList: Array<Record<string, unknown>> = [];
+let listJoinLinksImpl = async (): Promise<Array<Record<string, unknown>>> => joinLinksList;
 
+const actualApi = await import("../lib/api");
 mock.module("../lib/api", () => ({
+  ...actualApi,
   AuthError: class AuthError extends Error {},
+  ConflictError: class ConflictError extends Error {},
   ForbiddenError: class ForbiddenError extends Error {},
   ValidationError: class ValidationError extends Error {},
   LarkDirectoryApiError: class LarkDirectoryApiError extends Error {},
@@ -28,7 +32,7 @@ mock.module("../lib/api", () => ({
     shareCalls.push({ slug });
     return { name: "watch_deadbeef", created_at: 0, url: `https://x/c/${slug}?t=ap_watchtoken`, token: "ap_watchtoken" };
   }),
-  listJoinLinks: async () => joinLinksList,
+  listJoinLinks: () => listJoinLinksImpl(),
   listShareLinks: async () => [],
   listChannelJoinRequests: async () => {
     if (pendingError) throw pendingError;
@@ -101,6 +105,14 @@ class TestEventTarget {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 beforeEach(() => {
   joinCalls.length = 0;
   shareCalls.length = 0;
@@ -113,6 +125,7 @@ beforeEach(() => {
   ];
   pendingError = null;
   joinLinksList = [];
+  listJoinLinksImpl = async () => joinLinksList;
   clearApiBase();
   windowEvents = new TestEventTarget();
   documentEvents = new TestEventTarget();
@@ -128,7 +141,12 @@ afterEach(() => {
   Reflect.deleteProperty(globalThis, "document");
 });
 
-function render(props: { active?: boolean; onActiveChange?(open: boolean): void; larkDirectoryEnabled?: boolean } = { active: true }) {
+function render(props: {
+  active?: boolean;
+  embedded?: boolean;
+  onActiveChange?(open: boolean): void;
+  larkDirectoryEnabled?: boolean;
+} = { active: true }) {
   act(() => {
     renderer = create(
       <LocaleProvider>
@@ -283,16 +301,91 @@ describe("JoinLink invite mode selector", () => {
 });
 
 describe("JoinLink dismiss behavior", () => {
-  test("exposes the open panel as a modal dialog", () => {
-    const r = render();
-    const panel = r.root.find((node) => node.props.className === "joinlink-panel");
-    expect(panel.props.role).toBe("dialog");
-    expect(panel.props["aria-modal"]).toBe("true");
+  test("embedded mode renders an inline region without a second dialog or global dismiss listeners", async () => {
+    joinLinksList = [
+      {
+        code: "existing",
+        url: "https://x/join/existing",
+        channel_slug: "devchan",
+        created_by: "owner",
+        created_at: 0,
+        expires_at: null,
+        max_uses: 1,
+        uses: 0,
+        revoked_at: null,
+      },
+    ];
+    const r = render({ embedded: true });
+    await act(async () => {});
+    const panel = r.root.find((node) => String(node.props.className ?? "").includes("joinlink-panel--embedded"));
+    expect(panel.props.role).toBe("region");
+    expect(panel.props["aria-modal"]).toBeUndefined();
+    expect(r.root.findAllByProps({ className: "d-btn joinlink-btn" })).toHaveLength(0);
+    expect(windowEvents.count("keydown")).toBe(0);
+    expect(documentEvents.count("pointerdown")).toBe(0);
+    expect(r.root.findByProps({ className: "joinlink-url t-mono" }).children.join(""))
+      .toBe("https://x/join/existing");
   });
 
-  test("Escape and an outside pointer press request controlled close, while an inside press does not", () => {
+  test("a stale initial link request cannot overwrite a newer post-create refresh", async () => {
+    const initial = deferred<Array<Record<string, unknown>>>();
+    const afterCreate = deferred<Array<Record<string, unknown>>>();
+    let requests = 0;
+    listJoinLinksImpl = () => (++requests === 1 ? initial.promise : afterCreate.promise);
+
+    const r = render({ embedded: true });
+    clickPrimary(r);
+    await act(async () => {});
+    expect(requests).toBe(2);
+
+    afterCreate.resolve([
+      {
+        code: "new",
+        url: "https://x/join/new",
+        channel_slug: "devchan",
+        created_by: "owner",
+        created_at: 2,
+        expires_at: null,
+        max_uses: 1,
+        uses: 0,
+        revoked_at: null,
+      },
+    ]);
+    await act(async () => {});
+    initial.resolve([
+      {
+        code: "old",
+        url: "https://x/join/old",
+        channel_slug: "devchan",
+        created_by: "owner",
+        created_at: 1,
+        expires_at: null,
+        max_uses: 1,
+        uses: 0,
+        revoked_at: null,
+      },
+    ]);
+    await act(async () => {});
+
+    const urls = r.root
+      .findAllByProps({ className: "joinlink-url t-mono" })
+      .map((node) => node.children.join(""));
+    expect(urls).toContain("https://x/join/new");
+    expect(urls).not.toContain("https://x/join/old");
+  });
+
+  test("exposes the open panel as a modal dialog", async () => {
+    const r = render();
+    await act(async () => {});
+    const panel = r.root.find((node) => node.props.className === "joinlink-panel");
+    expect(panel.props.role).toBe("dialog");
+    expect(panel.props["aria-modal"]).toBe(true);
+  });
+
+  test("Escape and an outside pointer press request controlled close, while an inside press does not", async () => {
     const changes: boolean[] = [];
     render({ active: true, onActiveChange: (open) => changes.push(open) });
+    await act(async () => {});
 
     act(() => documentEvents.emit("pointerdown", { target: insideTarget }));
     expect(changes).toEqual([]);

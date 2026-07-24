@@ -647,6 +647,18 @@ export const openapiDocument = {
         parameters: [
           { name: "slug", in: "path", required: true, schema: { type: "string" } },
           { name: "since", in: "query", schema: { type: "integer", default: 0 } },
+          {
+            name: "before",
+            in: "query",
+            description: "return the latest messages with seq lower than this cursor",
+            schema: { type: "integer", minimum: 1 },
+          },
+          {
+            name: "around",
+            in: "query",
+            description: "return a bounded ascending window anchored on this exact message seq; takes precedence over before and since",
+            schema: { type: "integer", minimum: 1 },
+          },
           { name: "limit", in: "query", schema: { type: "integer", default: 100 } },
           { name: "completion", in: "query", schema: { type: "string", enum: ["1"] } },
         ],

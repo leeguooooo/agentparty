@@ -1,4 +1,6 @@
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { ChannelDO } from "../src/do";
 import { WsClient, api, completeCapabilityHello, createChannel, postMessage, seedToken, uniq } from "./helpers";
 
 interface MsgLike {
@@ -73,6 +75,15 @@ async function history(slug: string, token: string): Promise<MsgLike[]> {
   return ((await res.json()) as { messages: MsgLike[] }).messages;
 }
 
+async function pendingDecisions(slug: string, token: string) {
+  const res = await api(`/api/channels/${slug}/pending-decisions`, token);
+  expect(res.status).toBe(200);
+  return (await res.json()) as {
+    decisions: Array<{ seq: number; prompt: string; asker: string; waiting_on_me: boolean }>;
+    next_after: number | null;
+  };
+}
+
 describe("channel decision protocol (#284)", () => {
   it("defaults an option-less request to approve/reject and stays pending in approval mode", async () => {
     const { slug, agent } = await fixture();
@@ -81,6 +92,62 @@ describe("channel decision protocol (#284)", () => {
     const body = (await res.json()) as MsgLike;
     expect(body.decision_request).toEqual({ kind: "approval", prompt: "approve this plan?", options: ["approve", "reject"] });
     expect(body.decision_resolution).toEqual({ state: "pending" });
+  });
+
+  it("keeps unresolved decisions authoritative after they leave the latest 300-message window", async () => {
+    const { slug, agent, human, readonly } = await fixture();
+    const asked = await postDecision(slug, agent.token, { prompt: "ship the retained decision?" });
+    const question = (await asked.json()) as MsgLike;
+    const stub = env.CHANNELS.get(env.CHANNELS.idFromName(slug));
+    await runInDurableObject(stub, async (_instance: ChannelDO, state) => {
+      state.storage.sql.exec(
+        `WITH RECURSIVE noise(x) AS (
+           VALUES(1)
+           UNION ALL
+           SELECT x + 1 FROM noise WHERE x < 301
+         )
+         INSERT INTO messages (
+           seq, sender_name, sender_kind, kind, body, mentions_json, delivery_targets_json, ts
+         )
+         SELECT ? + x, 'noise', 'human', 'message', 'noise', '[]', '[]', ? + x
+           FROM noise`,
+        question.seq,
+        Date.now(),
+      );
+      state.storage.sql.exec(
+        `INSERT INTO meta (key, value) VALUES ('seq', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        String(question.seq + 301),
+      );
+    });
+
+    const recentResponse = await api(
+      `/api/channels/${slug}/messages?before=${Number.MAX_SAFE_INTEGER}&limit=300`,
+      human.token,
+    );
+    expect(recentResponse.status).toBe(200);
+    const recent = ((await recentResponse.json()) as { messages: MsgLike[] }).messages;
+    expect(recent).toHaveLength(300);
+    expect(recent.some((message) => message.seq === question.seq)).toBe(false);
+
+    expect(await pendingDecisions(slug, human.token)).toEqual({
+      decisions: [{
+        seq: question.seq,
+        prompt: "ship the retained decision?",
+        asker: agent.name,
+        waiting_on_me: true,
+      }],
+      next_after: null,
+    });
+    expect((await pendingDecisions(slug, readonly.token)).decisions[0]?.waiting_on_me).toBe(false);
+    expect((await pendingDecisions(slug, agent.token)).decisions[0]?.waiting_on_me).toBe(false);
+
+    const resolved = await api(`/api/channels/${slug}/messages/${question.seq}/decision`, human.token, {
+      method: "POST",
+      body: JSON.stringify({ action: "approve" }),
+    });
+    expect(resolved.status).toBe(200);
+    expect((await pendingDecisions(slug, human.token)).decisions).toEqual([]);
   });
 
   it("resolves an approval via a human clicking approve and emits a decision_response reply", async () => {
@@ -150,6 +217,9 @@ describe("channel decision protocol (#284)", () => {
     expect(asked.status).toBe(200);
     const question = (await asked.json()) as MsgLike;
     expect(question.decision_request).not.toHaveProperty("expected_responder_owner");
+    expect((await pendingDecisions(slug, expectedHuman.token)).decisions[0]?.waiting_on_me).toBe(true);
+    expect((await pendingDecisions(slug, wrongHuman.token)).decisions[0]?.waiting_on_me).toBe(false);
+    expect((await pendingDecisions(slug, moderatorAgent.token)).decisions[0]?.waiting_on_me).toBe(false);
 
     const denied = await api(`/api/channels/${slug}/messages/${question.seq}/decision`, wrongHuman.token, {
       method: "POST",

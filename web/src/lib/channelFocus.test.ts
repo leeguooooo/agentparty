@@ -229,6 +229,26 @@ describe("computeChannelFocus — 'waiting on me' highlight", () => {
     expect(worker.waitingOnMe).toHaveLength(0);
   });
 
+  test("authoritative waitingOnMe overrides the legacy public-message inference", () => {
+    const denied = computeChannelFocus({
+      presence: [],
+      tasks: [],
+      decisions: [{ seq: 1, prompt: "bound elsewhere", asker: "front", waitingOnMe: false }],
+      viewer: { name: "leo", account: "owner@x.com", canModerate: true },
+      now: NOW,
+    });
+    expect(denied.waitingOnMe).toHaveLength(0);
+
+    const allowed = computeChannelFocus({
+      presence: [],
+      tasks: [],
+      decisions: [{ seq: 2, prompt: "bound to me", asker: "front", waitingOnMe: true }],
+      viewer: { name: "leo", account: "owner@x.com", canModerate: false },
+      now: NOW,
+    });
+    expect(allowed.waitingOnMe.map((item) => item.seq)).toEqual([2]);
+  });
+
   test("a task assigned to the viewing human is 'waiting on me' and sorts first", () => {
     const focus = computeChannelFocus({
       presence: [presence({ name: "Evan", live: true })],

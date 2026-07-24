@@ -130,6 +130,33 @@ describe("ws client", () => {
     }
   });
 
+  test("accepts authoritative participant removal frames", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0));
+      sock.send({ type: "participant_removed", name: "removed-agent", removed_at: 123 });
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0, {});
+    const frames = await collect(conn, 2, 3000, false);
+    expect(frames).toEqual([
+      expect.objectContaining({ type: "welcome" }),
+      { type: "participant_removed", name: "removed-agent", removed_at: 123 },
+    ]);
+  });
+
+  test("drops malformed participant removal frames", async () => {
+    server = startMockServer((frame, sock) => {
+      if (frame.type !== "hello") return;
+      sock.send(welcomeFrame(0));
+      sock.send({ type: "participant_removed", name: "", removed_at: 123 });
+      sock.send({ type: "participant_removed", name: "removed-agent", removed_at: 0 });
+      sock.send(msgFrame(1, "after malformed removals"));
+    });
+    conn = connect(server.url, "ap_tok", "dev", 0, {});
+    const frames = await collect(conn, 2, 3000, false);
+    expect(frames.map((frame) => frame.type)).toEqual(["welcome", "msg"]);
+  });
+
   // Regression: DELIVERY_CAUSES must mirror DirectedDeliveryCause in the protocol; "mention_edit"
   // (a mention added by editing an existing message) was missing, so those delivery frames were dropped.
   test("accepts a directed-delivery frame whose cause is mention_edit", async () => {

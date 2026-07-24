@@ -279,7 +279,12 @@ describe("presence per-task heartbeat (issue #228)", () => {
     // 脏值被丢弃：不落 presence、不炸连接（心跳是自动流量，宁可静默忽略也别断流）。
     ws.send({ type: "heartbeat", current_task: -1, task_started_at: 1000, heartbeat_at: 1000 });
     ws.send({ type: "heartbeat", current_task: 9, task_started_at: 1000, heartbeat_at: 1000 });
-    await ws.nextOfType("presence");
+    // seed status 与 presence 的广播次序不构成协议承诺；全量并发下可能还残留 seed 帧。
+    // 以本次合法 heartbeat 的字段作为同步屏障，既不把旧帧误当成功，也继续验证脏帧未断 socket。
+    for (;;) {
+      const frame = await ws.nextOfType("presence");
+      if (frame.current_task === 9) break;
+    }
 
     const entry = (await fetchPresence(slug, agent.token)).find((e) => e.name === agent.name);
     expect(entry).toMatchObject({ current_task: 9 });

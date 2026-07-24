@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useT } from "../i18n/useT";
 import { desktopAgentAdapter, type DesktopAgentAdapter } from "../lib/desktopAgent";
 import { DesktopAgentPanel } from "./DesktopAgentPanel";
@@ -16,8 +17,8 @@ interface Props {
 
 /**
  * Cross-channel local-agent operations belong to a dedicated control center,
- * not to personal/global settings. Only the active module is mounted, so
- * opening Preferences no longer starts agent-status and log polling.
+ * not to personal/global settings. Modules stay mounted so in-progress filters
+ * and launch drafts survive navigation; inactive modules pause their I/O.
  */
 export function LocalAgentCenter({
   onClose,
@@ -25,26 +26,27 @@ export function LocalAgentCenter({
   initialSection = "overview",
 }: Props) {
   const t = useT();
+  const [activeSection, setActiveSection] = useState<LocalAgentCenterSection>(initialSection);
   const sections: readonly SectionedDialogSection<LocalAgentCenterSection>[] = [
     {
       id: "overview",
       label: t("LocalAgentCenter.section.overview"),
-      content: <LocalAgentsOverview t={t} adapter={adapter} />,
+      content: <LocalAgentsOverview t={t} adapter={adapter} active={activeSection === "overview"} />,
     },
     {
       id: "launcher",
       label: t("LocalAgentCenter.section.launcher"),
-      content: <DesktopAgentPanel t={t} adapter={adapter} />,
+      content: <DesktopAgentPanel t={t} adapter={adapter} active={activeSection === "launcher"} />,
     },
     {
       id: "logs",
       label: t("LocalAgentCenter.section.logs"),
-      content: <ResidentDutyLogs t={t} adapter={adapter} />,
+      content: <ResidentDutyLogs t={t} adapter={adapter} active={activeSection === "logs"} />,
     },
   ];
 
   return (
-    <SectionedDialog
+    <SectionedDialog<LocalAgentCenterSection>
       idPrefix="local-agent-center"
       title={t("LocalAgentCenter.title")}
       closeLabel={t("LocalAgentCenter.close")}
@@ -52,7 +54,7 @@ export function LocalAgentCenter({
       sections={sections}
       initialSection={initialSection}
       onClose={onClose}
-      keepMounted={false}
+      onActiveSectionChange={setActiveSection}
       panelClassName="settings-panel--agent-center"
     />
   );

@@ -405,6 +405,7 @@ export type RestErrorCode =
   | "conflict"
   | "unavailable"
   | "forbidden"
+  | "participant_removed"
   | "lark_contact_permission_required"
   | "invite_required";
 
@@ -1762,6 +1763,20 @@ export interface PresenceFrame {
   listening?: ListeningVerdict;
 }
 
+/**
+ * Authoritative channel-membership deletion.
+ *
+ * This is deliberately distinct from `presence: offline`: offline is a
+ * reconnectable runtime state, while this frame removes the identity from
+ * channel rosters. Clients keep a session-local tombstone so delayed presence
+ * or participants snapshots cannot resurrect the removed member.
+ */
+export interface ParticipantRemovedFrame {
+  type: "participant_removed";
+  name: string;
+  removed_at: number;
+}
+
 export interface ErrorFrame {
   type: "error";
   code: ErrorCode;
@@ -1793,6 +1808,7 @@ export interface DeliveryAdapterRegisteredFrame {
 export type ServerFrame =
   | WelcomeFrame
   | ParticipantsFrame
+  | ParticipantRemovedFrame
   | MsgFrame
   | MessageUpdateFrame
   | SentFrame

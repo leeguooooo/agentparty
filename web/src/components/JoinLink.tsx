@@ -34,6 +34,8 @@ interface Props {
   slug: string;
   token: string;
   onAuthFailed(message: string): void;
+  /** Render the invitation workflow inside a parent admin module without a nested dialog/toggle. */
+  embedded?: boolean;
   active?: boolean;
   onActiveChange?(open: boolean): void;
   larkDirectoryEnabled?: boolean;
@@ -79,7 +81,15 @@ function expiryLabel(link: Pick<JoinLinkInfo, "expires_at">, t: TFunc): string {
   return t("JoinLink.expiresInHours", { hours: Math.max(1, Math.floor(left / 3600000)) });
 }
 
-export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, larkDirectoryEnabled = false }: Props) {
+export function JoinLink({
+  slug,
+  token,
+  onAuthFailed,
+  embedded = false,
+  active,
+  onActiveChange,
+  larkDirectoryEnabled = false,
+}: Props) {
   const t = useT();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const EXPIRY_OPTIONS = expiryOptions(t);
@@ -101,7 +111,8 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, la
   const [reviewBusyId, setReviewBusyId] = useState<number | string | null>(null);
   const [rejectingId, setRejectingId] = useState<number | string | null>(null);
   const [rejectReason, setRejectReason] = useState("");
-  const isOpen = active ?? open;
+  const listRequestRef = useRef({ participate: 0, watch: 0, external: 0 });
+  const isOpen = embedded || (active ?? open);
 
   const handleErr = useCallback(
     (e: unknown) => {
@@ -116,26 +127,32 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, la
   );
 
   const refresh = useCallback(async () => {
+    const requestId = ++listRequestRef.current.participate;
     try {
-      setLinks(await listJoinLinks(token, slug));
+      const next = await listJoinLinks(token, slug);
+      if (requestId === listRequestRef.current.participate) setLinks(next);
     } catch (e) {
-      handleErr(e);
+      if (requestId === listRequestRef.current.participate) handleErr(e);
     }
   }, [token, slug, handleErr]);
 
   const refreshShare = useCallback(async () => {
+    const requestId = ++listRequestRef.current.watch;
     try {
-      setShareLinks(await listShareLinks(token, slug));
+      const next = await listShareLinks(token, slug);
+      if (requestId === listRequestRef.current.watch) setShareLinks(next);
     } catch (e) {
-      handleErr(e);
+      if (requestId === listRequestRef.current.watch) handleErr(e);
     }
   }, [token, slug, handleErr]);
 
   const refreshExternal = useCallback(async () => {
+    const requestId = ++listRequestRef.current.external;
     try {
-      setExternalInvites(await listExternalInvites(token, slug));
+      const next = await listExternalInvites(token, slug);
+      if (requestId === listRequestRef.current.external) setExternalInvites(next);
     } catch (e) {
-      handleErr(e);
+      if (requestId === listRequestRef.current.external) handleErr(e);
     }
   }, [token, slug, handleErr]);
 
@@ -165,10 +182,13 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, la
     }
     if (active === undefined) setOpen(true);
     onActiveChange?.(true);
-    if (links === null) void refresh();
-  }, [active, close, isOpen, links, onActiveChange, refresh]);
+  }, [active, close, isOpen, onActiveChange]);
 
-  useDismissableLayer({ active: isOpen, onDismiss: close, outsideRef: rootRef });
+  useDismissableLayer({ active: isOpen && !embedded, onDismiss: close, outsideRef: rootRef });
+
+  useEffect(() => {
+    if (isOpen && links === null) void refresh();
+  }, [isOpen, links, refresh]);
 
   useEffect(() => {
     if (isOpen && joinRequests === null && !joinRequestsError) void refreshJoinRequests();
@@ -314,11 +334,18 @@ export function JoinLink({ slug, token, onAuthFailed, active, onActiveChange, la
 
   return (
     <div className="joinlink" ref={rootRef}>
-      <button type="button" className="d-btn joinlink-btn" onClick={toggle} aria-expanded={isOpen}>
-        {t("JoinLink.button")}
-      </button>
+      {!embedded && (
+        <button type="button" className="d-btn joinlink-btn" onClick={toggle} aria-expanded={isOpen}>
+          {t("JoinLink.button")}
+        </button>
+      )}
       {isOpen && (
-        <div className="joinlink-panel" role="dialog" aria-modal="true" aria-label={t("JoinLink.button")}>
+        <div
+          className={`joinlink-panel${embedded ? " joinlink-panel--embedded" : ""}`}
+          role={embedded ? "region" : "dialog"}
+          aria-modal={embedded ? undefined : true}
+          aria-label={t("JoinLink.button")}
+        >
           <div className="joinlink-mode" role="radiogroup" aria-label={t("JoinLink.modeLabel")}>
             {(["participate", "watch", "external"] as InviteMode[]).map((m) => (
               <label key={m} className={`joinlink-mode-opt${mode === m ? " is-active" : ""}`}>

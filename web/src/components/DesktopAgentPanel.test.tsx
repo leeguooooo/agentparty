@@ -8,6 +8,7 @@ import type {
   DesktopAgentConfig,
   DesktopAgentStartInput,
   DesktopAgentStatus,
+  DesktopDutyEntry,
 } from "../lib/desktopAgent";
 import { DesktopAgentPanel, type DesktopAgentScheduler } from "./DesktopAgentPanel";
 
@@ -64,11 +65,21 @@ function adapter(overrides: Partial<DesktopAgentAdapter> = {}): DesktopAgentAdap
 let renderer: ReactTestRenderer | null = null;
 const t = (key: string) => DesktopSettingsStrings.en[key] ?? key;
 
-async function render(adapterValue: DesktopAgentAdapter, scheduler?: DesktopAgentScheduler) {
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function render(
+  adapterValue: DesktopAgentAdapter,
+  scheduler?: DesktopAgentScheduler,
+  active = true,
+) {
   await act(async () => {
     renderer = create(
       <LocaleProvider>
-        <DesktopAgentPanel adapter={adapterValue} scheduler={scheduler} t={t} />
+        <DesktopAgentPanel active={active} adapter={adapterValue} scheduler={scheduler} t={t} />
       </LocaleProvider>,
     );
   });
@@ -225,6 +236,277 @@ describe("DesktopAgentPanel 多实例 (#616)", () => {
   });
 });
 
+describe("DesktopAgentPanel module navigation", () => {
+  test("pauses inactive loading and preserves launch drafts across section changes", async () => {
+    let configLoads = 0;
+    const adapterValue = adapter({
+      listConfigs: async () => {
+        configLoads += 1;
+        return [config];
+      },
+    });
+
+    await render(adapterValue, undefined, false);
+    expect(configLoads).toBe(0);
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+    expect(configLoads).toBe(1);
+
+    const root = renderer!.root;
+    await act(async () => {
+      root.find((node) => node.props.name === "desktop-agent-channel").props.onChange({
+        target: { value: "draft-channel" },
+      });
+      root.find((node) => node.props.name === "desktop-agent-workdir").props.onChange({
+        target: { value: "/tmp/draft-workdir" },
+      });
+      root.find((node) => node.props.name === "desktop-agent-repo").props.onChange({
+        target: { value: "https://github.com/example/draft.git" },
+      });
+    });
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active={false} adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+    });
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(renderer!.root.find((node) => node.props.name === "desktop-agent-channel").props.value).toBe("draft-channel");
+    expect(renderer!.root.find((node) => node.props.name === "desktop-agent-workdir").props.value).toBe("/tmp/draft-workdir");
+    expect(renderer!.root.find((node) => node.props.name === "desktop-agent-repo").props.value).toBe("https://github.com/example/draft.git");
+  });
+
+  test("clears busy when an operation finishes while its module is inactive", async () => {
+    const pendingStart = deferred<DesktopAgentStatus>();
+    let statusLoads = 0;
+    const adapterValue = adapter({
+      statusAll: async () => {
+        statusLoads += 1;
+        return [];
+      },
+      start: async () => pendingStart.promise,
+    });
+    await render(adapterValue);
+
+    await act(async () => {
+      button("Start local agent").props.onClick();
+    });
+    expect(button("Start local agent").props.disabled).toBe(true);
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active={false} adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+    });
+    await act(async () => {
+      pendingStart.resolve({ ...stopped, state: "running", pid: 42 });
+      await pendingStart.promise;
+    });
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(button("Start local agent").props.disabled).toBe(false);
+    expect(statusLoads).toBe(2);
+  });
+
+  test("drops a status snapshot that started before deactivation and resolved last", async () => {
+    const oldRequest = deferred<DesktopAgentStatus[]>();
+    const newRequest = deferred<DesktopAgentStatus[]>();
+    let statusLoads = 0;
+    const adapterValue = adapter({
+      statusAll: () => {
+        statusLoads += 1;
+        return statusLoads === 1 ? oldRequest.promise : newRequest.promise;
+      },
+    });
+    const oldStatus: DesktopAgentStatus = {
+      ...stopped,
+      state: "running",
+      pid: 1,
+      configId: "local-main",
+      name: "stale-agent",
+      channel: "stale",
+      runner: "codex",
+      instanceId: "local-main:stale",
+    };
+    const newStatus: DesktopAgentStatus = {
+      ...oldStatus,
+      pid: 2,
+      name: "current-agent",
+      channel: "current",
+      instanceId: "local-main:current",
+    };
+
+    await act(async () => {
+      renderer = create(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+    expect(statusLoads).toBe(1);
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active={false} adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+    });
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+    expect(statusLoads).toBe(2);
+
+    await act(async () => {
+      newRequest.resolve([newStatus]);
+      await newRequest.promise;
+      await Promise.resolve();
+    });
+    await act(async () => {
+      oldRequest.resolve([oldStatus]);
+      await oldRequest.promise;
+      await Promise.resolve();
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain("current-agent");
+    expect(rendered).not.toContain("stale-agent");
+  });
+
+  test("keeps an in-flight log result when the stopped-agent module is temporarily inactive", async () => {
+    const pendingLogs = deferred<string[]>();
+    const adapterValue = adapter({
+      statusAll: async () => [],
+      logs: async () => pendingLogs.promise,
+    });
+    await render(adapterValue);
+
+    await act(async () => {
+      button("Show local agent logs").props.onClick();
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Loading logs");
+
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active={false} adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+    });
+    await act(async () => {
+      pendingLogs.resolve(["completed while hidden"]);
+      await pendingLogs.promise;
+      await Promise.resolve();
+    });
+    await act(async () => {
+      renderer!.update(
+        <LocaleProvider>
+          <DesktopAgentPanel active adapter={adapterValue} t={t} />
+        </LocaleProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain("completed while hidden");
+    expect(rendered).not.toContain("Loading logs");
+  });
+
+  test("drops an older polling log response when a newer poll finishes first", async () => {
+    const oldLogs = deferred<string[]>();
+    const currentLogs = deferred<string[]>();
+    const polls: Array<() => void> = [];
+    let logReads = 0;
+    const runningStatus: DesktopAgentStatus = {
+      ...stopped,
+      state: "running",
+      pid: 42,
+      configId: "local-main",
+      name: "Leo Codex",
+      channel: "agentparty",
+      runner: "codex",
+      instanceId: "local-main:agentparty",
+    };
+    const adapterValue = adapter({
+      statusAll: async () => [runningStatus],
+      logs: () => {
+        logReads += 1;
+        if (logReads === 1) return Promise.resolve(["initial logs"]);
+        return logReads === 2 ? oldLogs.promise : currentLogs.promise;
+      },
+    });
+    const scheduler: DesktopAgentScheduler = {
+      every: (callback) => {
+        polls.push(callback);
+        return () => {};
+      },
+    };
+    await render(adapterValue, scheduler);
+
+    await act(async () => {
+      button("Show local agent logs").props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(logReads).toBe(1);
+
+    const poll = polls[polls.length - 1]!;
+    await act(async () => {
+      poll();
+      poll();
+      await Promise.resolve();
+    });
+    expect(logReads).toBe(3);
+
+    await act(async () => {
+      currentLogs.resolve(["current polling logs"]);
+      await currentLogs.promise;
+      await Promise.resolve();
+    });
+    await act(async () => {
+      oldLogs.resolve(["stale polling logs"]);
+      await oldLogs.promise;
+      await Promise.resolve();
+    });
+
+    const rendered = JSON.stringify(renderer!.toJSON());
+    expect(rendered).toContain("current polling logs");
+    expect(rendered).not.toContain("stale polling logs");
+  });
+});
+
 // #616 phase 3：launchd 常驻
 describe("DesktopAgentPanel 系统常驻 (#616 phase 3)", () => {
   const duty = {
@@ -281,6 +563,41 @@ describe("DesktopAgentPanel 系统常驻 (#616 phase 3)", () => {
     expect(root.findAll((node) => node.props["aria-label"] === "System resident duty")).toHaveLength(0);
     expect(root.find((node) => node.props.name === "desktop-agent-persist").props.disabled).toBe(true);
     expect(button("Start local agent").props.disabled).toBe(false);
+  });
+
+  test("旧 plist 显示明确依赖问题，并按原参数修复而不是套用当前表单", async () => {
+    const persisted: unknown[] = [];
+    let entries: DesktopDutyEntry[] = [{
+      ...duty,
+      runner: "codex" as const,
+      workdir: "/old/workspace",
+      repo: "https://example.com/old.git",
+      runnerExecutable: "/Users/x/.local/bin/codex",
+      dependencyState: "repair-required" as const,
+    }];
+    const root = await render(adapter({
+      dutyList: async () => entries,
+      dutyPersist: async (input) => {
+        persisted.push(input);
+        entries = [{ ...entries[0]!, dependencyState: "ready" }];
+        return entries[0]!;
+      },
+    }));
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain("still relies on launchd PATH");
+    await act(async () => {
+      button("Repair local-main:agentparty").props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(persisted).toEqual([{
+      configId: "local-main",
+      channel: "agentparty",
+      runner: "codex",
+      workdir: "/old/workspace",
+      repo: "https://example.com/old.git",
+    }]);
+    expect(root.findAll((node) => node.props["aria-label"] === "Repair local-main:agentparty")).toHaveLength(0);
   });
 });
 

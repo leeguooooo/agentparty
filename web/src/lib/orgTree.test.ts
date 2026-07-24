@@ -9,7 +9,7 @@ function member(name: string, over: Partial<OrgMemberInput> = {}): OrgMemberInpu
     reportsTo: over.reportsTo ?? null,
     kind: over.kind ?? "agent",
     accountLabel: over.accountLabel,
-    source: over.source,
+    source: over.source ?? (over.role === undefined || over.role === null ? "unassigned" : "assigned"),
   };
 }
 
@@ -71,6 +71,41 @@ describe("buildOrgTree", () => {
     expect(names(findNode(tree.roots, "lead-a")!.children)).toEqual(["w"]);
   });
 
+  test("self-reported host is not promoted to a lead or formal org member", () => {
+    const tree = buildOrgTree([
+      member("assigned-lead", { role: "host", source: "assigned" }),
+      member("self-host", {
+        role: "host",
+        reportsTo: "assigned-lead",
+        source: "self",
+      }),
+    ]);
+
+    expect(names(tree.roots)).toEqual(["assigned-lead"]);
+    const selfHost = tree.unassigned.find((node) => node.name === "self-host");
+    expect(selfHost).toBeDefined();
+    expect(selfHost!.isLead).toBe(false);
+    expect(selfHost!.role).toBeNull();
+    expect(selfHost!.reportsTo).toBeNull();
+  });
+
+  test("unassigned runtime lineage never creates a formal reporting edge", () => {
+    const tree = buildOrgTree([
+      member("assigned-lead", { role: "host", source: "assigned" }),
+      member("runtime-child", {
+        role: "worker",
+        reportsTo: "assigned-lead",
+        source: "unassigned",
+      }),
+    ]);
+
+    expect(findNode(tree.roots, "assigned-lead")!.children).toHaveLength(0);
+    const runtimeChild = tree.unassigned.find((node) => node.name === "runtime-child");
+    expect(runtimeChild).toBeDefined();
+    expect(runtimeChild!.role).toBeNull();
+    expect(runtimeChild!.reportsTo).toBeNull();
+  });
+
   test("agent with no report target lands in unassigned, not the tree", () => {
     const tree = buildOrgTree([
       member("lead", { role: "host" }),
@@ -104,7 +139,7 @@ describe("buildOrgTree", () => {
     expect(rendered).toHaveLength(2);
   });
 
-  test("self-report (parent === self) is treated as no manager, not a self-loop", () => {
+  test("self-reference (parent === self) is treated as no manager, not a self-loop", () => {
     const tree = buildOrgTree([member("solo", { role: "worker", reportsTo: "solo" })]);
     const rendered = allNodes([...tree.roots, ...tree.unassigned]);
     expect(rendered.map((node) => node.name)).toEqual(["solo"]);

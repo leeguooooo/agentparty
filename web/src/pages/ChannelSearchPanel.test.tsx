@@ -31,6 +31,7 @@ const hit: SearchHit = {
 };
 
 const noop = () => {};
+const acceptJump = () => true;
 let renderer: ReactTestRenderer | null = null;
 let fakeWindow: EventTarget | null = null;
 
@@ -54,7 +55,7 @@ function baseProps(overrides: Partial<ChannelSearchPanelProps> = {}): ChannelSea
     onSearchSince: noop,
     onSearchLimit: noop,
     onClose: noop,
-    onJump: noop,
+    onJump: acceptJump,
     ...overrides,
   };
 }
@@ -114,18 +115,95 @@ describe("Channel search modal (#351)", () => {
     expect(root.findByProps({ role: "dialog" }).findByProps({ role: "alert" }).props.children).toBe("request failed");
   });
 
-  test("renders hits inside the dialog and closes before jumping", () => {
+  test("renders hits inside the dialog and closes only after an async jump succeeds", async () => {
     const events: string[] = [];
     const root = render(baseProps({
       onClose: () => events.push("close"),
-      onJump: (seq) => events.push(`jump:${seq}`),
+      onJump: async (seq) => {
+        events.push(`jump:${seq}`);
+        return true;
+      },
     }));
     const dialog = root.findByProps({ role: "dialog" });
     const jump = dialog.findByProps({ title: ChannelStrings.en["Channel.search.jumpTitle"] });
 
     expect(dialog.findByProps({ className: "search-hit-snippet" }).props.children).toBe("deploy completed");
-    act(() => jump.props.onClick());
-    expect(events).toEqual(["close", "jump:42"]);
+    await act(async () => { await jump.props.onClick(); });
+    expect(events).toEqual(["jump:42", "close"]);
+  });
+
+  test("keeps the search dialog open and shows the jump error when navigation fails", async () => {
+    const events: string[] = [];
+    const root = render(baseProps({
+      jumpError: "Message #42 is outside the loaded history.",
+      onClose: () => events.push("close"),
+      onJump: (seq) => {
+        events.push(`jump:${seq}`);
+        return false;
+      },
+    }));
+    const dialog = root.findByProps({ role: "dialog" });
+    const jump = dialog.findByProps({ title: ChannelStrings.en["Channel.search.jumpTitle"] });
+
+    await act(async () => { await jump.props.onClick(); });
+    expect(events).toEqual(["jump:42"]);
+    expect(dialog.findByProps({ role: "alert" }).props.children).toBe("Message #42 is outside the loaded history.");
+  });
+
+  test("does not close while an around-seq load is still pending", async () => {
+    const events: string[] = [];
+    let resolveJump!: (located: boolean) => void;
+    const pending = new Promise<boolean>((resolve) => { resolveJump = resolve; });
+    const root = render(baseProps({
+      onClose: () => events.push("close"),
+      onJump: (seq) => {
+        events.push(`jump:${seq}`);
+        return pending;
+      },
+    }));
+    const jump = root.findByProps({ title: ChannelStrings.en["Channel.search.jumpTitle"] });
+    let completion!: Promise<void>;
+
+    act(() => { completion = jump.props.onClick(); });
+    expect(events).toEqual(["jump:42"]);
+    expect(root.findByProps({ className: "chan-search-panel" }).props["aria-busy"]).toBe(true);
+    expect(jump.props.disabled).toBe(true);
+
+    resolveJump(true);
+    await act(async () => { await completion; });
+    expect(events).toEqual(["jump:42", "close"]);
+  });
+
+  test("reserves explicit #<seq> for navigation and searches bare numbers as text", () => {
+    let root = render(baseProps({
+      search: "634",
+      query: "634",
+      searchHits: [],
+      visibleSearchHits: [],
+    }));
+    let dialog = root.findByProps({ role: "dialog" });
+
+    expect(dialog.findAllByProps({ className: "d-btn chan-search-seq-jump" })).toHaveLength(0);
+    expect(dialog.findAllByProps({ className: "t-mono chan-filter-input" })).toHaveLength(2);
+    expect(dialog.findByProps({ type: "search" }).props.placeholder).toContain("#123");
+
+    act(() => renderer!.update(
+      <LocaleProvider>
+        <ChannelPanelModal title="Search" onClose={noop}>
+          <ChannelSearchPanel {...baseProps({
+            search: "#634",
+            query: "#634",
+            searchHits: [],
+            visibleSearchHits: [],
+          })} />
+        </ChannelPanelModal>
+      </LocaleProvider>,
+    ));
+    root = renderer!.root;
+    dialog = root.findByProps({ role: "dialog" });
+
+    expect(dialog.findByProps({ className: "d-btn chan-search-seq-jump" }).props.children).toContain("634");
+    expect(dialog.findAllByProps({ className: "t-mono chan-filter-input" })).toHaveLength(0);
   });
 
   test("renders both no-result states inside the dialog", () => {

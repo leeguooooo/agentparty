@@ -146,6 +146,30 @@ describe("team summaries", () => {
       ["agentparty-build-1", "worker"],
     ]);
   });
+
+  test("current roster prevents historical messages from recreating a removed team member", () => {
+    const historical = message("removed-child", 10, {
+      sender: sender("removed-child", { lineage: lineage({ team_id: "old-team" }) }),
+    });
+    const memberNames = new Set<string>();
+
+    expect(summarizeTeams({
+      now: NOW,
+      participants: [],
+      presence: {},
+      messages: [historical],
+      memberNames,
+    })).toEqual([]);
+
+    memberNames.add("removed-child");
+    expect(summarizeTeams({
+      now: NOW,
+      participants: [{ name: "removed-child", kind: "agent", lineage: lineage({ team_id: "old-team" }) }],
+      presence: {},
+      messages: [historical],
+      memberNames,
+    })[0]!.members.map((member) => member.name)).toEqual(["removed-child"]);
+  });
 });
 
 describe("team message grouping", () => {

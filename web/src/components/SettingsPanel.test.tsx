@@ -153,6 +153,28 @@ describe("SettingsPanel (#273)", () => {
     expect(notifyOptin).toBe(false);
   });
 
+  test("keeps in-app alerts enabled and explains when system notifications are unavailable", async () => {
+    let notifyOptin = false;
+    const r = render({
+      me,
+      canSetHandle: false,
+      notifyOptin,
+      onClose: () => {},
+      onLogout: () => {},
+      onNotifyOptinChange: (next) => { notifyOptin = next; },
+    });
+    const toggle = findByClass(r.toJSON(), "settings-toggle");
+
+    await act(async () => {
+      (toggle!.props.onClick as () => void)();
+      await Promise.resolve();
+    });
+
+    expect(notifyOptin).toBe(true);
+    expect(store.getItem("ap_notify_optin")).toBe("1");
+    expect(allText(r)).toContain("System notifications are unavailable");
+  });
+
   test("uses explicit sections and exposes only the selected panel", () => {
     const r = render({
       me,

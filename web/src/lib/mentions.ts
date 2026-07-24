@@ -75,6 +75,8 @@ export function mentionCandidates(
   roles: ChannelRoleAssignment[] = [],
   squads: ChannelSquad[] = [],
   messages: SenderIdentitySnapshot[] = [],
+  removedNames: ReadonlySet<string> = new Set(),
+  authoritativeNames?: ReadonlySet<string>,
 ): MentionCandidate[] {
   const online = new Set(participants.map((p) => p.name));
   const participantByName = new Map(participants.map((p) => [p.name, p]));
@@ -117,7 +119,17 @@ export function mentionCandidates(
   ]);
   const rank: Record<MentionTier, number> = { online: 0, wakeable: 1, recent: 2 };
   const base = [...names]
-    .filter((name) => name !== self && name !== "system")
+    // participant_removed only suppresses live addressing; retained sender
+    // snapshots still back historical message labels. When the caller has a
+    // current membership projection, history alone must not turn a deleted
+    // identity back into an @ target. A later authoritative welcome /
+    // participants snapshot adds the same name to this set and restores it.
+    .filter((name) => (
+      name !== self
+      && name !== "system"
+      && !removedNames.has(name)
+      && (authoritativeNames === undefined || authoritativeNames.has(name))
+    ))
     .map((name) => {
       const kind = kindFor(name);
       const p = presence[name];

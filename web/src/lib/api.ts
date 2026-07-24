@@ -1,7 +1,7 @@
 // rest 封装 + token 存取。
 // 规则（spec §10 / M2 契约）：URL 带 ?t= 时优先用它，并立即从地址栏移除；
 // share token 只放 sessionStorage，本次标签页可刷新，避免长期落 localStorage。
-import type { Attachment, ChannelRoleAssignment, ChannelSquad, CollaborationRole, MsgFrame, PresenceEntry, SearchHit, TaskAssigneeKind, TaskRecord, TaskState, TaskSummary, WakeDelivery } from "@agentparty/shared";
+import type { Attachment, ChannelRoleAssignment, ChannelSquad, CollaborationRole, MsgFrame, ParticipantRemovedFrame, PresenceEntry, SearchHit, TaskAssigneeKind, TaskRecord, TaskState, TaskSummary, WakeDelivery } from "@agentparty/shared";
 import { apiUrl } from "./base";
 import { isTauriEnvironment } from "./desktopUpdater";
 import type { WebSession } from "./oidc";
@@ -301,6 +301,12 @@ export interface ChannelIdentity {
   handle?: string;
 }
 
+export interface ChannelMemberInfo {
+  account: string;
+  added_by: string;
+  added_at: number;
+}
+
 export type ChannelRoleInfo = ChannelRoleAssignment;
 
 // 当前登录身份（spec §10）：topbar 显示真实 token name/kind/role，owner 仅作归属辅助信息。
@@ -577,6 +583,31 @@ export async function fetchChannelRoles(token: string, slug: string): Promise<Ch
   return data.roles;
 }
 
+export async function addChannelMember(
+  token: string,
+  slug: string,
+  account: string,
+  name?: string,
+): Promise<ChannelMemberInfo> {
+  const restoreBody = name === undefined ? undefined : JSON.stringify({ name });
+  const res = await fetchApi(
+    `/api/channels/${encodeURIComponent(slug)}/members/${encodeURIComponent(account)}`,
+    {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(restoreBody === undefined ? {} : { "content-type": "application/json" }),
+      },
+      body: restoreBody,
+    },
+  );
+  if (res.status === 401) throw new AuthError("invalid or revoked token");
+  if (res.status === 403) throw new ForbiddenError("only a channel moderator can add members");
+  if (res.status === 400) throw new ValidationError("invalid channel member");
+  if (!res.ok) throw new Error(`PUT /api/channels/${slug}/members/${account} failed (${res.status})`);
+  return (await res.json()) as ChannelMemberInfo;
+}
+
 export async function fetchTasks(token: string, slug: string): Promise<TaskRecord[]> {
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/tasks`, {
     headers: { authorization: `Bearer ${token}` },
@@ -701,6 +732,58 @@ export async function respondDecision(
   return (await res.json()) as { message: MsgFrame; reply?: MsgFrame };
 }
 
+export interface AuthoritativePendingDecision {
+  seq: number;
+  prompt: string;
+  asker: string;
+  waitingOnMe: boolean;
+}
+
+interface PendingDecisionPage {
+  decisions: Array<{
+    seq: number;
+    prompt: string;
+    asker: string;
+    waiting_on_me: boolean;
+  }>;
+  next_after: number | null;
+}
+
+// Focus 的未决项来自 DO 持久 decision_state，不复用页面当前 300 条消息窗口。
+// 端点按 seq 分页；完整拉取保证长期未决问题不会因超过单页上限再次消失。
+export async function fetchPendingDecisions(
+  token: string,
+  slug: string,
+): Promise<AuthoritativePendingDecision[]> {
+  const bySeq = new Map<number, AuthoritativePendingDecision>();
+  let after = 0;
+  for (;;) {
+    const params = new URLSearchParams({ after: String(after), limit: "200" });
+    const res = await fetchApi(
+      `/api/channels/${encodeURIComponent(slug)}/pending-decisions?${params.toString()}`,
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    if (res.status === 401) throw new AuthError("invalid or revoked token");
+    if (res.status === 403) throw new ForbiddenError("forbidden");
+    if (!res.ok) throw new Error(`GET /api/channels/${slug}/pending-decisions failed (${res.status})`);
+    const page = (await res.json()) as PendingDecisionPage;
+    for (const decision of page.decisions) {
+      bySeq.set(decision.seq, {
+        seq: decision.seq,
+        prompt: decision.prompt,
+        asker: decision.asker,
+        waitingOnMe: decision.waiting_on_me,
+      });
+    }
+    if (page.next_after === null) break;
+    if (!Number.isInteger(page.next_after) || page.next_after <= after) {
+      throw new Error("pending decision cursor did not advance");
+    }
+    after = page.next_after;
+  }
+  return [...bySeq.values()].sort((left, right) => left.seq - right.seq);
+}
+
 export async function setDecisionMode(
   token: string,
   slug: string,
@@ -803,14 +886,16 @@ export async function createChannel(
 }
 
 // IM 式加载都走这条 rest：初始最新一页（before=MAX_SAFE_INTEGER）、触顶上翻（before=已加载
-// 最老 seq）、归档频道回看（ws 被 1008 踢掉零补推，spec §6）。带 before 反向取最近 limit 条，仍升序返回。
+// 最老 seq）、搜索精确跳转（around=目标 seq）和归档频道回看（ws 被 1008 踢掉零补推，spec §6）。
+// before 与 around 返回的窗口都按 seq 升序。
 export async function fetchMessages(
   token: string,
   slug: string,
-  opts: { limit?: number; before?: number } = {},
+  opts: { limit?: number; before?: number; around?: number } = {},
 ): Promise<MsgFrame[]> {
   const params = new URLSearchParams({ limit: String(opts.limit ?? 1000) });
   if (opts.before !== undefined) params.set("before", String(opts.before));
+  if (opts.around !== undefined) params.set("around", String(opts.around));
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/messages?${params.toString()}`, {
     headers: { authorization: `Bearer ${token}` },
   });
@@ -824,7 +909,7 @@ export async function fetchMessages(
 export async function fetchMessagesWithRetry(
   token: string,
   slug: string,
-  opts: { limit?: number; before?: number } = {},
+  opts: { limit?: number; before?: number; around?: number } = {},
   retry: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<MsgFrame[]> {
   const attempts = Math.max(1, Math.floor(retry.attempts ?? 2));
@@ -1302,7 +1387,19 @@ export async function archiveChannel(token: string, slug: string): Promise<void>
   if (!res.ok) throw new Error(`POST /api/channels/${slug}/archive failed (${res.status})`);
 }
 
-export async function kickParticipant(token: string, slug: string, name: string, mode: "disconnect" | "remove" = "disconnect"): Promise<void> {
+export interface ParticipantRemovalResult {
+  ok: true;
+  removal: ParticipantRemovedFrame | null;
+  broadcasted: boolean;
+  restored?: true;
+}
+
+export async function kickParticipant(
+  token: string,
+  slug: string,
+  name: string,
+  mode: "disconnect" | "remove" = "disconnect",
+): Promise<ParticipantRemovalResult | null> {
   const body = mode === "remove" ? { name, mode } : { name };
   const res = await fetchApi(`/api/channels/${encodeURIComponent(slug)}/kick`, {
     method: "POST",
@@ -1312,6 +1409,29 @@ export async function kickParticipant(token: string, slug: string, name: string,
   if (res.status === 401) throw new AuthError("invalid or revoked token");
   if (res.status === 403) throw new ForbiddenError("forbidden");
   if (!res.ok) throw new Error(`POST /api/channels/${slug}/kick failed (${res.status})`);
+  if (mode !== "remove") return null;
+  const result = (await res.json().catch(() => null)) as {
+    ok?: unknown;
+    removal?: unknown;
+    broadcasted?: unknown;
+    restored?: unknown;
+  } | null;
+  const candidate = result?.removal as Partial<ParticipantRemovedFrame> | null | undefined;
+  const validRemoval = (
+    candidate?.type === "participant_removed"
+    && candidate.name === name
+    && typeof candidate.removed_at === "number"
+    && Number.isFinite(candidate.removed_at)
+  );
+  const removal = result?.restored === true || !validRemoval
+    ? null
+    : candidate as ParticipantRemovedFrame;
+  return {
+    ok: true,
+    removal,
+    broadcasted: result?.broadcasted === true,
+    ...(result?.restored === true ? { restored: true as const } : {}),
+  };
 }
 
 // 人为暂停某 agent 的接待（issue #180）。resumeAt = 定时恢复时刻（epoch ms），省略则手动恢复。moderator only。

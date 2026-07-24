@@ -1,5 +1,6 @@
 export type DesktopAgentState = "stopped" | "starting" | "running" | "stopping" | "failed";
 export type DesktopAgentRunner = "codex" | "claude" | "codex-sdk";
+export type DesktopDutyDependencyState = "ready" | "missing" | "repair-required" | "not-required" | "unknown";
 
 export interface DesktopAgentConfig {
   configId: string;
@@ -34,6 +35,25 @@ export interface DesktopAgentStartInput {
   repo?: string;
 }
 
+export function dutyRepairInput(entry: DesktopDutyEntry): DesktopAgentStartInput | null {
+  if (entry.runner == null) return null;
+  const separator = entry.instanceId.indexOf(":");
+  if (separator <= 0 || separator === entry.instanceId.length - 1) return null;
+  return {
+    configId: entry.instanceId.slice(0, separator),
+    channel: entry.instanceId.slice(separator + 1),
+    runner: entry.runner,
+    workdir: entry.workdir ?? undefined,
+    repo: entry.repo ?? undefined,
+  };
+}
+
+export function dutyDependencyErrorRunner(value: unknown): "codex" | "claude" | null {
+  const message = value instanceof Error ? value.message : String(value);
+  const match = message.match(/(?:^|:\s*)runner_dependency_missing:(codex|claude)(?::|$)/);
+  return match?.[1] === "codex" || match?.[1] === "claude" ? match[1] : null;
+}
+
 // #616 phase 3：launchd 系统级常驻值守条目。
 export interface DesktopDutyEntry {
   label: string;
@@ -41,6 +61,13 @@ export interface DesktopDutyEntry {
   plistPath: string;
   logPath: string;
   loaded: boolean;
+  /** Optional keeps older desktop shells and test adapters compatible. */
+  runner?: DesktopAgentRunner | null;
+  workdir?: string | null;
+  repo?: string | null;
+  /** Absolute executable bound into the launchd job, or the repair candidate for a legacy job. */
+  runnerExecutable?: string | null;
+  dependencyState?: DesktopDutyDependencyState;
 }
 
 export interface DesktopAgentAdapter {
@@ -75,6 +102,10 @@ function isNullableString(value: unknown): value is string | null {
 
 function isNullableNumber(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
+function isDesktopAgentRunner(value: unknown): value is DesktopAgentRunner {
+  return value === "codex" || value === "claude" || value === "codex-sdk";
 }
 
 function parseConfig(value: unknown): DesktopAgentConfig | null {
@@ -145,12 +176,38 @@ function parseDutyEntry(value: unknown): DesktopDutyEntry {
     typeof value.logPath !== "string" ||
     typeof value.loaded !== "boolean"
   ) throw new Error("invalid desktop duty entry");
+  const runner = value.runner === undefined || value.runner === null
+    ? null
+    : isDesktopAgentRunner(value.runner)
+      ? value.runner
+      : undefined;
+  const dependencyState = value.dependencyState === undefined
+    ? "unknown"
+    : value.dependencyState;
+  if (
+    runner === undefined ||
+    (value.workdir !== undefined && !isNullableString(value.workdir)) ||
+    (value.repo !== undefined && !isNullableString(value.repo)) ||
+    (value.runnerExecutable !== undefined && !isNullableString(value.runnerExecutable)) ||
+    (
+      dependencyState !== "ready" &&
+      dependencyState !== "missing" &&
+      dependencyState !== "repair-required" &&
+      dependencyState !== "not-required" &&
+      dependencyState !== "unknown"
+    )
+  ) throw new Error("invalid desktop duty entry");
   return {
     label: value.label,
     instanceId: value.instanceId,
     plistPath: value.plistPath,
     logPath: value.logPath,
     loaded: value.loaded,
+    runner,
+    workdir: typeof value.workdir === "string" ? value.workdir : null,
+    repo: typeof value.repo === "string" ? value.repo : null,
+    runnerExecutable: typeof value.runnerExecutable === "string" ? value.runnerExecutable : null,
+    dependencyState,
   };
 }
 

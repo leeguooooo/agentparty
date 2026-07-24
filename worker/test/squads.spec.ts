@@ -139,7 +139,7 @@ describe("channel squads", () => {
 
     const originalPrepare = env.DB.prepare.bind(env.DB);
     const prepare = vi.spyOn(env.DB, "prepare").mockImplementation((query: string) => {
-      if (query.includes("SELECT name FROM tokens") && query.includes("role = 'agent'")) {
+      if (query.includes("FROM tokens t") && query.includes("role = 'agent'")) {
         throw new Error("agent directory unavailable");
       }
       return originalPrepare(query);

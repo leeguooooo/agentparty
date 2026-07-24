@@ -2,8 +2,8 @@
 // App 用 key={slug} 挂载本组件，切频道即整体重建（socket/状态零残留）。
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { buildHostBoard, type Attachment, type ChannelSquad, type CollaborationRole, type HostBoard, type MsgFrame, type PresenceEntry, type PublicDirectedDelivery, type ReadCursor, type SearchHit, type Sender, type TaskAssigneeKind, type TaskRecord, type TaskState, type TaskSummary, type WakeDelivery } from "@agentparty/shared";
-import { AgentDetailModal } from "../components/AgentDetailModal";
+import { buildHostBoard, type Attachment, type ChannelSquad, type CollaborationRole, type HostBoard, type MsgFrame, type ParticipantRemovedFrame, type PresenceEntry, type PublicDirectedDelivery, type ReadCursor, type SearchHit, type Sender, type TaskAssigneeKind, type TaskRecord, type TaskState, type TaskSummary, type WakeDelivery } from "@agentparty/shared";
+import { AgentDetailPanel } from "../components/AgentDetailModal";
 import { TeamTabs } from "../components/TeamTabs";
 import { AgentJoin } from "../components/AgentJoin";
 import { AgentTokens } from "../components/AgentTokens";
@@ -17,10 +17,19 @@ import { MessageCard } from "../components/MessageCard";
 import { MentionHeaderNotice, type MentionToastItem } from "../components/MentionToast";
 import { PresenceBar } from "../components/PresenceBar";
 import { ChannelFocusBar } from "../components/ChannelFocusBar";
-import { computeChannelFocus, pendingDecisionsFromMessages } from "../lib/channelFocus";
+import { ChannelFocusPanel } from "../components/ChannelFocusPanel";
+import { ChannelAdminView, type ChannelAdminMember } from "../components/ChannelAdminView";
+import { computeChannelFocus } from "../lib/channelFocus";
+import {
+  focusMessageNavigationTarget,
+  planLoadedMessageNavigation,
+  resolveMessageNavigationTarget,
+} from "../lib/channelNavigation";
+import { useAuthoritativePendingDecisions } from "../lib/pendingDecisions";
 import { AttachmentList } from "../components/AttachmentList";
 import { OrgTreePreview } from "../components/OrgTreePreview";
 import {
+  addChannelMember,
   archiveChannel,
   AuthError,
   type ChannelCharter,
@@ -91,6 +100,7 @@ import { isNearBottom, pinToBottom } from "../lib/scrollPin";
 import { summarizeReplyPreview } from "../lib/replyPreview";
 import { fmtTime } from "../lib/time";
 import { groupTeamMessages, summarizeTeams, type TeamMessageThread, type TeamSummary } from "../lib/teams";
+import { resolveTeamMemberView } from "../lib/teamMember";
 import { ChannelSocket } from "../lib/ws";
 import { channelReducer, initialChannelState } from "../state";
 import { useT, type TFunc } from "../i18n/useT";
@@ -100,6 +110,17 @@ import "../i18n/strings/Composer";
 import "../i18n/strings/WakeReceipt";
 
 const EMPTY_RECENT_MESSAGES: MsgFrame[] = [];
+const SCREEN_READER_ONLY_STYLE: CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: "hidden",
+  clipPath: "inset(50%)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
 
 interface Props {
   slug: string;
@@ -198,8 +219,23 @@ export interface RoleDraft {
   responsibility: string;
 }
 
-type ChannelPanel = "charter" | "team" | "tasks" | "search" | "settings";
-type AdminSurface = "agentJoin" | "agentTokens" | "joinLink";
+type ChannelPanel = "charter" | "team" | "focus" | "tasks" | "search" | "admin";
+type MemberDetailSource = Extract<ChannelPanel, "team" | "admin">;
+
+interface MemberDetailRoute {
+  name: string;
+  source: MemberDetailSource;
+}
+
+interface RemovedChannelMemberSnapshot {
+  name: string;
+  display: string;
+  kind: "agent" | "human";
+  account: string;
+  detail: string | null;
+}
+
+type AdminSurface = "agentJoin" | "agentTokens";
 const TASK_BOARD_STATES: readonly TaskState[] = ["triage", "backlog", "assigned", "in_progress", "needs_review", "blocked", "done"];
 
 function taskCompletionSeq(task: TaskRecord): number | null {
@@ -601,12 +637,11 @@ export function DivisionBoard({
   };
   const identityByName = new Map(identities.map((identity) => [identity.name, identity]));
   const selfRoles = selfReportedRoles(roles, presence, identities);
-  // issue #169：unassigned 也并入同一份 roleViews，保证 role-account-group 按
-  // accountLabel 分组、渲染时 roster 完整——但 header 上的「N 个分工」徽标只数
-  // 「已声明角色」（assigned + self），语义与 Channel.tools.roles 按钮上的
-  // structuredRoleCount 徽标保持一致，不把「未分工」的人也算进"分工数"里。
+  // issue #169：unassigned 也并入同一份 roleViews，保证 roster 完整。header 的
+  // 「N 个分工」只数正式 channel_roles；presence self report 仍显示，但标为待确认。
   const unassigned = unassignedMembers(roles, selfRoles, presence, identities, t);
-  const declaredCount = roles.length + selfRoles.length;
+  // 只有 channel_roles 是正式分工；presence 自报只是一条待确认 claim。
+  const declaredCount = roles.length;
   const roleViews = [
     ...roles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "assigned" as const, name: role.name })),
     ...selfRoles.map((role) => ({ ...roleViewFor(role, identityByName.get(role.name), t), source: "self" as const, name: role.name })),
@@ -618,25 +653,20 @@ export function DivisionBoard({
         (a.role?.role ?? "\uffff").localeCompare(b.role?.role ?? "\uffff") ||
         a.display.localeCompare(b.display),
     );
-  // issue #168\uff1a\u5206\u5de5\u8981\u770b\u5f97\u51fa\u7ec4\u7ec7\u67b6\u6784\u5173\u7cfb\u3002\u6c47\u62a5\u4eba\u53d6 presence.lineage.parent_agent\u2014\u2014
-  // \u5728 agentparty \u7684 agent-dispatch \u6a21\u578b\u91cc\uff0c"\u8c01 spawn \u6211" \u672c\u5c31\u7b49\u4ef7\u4e8e "\u6211\u5411\u8c01\u6c47\u62a5/
-  // \u4ea4\u4ed8"\uff0c\u4e0d\u662f\u53e6\u9020\u4e00\u5957\u4eba\u4e8b\u5173\u7cfb\u3002roster \u91cc\u540c\u65f6\u6536 assigned/self/unassigned \u4e09\u7c7b
-  // \u540d\u5b57\uff0c\u7528\u6765\u5224\u65ad\u6c47\u62a5\u5bf9\u8c61\u300c\u662f\u5426\u5728\u672c\u9891\u9053\u53ef\u89c1\u300d\u2014\u2014\u4e0d\u5728\u573a\u5c31\u63d0\u793a\uff0c\u5e2e\u52a9\u53d1\u73b0/\u907f\u514d
-  // \u8de8\u51fa\u672c\u9891\u9053\u8fb9\u754c\u7684\u6c47\u62a5\u5173\u7cfb\uff08\u771f\u6b63\u610f\u4e49\u4e0a\u7684\u7ec4\u7ec7\u5c42\u7ea7\u8df3\u7ea7\u5224\u5b9a\uff0c\u9700\u8981\u4e00\u4e2a\u6b63\u5f0f\u7684
-  // \u7ba1\u7406\u5c42\u7ea7\u6a21\u578b\uff0c\u73b0\u6709\u6570\u636e\u505a\u4e0d\u5230\uff0c\u89c1\u4ea4\u63a5\u62a5\u544a\uff09\u3002
-  const knownNames = new Set(roleViews.map((view) => view.name));
-  // #370：优先用正式管理层级 channel_roles.reports_to（可跨 owner，owner 定的模型）；
-  // 没显式设置的回落到 lineage.parent_agent（spawn 血缘，#281 的旧近似）。组织树从此显示真汇报线。
+  // issue #168 + #370：只有 channel_roles assignment 是正式组织权威。
+  // presence.lineage 仍可在运行时详情里解释派生关系，但不能提升成角色、负责人或汇报线。
+  const knownAssignedNames = new Set(
+    roleViews.filter((view) => view.source === "assigned").map((view) => view.name),
+  );
   const roleViewsWithReports = roleViews.map((view) => ({
     ...view,
-    reportsTo: view.role?.reports_to ?? presence[view.name]?.lineage?.parent_agent ?? null,
+    reportsTo: view.source === "assigned" ? view.role?.reports_to ?? null : null,
   }));
-  // issue #281：把同一份 roleViews（assigned/self/unassigned + reportsTo）喂给 buildOrgTree，
-  // 折成一棵可整体预览的频道组织/汇报树——纯函数在 lib/orgTree.ts，环/孤儿处理都在那里。
+  // self/unassigned 仍作为 roster 节点显示，但不携带正式 role/reportsTo/lead 语义。
   const orgMembers: OrgMemberInput[] = roleViewsWithReports.map((view) => ({
     name: view.name,
     display: view.display,
-    role: view.role?.role ?? null,
+    role: view.source === "assigned" ? view.role?.role ?? null : null,
     reportsTo: view.reportsTo,
     kind: view.kind,
     accountLabel: view.accountLabel,
@@ -651,14 +681,20 @@ export function DivisionBoard({
     else groups.push({ accountLabel: view.accountLabel, roles: [view] });
   }
   const roleCounts = COLLAB_ROLES
-    .map((role) => ({ role, count: roleViews.filter((item) => item.role?.role === role).length }))
+    .map((role) => ({
+      role,
+      count: roleViews.filter((item) => item.source === "assigned" && item.role?.role === role).length,
+    }))
     .filter((item) => item.count > 0);
 
   // issue #150\uff1a\u62ff\u5f53\u524d\u5df2\u58f0\u660e\u5206\u5de5\uff08assigned + self\uff0c\u4e0d\u542b\u672a\u5206\u5de5\u5360\u4f4d\uff09\u62fc\u6210 markdown
   // \u5c0f\u8282\uff0c\u5408\u5e76\u8fdb\u73b0\u6709\u516c\u544a\u6587\u672c\u3002\u7eaf\u8ba1\u7b97\u653e\u5728\u6e32\u67d3\u671f\uff0c\u624b\u52a8\u6309\u94ae\u548c\u4e0b\u9762\u7684\u81ea\u52a8\u540c\u6b65 effect
   // \u5171\u7528\u540c\u4e00\u4efd\u5408\u5e76\u7ed3\u679c nextCharterText\u2014\u2014\u4fdd\u8bc1\u300c\u624b\u70b9\u300d\u548c\u300c\u81ea\u52a8\u300d\u5199\u8fdb\u53bb\u7684\u6587\u672c\u4e00\u6a21\u4e00\u6837\u3002
   const declaredRoleIdentities = roleViews
-    .filter((view): view is typeof view & { role: NonNullable<typeof view.role> } => view.role !== null)
+    .filter(
+      (view): view is typeof view & { role: NonNullable<typeof view.role> } =>
+        view.source === "assigned" && view.role !== null,
+    )
     .map((view) => ({
       ...view,
       kind: view.role.kind ?? identityByName.get(view.name)?.kind ?? presence[view.name]?.kind,
@@ -794,7 +830,14 @@ export function DivisionBoard({
             t={t}
             interactive={
               canModerate && onSetReportsTo !== undefined
-                ? { canModerate, allNames: orgMembers.map((m) => m.name), busyName: roleSaving, onSetReportsTo }
+                ? {
+                    canModerate,
+                    allNames: orgMembers
+                      .filter((member) => member.source === "assigned")
+                      .map((member) => member.name),
+                    busyName: roleSaving,
+                    onSetReportsTo,
+                  }
                 : undefined
             }
           />
@@ -817,7 +860,7 @@ export function DivisionBoard({
                     const draftForRole = role !== null ? roleDrafts[role.name] ?? roleDraftFrom(role) : null;
                     // issue #168：汇报对象是否在本频道 roster 里可见——不可见就提示，帮助
                     // 发现/避免跨出本频道边界的汇报关系。
-                    const reportsToVisible = reportsTo !== null && knownNames.has(reportsTo);
+                    const reportsToVisible = reportsTo !== null && knownAssignedNames.has(reportsTo);
                     const title = [
                       name !== display ? name : null,
                       t("Composer.owner", { account: accountLabel }),
@@ -839,6 +882,7 @@ export function DivisionBoard({
                             <button
                               type="button"
                               className="role-person-name role-person-name--btn t-mono"
+                              data-team-member={name}
                               onClick={() => onOpenAgentDetail(name)}
                             >
                               {display}
@@ -847,7 +891,7 @@ export function DivisionBoard({
                             <span className="role-person-name t-mono">{display}</span>
                           )}
                           <span className={`role-kind role-kind--${kind}`}>{t(`Composer.kind.${kind}`)}</span>
-                          {role !== null && role.role === "host" && (
+                          {source === "assigned" && role !== null && role.role === "host" && (
                             <span className="role-lead-tag t-mono">{t("Channel.roles.channelLead")}</span>
                           )}
                           {source === "self" && <span className="role-source t-mono">{t("Channel.roles.selfReported")}</span>}
@@ -1002,29 +1046,105 @@ export function ChannelPanelModal({
   title,
   subtitle,
   onClose,
+  onEscape,
   children,
   hideHeader = false,
+  shouldRestoreFocus,
 }: {
   title: string;
   subtitle?: string;
   onClose: () => void;
+  onEscape?: () => void;
   children: ReactNode;
   // #504：内容自带头部（如团队面板博客风头）时隐藏 modal 默认头，避免双 header。
   hideHeader?: boolean;
+  /** A successful message jump deliberately leaves focus on the destination. */
+  shouldRestoreFocus?: () => boolean;
 }) {
   const t = useT();
+  const cardRef = useRef<HTMLElement | null>(null);
+  const shouldRestoreFocusRef = useRef(shouldRestoreFocus);
+  shouldRestoreFocusRef.current = shouldRestoreFocus;
+  const restoreFocusRef = useRef<HTMLElement | null>(
+    typeof document !== "undefined"
+      && typeof HTMLElement !== "undefined"
+      && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+  );
+  const focusableElements = useCallback(() => {
+    const card = cardRef.current;
+    if (card === null) return [];
+    return [...card.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter(
+      (element) => (
+        element.tabIndex >= 0
+        && element.closest('[hidden], [aria-hidden="true"]') === null
+      ),
+    );
+  }, []);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        if (event.defaultPrevented) return;
+        (onEscape ?? onClose)();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      if (typeof document === "undefined") return;
+      const card = cardRef.current;
+      if (card === null) return;
+      const focusable = focusableElements();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        card.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      const active = document.activeElement;
+      if (active === null || active.isConnected === false || !card.contains(active)) {
+        event.preventDefault();
+        first.focus();
+        return;
+      }
+      if (active === card) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [focusableElements, onClose, onEscape]);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const card = cardRef.current;
+    if (card !== null && !card.contains(document.activeElement)) {
+      const focusable = focusableElements();
+      const first = focusable.find((element) => element.hasAttribute("autofocus"))
+        ?? focusable[0];
+      (first ?? card).focus();
+    }
+    return () => {
+      if (shouldRestoreFocusRef.current?.() === false) return;
+      const previous = restoreFocusRef.current;
+      if (previous?.isConnected) previous.focus();
+    };
+  }, [focusableElements]);
 
   return (
     <div className="channel-panel-overlay" role="dialog" aria-modal="true" aria-label={title}>
       <button className="channel-panel-scrim" type="button" aria-label={t("Channel.tools.close")} onClick={onClose} />
-      <section className="channel-panel-card">
+      <section ref={cardRef} className="channel-panel-card" tabIndex={-1}>
         {!hideHeader && (
           <header className="channel-panel-head">
             <div className="channel-panel-titlebox">
@@ -1195,7 +1315,15 @@ function CatchupPanel({
   );
 }
 
-function SearchHitCard({ hit, onJump }: { hit: SearchHit; onJump: (seq: number) => void }) {
+function SearchHitCard({
+  hit,
+  onJump,
+  disabled,
+}: {
+  hit: SearchHit;
+  onJump: (seq: number) => void | Promise<void>;
+  disabled: boolean;
+}) {
   const t = useT();
   const hueStyle = { "--ah": agentHue(hit.sender.name) } as CSSProperties;
   return (
@@ -1212,6 +1340,7 @@ function SearchHitCard({ hit, onJump }: { hit: SearchHit; onJump: (seq: number) 
           className="t-mono completion-jump"
           type="button"
           title={t("Channel.search.jumpTitle")}
+          disabled={disabled}
           onClick={() => onJump(hit.seq)}
         >
           #{hit.seq}
@@ -1237,12 +1366,13 @@ export interface ChannelSearchPanelProps {
   agentFilterActive: boolean;
   searchInputError: string | null;
   searchError: string | null;
+  jumpError?: string | null;
   onSearch(value: string): void;
   onSearchFrom(value: string): void;
   onSearchSince(value: string): void;
   onSearchLimit(value: string): void;
   onClose(): void;
-  onJump(seq: number): void;
+  onJump(seq: number): boolean | Promise<boolean>;
 }
 
 export function ChannelSearchPanel({
@@ -1259,6 +1389,7 @@ export function ChannelSearchPanel({
   agentFilterActive,
   searchInputError,
   searchError,
+  jumpError = null,
   onSearch,
   onSearchFrom,
   onSearchSince,
@@ -1271,13 +1402,17 @@ export function ChannelSearchPanel({
   // isSeqQuery 时屏蔽所有全文检索专属 UI（计数/结果/空态），否则会与「跳到 #N」并存出现「0 命中」误导（#718 评审）。
   const seqQuery = seqFromQuery(search);
   const isSeqQuery = seqQuery !== null;
-  const selectHit = (seq: number) => {
-    onClose();
-    onJump(seq);
+  const [jumpingSeq, setJumpingSeq] = useState<number | null>(null);
+  const selectHit = async (seq: number) => {
+    if (jumpingSeq !== null) return;
+    setJumpingSeq(seq);
+    const located = await onJump(seq);
+    setJumpingSeq(null);
+    if (located) onClose();
   };
 
   return (
-    <div className="chan-search-panel">
+    <div className="chan-search-panel" aria-busy={jumpingSeq !== null}>
       <div className="chan-search-row">
         <input
           className="t-mono chan-search"
@@ -1304,6 +1439,7 @@ export function ChannelSearchPanel({
         <button
           type="button"
           className="d-btn chan-search-seq-jump"
+          disabled={jumpingSeq !== null}
           onClick={() => selectHit(seqQuery)}
         >
           {t("Channel.search.jumpToSeq", { seq: String(seqQuery) })}
@@ -1358,8 +1494,13 @@ export function ChannelSearchPanel({
           {searchError}
         </p>
       )}
+      {jumpError !== null && (
+        <p className="banner banner--yellow" role="alert">
+          {jumpError}
+        </p>
+      )}
       {query !== "" && !isSeqQuery && visibleSearchHits.map((hit) => (
-        <SearchHitCard key={hit.seq} hit={hit} onJump={selectHit} />
+        <SearchHitCard key={hit.seq} hit={hit} onJump={selectHit} disabled={jumpingSeq !== null} />
       ))}
       {query !== "" && !isSeqQuery && !searchLoading && searchHits.length === 0 && searchInputError === null && searchError === null && (
         <p className="d-empty" role="status" aria-live="polite">
@@ -1576,28 +1717,37 @@ export function agentPresenceSummary(
   presence: PresenceEntry[],
   participants: Sender[],
   taskAgentNames: Iterable<string> = [],
+  memberNames?: ReadonlySet<string>,
 ) {
+  const included = (name: string) => memberNames === undefined || memberNames.has(name);
   const participantKinds = new Map(participants.map((participant) => [participant.name, participant.kind]));
   const agentNames = new Set<string>();
   for (const entry of presence) {
-    if ((participantKinds.get(entry.name) ?? entry.kind) !== "human") agentNames.add(entry.name);
+    if (included(entry.name) && (participantKinds.get(entry.name) ?? entry.kind) !== "human") agentNames.add(entry.name);
   }
   for (const participant of participants) {
+    if (!included(participant.name)) continue;
     if (participant.kind === "agent") agentNames.add(participant.name);
     else agentNames.delete(participant.name);
   }
-  for (const name of taskAgentNames) agentNames.add(name);
+  for (const name of taskAgentNames) {
+    if (included(name)) agentNames.add(name);
+  }
 
   // participants is the Durable Object's authoritative list of currently open
   // connections. A freshly connected agent does not necessarily have a
   // persisted presence row yet, so presence.live alone under-counts the board.
   const onlineNames = new Set(
     participants
-      .filter((participant) => participant.kind === "agent")
+      .filter((participant) => participant.kind === "agent" && included(participant.name))
       .map((participant) => participant.name),
   );
   for (const entry of presence) {
-    if (entry.live === true && (participantKinds.get(entry.name) ?? entry.kind) !== "human") {
+    if (
+      included(entry.name)
+      && entry.live === true
+      && (participantKinds.get(entry.name) ?? entry.kind) !== "human"
+    ) {
       onlineNames.add(entry.name);
     }
   }
@@ -1618,17 +1768,23 @@ export function AgentBoardPanel({
   tasks,
   deliveries = [],
   messages = [],
+  onOpenAgentDetail,
+  memberNames,
 }: {
   presence: PresenceEntry[];
   participants?: Sender[];
   tasks: TaskRecord[];
   deliveries?: PublicDirectedDelivery[];
   messages?: MsgFrame[];
+  onOpenAgentDetail?: (name: string) => void;
+  /** Current channel roster; task/delivery/history cannot recreate a removed member. */
+  memberNames?: ReadonlySet<string>;
 }) {
   const t = useT();
   const messagesBySeq = new Map(messages.map((message) => [message.seq, message]));
   const activeDeliveriesByName = new Map<string, PublicDirectedDelivery[]>();
   for (const delivery of deliveries) {
+    if (memberNames !== undefined && !memberNames.has(delivery.target_name)) continue;
     if (!ACTIVE_DELIVERY_STATES.has(delivery.state)) continue;
     const assigned = activeDeliveriesByName.get(delivery.target_name) ?? [];
     assigned.push(delivery);
@@ -1641,6 +1797,7 @@ export function AgentBoardPanel({
   for (const task of tasks) {
     const name = agentBoardTaskAssignee(task);
     if (name === null) continue;
+    if (memberNames !== undefined && !memberNames.has(name)) continue;
     const assigned = tasksByName.get(name) ?? [];
     assigned.push(task);
     tasksByName.set(name, assigned);
@@ -1660,7 +1817,12 @@ export function AgentBoardPanel({
     );
   }
   const presenceByName = new Map(presence.map((p) => [p.name, p]));
-  const presenceSummary = agentPresenceSummary(presence, participants, [...tasksByName.keys(), ...activeDeliveriesByName.keys()]);
+  const presenceSummary = agentPresenceSummary(
+    presence,
+    participants,
+    [...tasksByName.keys(), ...activeDeliveriesByName.keys()],
+    memberNames,
+  );
   const names = new Set(presenceSummary.agentNames);
   const statusOf = (name: string, p: PresenceEntry | undefined, activeDeliveries: PublicDirectedDelivery[]): AgentBoardStatus => {
     if (p?.state === "blocked" || activeDeliveries.some((delivery) => delivery.state === "waiting_owner")) return "blocked";
@@ -1749,7 +1911,22 @@ export function AgentBoardPanel({
             {laneRows.map((row) => (
               <article key={row.name} className={`agent-board-row agent-board-row--${row.status}`} data-agent={row.name}>
                 <div className="agent-board-row-head">
-                  <span className="agent-board-name"><span className={`agent-board-live-dot${row.online ? " is-online" : ""}`} aria-hidden="true" />{row.name}</span>
+                  {onOpenAgentDetail !== undefined ? (
+                    <button
+                      type="button"
+                      className="agent-board-name agent-board-name--button"
+                      data-team-member={row.name}
+                      onClick={() => onOpenAgentDetail(row.name)}
+                    >
+                      <span className={`agent-board-live-dot${row.online ? " is-online" : ""}`} aria-hidden="true" />
+                      {row.name}
+                    </button>
+                  ) : (
+                    <span className="agent-board-name">
+                      <span className={`agent-board-live-dot${row.online ? " is-online" : ""}`} aria-hidden="true" />
+                      {row.name}
+                    </span>
+                  )}
                   <span className={`t-mono agent-board-status agent-board-status--${row.status}`}>{statusLabel}</span>
                 </div>
                 {row.note !== null && row.note.trim() !== "" && <p className="agent-board-note">{row.note}</p>}
@@ -1908,6 +2085,7 @@ export function TaskLedgerPanel({
   identities = [],
   onUploadAttachment,
   onClose,
+  selectedTaskId = null,
 }: {
   tasks: TaskRecord[];
   loading: boolean;
@@ -1927,6 +2105,8 @@ export function TaskLedgerPanel({
   identities?: ChannelIdentity[];
   // #369：上传图片/文件到 R2 拿引用（Channel 提供 token/slug）。缺省则不显上传入口（如从消息建任务）。
   onUploadAttachment?: (file: File) => Promise<Attachment>;
+  // 从 Focus 等外部入口精确跳转任务。仅临时穿透筛选，不重置面板内搜索、筛选或草稿。
+  selectedTaskId?: number | null;
 }) {
   const t = useT();
   const [assignDrafts, setAssignDrafts] = useState<Record<number, string>>({});
@@ -1959,9 +2139,53 @@ export function TaskLedgerPanel({
   const [doneLimit, setDoneLimit] = useState(6);
   // #271(d)：展开放大——CSS class 切宽度，外层 channel-panel-card 用 :has() 跟随。
   const [expandedView, setExpandedView] = useState(false);
-  // #271(c)：任务详情弹层。存 id 不存快照，刷新后始终显示最新记录。
+  // #271(c)：任务详情作为台账内路由。存 id 不存快照，刷新后始终显示最新记录。
   const [detailTaskId, setDetailTaskId] = useState<number | null>(null);
+  const taskCardRefs = useRef(new Map<number, HTMLLIElement>());
+  const taskTitleRefs = useRef(new Map<number, HTMLButtonElement>());
+  const detailBackRef = useRef<HTMLButtonElement | null>(null);
+  const detailReturnFocusIdRef = useRef<number | null>(null);
+  const selectedTask = selectedTaskId === null
+    ? null
+    : tasks.find((task) => task.id === selectedTaskId) ?? null;
+  const resolvedSelectedTaskId = selectedTask?.id ?? null;
   const detailTask = detailTaskId === null ? null : tasks.find((task) => task.id === detailTaskId) ?? null;
+  useEffect(() => {
+    if (resolvedSelectedTaskId === null) return;
+    setOpenTaskId(resolvedSelectedTaskId);
+  }, [resolvedSelectedTaskId]);
+  useEffect(() => {
+    if (resolvedSelectedTaskId === null || openTaskId !== resolvedSelectedTaskId) return;
+    const card = taskCardRefs.current.get(resolvedSelectedTaskId);
+    if (card === undefined) return;
+    card.scrollIntoView({ block: "nearest" });
+    card.focus({ preventScroll: true });
+  }, [openTaskId, resolvedSelectedTaskId]);
+  useLayoutEffect(() => {
+    if (detailTaskId !== null) {
+      detailBackRef.current?.focus();
+      return;
+    }
+    const returnFocusId = detailReturnFocusIdRef.current;
+    if (returnFocusId === null) return;
+    detailReturnFocusIdRef.current = null;
+    taskTitleRefs.current.get(returnFocusId)?.focus();
+  }, [detailTaskId]);
+  const closeTaskDetail = useCallback(() => {
+    detailReturnFocusIdRef.current = detailTaskId;
+    setDetailTaskId(null);
+  }, [detailTaskId]);
+  useEffect(() => {
+    if (detailTask === null || typeof window === "undefined") return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeTaskDetail();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [closeTaskDetail, detailTask]);
   const counts = tasks.reduce<Record<string, number>>((acc, task) => {
     acc[task.state] = (acc[task.state] ?? 0) + 1;
     return acc;
@@ -1971,6 +2195,8 @@ export function TaskLedgerPanel({
   )].sort();
   const q = taskQuery.trim().toLowerCase();
   const visibleTasks = tasks.filter((task) => {
+    // 外部精确跳转的目标始终可见，但不改写用户已有筛选；清除选择后自然恢复原视图。
+    if (task.id === resolvedSelectedTaskId) return true;
     // 受理人
     if (assigneeFilter === "__unassigned__" && task.assignee !== null) return false;
     if (assigneeFilter !== "all" && assigneeFilter !== "__unassigned__" && task.assignee?.name !== assigneeFilter) return false;
@@ -2025,6 +2251,12 @@ export function TaskLedgerPanel({
     return (
       <li
         key={task.id}
+        ref={(node) => {
+          if (node === null) taskCardRefs.current.delete(task.id);
+          else taskCardRefs.current.set(task.id, node);
+        }}
+        data-task-id={task.id}
+        tabIndex={-1}
         className={`task-card task-card--${task.state}` + (open ? " task-card--open" : "") + (dragTaskId === task.id ? " is-dragging" : "")}
         draggable={!disabled && !taskBusy}
         onDragStart={(event) => {
@@ -2040,6 +2272,10 @@ export function TaskLedgerPanel({
           <button
             type="button"
             className="task-card-title"
+            ref={(node) => {
+              if (node === null) taskTitleRefs.current.delete(task.id);
+              else taskTitleRefs.current.set(task.id, node);
+            }}
             aria-label={t("Channel.tasks.detailOpenAria", { id: task.id })}
             onClick={() => setDetailTaskId(task.id)}
           >
@@ -2167,14 +2403,22 @@ export function TaskLedgerPanel({
     <section
       className={"task-ledger-panel" + (expandedView ? " task-ledger-panel--expanded" : "")}
       aria-label={t("Channel.tasks.panelAria")}
+      onKeyDownCapture={(event) => {
+        if (event.key !== "Escape" || detailTask === null) return;
+        event.preventDefault();
+        event.stopPropagation();
+        closeTaskDetail();
+      }}
     >
-      {/* #271(b)：所有任务卡的指派输入共用同一份候选（参照 channel-role-targets 的写法） */}
-      <datalist id="task-assignee-targets">
-        {identities.map((identity) => (
-          <option key={identity.name} value={identity.name}>{identity.display}</option>
-        ))}
-      </datalist>
-      <header className="task-blog-head">
+      {detailTask === null ? (
+        <>
+          {/* #271(b)：所有任务卡的指派输入共用同一份候选（参照 channel-role-targets 的写法） */}
+          <datalist id="task-assignee-targets">
+            {identities.map((identity) => (
+              <option key={identity.name} value={identity.name}>{identity.display}</option>
+            ))}
+          </datalist>
+          <header className="task-blog-head">
         <div className="task-blog-title">
           <h2 className="task-blog-name">{t("Channel.tasks.title")}</h2>
           <span className="t-mono task-blog-prompt">{t("Channel.tasks.overviewPrompt", { count: tasks.length })}</span>
@@ -2215,8 +2459,8 @@ export function TaskLedgerPanel({
             </button>
           )}
         </div>
-      </header>
-      <div className="task-blog-filter">
+          </header>
+          <div className="task-blog-filter">
         <div className="task-blog-filter-row">
           <span className="t-mono task-blog-grep">{t("Channel.tasks.grepState")}</span>
           {stateChipDefs.map((chip) => (
@@ -2272,8 +2516,8 @@ export function TaskLedgerPanel({
             </button>
           )}
         </div>
-      </div>
-      {composerOpen && canWrite && (
+          </div>
+          {composerOpen && canWrite && (
         <form className="task-new-form" onSubmit={submitNewTask}>
           <input
             className="task-new-title"
@@ -2338,15 +2582,21 @@ export function TaskLedgerPanel({
             </button>
           </div>
         </form>
-      )}
-      {error !== null && <p className="banner banner--red">{error}</p>}
-      {actionError !== null && <p className="banner banner--red">{actionError}</p>}
-      {tasks.length === 0 && error === null ? (
+          )}
+          {error !== null && <p className="banner banner--red">{error}</p>}
+          {actionError !== null && <p className="banner banner--red">{actionError}</p>}
+          {tasks.length === 0 && error === null ? (
         <p className="charter-empty">{t("Channel.tasks.empty")}</p>
       ) : (
         <div className="task-board" role="list" aria-label={t("Channel.tasks.boardAria")}>
           {TASK_BOARD_STATES.map((state) => {
             const columnTasks = tasksByState.get(state) ?? [];
+            const limitedColumnTasks = state === "done" ? columnTasks.slice(0, doneLimit) : columnTasks;
+            const selectedColumnTask = selectedTask?.state === state ? selectedTask : null;
+            const renderedColumnTasks = selectedColumnTask !== null && !limitedColumnTasks.some((task) => task.id === selectedColumnTask.id)
+              ? [...limitedColumnTasks, selectedColumnTask]
+              : limitedColumnTasks;
+            const remainingTaskCount = columnTasks.length - renderedColumnTasks.length;
             return (
               <section
                 key={state}
@@ -2375,15 +2625,15 @@ export function TaskLedgerPanel({
                 ) : (
                   <>
                     <ol className="task-list">
-                      {(state === "done" ? columnTasks.slice(0, doneLimit) : columnTasks).map(renderTask)}
+                      {renderedColumnTasks.map(renderTask)}
                     </ol>
-                    {state === "done" && columnTasks.length > doneLimit && (
+                    {state === "done" && remainingTaskCount > 0 && (
                       <button
                         type="button"
                         className="task-blog-more"
                         onClick={() => setDoneLimit((n) => n + 20)}
                       >
-                        ▾ {t("Channel.tasks.showMore", { count: columnTasks.length - doneLimit })}
+                        ▾ {t("Channel.tasks.showMore", { count: remainingTaskCount })}
                       </button>
                     )}
                   </>
@@ -2392,29 +2642,26 @@ export function TaskLedgerPanel({
             );
           })}
         </div>
-      )}
-      {detailTask !== null && (
-        <div
-          className="task-detail-overlay"
-          role="dialog"
-          aria-modal="true"
+          )}
+        </>
+      ) : (
+        <section
+          className="task-detail-card task-detail-route"
           aria-label={t("Channel.tasks.detailAria", { id: detailTask.id })}
         >
-          <button
-            className="task-detail-scrim"
-            type="button"
-            aria-label={t("Channel.tasks.detailClose")}
-            onClick={() => setDetailTaskId(null)}
-          />
-          <section className="task-detail-card">
-            <header className="task-detail-head">
+          <header className="task-detail-head">
+              <button
+                ref={detailBackRef}
+                className="d-btn task-detail-close"
+                type="button"
+                onClick={closeTaskDetail}
+              >
+                ← {t("Channel.tasks.detailBack")}
+              </button>
               <span className="t-mono task-id">#{detailTask.id}</span>
               <strong className="task-detail-title">{detailTask.title}</strong>
               <span className={`t-mono task-state task-state--${detailTask.state}`}>{stateLabel(detailTask.state)}</span>
-              <button className="d-btn task-detail-close" type="button" onClick={() => setDetailTaskId(null)}>
-                {t("Channel.tasks.detailClose")}
-              </button>
-            </header>
+          </header>
             {detailTask.desc !== null && detailTask.desc !== "" ? (
               <p className="task-detail-desc">{detailTask.desc}</p>
             ) : (
@@ -2473,9 +2720,8 @@ export function TaskLedgerPanel({
                   <dd className="t-mono">{fmtTime(detailTask.completed_at)}</dd>
                 </>
               )}
-            </dl>
-          </section>
-        </div>
+          </dl>
+        </section>
       )}
     </section>
   );
@@ -2649,25 +2895,39 @@ export function ChannelPage({
   const [guardResetting, setGuardResetting] = useState(false);
   const [guardResetError, setGuardResetError] = useState<string | null>(null);
   const [removingName, setRemovingName] = useState<string | null>(null);
+  const [restoringName, setRestoringName] = useState<string | null>(null);
   const [kickError, setKickError] = useState<string | null>(null);
+  const [removedChannelMemberSnapshots, setRemovedChannelMemberSnapshots] = useState<
+    Record<string, RemovedChannelMemberSnapshot>
+  >({});
+  const channelAdminMemberRowsRef = useRef(new Map<string, ChannelAdminMember>());
   const [pausingName, setPausingName] = useState<string | null>(null);
   const [pauseError, setPauseError] = useState<string | null>(null);
   const [archiving, setArchiving] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [charter, setCharter] = useState<ChannelCharter | null>(null);
   const [wakeDeliveries, setWakeDeliveries] = useState<WakeDelivery[]>([]); // @ 唤醒台账（webhook 侧硬证据）
-  // issue #272（审计重开）：单 Agent 详情弹窗——存被点开的 agent name，null = 关闭。
-  const [openAgentDetail, setOpenAgentDetail] = useState<string | null>(null);
+  // 成员详情保留显式来源：Team 返回 roster，Admin 返回 Members。
+  // 两条路由共用外层 dialog，但各自由原面板负责恢复页签与焦点。
+  const [memberDetailRoute, setMemberDetailRoute] = useState<MemberDetailRoute | null>(null);
   const [charterEditing, setCharterEditing] = useState(false);
   const [charterDraft, setCharterDraft] = useState("");
   const [charterSaving, setCharterSaving] = useState(false);
   const [charterError, setCharterError] = useState<string | null>(null);
   const [channelRoles, setChannelRoles] = useState<ChannelRoleInfo[]>([]);
+  // 跨 WS/REST 链路共享的成员删除墓碑：participant_removed 可能先于/晚于
+  // identities / roles 请求，旧响应不得把已经权威删除的成员重新塞回 roster。
+  const removedChannelMembersRef = useRef(new Map<string, number>());
+  const channelIdentitiesRequestRef = useRef(0);
+  const unknownMemberIdentityRefreshRef = useRef(new Set<string>());
+  const channelRolesRequestRef = useRef(0);
   const [channelSquads, setChannelSquads] = useState<ChannelSquad[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [taskSummary, setTaskSummary] = useState<TaskSummary | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
+  const taskLedgerRequestRef = useRef(0);
   const [tasksError, setTasksError] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [taskActionBusyId, setTaskActionBusyId] = useState<number | null>(null);
   const [taskActionError, setTaskActionError] = useState<string | null>(null);
   const [taskCreating, setTaskCreating] = useState(false);
@@ -2696,6 +2956,26 @@ export function ChannelPage({
   const [teamNow, setTeamNow] = useState(() => Date.now());
   const [completionOnly, setCompletionOnly] = useState(false);
   const [agentFilter, setAgentFilter] = useState<AgentFilter>(() => parseAgentFilter(window.location.search));
+  const [messageViewRestore, setMessageViewRestore] = useState<{
+    completionOnly: boolean;
+    agentFilter: AgentFilter;
+  } | null>(null);
+  const messageNavigationRequestRef = useRef(0);
+  const messageNavigationCompletionRef = useRef<{
+    request: number;
+    resolve: (located: boolean) => void;
+  } | null>(null);
+  const skipPanelFocusRestoreRef = useRef(false);
+  const [pendingMessageJump, setPendingMessageJump] = useState<{
+    seq: number;
+    sender: string;
+    request: number;
+  } | null>(null);
+  const [messageNavigationError, setMessageNavigationError] = useState<string | null>(null);
+  const [messageNavigationAnnouncement, setMessageNavigationAnnouncement] = useState("");
+  useEffect(() => {
+    if (activePanel !== null) skipPanelFocusRestoreRef.current = false;
+  }, [activePanel]);
   const [replyTo, setReplyTo] = useState<number | null>(null);
   const [editingSeq, setEditingSeq] = useState<number | null>(null);
   const [editDraft, setEditDraft] = useState("");
@@ -2726,13 +3006,22 @@ export function ChannelPage({
   const dismissToast = useCallback((seq: number) => {
     setToasts((cur) => cur.filter((tt) => tt.seq !== seq));
   }, []);
-  const jumpToMention = useCallback((seq: number) => {
-    setToasts((cur) => cur.filter((tt) => tt.seq !== seq));
-    const el = document.getElementById(`msg-${seq}`);
-    if (el === null) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("msg-jump-highlight");
-    window.setTimeout(() => el.classList.remove("msg-jump-highlight"), 1200);
+  const settleMessageNavigation = useCallback((request: number, located: boolean) => {
+    const completion = messageNavigationCompletionRef.current;
+    if (completion?.request !== request) return;
+    messageNavigationCompletionRef.current = null;
+    completion.resolve(located);
+  }, []);
+  const cancelPendingMessageNavigation = useCallback(() => {
+    const completion = messageNavigationCompletionRef.current;
+    messageNavigationCompletionRef.current = null;
+    completion?.resolve(false);
+    setPendingMessageJump(null);
+  }, []);
+  useEffect(() => () => {
+    const completion = messageNavigationCompletionRef.current;
+    messageNavigationCompletionRef.current = null;
+    completion?.resolve(false);
   }, []);
   const sockRef = useRef<ChannelSocket | null>(null);
   const streamRef = useRef<HTMLDivElement | null>(null);
@@ -2743,6 +3032,17 @@ export function ChannelPage({
   const stickBottom = useRef(true);
   const authFailedRef = useRef(onAuthFailed);
   authFailedRef.current = onAuthFailed;
+  const {
+    lastSuccessfulData: pendingDecisionData,
+    loading: pendingDecisionsLoading,
+    error: pendingDecisionsError,
+    refresh: refreshPendingDecisions,
+    observeFrame: observePendingDecisionFrame,
+  } = useAuthoritativePendingDecisions({
+    token,
+    slug,
+    onAuthError: () => authFailedRef.current(tRef.current("Channel.error.tokenRevoked")),
+  });
 
   useEffect(() => {
     setLocalLoopGuardEnabled(loopGuardEnabled);
@@ -2764,13 +3064,116 @@ export function ChannelPage({
   const charterRevRef = useRef(0);
   oldestSeqRef.current = state.messages.length > 0 ? state.messages[0]!.seq : 0;
   charterRevRef.current = charter?.charter_rev ?? 0;
+  const removedMemberNames = useMemo(
+    () => new Set(Object.keys(state.removedParticipants)),
+    [state.removedParticipants],
+  );
+  useEffect(() => {
+    // Snapshot rows are session-local recovery affordances. Once a later
+    // authoritative roster releases a tombstone, discard the old row rather
+    // than turning historical identity data into durable membership.
+    setRemovedChannelMemberSnapshots((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const name of Object.keys(next)) {
+        if (removedMemberNames.has(name)) continue;
+        delete next[name];
+        changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [removedMemberNames]);
+  // Current roster authority deliberately excludes message history. Otherwise a
+  // freshly reloaded page would recreate a permanently removed member from an
+  // old sender snapshot even though identities / roles / participants all
+  // agree that the identity is gone.
+  const authoritativeMemberNames = useMemo(() => {
+    const names = new Set<string>([
+      ...state.participants.map((participant) => participant.name),
+      ...Object.keys(state.presence),
+      ...channelIdentities.map((identity) => identity.name),
+      ...channelRoles.map((role) => role.name),
+    ]);
+    for (const name of removedMemberNames) names.delete(name);
+    names.delete("system");
+    return names;
+  }, [
+    channelIdentities,
+    channelRoles,
+    removedMemberNames,
+    state.participants,
+    state.presence,
+  ]);
+  const authoritativeMemberNamesRef = useRef(authoritativeMemberNames);
+  authoritativeMemberNamesRef.current = authoritativeMemberNames;
   // 发送、编辑和草稿状态条必须使用同一份最终补全候选。否则中文紧邻正文
   // （例如“请@小明看一下”）会在预览中解析正确，提交时却把正文后缀吞进目标名。
   const mentionOptions = useMemo(
-    () => mentionCandidates(state.participants, state.presence, state.self, teamNow, channelIdentities, channelRoles, channelSquads, Object.values(state.mentionSenders)),
-    [channelIdentities, channelRoles, channelSquads, state.mentionSenders, state.participants, state.presence, state.self, teamNow],
+    () => mentionCandidates(
+      state.participants,
+      state.presence,
+      state.self,
+      teamNow,
+      channelIdentities,
+      channelRoles,
+      channelSquads,
+      Object.values(state.mentionSenders),
+      removedMemberNames,
+      authoritativeMemberNames,
+    ),
+    [
+      channelIdentities,
+      channelRoles,
+      channelSquads,
+      authoritativeMemberNames,
+      removedMemberNames,
+      state.mentionSenders,
+      state.participants,
+      state.presence,
+      state.self,
+      teamNow,
+    ],
   );
   const mentionNames = useMemo(() => mentionOptions.map((candidate) => candidate.name), [mentionOptions]);
+
+  const applyParticipantRemoval = useCallback((removal: ParticipantRemovedFrame) => {
+    const member = channelAdminMemberRowsRef.current.get(removal.name);
+    if (member?.account != null && member.account !== "") {
+      setRemovedChannelMemberSnapshots((current) => {
+        if (current[removal.name] !== undefined) return current;
+        return {
+          ...current,
+          [removal.name]: {
+            name: member.name,
+            display: member.display,
+            kind: member.kind,
+            account: member.account!,
+            detail: member.detail ?? null,
+          },
+        };
+      });
+    }
+    const previous = removedChannelMembersRef.current.get(removal.name) ?? 0;
+    removedChannelMembersRef.current.set(removal.name, Math.max(previous, removal.removed_at));
+    channelIdentitiesRequestRef.current += 1;
+    channelRolesRequestRef.current += 1;
+    dispatch({ type: "frame", frame: removal });
+    setChannelIdentities((current) => {
+      const next = current.filter((identity) => identity.name !== removal.name);
+      return next.length === current.length ? current : next;
+    });
+    setChannelRoles((current) => {
+      const next = current.filter((role) => role.name !== removal.name);
+      return next.length === current.length ? current : next;
+    });
+    setRoleDrafts((current) => {
+      if (!(removal.name in current)) return current;
+      const next = { ...current };
+      delete next[removal.name];
+      return next;
+    });
+    setMemberDetailRoute((current) => current?.name === removal.name ? null : current);
+  }, []);
 
   const loadCharter = useCallback(() => {
     return fetchChannelCharter(token, slug)
@@ -2785,18 +3188,64 @@ export function ChannelPage({
       });
   }, [slug, token]);
 
+  const loadIdentities = useCallback(() => {
+    const requestId = ++channelIdentitiesRequestRef.current;
+    return fetchChannelIdentities(token, slug)
+      .then((identities) => {
+        if (requestId !== channelIdentitiesRequestRef.current) return;
+        setChannelIdentities(
+          identities.filter((identity) => !removedChannelMembersRef.current.has(identity.name)),
+        );
+      })
+      .catch((err: unknown) => {
+        if (requestId !== channelIdentitiesRequestRef.current) return;
+        if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
+      });
+  }, [slug, token]);
+
   const loadRoles = useCallback(() => {
+    const requestId = ++channelRolesRequestRef.current;
     return fetchChannelRoles(token, slug)
       .then((roles) => {
-        setChannelRoles(roles);
-        setRoleDrafts(Object.fromEntries(roles.map((role) => [role.name, roleDraftFrom(role)])));
+        if (requestId !== channelRolesRequestRef.current) return;
+        const currentRoles = roles.filter((role) => !removedChannelMembersRef.current.has(role.name));
+        setChannelRoles(currentRoles);
+        setRoleDrafts(Object.fromEntries(currentRoles.map((role) => [role.name, roleDraftFrom(role)])));
         setRoleError(null);
       })
       .catch((err: unknown) => {
+        if (requestId !== channelRolesRequestRef.current) return;
         if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
         else if (!(err instanceof ForbiddenError)) setRoleError(tRef.current("Channel.roles.loadFailed"));
       });
   }, [slug, token]);
+
+  const applyAuthoritativeParticipantRemoval = useCallback((removal: ParticipantRemovedFrame) => {
+    // A generic removal can create an account tombstone, so the named frame
+    // is not a complete list of affected identities. Apply its immediate
+    // target cleanup, then replace identities/roles from server authority so
+    // same-owner siblings cannot remain as Team/@ ghosts.
+    applyParticipantRemoval(removal);
+    void loadIdentities();
+    void loadRoles();
+  }, [applyParticipantRemoval, loadIdentities, loadRoles]);
+
+  const restoreParticipantProjection = useCallback((name: string) => {
+    // restored:true is the REST authority that the server no longer has a
+    // current removal tombstone. No other response may release these local
+    // guards: an absent removal frame alone can also mean a malformed/stale
+    // response and must remain fail-closed.
+    removedChannelMembersRef.current.delete(name);
+    dispatch({ type: "participant_restored", name });
+    setRemovedChannelMemberSnapshots((current) => {
+      if (current[name] === undefined) return current;
+      const next = { ...current };
+      delete next[name];
+      return next;
+    });
+    void loadIdentities();
+    void loadRoles();
+  }, [loadIdentities, loadRoles]);
 
   const loadSquads = useCallback(() => {
     return fetchSquads(token, slug)
@@ -2810,20 +3259,25 @@ export function ChannelPage({
   }, [slug, token]);
 
   const loadTaskLedger = useCallback(() => {
+    const requestId = ++taskLedgerRequestRef.current;
     setTasksLoading(true);
     return Promise.all([fetchTasks(token, slug), fetchTaskSummary(token, slug)])
       .then(([items, summary]) => {
+        if (requestId !== taskLedgerRequestRef.current) return;
         setTasks(items);
         setTaskSummary(summary);
         setTasksError(null);
         setTaskActionError(null);
       })
       .catch((err: unknown) => {
+        if (requestId !== taskLedgerRequestRef.current) return;
         if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
         else if (err instanceof ForbiddenError) setTasksError(tRef.current("Channel.tasks.error.notVisible"));
         else setTasksError(tRef.current("Channel.tasks.error.loadFailed"));
       })
-      .finally(() => setTasksLoading(false));
+      .finally(() => {
+        if (requestId === taskLedgerRequestRef.current) setTasksLoading(false);
+      });
   }, [slug, token]);
 
   const loadTaskSummary = useCallback(() => {
@@ -2840,6 +3294,8 @@ export function ChannelPage({
     setTaskActionError(null);
     updateTask(token, slug, id, body)
       .then((task) => {
+        taskLedgerRequestRef.current += 1;
+        setTasksLoading(false);
         setTasks((current) => current.map((item) => item.id === task.id ? task : item));
         void loadTaskSummary();
       })
@@ -2877,6 +3333,8 @@ export function ChannelPage({
       ...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
     })
       .then((task) => {
+        taskLedgerRequestRef.current += 1;
+        setTasksLoading(false);
         setTasks((current) => current.some((item) => item.id === task.id) ? current : [task, ...current]);
         void loadTaskSummary();
         setTasksError(null);
@@ -2931,6 +3389,7 @@ export function ChannelPage({
       }
       setDecisionBusySeq(seq);
       respondDecision(token, slug, seq, body)
+        .then(() => refreshPendingDecisions())
         .catch((err: unknown) => {
           if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
           else if (err instanceof ForbiddenError) setMessageActionError({ seq, message: t("Channel.decision.error.forbidden") });
@@ -2939,7 +3398,7 @@ export function ChannelPage({
         })
         .finally(() => setDecisionBusySeq(null));
     },
-    [decisionBusySeq, slug, token, t],
+    [decisionBusySeq, refreshPendingDecisions, slug, token, t],
   );
 
   // #204：host board 的 conflicts 与 resolve-conflict / review-blockers 建议都从任务台账派生。
@@ -2964,10 +3423,13 @@ export function ChannelPage({
       anchor_seqs: [message.seq],
     })
       .then((task) => {
+        taskLedgerRequestRef.current += 1;
+        setTasksLoading(false);
         setTasks((current) => current.some((item) => item.id === task.id) ? current : [task, ...current]);
         void loadTaskSummary();
         setTasksError(null);
         setActiveAdminSurface(null);
+        setSelectedTaskId(task.id);
         setActivePanel("tasks");
       })
       .catch((err: unknown) => {
@@ -2979,20 +3441,66 @@ export function ChannelPage({
       .finally(() => setMessageActionBusySeq(null));
   }, [loadTaskSummary, messageActionBusySeq, slug, state.messages, token, t]);
 
+  const restoreRemovedParticipant = useCallback((member: ChannelAdminMember) => {
+    if (
+      removingName !== null
+      || restoringName !== null
+      || member.removed !== true
+      || member.account == null
+      || member.account === ""
+    ) {
+      return;
+    }
+    setRestoringName(member.name);
+    setKickError(null);
+    addChannelMember(token, slug, member.account, member.name)
+      .then(() => {
+        // PUT success is the authority that membership and the targeted
+        // tombstone were restored. Do not fabricate a participant locally;
+        // release guards and let the full identities/roles snapshots converge.
+        restoreParticipantProjection(member.name);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
+        else if (err instanceof ForbiddenError) setKickError(t("ChannelAdmin.members.restoreForbidden"));
+        else setKickError(t("ChannelAdmin.members.restoreFailed"));
+      })
+      .finally(() => setRestoringName(null));
+  }, [removingName, restoreParticipantProjection, restoringName, slug, token, t]);
+
   const removeParticipant = useCallback((name: string) => {
-    if (removingName !== null) return;
+    if (removingName !== null || restoringName !== null) return;
     const ok = window.confirm(t("Channel.kick.confirm", { name }));
     if (!ok) return;
     setRemovingName(name);
     setKickError(null);
     kickParticipant(token, slug, name, "remove")
+      .then((result) => {
+        // A broadcast failure is not a removal failure: the server keeps the
+        // tombstone active and returns it so the requester can project it
+        // locally. restored:true is the only response allowed to release a
+        // tombstone after an authoritative same-name rejoin.
+        if (result?.restored === true) {
+          restoreParticipantProjection(name);
+        } else if (result?.removal !== null && result?.removal !== undefined) {
+          applyAuthoritativeParticipantRemoval(result.removal);
+        }
+      })
       .catch((err: unknown) => {
         if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
         else if (err instanceof ForbiddenError) setKickError(t("Channel.kick.forbidden"));
         else setKickError(t("Channel.kick.failed"));
       })
       .finally(() => setRemovingName(null));
-  }, [removingName, slug, token, t]);
+  }, [
+    applyAuthoritativeParticipantRemoval,
+    removingName,
+    restoreParticipantProjection,
+    restoringName,
+    slug,
+    token,
+    t,
+  ]);
 
   // 人为暂停某 agent 的接待（#180）：被 @ 也不唤醒（webhook 不投、serve/watch 自我抑制），消息仍进历史。
   const pauseAgentReception = useCallback((name: string, resumeAt: number | null) => {
@@ -3043,24 +3551,10 @@ export function ChannelPage({
     setSeenCharterRev(readSeenCharterRev(slug));
     setCharterEditing(false);
     void loadCharter();
+    void loadIdentities();
     void loadRoles();
     void loadSquads();
-  }, [loadCharter, loadRoles, loadSquads, slug]);
-
-  useEffect(() => {
-    let alive = true;
-    setChannelIdentities([]);
-    fetchChannelIdentities(token, slug)
-      .then((identities) => {
-        if (alive) setChannelIdentities(identities);
-      })
-      .catch((err: unknown) => {
-        if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
-      });
-    return () => {
-      alive = false;
-    };
-  }, [slug, token]);
+  }, [loadCharter, loadIdentities, loadRoles, loadSquads, slug]);
 
   // IM 式初始加载：先用 rest 拉最新一页（打开即到底部），把 ws 起始游标 seed 到页尾，
   // ws 只补拉/直播页尾之后的新消息——不再全量重放整个频道历史。
@@ -3114,6 +3608,48 @@ export function ChannelPage({
       token,
       {
         onFrame: (frame) => {
+          if (frame.type === "participant_removed") {
+            applyAuthoritativeParticipantRemoval(frame);
+            return;
+          }
+          // participant_removed 是 live 事件、不会历史重放。断线期间错过它时，
+          // welcome 的权威 roster + 最新 identities / roles REST 一起完成收敛。
+          // 若权威 welcome 明确包含同名成员，说明这是删除后的合法重入：解除
+          // session tombstone 后重拉两个 roster；旧在途响应由请求号挡住。
+          if (frame.type === "welcome") {
+            for (const participant of frame.participants) {
+              removedChannelMembersRef.current.delete(participant.name);
+            }
+            void loadIdentities();
+            void loadRoles();
+          }
+          if (frame.type === "participants") {
+            let restoredMember = false;
+            for (const participant of frame.participants) {
+              restoredMember = removedChannelMembersRef.current.delete(participant.name) || restoredMember;
+            }
+            if (restoredMember) {
+              void loadIdentities();
+              void loadRoles();
+            }
+          }
+          if (
+            (frame.type === "msg" || frame.type === "status")
+            && frame.sender.name !== "system"
+            && !authoritativeMemberNamesRef.current.has(frame.sender.name)
+            && !removedChannelMembersRef.current.has(frame.sender.name)
+            && !unknownMemberIdentityRefreshRef.current.has(frame.sender.name)
+          ) {
+            // identities is the durable membership authority, but it was
+            // fetched at mount. A newly joined webhook/REST sender may speak
+            // without first appearing in participants/presence, so refresh
+            // once before allowing its historical snapshot into @/Team.
+            unknownMemberIdentityRefreshRef.current.add(frame.sender.name);
+            void loadIdentities().finally(() => {
+              unknownMemberIdentityRefreshRef.current.delete(frame.sender.name);
+            });
+          }
+          observePendingDecisionFrame(frame);
           if (frame.type === "welcome" && typeof frame.charter_rev === "number" && frame.charter_rev > charterRevRef.current) {
             void loadCharter();
           }
@@ -3211,7 +3747,18 @@ export function ChannelPage({
       sock.dispose();
       sockRef.current = null;
     };
-  }, [slug, token, shareMode, bootstrapped, loadCharter, loadTaskLedger]);
+  }, [
+    slug,
+    token,
+    shareMode,
+    bootstrapped,
+    applyAuthoritativeParticipantRemoval,
+    loadCharter,
+    loadIdentities,
+    loadRoles,
+    loadTaskLedger,
+    observePendingDecisionFrame,
+  ]);
 
   useEffect(() => {
     const onPopState = () => setAgentFilter(parseAgentFilter(window.location.search));
@@ -3540,18 +4087,57 @@ export function ChannelPage({
   }, [lastSeq, seenKey]);
 
   const openPanel = useCallback((panel: ChannelPanel) => {
+    skipPanelFocusRestoreRef.current = false;
     setActiveAdminSurface(null);
+    setMemberDetailRoute(null);
+    setSelectedTaskId(null);
     if (panel === "charter" && charter !== null) {
       writeSeenCharterRev(slug, charter.charter_rev);
       setSeenCharterRev(charter.charter_rev);
     }
-    if (panel === "tasks" || panel === "team") void loadTaskLedger();
+    if (panel === "tasks" || panel === "team" || panel === "focus") void loadTaskLedger();
     setActivePanel(panel);
   }, [charter, loadTaskLedger, slug]);
 
+  const openFocusedTask = useCallback((taskId: number) => {
+    skipPanelFocusRestoreRef.current = false;
+    setActiveAdminSurface(null);
+    setMemberDetailRoute(null);
+    setSelectedTaskId(taskId);
+    void loadTaskLedger();
+    setActivePanel("tasks");
+  }, [loadTaskLedger]);
+
   const setAdminSurface = useCallback((surface: AdminSurface, open: boolean) => {
     setActivePanel(null);
+    setMemberDetailRoute(null);
     setActiveAdminSurface(open ? surface : null);
+  }, []);
+
+  const openTeamMember = useCallback((name: string) => {
+    skipPanelFocusRestoreRef.current = false;
+    setActiveAdminSurface(null);
+    setMemberDetailRoute({ name, source: "team" });
+    setActivePanel("team");
+    void loadTaskLedger();
+  }, [loadTaskLedger]);
+
+  const openAdminMember = useCallback((name: string) => {
+    skipPanelFocusRestoreRef.current = false;
+    setActiveAdminSurface(null);
+    setMemberDetailRoute({ name, source: "admin" });
+  }, []);
+
+  const closeChannelPanel = useCallback(() => {
+    messageNavigationRequestRef.current += 1;
+    cancelPendingMessageNavigation();
+    setMemberDetailRoute(null);
+    setSelectedTaskId(null);
+    setActivePanel(null);
+  }, [cancelPendingMessageNavigation]);
+
+  const closeMemberDetail = useCallback(() => {
+    setMemberDetailRoute(null);
   }, []);
 
   const editCharter = useCallback(() => {
@@ -3713,10 +4299,21 @@ export function ChannelPage({
     setChannelRole(token, slug, name, roleDraft.role, roleDraft.responsibility)
       .then((saved) => {
         setChannelRoles((current) => {
+          if (removedChannelMembersRef.current.has(saved.name)) {
+            return current.filter((role) => role.name !== saved.name);
+          }
           const previous = current.find((role) => role.name === saved.name);
           return [...current.filter((role) => role.name !== saved.name), { ...previous, ...saved }];
         });
-        setRoleDrafts((current) => ({ ...current, [saved.name]: roleDraftFrom(saved) }));
+        setRoleDrafts((current) => {
+          if (!removedChannelMembersRef.current.has(saved.name)) {
+            return { ...current, [saved.name]: roleDraftFrom(saved) };
+          }
+          if (!(saved.name in current)) return current;
+          const next = { ...current };
+          delete next[saved.name];
+          return next;
+        });
         if (savingKey === "__new__") {
           setNewRoleName("");
           setNewRoleDraft({ role: "worker", responsibility: "" });
@@ -3740,7 +4337,11 @@ export function ChannelPage({
     setRoleError(null);
     setChannelRole(token, slug, name, current.role, current.responsibility ?? "", reportsTo)
       .then((saved) => {
-        setChannelRoles((roles) => [...roles.filter((role) => role.name !== saved.name), { ...current, ...saved }]);
+        setChannelRoles((roles) => (
+          removedChannelMembersRef.current.has(saved.name)
+            ? roles.filter((role) => role.name !== saved.name)
+            : [...roles.filter((role) => role.name !== saved.name), { ...current, ...saved }]
+        ));
       })
       .catch((err: unknown) => {
         if (err instanceof AuthError) authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
@@ -3938,8 +4539,9 @@ export function ChannelPage({
         participants: state.participants,
         messages: state.messages,
         now: teamNow,
+        memberNames: authoritativeMemberNames,
       }),
-    [state.messages, state.participants, state.presence, teamNow],
+    [authoritativeMemberNames, state.messages, state.participants, state.presence, teamNow],
   );
   const hostBoard = useMemo(
     // #204 open_claims / conflicts / blockers 改由任务台账派生：把已加载的 tasks 一并喂进 buildHostBoard。
@@ -3957,6 +4559,102 @@ export function ChannelPage({
         presence: state.presence,
       }),
     [channelIdentities, mentionOptions, state.messages, state.participants, state.presence],
+  );
+  const activeChannelAdminMembers = useMemo<ChannelAdminMember[]>(() => {
+    const names = new Set<string>([
+      ...state.participants.map((participant) => participant.name),
+      ...Object.keys(state.presence),
+      ...channelIdentities.map((identity) => identity.name),
+      ...channelRoles.map((role) => role.name),
+    ]);
+    return [...names]
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => {
+        const participant = state.participants.find((entry) => entry.name === name);
+        const presence = state.presence[name];
+        const assignment = channelRoles.find((role) => role.name === name);
+        const identity = identityDisplay[name];
+        const kind = identity?.kind ?? assignment?.kind ?? presence?.kind ?? participant?.kind ?? "agent";
+        const detail = assignment !== undefined
+          ? [assignment.role, assignment.responsibility].filter(Boolean).join(" · ")
+          : presence?.state ?? null;
+        return {
+          name,
+          display: identity?.display ?? assignment?.display ?? name,
+          kind,
+          account: identity?.account
+            ?? assignment?.account
+            ?? presence?.account
+            ?? participant?.owner
+            ?? null,
+          detail,
+          canRemove: canModerate && !state.archived && name !== state.self,
+        };
+      });
+  }, [
+    canModerate,
+    channelIdentities,
+    channelRoles,
+    identityDisplay,
+    state.archived,
+    state.participants,
+    state.presence,
+    state.self,
+  ]);
+  channelAdminMemberRowsRef.current = new Map(
+    activeChannelAdminMembers.map((member) => [member.name, member]),
+  );
+  const channelAdminMembers = useMemo<ChannelAdminMember[]>(() => {
+    const activeNames = new Set(activeChannelAdminMembers.map((member) => member.name));
+    const removed = Object.values(removedChannelMemberSnapshots)
+      .filter((member) => removedMemberNames.has(member.name) && !activeNames.has(member.name))
+      .map((member): ChannelAdminMember => ({
+        ...member,
+        removed: true,
+        canRemove: false,
+        canRestore: canModerate && !state.archived,
+      }));
+    return [...activeChannelAdminMembers, ...removed]
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }, [
+    activeChannelAdminMembers,
+    canModerate,
+    removedChannelMemberSnapshots,
+    removedMemberNames,
+    state.archived,
+  ]);
+  const selectedTeamMember = useMemo(() => {
+    if (memberDetailRoute === null) return null;
+    const { name } = memberDetailRoute;
+    return resolveTeamMemberView({
+      name,
+      assignment: channelRoles.find((role) => role.name === name) ?? null,
+      identity: identityDisplay[name] ?? null,
+      presence: state.presence[name] ?? null,
+      participant: state.participants.find((participant) => participant.name === name) ?? null,
+    });
+  }, [channelRoles, identityDisplay, memberDetailRoute, state.participants, state.presence]);
+  const memberDetailContent = selectedTeamMember === null ? null : (
+    <AgentDetailPanel
+      name={selectedTeamMember.name}
+      display={selectedTeamMember.display}
+      kind={selectedTeamMember.kind}
+      owner={selectedTeamMember.owner}
+      online={selectedTeamMember.runtime.online}
+      presence={selectedTeamMember.runtime.presence}
+      messages={state.messages}
+      assignment={{
+        role: selectedTeamMember.role.role,
+        responsibility: selectedTeamMember.role.responsibility,
+        reportsTo: selectedTeamMember.role.reportsTo,
+        source:
+          selectedTeamMember.role.source === "channel_roles"
+            ? "assigned"
+            : selectedTeamMember.role.source === "presence"
+              ? "self_reported"
+              : "none",
+      }}
+    />
   );
   // 只给「确定是 agent」的 @ 目标算回执：kind 已知 agent 才纳入，未知/人类不标（避免把人误标成待唤醒）。
   const isAgentMention = useMemo(() => {
@@ -4040,16 +4738,15 @@ export function ChannelPage({
   const agentFilterActive = agentFilter.agents.length > 0 || agentFilter.kind !== null;
   const totalInView = q === "" ? timelineMessages.length : searchHits.length;
   const visibleInView = q === "" ? visibleMessages.length : visibleSearchHits.length;
-  const channelSelfRoles = selfReportedRoles(channelRoles, state.presence, channelIdentities);
-  const structuredRoleCount = channelRoles.length + channelSelfRoles.length;
+  // Team 的「正式分工」角标只数 channel_roles；presence 自报留作待确认 claim。
+  const structuredRoleCount = channelRoles.length;
   const channelRolesByName = useMemo(
     () => Object.fromEntries(channelRoles.map((role) => [role.name, role])),
     [channelRoles],
   );
-  // 公告摘要与团队面板共用「管理员分配 + agent 自报」口径，并直接列出 agent 名。
-  // 已知 agent 存在时排除陈旧的人类/未知 role 行，避免 owner account 抢占 host 展示。
+  // 公告摘要只从正式 channel_roles 派生。presence 自报不得写成频道正式分工。
   const charterDivisionSummary = formatAgentRoleSummary(
-    [...channelRoles, ...channelSelfRoles].map((role) => ({
+    channelRoles.map((role) => ({
       name: role.name,
       display: identityDisplay[role.name]?.display ?? role.display ?? role.name,
       kind: role.kind ?? identityDisplay[role.name]?.kind ?? state.presence[role.name]?.kind,
@@ -4068,8 +4765,9 @@ export function ChannelPage({
         ...tasks.map(agentBoardTaskAssignee).filter((name): name is string => name !== null),
         ...activeDeliveryTargets(Object.values(state.directedDeliveries)),
       ],
+      authoritativeMemberNames,
     ),
-    [state.directedDeliveries, state.participants, state.presence, tasks],
+    [authoritativeMemberNames, state.directedDeliveries, state.participants, state.presence, tasks],
   );
   const onlineAgentCount = agentPresence.online;
   // #504 团队面板博客风页签的角标：离线 agent 数 / 未认领分工数 / @我未读数。
@@ -4077,7 +4775,7 @@ export function ChannelPage({
   const offlineAgentCount = agentPresence.offline;
   const unclaimedTeamCount = unassignedMembers(
     channelRoles,
-    selfReportedRoles(channelRoles, state.presence, channelIdentities),
+    [],
     state.presence,
     channelIdentities,
     t,
@@ -4089,12 +4787,17 @@ export function ChannelPage({
     () => computeChannelFocus({
       presence: Object.values(state.presence),
       tasks,
-      decisions: pendingDecisionsFromMessages(state.messages),
+      decisions: pendingDecisionData ?? [],
       viewer: { name: state.self, account: accountKey, canModerate },
       now: teamNow,
     }),
-    [state.presence, state.messages, state.self, tasks, accountKey, canModerate, teamNow],
+    [state.presence, state.self, tasks, pendingDecisionData, accountKey, canModerate, teamNow],
   );
+  const pendingDecisionLoadState = useMemo(() => ({
+    lastSuccessfulData: pendingDecisionData,
+    loading: pendingDecisionsLoading,
+    error: pendingDecisionsError,
+  }), [pendingDecisionData, pendingDecisionsError, pendingDecisionsLoading]);
 
   const setAgentMode = useCallback((mode: AgentFilterMode) => {
     setAgentFilter((current) => ({ ...current, mode }));
@@ -4112,27 +4815,155 @@ export function ChannelPage({
     setAgentFilter((current) => ({ ...current, agents: [], kind: null }));
   }, []);
 
-  const jumpToCompletion = useCallback((seq: number) => {
-    setSearch("");
-    setCompletionOnly(true);
-    window.setTimeout(() => {
-      document.getElementById(`msg-${seq}`)?.scrollIntoView({ block: "center" });
-    }, 0);
-  }, []);
+  const revealMessage = useCallback((
+    target: MsgFrame,
+    request: number,
+    desiredCompletionOnly = false,
+  ): Promise<boolean> => {
+    if (request !== messageNavigationRequestRef.current) return Promise.resolve(false);
+    const plan = planLoadedMessageNavigation({
+      messages: [target],
+      seq: target.seq,
+      agentFilter,
+      completionOnly,
+      desiredCompletionOnly,
+    });
+    if (!plan.found) return Promise.resolve(false);
+    if (plan.preserveCurrentView) {
+      setMessageViewRestore((current) => current ?? { completionOnly, agentFilter });
+    }
+    if (plan.clearAgentFilter) {
+      setAgentFilter((current) => ({ ...current, agents: [], kind: null }));
+    }
+    if (plan.changeCompletionView) setCompletionOnly(desiredCompletionOnly);
+    setMessageNavigationError(null);
+    setMessageNavigationAnnouncement("");
+    return new Promise<boolean>((resolve) => {
+      const previous = messageNavigationCompletionRef.current;
+      messageNavigationCompletionRef.current = null;
+      previous?.resolve(false);
+      messageNavigationCompletionRef.current = { request, resolve };
+      setPendingMessageJump({ seq: target.seq, sender: target.sender.name, request });
+    });
+  }, [agentFilter, completionOnly]);
 
-  // #342 搜索命中跳回原消息。不复用 jumpToCompletion：它会 setCompletionOnly(true)，
-  // 把非 completion 的命中从消息流里滤掉。清空搜索恢复消息流后再滚动+高亮（同 jumpToMention）；
-  // 消息不在已加载窗口（MESSAGE_CAP/翻页边界外）时 getElementById 为 null → 停在原地，按钮 title 已注明。
-  const jumpToSearchHit = useCallback((seq: number) => {
-    setSearch("");
-    window.setTimeout(() => {
-      const el = document.getElementById(`msg-${seq}`);
-      if (el === null) return;
-      el.scrollIntoView({ block: "center" });
-      el.classList.add("msg-jump-highlight");
-      window.setTimeout(() => el.classList.remove("msg-jump-highlight"), 1200);
-    }, 0);
-  }, []);
+  const navigateToMessage = useCallback(async (
+    seq: number,
+    desiredCompletionOnly = false,
+  ): Promise<boolean> => {
+    const request = ++messageNavigationRequestRef.current;
+    cancelPendingMessageNavigation();
+    setMessageNavigationError(null);
+    try {
+      const resolved = await resolveMessageNavigationTarget({
+        messages: state.messages,
+        seq,
+        loadAround: (targetSeq) => fetchMessages(token, slug, {
+          around: targetSeq,
+          limit: PAGE_SIZE,
+        }),
+      });
+      if (request !== messageNavigationRequestRef.current) return false;
+      if (resolved === null) {
+        setMessageNavigationError(t("Channel.navigation.notLoaded", { seq: String(seq) }));
+        return false;
+      }
+      for (const message of resolved.messagesToMerge) {
+        dispatch({ type: "frame", frame: message });
+      }
+      return await revealMessage(resolved.target, request, desiredCompletionOnly);
+    } catch (error) {
+      if (request !== messageNavigationRequestRef.current) return false;
+      if (error instanceof AuthError) {
+        authFailedRef.current(tRef.current("Channel.error.tokenRevoked"));
+      } else if (error instanceof ForbiddenError) {
+        dispatch({ type: "fatal", reason: "forbidden" });
+      } else {
+        setMessageNavigationError(t("Channel.navigation.loadFailed", { seq: String(seq) }));
+      }
+      return false;
+    }
+  }, [cancelPendingMessageNavigation, revealMessage, slug, state.messages, t, token]);
+
+  useEffect(() => {
+    if (pendingMessageJump === null) return;
+    const jump = pendingMessageJump;
+    let attempts = 0;
+    let frame = 0;
+    const finish = (located: boolean) => {
+      setPendingMessageJump((current) => current?.request === jump.request ? null : current);
+      settleMessageNavigation(jump.request, located);
+    };
+    const locate = () => {
+      if (jump.request !== messageNavigationRequestRef.current) {
+        finish(false);
+        return;
+      }
+      const element = document.getElementById(`msg-${jump.seq}`);
+      if (element === null && attempts < 1) {
+        attempts += 1;
+        frame = window.requestAnimationFrame(locate);
+        return;
+      }
+      if (element === null) {
+        setMessageNavigationError(t("Channel.navigation.renderFailed", { seq: String(jump.seq) }));
+        finish(false);
+        return;
+      }
+      let focused = false;
+      focusMessageNavigationTarget(
+        element,
+        () => {
+          focused = document.activeElement === element;
+          if (focused) {
+            setMessageNavigationAnnouncement(t("Channel.navigation.arrived", {
+              seq: String(jump.seq),
+              sender: jump.sender,
+            }));
+          }
+        },
+        (callback, delayMs) => window.setTimeout(callback, delayMs),
+      );
+      if (!focused) {
+        setMessageNavigationError(t("Channel.navigation.renderFailed", { seq: String(jump.seq) }));
+      }
+      finish(focused);
+    };
+    frame = window.requestAnimationFrame(locate);
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingMessageJump, settleMessageNavigation, t, visibleMessages]);
+
+  const restoreMessageView = useCallback(() => {
+    if (messageViewRestore === null) return;
+    setCompletionOnly(messageViewRestore.completionOnly);
+    setAgentFilter(messageViewRestore.agentFilter);
+    setMessageViewRestore(null);
+  }, [messageViewRestore]);
+
+  const jumpToMention = useCallback(async (seq: number): Promise<boolean> => {
+    const located = await navigateToMessage(seq);
+    if (located) {
+      setToasts((current) => current.filter((toast) => toast.seq !== seq));
+    }
+    return located;
+  }, [navigateToMessage]);
+
+  const jumpToCompletion = useCallback(async (seq: number): Promise<boolean> => {
+    const located = await navigateToMessage(seq, true);
+    if (located) setSearch("");
+    return located;
+  }, [navigateToMessage]);
+
+  // 所有入口（Search / mention / Focus decision / completion）统一走有锚历史解析。
+  // Promise 只在目标 DOM 真正拿到焦点后才返回 true；失败则保留调用入口供重试。
+  const jumpToSearchHit = useCallback(async (seq: number): Promise<boolean> => {
+    const located = await navigateToMessage(seq);
+    if (located) {
+      setSearch("");
+      if (activePanel === "search") skipPanelFocusRestoreRef.current = true;
+    }
+    return located;
+  }, [activePanel, navigateToMessage]);
 
   useEffect(() => {
     if (q === "") {
@@ -4248,17 +5079,31 @@ export function ChannelPage({
       agentFilterActive={agentFilterActive}
       searchInputError={searchInputError}
       searchError={searchError}
-      onSearch={setSearch}
+      jumpError={messageNavigationError}
+      onSearch={(value) => {
+        messageNavigationRequestRef.current += 1;
+        cancelPendingMessageNavigation();
+        setSearch(value);
+        setMessageNavigationError(null);
+      }}
       onSearchFrom={setSearchFrom}
       onSearchSince={setSearchSince}
       onSearchLimit={setSearchLimit}
-      onClose={() => setActivePanel(null)}
+      onClose={closeChannelPanel}
       onJump={jumpToSearchHit}
     />
   );
 
   return (
     <div className="chan">
+      <span
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        style={SCREEN_READER_ONLY_STYLE}
+      >
+        {messageNavigationAnnouncement}
+      </span>
       <PresenceBar
         presence={state.presence}
         participants={state.participants}
@@ -4267,34 +5112,37 @@ export function ChannelPage({
         isPublic={localPublic}
         publicWatch={localWatch}
         canModerate={canModerate}
-        removingName={removingName}
-        onRemoveParticipant={removeParticipant}
         pausingName={pausingName}
         onPauseAgent={pauseAgentReception}
         onResumeAgent={resumeAgentReception}
         roles={channelRoles}
-        onOpenAgentDetail={setOpenAgentDetail}
-        headerControls={canModerate && !state.archived ? (
-          <VisibilityToggle
-            slug={slug}
-            token={token}
-            visibility={localVisibility}
-            onChanged={setLocalVisibility}
-            onAuthFailed={onAuthFailed}
-          />
-        ) : null}
+        onOpenAgentDetail={openTeamMember}
         focus={
           <ChannelFocusBar
             focus={channelFocus}
+            decisionState={pendingDecisionLoadState}
             viewerIsModerator={canModerate}
-            onOpenTask={() => openPanel("tasks")}
+            onOpenTask={openFocusedTask}
             onJumpSeq={jumpToMention}
+            onOpenOverview={() => openPanel("focus")}
+            onRetryDecisions={() => void refreshPendingDecisions()}
           />
         }
       />
       {kickError !== null && <p className="banner banner--red">{kickError}</p>}
       {pauseError !== null && <p className="banner banner--red">{pauseError}</p>}
       {archiveError !== null && <p className="banner banner--red">{archiveError}</p>}
+      {activePanel !== "search" && messageNavigationError !== null && (
+        <p className="banner banner--yellow" role="alert">{messageNavigationError}</p>
+      )}
+      {messageViewRestore !== null && (
+        <aside className="banner banner--yellow" aria-live="polite">
+          {t("Channel.navigation.filtersRevealed")}{" "}
+          <button type="button" className="d-btn" onClick={restoreMessageView}>
+            {t("Channel.navigation.restoreFilters")}
+          </button>
+        </aside>
+      )}
       {/* #662：owner 进入/刷新页面时，主动提醒名下跑着过时 CLI 的 agent，引导用接入包升级。
           CTA 打开 AgentJoin 接入面板（复用 join-pack 生成）；只有能铸 agent 的 owner 才挂该面板，
           故 onUpgrade 仅在 canMintAgent && accountKey!=null 时接线，否则退化为纯提醒（无升级按钮）。 */}
@@ -4384,38 +5232,15 @@ export function ChannelPage({
                   />
                 </div>
               )}
-              {canModerate && !state.archived && (
-                <div className="chan-admin-group chan-admin-group--access">
-                  <JoinLink
-                    slug={slug}
-                    token={token}
-                    larkDirectoryEnabled={larkDirectoryEnabled}
-                    onAuthFailed={onAuthFailed}
-                    active={activeAdminSurface === "joinLink"}
-                    onActiveChange={(open) => setAdminSurface("joinLink", open)}
-                  />
-                </div>
-              )}
               {canModerate && (
                 <div className="chan-admin-group chan-admin-group--channel">
-                  <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("settings")}>
+                  <button type="button" className="d-btn chan-tool-btn" onClick={() => openPanel("admin")}>
                     <span className="ap-sprite ap-sprite--settings" aria-hidden="true" />
-                    <span>{t("Channel.tools.settings")}</span>
+                    <span>{t("Channel.tools.manage")}</span>
                     <span className="t-mono chan-tool-badge">
-                      {localLoopGuardEnabled ? localLoopGuardLimit : t("Channel.settings.unlimited")}
+                      {localVisibility}
                     </span>
                   </button>
-                  {!state.archived && (
-                    <button
-                      type="button"
-                      className="d-btn archive-channel-btn"
-                      disabled={archiving}
-                      onClick={archiveCurrentChannel}
-                      title={t("Channel.archive.buttonTitle")}
-                    >
-                      {archiving ? t("Channel.archive.archiving") : t("Channel.archive.button")}
-                    </button>
-                  )}
                 </div>
               )}
             </div>
@@ -4428,20 +5253,32 @@ export function ChannelPage({
           title={
             activePanel === "charter" ? t("Channel.tools.charter") :
             activePanel === "team" ? t("Channel.tools.team") :
+            activePanel === "focus" ? t("ChannelFocusBar.overviewTitle") :
             activePanel === "tasks" ? t("Channel.tasks.title") :
-            activePanel === "settings" ? t("Channel.tools.settings") :
+            activePanel === "admin" ? t("ChannelAdmin.title") :
             t("Channel.tools.search")
           }
           subtitle={
             activePanel === "charter" && charter !== null ? t("Channel.charter.rev", { rev: charter.charter_rev }) :
             activePanel === "team" ? t("Channel.team.subtitle", { roles: String(structuredRoleCount), online: String(onlineAgentCount) }) :
+            activePanel === "focus" ? t("ChannelFocusBar.counts", {
+              working: channelFocus.counts.working,
+              blocked: channelFocus.counts.blocked,
+              decision: channelFocus.counts.waitingDecision,
+              stalled: channelFocus.counts.stalled,
+            }) :
             activePanel === "tasks" ? t("Channel.tasks.subtitle", { open: taskOpenCount, review: taskReviewCount, blocked: taskBlockedCount }) :
-            activePanel === "settings" ? (localLoopGuardEnabled ? t("Channel.settings.enabled") : t("Channel.settings.unlimited")) :
             activePanel === "search" && q !== "" && seqFromQuery(q) === null ? t("Channel.search.hits", { count: searchHits.length }) :
             undefined
           }
-          onClose={() => setActivePanel(null)}
-          hideHeader={activePanel === "team" || activePanel === "tasks"}
+          onClose={closeChannelPanel}
+          onEscape={
+            memberDetailRoute !== null && memberDetailRoute.source === activePanel
+              ? closeMemberDetail
+              : undefined
+          }
+          shouldRestoreFocus={() => !skipPanelFocusRestoreRef.current}
+          hideHeader={activePanel === "team" || activePanel === "tasks" || activePanel === "admin"}
         >
           {activePanel === "charter" && (
             <CharterBanner
@@ -4477,7 +5314,7 @@ export function ChannelPage({
             // 结构一目了然、页签带角标。各段数据逻辑不动（DivisionBoard 等原样），TeamTabs 只管外壳。
             // 组织架构树仍在 DivisionBoard 顶部（OrgTreePreview）。
             <TeamTabs
-              onClose={() => setActivePanel(null)}
+              onClose={closeChannelPanel}
               stats={{
                 roles: structuredRoleCount,
                 online: onlineAgentCount,
@@ -4509,7 +5346,7 @@ export function ChannelPage({
                   syncingCharter={charterSaving}
                   canManageAgentRules={canMintAgent && accountKey !== null}
                   onOpenAgentRules={openAgentRulesFromDivision}
-                  onOpenAgentDetail={setOpenAgentDetail}
+                  onOpenAgentDetail={openTeamMember}
                 />
               }
               board={(
@@ -4519,9 +5356,31 @@ export function ChannelPage({
                   tasks={tasks}
                   deliveries={Object.values(state.directedDeliveries)}
                   messages={state.messages}
+                  onOpenAgentDetail={openTeamMember}
+                  memberNames={authoritativeMemberNames}
                 />
               )}
               coordination={coordinationContent}
+              detail={memberDetailRoute?.source === "team" ? memberDetailContent : null}
+              detailBackLabel={t("Channel.team.member.back")}
+              onBackFromDetail={closeMemberDetail}
+            />
+          )}
+          {activePanel === "focus" && (
+            <ChannelFocusPanel
+              focus={channelFocus}
+              decisionState={pendingDecisionLoadState}
+              jumpError={messageNavigationError}
+              onOpenTask={openFocusedTask}
+              onRetryDecisions={() => void refreshPendingDecisions()}
+              onJumpSeq={async (seq) => {
+                const located = await navigateToMessage(seq);
+                if (located) {
+                  skipPanelFocusRestoreRef.current = true;
+                  closeChannelPanel();
+                }
+                return located;
+              }}
             />
           )}
           {activePanel === "tasks" && (
@@ -4540,43 +5399,80 @@ export function ChannelPage({
               onReview={reviewTask}
               onCreateTask={createTaskDraft}
               identities={channelIdentities}
+              selectedTaskId={selectedTaskId}
               onUploadAttachment={canWrite ? (file) => uploadAttachment(token, slug, file) : undefined}
-              onClose={() => setActivePanel(null)}
+              onClose={closeChannelPanel}
             />
           )}
-          {activePanel === "settings" && (
-            <GuardSettingsPanel
-              canModerate={canModerate}
-              loopEnabled={localLoopGuardEnabled}
-              loopLimit={localLoopGuardLimit}
-              workflowEnabled={localWorkflowGuardEnabled}
-              workflowLimit={localWorkflowGuardLimit}
-              saving={guardSaving}
-              error={guardConfigError}
-              onLoopEnabled={setLocalLoopGuardEnabled}
-              onLoopLimit={setLocalLoopGuardLimit}
-              onWorkflowEnabled={setLocalWorkflowGuardEnabled}
-              onWorkflowLimit={setLocalWorkflowGuardLimit}
-              onSaveLoop={saveLoopGuard}
-              onSaveWorkflow={saveWorkflowGuard}
-              onLoopUnlimited={setLoopUnlimited}
-              onWorkflowUnlimited={setWorkflowUnlimited}
+          {activePanel === "admin" && (
+            <ChannelAdminView
+              slug={slug}
+              visibility={localVisibility}
+              archived={state.archived}
+              capabilities={{
+                manageAccess: canModerate,
+                manageMembers: canModerate,
+                manageSafety: canModerate,
+                archive: canModerate,
+              }}
+              members={channelAdminMembers}
+              accessControls={!state.archived
+                ? (active) => (
+                    <VisibilityToggle
+                      active={active}
+                      slug={slug}
+                      token={token}
+                      visibility={localVisibility}
+                      onChanged={setLocalVisibility}
+                      onAuthFailed={onAuthFailed}
+                    />
+                  )
+                : undefined}
+              invitationControls={!state.archived ? (
+                <JoinLink
+                  embedded
+                  slug={slug}
+                  token={token}
+                  larkDirectoryEnabled={larkDirectoryEnabled}
+                  onAuthFailed={onAuthFailed}
+                />
+              ) : undefined}
+              safetyControls={(
+                <GuardSettingsPanel
+                  canModerate={canModerate}
+                  loopEnabled={localLoopGuardEnabled}
+                  loopLimit={localLoopGuardLimit}
+                  workflowEnabled={localWorkflowGuardEnabled}
+                  workflowLimit={localWorkflowGuardLimit}
+                  saving={guardSaving}
+                  error={guardConfigError}
+                  onLoopEnabled={setLocalLoopGuardEnabled}
+                  onLoopLimit={setLocalLoopGuardLimit}
+                  onWorkflowEnabled={setLocalWorkflowGuardEnabled}
+                  onWorkflowLimit={setLocalWorkflowGuardLimit}
+                  onSaveLoop={saveLoopGuard}
+                  onSaveWorkflow={saveWorkflowGuard}
+                  onLoopUnlimited={setLoopUnlimited}
+                  onWorkflowUnlimited={setWorkflowUnlimited}
+                />
+              )}
+              removingMember={removingName}
+              restoringMember={restoringName}
+              memberError={kickError}
+              archiving={archiving}
+              lifecycleError={archiveError}
+              detail={memberDetailRoute?.source === "admin" ? memberDetailContent : null}
+              detailBackLabel={t("ChannelAdmin.members.back")}
+              onBackFromDetail={closeMemberDetail}
+              onOpenMember={openAdminMember}
+              onRemoveMember={removeParticipant}
+              onRestoreMember={restoreRemovedParticipant}
+              onArchive={archiveCurrentChannel}
+              onClose={closeChannelPanel}
             />
           )}
           {activePanel === "search" && searchContent}
         </ChannelPanelModal>
-      )}
-      {openAgentDetail !== null && (
-        <AgentDetailModal
-          name={openAgentDetail}
-          display={identityDisplay[openAgentDetail]?.display ?? openAgentDetail}
-          kind={identityDisplay[openAgentDetail]?.kind ?? state.presence[openAgentDetail]?.kind ?? "agent"}
-          owner={identityDisplay[openAgentDetail]?.account ?? state.presence[openAgentDetail]?.account ?? null}
-          online={state.participants.some((p) => p.name === openAgentDetail)}
-          presence={state.presence[openAgentDetail] ?? null}
-          messages={state.messages}
-          onClose={() => setOpenAgentDetail(null)}
-        />
       )}
       {/* overflow-anchor:none —— 浏览器原生滚动锚定会和我们手动的 prepend 锚定打架 */}
       <div className="stream" ref={streamRef} onScroll={onScroll} style={{ overflowAnchor: "none" }}>

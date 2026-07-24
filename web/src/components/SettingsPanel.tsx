@@ -1,6 +1,6 @@
 // 全局设置只承载个人与设备设置。跨频道的本机 Agent 监控、启停、常驻和日志
 // 已移到独立 LocalAgentCenter，避免打开偏好设置就启动多套本机 IPC/轮询。
-import { useCallback, useState, type ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { useT } from "../i18n/useT";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { HandleSetup } from "./HandleSetup";
@@ -39,6 +39,7 @@ export function SettingsPanel({
   onShowOnboarding,
   desktopAppSettings = null,
   initialSection = "preferences",
+  restoreFocusOnUnmount = true,
 }: {
   me: SettingsMe | null;
   notifyOptin: boolean;
@@ -50,9 +51,12 @@ export function SettingsPanel({
   onShowOnboarding?: () => void;
   desktopAppSettings?: ReactNode;
   initialSection?: SettingsSectionId;
+  restoreFocusOnUnmount?: boolean;
 }) {
   const t = useT();
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
+  const [notifyHint, setNotifyHint] = useState<string | null>(null);
+  const notifyRequestRef = useRef(0);
 
   const pickTheme = useCallback((next: Theme) => {
     applyTheme(next);
@@ -61,10 +65,18 @@ export function SettingsPanel({
 
   const toggleNotify = useCallback(() => {
     const next = !notifyOptin;
+    const requestId = ++notifyRequestRef.current;
+    setNotifyHint(null);
     writeNotifyOptin(next);
     onNotifyOptinChange(next);
-    if (next) void requestNotifySystemPermission();
-  }, [notifyOptin, onNotifyOptinChange]);
+    if (next) {
+      void requestNotifySystemPermission().then((granted) => {
+        if (requestId === notifyRequestRef.current && !granted) {
+          setNotifyHint(t("App.settings.notify.inAppOnly"));
+        }
+      });
+    }
+  }, [notifyOptin, onNotifyOptinChange, t]);
 
   const sections: SectionedDialogSection<SettingsSectionId>[] = [
     {
@@ -108,6 +120,9 @@ export function SettingsPanel({
               {notifyOptin ? t("App.settings.notify.on") : t("App.settings.notify.off")}
             </button>
             <p className="settings-hint">{t("App.settings.notify.hint")}</p>
+            {notifyHint !== null && (
+              <p className="settings-hint" role="status">{notifyHint}</p>
+            )}
           </section>
         </>
       ),
@@ -194,6 +209,7 @@ export function SettingsPanel({
       sections={sections}
       initialSection={initialSection}
       onClose={onClose}
+      restoreFocusOnUnmount={restoreFocusOnUnmount}
     />
   );
 }

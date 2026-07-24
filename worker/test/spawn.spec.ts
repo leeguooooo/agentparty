@@ -1,5 +1,5 @@
-import { SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { SELF, env } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
 import { WsClient, api, completeCapabilityHello, createChannel, seedToken, uniq } from "./helpers";
 
 describe("agent spawn lineage", () => {
@@ -42,6 +42,54 @@ describe("agent spawn lineage", () => {
         scoped_to: slug,
       },
     });
+  });
+
+  it("fails the final spawn CAS when the parent is revoked immediately before child persistence", async () => {
+    const owner = await seedToken("agent", uniq("owner"), { owner: "leo" });
+    const slug = await createChannel(owner.token);
+    const parent = await seedToken("agent", uniq("parent"), { owner: "leo", channelScope: slug });
+    const childName = uniq("child-cas");
+    const originalPrepare = env.DB.prepare.bind(env.DB);
+    let intercepted = false;
+    const prepare = vi.spyOn(env.DB, "prepare").mockImplementation((query: string) => {
+      const statement = originalPrepare(query);
+      if (
+        !query.includes("INSERT INTO tokens (") ||
+        !query.includes("SELECT ?, ?, 'agent'") ||
+        !query.includes("parent.parent_agent IS NULL")
+      ) {
+        return statement;
+      }
+      return {
+        bind: (...values: unknown[]) => {
+          const bound = statement.bind(...values);
+          return {
+            run: async () => {
+              intercepted = true;
+              await originalPrepare(
+                "UPDATE tokens SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL",
+              ).bind(Date.now(), parent.name).run();
+              return bound.run();
+            },
+          } as D1PreparedStatement;
+        },
+      } as D1PreparedStatement;
+    });
+
+    let response: Response;
+    try {
+      response = await api("/api/spawn", parent.token, {
+        method: "POST",
+        body: JSON.stringify({ name: childName, channel_scope: slug, ttl_sec: 3600 }),
+      });
+    } finally {
+      prepare.mockRestore();
+    }
+
+    expect(intercepted).toBe(true);
+    expect(response!.status).toBe(409);
+    expect(await response!.json()).toMatchObject({ error: { code: "participant_removed" } });
+    expect(await env.DB.prepare("SELECT name FROM tokens WHERE name = ?").bind(childName).first()).toBeNull();
   });
 
   it("rejects unscoped parents, cross-scope spawn, child recursion, and expired child tokens", async () => {
