@@ -1211,6 +1211,19 @@ function truncateCodePoints(value: string, maxLength: number): string {
   return points.length <= maxLength ? value : points.slice(0, maxLength).join("");
 }
 
+function truncateCodePointsWithNotice(
+  value: string | null,
+  maxLength: number,
+  notice: string,
+): string | null {
+  if (value === null) return null;
+  if (codePointLength(value) <= maxLength) return value;
+  const noticeLength = codePointLength(notice);
+  return noticeLength >= maxLength
+    ? truncateCodePoints(notice, maxLength)
+    : truncateCodePoints(value, maxLength - noticeLength) + notice;
+}
+
 // 把一条 @mention 的完整上下文落成 JSON 文件，命令拿路径读——避开 env/stdin 的 shell quoting/注入，
 // 也让 runner 能一次拿全 channel/seq/sender/body/reply_to/recent/protocol_reminder（评审建议）。
 // recent = 触发消息之前、serve 在线期间看到的最近频道消息（含自己/未 @ 的闲聊，正文截断），
@@ -1229,14 +1242,11 @@ function buildWakeContext(
   const body = frame.kind === "message" ? frame.body : (frame.note ?? "");
   const rawCharter = charter?.charter ?? null;
   const charterNotice = `\n… [charter truncated; run \`party charter ${channel}\`]`;
-  const charterNoticeLength = codePointLength(charterNotice);
-  const boundedCharter = rawCharter === null
-    ? null
-    : codePointLength(rawCharter) <= WAKE_CHARTER_BODY_MAX
-      ? rawCharter
-      : charterNoticeLength >= WAKE_CHARTER_BODY_MAX
-        ? truncateCodePoints(charterNotice, WAKE_CHARTER_BODY_MAX)
-        : truncateCodePoints(rawCharter, WAKE_CHARTER_BODY_MAX - charterNoticeLength) + charterNotice;
+  const boundedCharter = truncateCodePointsWithNotice(
+    rawCharter,
+    WAKE_CHARTER_BODY_MAX,
+    charterNotice,
+  );
   const boundedCharterLength = boundedCharter === null ? 0 : codePointLength(boundedCharter);
   const rawDecisionSnapshot = channelDecisionSnapshotBodyLines(charter?.active_decisions ?? []).join("\n") || null;
   const decisionNotice = `\n… [decision snapshot truncated; run \`party decision list --channel ${channel}\`]`;
@@ -1244,14 +1254,11 @@ function buildWakeContext(
     WAKE_DECISION_BODY_MAX,
     Math.max(0, WAKE_AUX_BODY_MAX - boundedCharterLength),
   );
-  const decisionNoticeLength = codePointLength(decisionNotice);
-  const boundedDecisionSnapshot = rawDecisionSnapshot === null
-    ? null
-    : codePointLength(rawDecisionSnapshot) <= decisionBudget
-      ? rawDecisionSnapshot
-      : decisionNoticeLength >= decisionBudget
-        ? truncateCodePoints(decisionNotice, decisionBudget)
-        : truncateCodePoints(rawDecisionSnapshot, decisionBudget - decisionNoticeLength) + decisionNotice;
+  const boundedDecisionSnapshot = truncateCodePointsWithNotice(
+    rawDecisionSnapshot,
+    decisionBudget,
+    decisionNotice,
+  );
   const boundedDecisionLength =
     boundedDecisionSnapshot === null ? 0 : codePointLength(boundedDecisionSnapshot);
   let recentBudget = WAKE_AUX_BODY_MAX - boundedCharterLength - boundedDecisionLength;

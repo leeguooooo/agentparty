@@ -979,6 +979,52 @@ describe("runServe", () => {
     }
   });
 
+  test("wake context truncates the decision snapshot with its recovery notice", () => {
+    const trigger = msgFrame(50, "continue", { mentions: ["me"] }) as unknown as MsgFrame;
+    const path = writeContextFile(
+      tempDir("ap-decision-snapshot-truncated-"),
+      trigger,
+      "dev",
+      "me",
+      [],
+      {
+        charter: null,
+        charter_rev: 0,
+        updated_at: null,
+        updated_by: null,
+        active_decisions: Array.from({ length: 20 }, (_, index) => ({
+          type: "channel_decision" as const,
+          id: `decision_${String(index).padStart(32, "0")}`,
+          channel: "dev",
+          topic: `topic-${index}`,
+          summary: "D".repeat(200),
+          source_seq: null,
+          supersedes_id: null,
+          superseded_by_id: null,
+          status: "active" as const,
+          created_by: "owner",
+          created_by_kind: "human" as const,
+          created_at: index,
+        })),
+      },
+    );
+    try {
+      const ctx = JSON.parse(readFileSync(path, "utf8"));
+      expect(Array.from(ctx.decision_snapshot)).toHaveLength(3_000);
+      expect(ctx.decision_snapshot).toEndWith(
+        "[decision snapshot truncated; run `party decision list --channel dev`]",
+      );
+      expect(ctx.context_budget).toMatchObject({
+        auxiliary_body_chars: 3_000,
+        decision_snapshot_chars: 3_000,
+        decision_snapshot_truncated: true,
+        recent_body_chars: 0,
+      });
+    } finally {
+      unlinkSync(path);
+    }
+  });
+
   test("wake context truncates on Unicode code-point boundaries", () => {
     const triggerBody = "🧭".repeat(10);
     const trigger = msgFrame(50, triggerBody, { mentions: ["me"] }) as unknown as MsgFrame;

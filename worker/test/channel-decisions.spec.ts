@@ -334,6 +334,40 @@ describe("authoritative channel decision ledger (#736)", () => {
     expect(assignedStatus.status).toBe(200);
     expect(await responseJson<{ role_warning?: string }>(assignedStatus)).not.toHaveProperty("role_warning");
 
+    // Worker/DO role snapshots can briefly arrive out of order after reassignment. The durable
+    // name + owner role binding still recognizes the real host without trusting a same-name impostor.
+    const assignedToken = await env.DB.prepare("SELECT hash, owner FROM tokens WHERE name = ?")
+      .bind(assigned.name)
+      .first<{ hash: string; owner: string }>();
+    expect(assignedToken).not.toBeNull();
+    const staleRoleStatus = await env.CHANNELS.get(env.CHANNELS.idFromName(slug)).fetch(
+      "http://ap.test/internal/messages",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-partykit-room": slug,
+          "x-ap-name": assigned.name,
+          "x-ap-kind": "agent",
+          "x-ap-role": "agent",
+          "x-ap-owner": assignedToken!.owner,
+          "x-ap-token-hash": assignedToken!.hash,
+          "x-ap-assigned-host": assigned.name,
+          "x-ap-can-write": "1",
+        },
+        body: JSON.stringify({
+          type: "send",
+          kind: "status",
+          state: "working",
+          note: "assigned host with a stale collaboration-role snapshot",
+          mentions: [],
+          role: "host",
+        }),
+      },
+    );
+    expect(staleRoleStatus.status).toBe(200);
+    expect(await responseJson<{ role_warning?: string }>(staleRoleStatus)).not.toHaveProperty("role_warning");
+
     // 先让已连接 socket 真正拿到 host，再在线改派成 reviewer；旧连接不能保留 stale host。
     expect(
       (

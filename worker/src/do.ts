@@ -7643,6 +7643,27 @@ export class ChannelDO extends Server<Env> {
     return undeliverable;
   }
 
+  private async isAssignedHostPrincipal(identity: Pick<Identity, "name" | "owner">): Promise<boolean> {
+    if (identity.owner === undefined) return false;
+    try {
+      const row = await this.env.DB.prepare(
+        `SELECT 1 AS matched
+           FROM channel_roles
+          WHERE channel_slug = ?
+            AND agent_name = ?
+            AND role = 'host'
+            AND owner_account = ?
+          LIMIT 1`,
+      )
+        .bind(this.name, identity.name, identity.owner)
+        .first<{ matched: number }>();
+      return row !== null;
+    } catch {
+      // Authority lookup failure must not suppress a conflicting-host warning.
+      return false;
+    }
+  }
+
   // 校验 → 分配 seq → 落库 → 修剪/presence，返回待广播帧
   private async handleSend(
     identity: Identity,
@@ -7684,7 +7705,11 @@ export class ChannelDO extends Server<Env> {
       frame.kind === "status" &&
       frame.role === "host" &&
       identity.collabRole !== "host" &&
-      assignedHost !== null
+      assignedHost !== null &&
+      (
+        assignedHost !== identity.name ||
+        !(await this.isAssignedHostPrincipal(identity))
+      )
       ? `channel already has assigned host @${assignedHost}; ask the owner to reassign before taking host, or report --role worker`
       : undefined;
     const privateDecisionRequest =

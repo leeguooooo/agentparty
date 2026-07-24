@@ -52,6 +52,7 @@ BEGIN
     THEN RAISE(ABORT, 'active decision already exists for topic')
   END;
   SELECT CASE
+    -- Keep this literal aligned with shared/src/protocol.ts CHANNEL_DECISION_ACTIVE_MAX.
     WHEN NEW.supersedes_id IS NULL AND (
       SELECT COUNT(*) FROM channel_decision_heads h
        WHERE h.channel_slug = NEW.channel_slug
