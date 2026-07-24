@@ -1,11 +1,13 @@
 // 左侧频道列表：频道名 + 最近一条消息 + 参与者状态点（spec §9 第 1 块）
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChannelInfo } from "../lib/api";
 import { useT } from "../i18n/useT";
 import "../i18n/strings/Home"; // 复用 "已归档 (N)" key，两处折叠开关文案一致
 import "../i18n/strings/App";
 
 interface Props {
+  /** 服务器视图身份；切换实例时分类和归档展开状态必须从默认值重新开始。 */
+  scopeKey: string;
   channels: ChannelInfo[] | null;
   active: string | null;
   error: string | null;
@@ -29,10 +31,20 @@ const CATEGORY_EMPTY_KEY: Record<Exclude<ChannelCategory, "all">, string> = {
 
 const MAX_DOTS = 4;
 
+function presenceDotPriority(state: ChannelInfo["presence"][number]["state"]): number {
+  if (state === "working") return 0;
+  if (state === "offline") return 2;
+  return 1;
+}
+
 // 参与者状态点：每人一个蜡笔点，色 = presence 状态；没人报过 presence 给一颗灰点占位
 export function PresenceDots({ channel }: { channel: ChannelInfo }) {
   const t = useT();
-  const entries = channel.presence.slice(0, MAX_DOTS);
+  // 列表最多只能放四颗点：先把正在工作和其他在线成员提到离线记录前面，再截断。
+  // sort 是稳定的，同一优先级内继续沿用服务端顺序，不让状态点在每次刷新时乱跳。
+  const entries = [...(channel.presence ?? [])]
+    .sort((a, b) => presenceDotPriority(a.state) - presenceDotPriority(b.state))
+    .slice(0, MAX_DOTS);
   return (
     <span className="chan-dots">
       {entries.length === 0 && <span className="d-dot d-dot--offline" title={t("Home.noParticipants")} />}
@@ -44,7 +56,7 @@ export function PresenceDots({ channel }: { channel: ChannelInfo }) {
 }
 
 export function lastMessagePreview(c: ChannelInfo): string | null {
-  if (c.last_message === null) return null;
+  if (c.last_message == null) return null;
   const body = c.last_message.body.replace(/\s+/g, " ").trim();
   return `${c.last_message.sender}: ${body === "" ? `[${c.last_message.kind}]` : body}`;
 }
@@ -83,9 +95,12 @@ function ChannelPill({
   );
 }
 
-export function ChannelList({ channels, active, error, onOpen, onRetry }: Props) {
+type ScopedProps = Omit<Props, "scopeKey">;
+
+function ScopedChannelList({ channels, active, error, onOpen, onRetry }: ScopedProps) {
   const [showArchived, setShowArchived] = useState(false);
   const [category, setCategory] = useState<ChannelCategory>("all");
+  const previousActiveRef = useRef<string | null | undefined>(undefined);
   const t = useT();
   // 默认只显示活跃频道；归档的（联调用完的 temp 等）折叠起来，避免刷屏
   const live = channels?.filter((c) => c.archived_at === null) ?? null;
@@ -98,6 +113,21 @@ export function ChannelList({ channels, active, error, onOpen, onRetry }: Props)
     created: createdCount,
     joined: joinedCount,
   };
+  useEffect(() => {
+    if (channels === null || previousActiveRef.current === active) return;
+    previousActiveRef.current = active;
+    if (active === null) return;
+    const activeChannel = channels.find((channel) => channel.slug === active);
+    if (activeChannel === undefined) return;
+    if (activeChannel.archived_at !== null) {
+      setShowArchived(true);
+      return;
+    }
+    const excluded =
+      (category === "created" && activeChannel.owned !== true) ||
+      (category === "joined" && activeChannel.member !== true);
+    if (excluded) setCategory("all");
+  }, [active, category, channels]);
   const filteredLive =
     live === null
       ? null
@@ -162,4 +192,8 @@ export function ChannelList({ channels, active, error, onOpen, onRetry }: Props)
       )}
     </nav>
   );
+}
+
+export function ChannelList({ scopeKey, ...props }: Props) {
+  return <ScopedChannelList key={scopeKey} {...props} />;
 }

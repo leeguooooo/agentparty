@@ -1373,6 +1373,7 @@ export function App() {
             />
           )}
           <ChannelList
+            scopeKey={activeOrigin}
             channels={channels}
             active={slug}
             error={listError}
