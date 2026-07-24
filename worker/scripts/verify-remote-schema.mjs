@@ -185,6 +185,7 @@ const requiredIndexes = {
     "idx_channel_decisions_supersedes",
     "idx_channel_decisions_channel_created",
   ],
+  channel_roles: ["idx_channel_roles_agent_name"],
   desktop_token_recoveries: ["idx_desktop_token_recoveries_expires_at"],
   management_audit: [
     "idx_management_audit_cursor_token",

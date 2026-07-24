@@ -30,6 +30,9 @@ END;
 -- Role validity also depends on the live token principal and scope. Bump every
 -- channel that binds the old/new token name so the snapshot double-read detects
 -- revocation, reminting, owner changes and scope changes.
+CREATE INDEX idx_channel_roles_agent_name
+ON channel_roles(agent_name, channel_slug);
+
 CREATE TRIGGER tokens_bump_role_revision_insert
 AFTER INSERT ON tokens
 BEGIN
